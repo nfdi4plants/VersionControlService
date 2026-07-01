@@ -1,0 +1,12 @@
+<Project>
+    <PropertyGroup>
+        <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    </PropertyGroup>
+    <ItemGroup>
+        <PackageVersion Include="FSharp.Core" Version="10.1.203"/>
+        <PackageVersion Include="ARCtrl.Javascript" Version="3.0.0-beta.12"/>
+        <PackageVersion Include="Fable.Core" Version="5.2.0"/>
+        <PackageVersion Include="YAMLicious" Version="1.0.0-alpha.1"/>
+        <PackageVersion Include="Vitest" Version="1.0.0"/>
+    </ItemGroup>
+</Project>

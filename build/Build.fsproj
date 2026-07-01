@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="ProjectInfo.fs"/>
+    <Compile Include="Util.fs"/>
+    <Compile Include="Actions\Bundle.fs"/>
+    <Compile Include="Actions\Test.fs"/>
+    <Compile Include="Build.fs"/>
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="SimpleExec" Version="12.0.0"/>
+    <PackageReference Include="Semver" Version="3.0.0"/>
+    <PackageReference Include="FsToolkit.ErrorHandling" Version="5.1.0"/>
+    <PackageReference Update="FSharp.Core" Version="9.0.300"/>
+  </ItemGroup>
+</Project>

@@ -427,3 +427,9 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# Fable compiler output
+*/**/fable_modules
+*.fs.ts
+*.fs.js.map
+output/

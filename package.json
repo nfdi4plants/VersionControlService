@@ -1,0 +1,16 @@
+{
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "~22",
+    "npm": "~10 || ~11"
+  },
+  "dependencies": {
+    "simple-git": "^3.32.3"
+  },
+  "devDependencies": {
+    "@fable-org/fable-library-js": "^2.3.0",
+    "vitest": "^4.0.18"
+  }
+}

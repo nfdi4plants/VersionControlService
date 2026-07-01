@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="VitestBindings.fs" />
+    <Compile Include="Scaffold.test.fs" />
+    <Compile Include="GitService.test.fs" />
+    <Compile Include="GitValidation.test.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\VersionControlService\VersionControlService.fsproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Fable.Core" />
+    <PackageReference Include="Vitest" />
+  </ItemGroup>
+</Project>
