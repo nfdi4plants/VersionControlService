@@ -114,10 +114,21 @@ type VersionControlDiffViewDataDto = {
     WordDiffText: string
 }
 
-type VersionControlMergeConflictViewDataDto = {
+type VersionControlContentConflictDto = {
     Path: string
-    MergeConflictContent: string
+    ConflictContent: string
 }
+
+type VersionControlVersionConflictDto = {
+    Path: string
+    SourceLabel: string option
+    TargetLabel: string option
+}
+
+[<RequireQualifiedAccess>]
+type VersionControlMergeConflictViewDataDto =
+    | Content of VersionControlContentConflictDto
+    | VersionPick of VersionControlVersionConflictDto
 
 type VersionControlUnsupportedContentDto = {
     Path: string
@@ -251,10 +262,15 @@ type VersionControlCreateBranchRequest = {
 
 type VersionControlCheckoutBranchRequest = { ProviderRef: string }
 
+[<RequireQualifiedAccess>]
+type VersionControlMergeResolution =
+    | Content of expectedConflictContent: string * resolvedContent: string
+    | TakeSourceVersion
+    | TakeTargetVersion
+
 type VersionControlConfirmMergeResolutionRequest = {
     Path: string
-    ExpectedConflictContent: string
-    ResolvedContent: string
+    Resolution: VersionControlMergeResolution
     AutoCommit: bool
 }
 

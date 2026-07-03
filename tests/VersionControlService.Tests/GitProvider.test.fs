@@ -643,7 +643,10 @@ Vitest.describe (
 
                         let mergeConflictContent =
                             match mergeViewLoad with
-                            | VersionControlPageLoadResultDto.Loaded view -> view.MergeConflictContent
+                            | VersionControlPageLoadResultDto.Loaded(VersionControlMergeConflictViewDataDto.Content view) ->
+                                view.ConflictContent
+                            | VersionControlPageLoadResultDto.Loaded(VersionControlMergeConflictViewDataDto.VersionPick _) ->
+                                failwith "Expected content-based conflict view from the Git provider."
                             | VersionControlPageLoadResultDto.Unsupported _ ->
                                 failwith "Expected loaded merge conflict view."
 
@@ -652,8 +655,11 @@ Vitest.describe (
                                 repoPath
                                 {
                                     Path = "conflict.txt"
-                                    ExpectedConflictContent = mergeConflictContent
-                                    ResolvedContent = "resolved content\n"
+                                    Resolution =
+                                        VersionControlMergeResolution.Content(
+                                            mergeConflictContent,
+                                            "resolved content\n"
+                                        )
                                     AutoCommit = false
                                 }
 
@@ -663,6 +669,27 @@ Vitest.describe (
                         Vitest.expect(resolution.NextConflictedPath).toEqual (None)
                         Vitest.expect(resolution.UpdatedStatus.IsMergeInProgress).toBe (true)
                         Vitest.expect(resolution.UpdatedStatus.Conflicted).toEqual ([||])
+                    })
+            }
+        )
+
+        Vitest.test (
+            "returns Unsupported for version-pick resolution regardless of repository state",
+            providerIntegrationTestOptions,
+            fun () -> promise {
+                do!
+                    withProviderTempRepository (fun provider repoPath _git -> promise {
+                        let! resolutionResult =
+                            provider.ConfirmMergeResolution
+                                repoPath
+                                {
+                                    Path = "any.txt"
+                                    Resolution = VersionControlMergeResolution.TakeSourceVersion
+                                    AutoCommit = false
+                                }
+
+                        let failure = expectProviderError resolutionResult
+                        Vitest.expect(failure.Kind).toEqual (VersionControlFailureKind.Unsupported)
                     })
             }
         )

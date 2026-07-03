@@ -204,10 +204,11 @@ let private toDiffViewData (data: GitDiffViewDataDto) : VersionControlDiffViewDa
     WordDiffText = data.WordDiffText
 }
 
-let private toMergeConflictViewData (data: GitMergeConflictViewDataDto) : VersionControlMergeConflictViewDataDto = {
-    Path = data.Path
-    MergeConflictContent = data.MergeConflictContent
-}
+let private toMergeConflictViewData (data: GitMergeConflictViewDataDto) : VersionControlMergeConflictViewDataDto =
+    VersionControlMergeConflictViewDataDto.Content {
+        Path = data.Path
+        ConflictContent = data.MergeConflictContent
+    }
 
 let private toUnsupportedContent (unsupported: GitUnsupportedContentDto) : VersionControlUnsupportedContentDto = {
     Path = unsupported.Path
@@ -519,13 +520,22 @@ let create () : VersionControlProvider = {
             |> wrapGitPageLoadResult requestedPath toMergeConflictViewData
     ConfirmMergeResolution =
         fun repoPath request ->
-            GitService.confirmMergeResolution
-                repoPath
-                request.Path
-                request.ExpectedConflictContent
-                request.ResolvedContent
-                request.AutoCommit
-            |> wrapGitResult toConfirmMergeResolutionResult
+            match request.Resolution with
+            | VersionControlMergeResolution.Content(expectedConflictContent, resolvedContent) ->
+                GitService.confirmMergeResolution
+                    repoPath
+                    request.Path
+                    expectedConflictContent
+                    resolvedContent
+                    request.AutoCommit
+                |> wrapGitResult toConfirmMergeResolutionResult
+            | VersionControlMergeResolution.TakeSourceVersion
+            | VersionControlMergeResolution.TakeTargetVersion ->
+                promise {
+                    return
+                        VersionControlResult.unsupported
+                            "Git provider resolves merge conflicts through edited content, not version picking."
+                }
     SetPathLargeFilePolicy = setPathLargeFilePolicy
     DownloadLargeObject =
         fun repoPath request -> GitService.downloadLfsFile repoPath request.Path |> wrapGitUnit
