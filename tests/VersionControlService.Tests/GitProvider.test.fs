@@ -847,3 +847,94 @@ Vitest.describe (
             }
         )
 )
+
+Vitest.describe (
+    "Provider registry workspace detection",
+    fun () ->
+        Vitest.test (
+            "detects a Git workspace and resolves the Git provider",
+            providerIntegrationTestOptions,
+            fun () -> promise {
+                ProviderRegistry.resetToDefault ()
+
+                do!
+                    withProviderTempRepository (fun _provider repoPath _git -> promise {
+                        let! detectedKind = ProviderRegistry.detectWorkspaceKind repoPath
+                        Vitest.expect(detectedKind).toEqual (Some VersionControlProviderKind.Git)
+
+                        let! resolved = ProviderRegistry.getForWorkspace repoPath
+
+                        match resolved with
+                        | Some provider ->
+                            Vitest.expect(provider.Kind).toEqual (VersionControlProviderKind.Git)
+                        | None -> failwith "Expected the Git provider for a Git workspace."
+                    })
+            }
+        )
+
+        Vitest.test (
+            "returns no provider kind for an unmanaged directory",
+            providerIntegrationTestOptions,
+            fun () -> promise {
+                ProviderRegistry.resetToDefault ()
+
+                let! plainDirectory = createTempDirectoryAsync ()
+
+                try
+                    let! detectedKind = ProviderRegistry.detectWorkspaceKind plainDirectory
+                    Vitest.expect(detectedKind).toEqual (None)
+
+                    let! resolved = ProviderRegistry.getForWorkspace plainDirectory
+                    Vitest.expect(resolved.IsNone).toBe (true)
+                    do! removeDirectoryAsync plainDirectory
+                with error ->
+                    do! removeDirectoryAsync plainDirectory
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "detects a registered kind without a provider and still returns no provider",
+            providerIntegrationTestOptions,
+            fun () -> promise {
+                ProviderRegistry.resetToDefault ()
+
+                let! markerDirectory = createTempDirectoryAsync ()
+
+                try
+                    do! writeUtf8FileAsync (join [| markerDirectory; ".contract-test-marker" |]) "marker\n"
+
+                    ProviderRegistry.registerDetector {
+                        Kind = VersionControlProviderKind.LakeFs
+                        Detect =
+                            fun workspacePath ->
+                                promise {
+                                    try
+                                        let! _ =
+                                            fsPromisesDynamic?stat (join [| workspacePath; ".contract-test-marker" |])
+                                            |> unbox<JS.Promise<obj>>
+
+                                        return true
+                                    with _ ->
+                                        return false
+                                }
+                    }
+
+                    let! detectedKind = ProviderRegistry.detectWorkspaceKind markerDirectory
+                    Vitest.expect(detectedKind).toEqual (Some VersionControlProviderKind.LakeFs)
+
+                    let! resolved = ProviderRegistry.getForWorkspace markerDirectory
+                    Vitest.expect(resolved.IsNone).toBe (true)
+
+                    ProviderRegistry.resetToDefault ()
+
+                    let! kindAfterReset = ProviderRegistry.detectWorkspaceKind markerDirectory
+                    Vitest.expect(kindAfterReset).toEqual (None)
+
+                    do! removeDirectoryAsync markerDirectory
+                with error ->
+                    do! removeDirectoryAsync markerDirectory
+                    return raise error
+            }
+        )
+)
