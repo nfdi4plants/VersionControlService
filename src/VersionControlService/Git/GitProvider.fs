@@ -478,6 +478,10 @@ let create () : VersionControlProvider = {
             match GitService.cancelPush repoPath with
             | Ok() -> VersionControlResult.performed ()
             | Error failure -> Error(toFailure failure)
+    VerifyRemoteAccess =
+        fun repoPath request ->
+            GitService.verifyRemoteAccess repoPath request.Remote
+            |> wrapGitUnit
     InitializeWorkspace = initializeWorkspace
     CloneRepository =
         fun request progress ->

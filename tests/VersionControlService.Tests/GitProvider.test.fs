@@ -11,6 +11,7 @@ open Vitest
 
 module GitProvider = VersionControlService.Git.GitProvider
 module ProviderRegistry = VersionControlService.VersionControlProviderRegistry
+module GitTokenProvider = VersionControlService.Git.GitTokenProvider
 
 let private fsPromisesDynamic: obj = importAll "fs/promises"
 let private osDynamic: obj = importAll "os"
@@ -82,6 +83,37 @@ let private writeLocalRemoteRewriteAsync (rootPath: string) (remotePath: string)
         $"[url \"{localRemoteUrl}\"]\n\tinsteadOf = {testRemoteUrl}\n"
 
     writeUtf8FileAsync (join [| rootPath; ".gitconfig" |]) gitConfig
+
+let private testRemoteHost = "provider.local.test"
+let private testRemoteToken = "provider-test-token"
+
+let private testAuthenticatedRemoteUrl =
+    $"https://oauth2:{testRemoteToken}@{testRemoteHost}/origin.git"
+
+let private configureLocalRemoteRewriteAsync (git: ISimpleGit) (remotePath: string) : JS.Promise<unit> = promise {
+    let localRemoteUrl = toFileRemoteUrl remotePath
+    let! _ = git.raw [| "config"; "--add"; $"url.{localRemoteUrl}.insteadOf"; testRemoteUrl |]
+    let! _ = git.raw [| "config"; "--add"; $"url.{localRemoteUrl}.insteadOf"; testAuthenticatedRemoteUrl |]
+    return ()
+}
+
+let private withTestTokenProvider (body: unit -> JS.Promise<'T>) : JS.Promise<'T> = promise {
+    GitTokenProvider.setTokenProvider {
+        TryGetAccessToken =
+            fun host -> promise {
+                return
+                    if String.Equals(host, testRemoteHost, StringComparison.OrdinalIgnoreCase) then
+                        Some testRemoteToken
+                    else
+                        None
+            }
+    }
+
+    try
+        return! body ()
+    finally
+        GitTokenProvider.setTokenProvider GitTokenProvider.defaultTokenProvider
+}
 
 let private withTemporaryGitHome (homePath: string) (body: unit -> JS.Promise<'T>) : JS.Promise<'T> =
     promise {
@@ -764,6 +796,53 @@ Vitest.describe (
                         match summary.Insertions with
                         | Some insertions -> Vitest.expect(insertions >= 1).toBe (true)
                         | None -> failwith "Expected insertion count from Git provider."
+                    })
+            }
+        )
+)
+
+Vitest.describe (
+    "GitProvider remote access verification",
+    fun () ->
+        Vitest.test (
+            "fails with a redacted message when no remote is configured",
+            providerIntegrationTestOptions,
+            fun () -> promise {
+                do!
+                    withProviderTempRepository (fun provider repoPath _git -> promise {
+                        let! result = provider.VerifyRemoteAccess repoPath { Remote = None; Branch = None }
+                        let failure = expectProviderError result
+                        Vitest.expect(String.IsNullOrWhiteSpace failure.Message).toBe (false)
+                    })
+            }
+        )
+
+        Vitest.test (
+            "succeeds against a reachable remote",
+            providerIntegrationTestOptions,
+            fun () -> promise {
+                do!
+                    withProviderTempRepository (fun provider repoPath git -> promise {
+                        let rootPath = dirname repoPath
+                        let! remotePath, _baseBranch = createPushedBareRemote rootPath provider repoPath git
+
+                        do! configureLocalRemoteRewriteAsync git remotePath
+                        let! _ = git.raw [| "remote"; "set-url"; "origin"; testRemoteUrl |]
+
+                        do!
+                            withTestTokenProvider (fun () -> promise {
+                                let! result =
+                                    provider.VerifyRemoteAccess repoPath { Remote = None; Branch = None }
+
+                                match result with
+                                | Ok outcome ->
+                                    match outcome.Effect with
+                                    | VersionControlEffect.Performed _ -> Vitest.expect(true).toBe (true)
+                                    | VersionControlEffect.NoOp _ ->
+                                        failwith "Expected Performed for a real remote check."
+                                | Error failure ->
+                                    failwith $"verify remote access failed ({failure.Kind}): {failure.Message}"
+                            })
                     })
             }
         )

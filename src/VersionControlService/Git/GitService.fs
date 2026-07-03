@@ -1624,6 +1624,25 @@ let fetch
                 return result
     }
 
+/// Verifies that the configured remote is reachable with the current credentials
+/// without transferring repository content. Uses the same auth path as fetch/pull/push
+/// so failures are classified and redacted identically.
+let verifyRemoteAccess (arcPath: string) (remoteName: string option) : JS.Promise<GitResult<unit>> =
+    promise {
+        match validateRemoteName (remoteName |> Option.defaultValue "origin") with
+        | Error remoteError -> return errorResult remoteError
+        | Ok safeRemoteName ->
+            return!
+                withAuthenticatedGit
+                    arcPath
+                    safeRemoteName
+                    None
+                    (fun git -> promise {
+                        let! _ = git.raw [| "ls-remote"; "--heads"; safeRemoteName |]
+                        return ()
+                    })
+    }
+
 /// Fetches and runs a merge-tree preflight to classify whether pull is likely safe or requires merge resolution.
 /// Renderer workflow uses this before "update from online" actions.
 let previewPull

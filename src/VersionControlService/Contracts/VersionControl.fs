@@ -312,6 +312,10 @@ type VersionControlProvider = {
         VersionControlProgressCallback option ->
             JS.Promise<VersionControlResult<unit>>
     CancelPush: string -> VersionControlResult<unit>
+    VerifyRemoteAccess:
+        string ->
+        VersionControlRemoteOperationRequest ->
+            JS.Promise<VersionControlResult<unit>>
     InitializeWorkspace: VersionControlInitializeWorkspaceRequest -> JS.Promise<VersionControlResult<string>>
     CloneRepository:
         VersionControlCloneRepositoryRequest ->
