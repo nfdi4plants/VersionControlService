@@ -142,8 +142,8 @@ type VersionControlStatusDto = {
 
 type VersionControlDiffSummaryDto = {
     Changed: int
-    Insertions: int
-    Deletions: int
+    Insertions: int option
+    Deletions: int option
 }
 
 type VersionControlProgressDto = {
@@ -231,7 +231,10 @@ type VersionControlCapabilities = {
     SupportsInitializeWorkspace: bool
     SupportsSelectedPathCommit: bool
     SupportsPullPreflight: bool
-    SupportsMergeConflictResolution: bool
+    SupportsContentMergeResolution: bool
+    SupportsVersionPickMergeResolution: bool
+    SupportsDiffLineCounts: bool
+    SupportsWordDiff: bool
     SupportsLargeFilePolicySelection: bool
     SupportsLargeFileThreshold: bool
     SupportsDownloadLargeObjectsToggle: bool

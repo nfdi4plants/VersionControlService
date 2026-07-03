@@ -31,7 +31,10 @@ let capabilities = {
     SupportsInitializeWorkspace = true
     SupportsSelectedPathCommit = true
     SupportsPullPreflight = true
-    SupportsMergeConflictResolution = true
+    SupportsContentMergeResolution = true
+    SupportsVersionPickMergeResolution = false
+    SupportsDiffLineCounts = true
+    SupportsWordDiff = true
     SupportsLargeFilePolicySelection = true
     SupportsLargeFileThreshold = true
     SupportsDownloadLargeObjectsToggle = true
@@ -162,8 +165,8 @@ let private toBranchRef (branch: GitBranchRefDto) : VersionControlBranchRefDto =
 
 let private toDiffSummary (summary: GitDiffSummaryDto) : VersionControlDiffSummaryDto = {
     Changed = summary.Changed
-    Insertions = summary.Insertions
-    Deletions = summary.Deletions
+    Insertions = Some summary.Insertions
+    Deletions = Some summary.Deletions
 }
 
 let private toProgress (progress: GitProgressDto) : VersionControlProgressDto = {

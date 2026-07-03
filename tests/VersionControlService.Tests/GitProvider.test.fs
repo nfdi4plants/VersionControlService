@@ -244,7 +244,10 @@ Vitest.describe (
                 Vitest.expect(provider.Capabilities.SupportsInitializeWorkspace).toBe (true)
                 Vitest.expect(provider.Capabilities.SupportsSelectedPathCommit).toBe (true)
                 Vitest.expect(provider.Capabilities.SupportsPullPreflight).toBe (true)
-                Vitest.expect(provider.Capabilities.SupportsMergeConflictResolution).toBe (true)
+                Vitest.expect(provider.Capabilities.SupportsContentMergeResolution).toBe (true)
+                Vitest.expect(provider.Capabilities.SupportsVersionPickMergeResolution).toBe (false)
+                Vitest.expect(provider.Capabilities.SupportsDiffLineCounts).toBe (true)
+                Vitest.expect(provider.Capabilities.SupportsWordDiff).toBe (true)
                 Vitest.expect(provider.Capabilities.SupportsLargeFilePolicySelection).toBe (true)
                 Vitest.expect(provider.Capabilities.SupportsLargeFileThreshold).toBe (true)
                 Vitest.expect(provider.Capabilities.SupportsDownloadLargeObjectsToggle).toBe (true)
@@ -696,5 +699,45 @@ Vitest.describe (
                         Vitest.expect(reason.Contains("already materialized")).toBe (true)
                     | _ -> failwith "Expected NoOp effect."
                 | Error failure -> failwith $"Expected successful NoOp but got {failure.Kind}: {failure.Message}"
+        )
+)
+
+Vitest.describe (
+    "GitProvider diff summary",
+    fun () ->
+        Vitest.test (
+            "reports line counts because SupportsDiffLineCounts is true",
+            providerIntegrationTestOptions,
+            fun () -> promise {
+                do!
+                    withProviderTempRepository (fun provider repoPath _git -> promise {
+                        let filePath = join [| repoPath; "summary.txt" |]
+
+                        do! writeUtf8FileAsync filePath "one\n"
+
+                        let! baseCommit =
+                            provider.Commit
+                                repoPath
+                                {
+                                    Message = "test: diff summary base"
+                                    Paths = [| "summary.txt" |]
+                                }
+
+                        expectProviderOk "diff summary base commit" baseCommit |> ignore
+
+                        do! writeUtf8FileAsync filePath "one\ntwo\n"
+
+                        let! summaryResult = provider.GetDiffSummary repoPath
+                        let summary = expectProviderOk "diff summary" summaryResult
+
+                        Vitest.expect(summary.Changed).toBe (1)
+                        Vitest.expect(summary.Insertions.IsSome).toBe (true)
+                        Vitest.expect(summary.Deletions.IsSome).toBe (true)
+
+                        match summary.Insertions with
+                        | Some insertions -> Vitest.expect(insertions >= 1).toBe (true)
+                        | None -> failwith "Expected insertion count from Git provider."
+                    })
+            }
         )
 )
