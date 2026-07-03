@@ -7,6 +7,7 @@
     <Compile Include="Scaffold.test.fs" />
     <Compile Include="GitService.test.fs" />
     <Compile Include="GitValidation.test.fs" />
+    <Compile Include="GitProvider.test.fs" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\VersionControlService\VersionControlService.fsproj" />

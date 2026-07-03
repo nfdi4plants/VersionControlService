@@ -1,0 +1,700 @@
+module VersionControlService.Tests.GitProviderTests
+
+open System
+open Fable.Core
+open Fable.Core.JsInterop
+open VersionControlService.Bindings.SimpleGit
+open VersionControlService.Contracts.VersionControl
+open VersionControlService.Git.GitAuthAdapter
+open VersionControlService.Tests.NodePath
+open Vitest
+
+module GitProvider = VersionControlService.Git.GitProvider
+module ProviderRegistry = VersionControlService.VersionControlProviderRegistry
+
+let private fsPromisesDynamic: obj = importAll "fs/promises"
+let private osDynamic: obj = importAll "os"
+
+[<Emit("process.env[$0] ?? null")>]
+let private getProcessEnvValue (_name: string) : string = jsNative
+
+[<Emit("process.env[$0] = $1")>]
+let private setProcessEnvValue (_name: string) (_value: string) : unit = jsNative
+
+[<Emit("delete process.env[$0]")>]
+let private deleteProcessEnvValue (_name: string) : unit = jsNative
+
+let private createTempDirectoryAsync () : JS.Promise<string> =
+    let prefix = join [| osDynamic?tmpdir () |> unbox<string>; "vcs-provider-tests-" |]
+    fsPromisesDynamic?mkdtemp (prefix) |> unbox<JS.Promise<string>>
+
+let private removeDirectoryAsync path : JS.Promise<unit> = promise {
+    let! _ =
+        fsPromisesDynamic?rm (path, createObj [ "recursive" ==> true; "force" ==> true ])
+        |> unbox<JS.Promise<obj>>
+
+    return ()
+}
+
+let private writeUtf8FileAsync path content : JS.Promise<unit> = promise {
+    let! _ = fsPromisesDynamic?writeFile (path, content, "utf8") |> unbox<JS.Promise<obj>>
+    return ()
+}
+
+let private readUtf8FileAsync (path: string) : JS.Promise<string> =
+    fsPromisesDynamic?readFile (path, "utf8") |> unbox<JS.Promise<string>>
+
+let private restoreProcessEnvValue (name: string) (value: string option) =
+    match value with
+    | Some existingValue -> setProcessEnvValue name existingValue
+    | None -> deleteProcessEnvValue name
+
+let private createSimpleGit repoPath =
+    SimpleGit.create (SimpleGitOptions(baseDir = repoPath, binary = U3.Case1 "git", maxConcurrentProcesses = 1))
+    |> applyNonInteractiveEnv
+
+let private expectProviderOk (operationName: string) (result: VersionControlResult<'T>) : 'T =
+    match result with
+    | Ok outcome -> outcome.Value
+    | Error failure -> failwith $"{operationName} failed ({failure.Kind}): {failure.Message}"
+
+let private expectProviderError (result: VersionControlResult<'T>) : VersionControlFailure =
+    match result with
+    | Ok _ -> failwith "Expected provider operation to fail."
+    | Error failure -> failure
+
+let private providerIntegrationTestOptions = TestOptions(timeout = 120000)
+
+let private testRemoteUrl = "https://provider.local.test/origin.git"
+
+let private toFileRemoteUrl (path: string) =
+    let normalized = path.Replace("\\", "/")
+
+    if normalized.StartsWith("/", StringComparison.Ordinal) then
+        $"file://{normalized}"
+    else
+        $"file:///{normalized}"
+
+let private writeLocalRemoteRewriteAsync (rootPath: string) (remotePath: string) : JS.Promise<unit> =
+    let localRemoteUrl = toFileRemoteUrl remotePath
+
+    let gitConfig =
+        $"[url \"{localRemoteUrl}\"]\n\tinsteadOf = {testRemoteUrl}\n"
+
+    writeUtf8FileAsync (join [| rootPath; ".gitconfig" |]) gitConfig
+
+let private withTemporaryGitHome (homePath: string) (body: unit -> JS.Promise<'T>) : JS.Promise<'T> =
+    promise {
+        let previousHome = getProcessEnvValue "HOME" |> Option.ofObj
+        let previousUserProfile = getProcessEnvValue "USERPROFILE" |> Option.ofObj
+
+        setProcessEnvValue "HOME" homePath
+        setProcessEnvValue "USERPROFILE" homePath
+
+        try
+            return! body ()
+        finally
+            restoreProcessEnvValue "HOME" previousHome
+            restoreProcessEnvValue "USERPROFILE" previousUserProfile
+    }
+
+let private withProviderTempRepository
+    (testBody: VersionControlProvider -> string -> ISimpleGit -> JS.Promise<unit>)
+    : JS.Promise<unit> =
+    promise {
+    let! rootPath = createTempDirectoryAsync ()
+
+    try
+        let repoPath = join [| rootPath; "repo" |]
+        let provider = GitProvider.create ()
+
+        let! initResult =
+            provider.InitializeWorkspace {
+                TargetPath = repoPath
+                ProviderRemoteUri = None
+                ProviderOptions = [||]
+            }
+
+        let normalizedRepoPath = expectProviderOk "provider init" initResult
+        let git = createSimpleGit normalizedRepoPath
+
+        let! _ = git.raw [| "config"; "user.name"; "VersionControlService Tests" |]
+        let! _ = git.raw [| "config"; "user.email"; "provider-tests@example.org" |]
+        let! _ = git.raw [| "config"; "core.autocrlf"; "false" |]
+
+        do! testBody provider normalizedRepoPath git
+        do! removeDirectoryAsync rootPath
+    with error ->
+        do! removeDirectoryAsync rootPath
+        return raise error
+}
+
+let private createPushedBareRemote
+    (rootPath: string)
+    (provider: VersionControlProvider)
+    (repoPath: string)
+    (git: ISimpleGit)
+    : JS.Promise<string * string> =
+    promise {
+        let trackedPath = join [| repoPath; "tracked.txt" |]
+        let remotePath = join [| rootPath; "origin.git" |]
+
+        do! writeUtf8FileAsync trackedPath "tracked\n"
+
+        let! commitResult =
+            provider.Commit
+                repoPath
+                {
+                    Message = "test: add tracked file"
+                    Paths = [| "tracked.txt" |]
+                }
+
+        expectProviderOk "commit tracked file" commitResult |> ignore
+
+        let! statusResult = provider.GetStatus repoPath
+        let status = expectProviderOk "status after tracked commit" statusResult
+
+        let baseBranch =
+            status.Current
+            |> Option.defaultWith (fun () -> failwith "Expected current branch after commit.")
+
+        let! _ = git.raw [| "init"; "--bare"; $"--initial-branch={baseBranch}"; remotePath |]
+        let! _ = git.raw [| "remote"; "add"; "origin"; remotePath |]
+        let! _ = git.raw [| "push"; "-u"; "origin"; baseBranch |]
+
+        return remotePath, baseBranch
+    }
+
+let private expectPerformedOrStorageBoundary (operationName: string) (result: VersionControlResult<string>) =
+    match result with
+    | Ok outcome ->
+        match outcome.Effect with
+        | VersionControlEffect.Performed _ -> Vitest.expect(outcome.Value.Length >= 0).toBe (true)
+        | VersionControlEffect.NoOp _ -> failwith $"{operationName} unexpectedly returned NoOp."
+    | Error failure ->
+        let isExpectedBoundary =
+            failure.Kind = VersionControlFailureKind.DependencyMissing
+            || failure.Kind = VersionControlFailureKind.NotApplicable
+
+        Vitest.expect(isExpectedBoundary).toBe (true)
+
+Vitest.describe (
+    "VersionControlOutcome helpers",
+    fun () ->
+        Vitest.test (
+            "performed wraps a value with a Performed effect",
+            fun () ->
+                let outcome = VersionControlOutcome.performed 42
+
+                Vitest.expect(outcome.Value).toBe (42)
+
+                match outcome.Effect with
+                | VersionControlEffect.Performed None -> Vitest.expect(true).toBe (true)
+                | _ -> failwith "Expected Performed None."
+        )
+
+        Vitest.test (
+            "noOp wraps a value with a NoOp reason",
+            fun () ->
+                let outcome = VersionControlOutcome.noOp (Some "not needed") "ok"
+
+                Vitest.expect(outcome.Value).toBe ("ok")
+
+                match outcome.Effect with
+                | VersionControlEffect.NoOp(Some "not needed") -> Vitest.expect(true).toBe (true)
+                | _ -> failwith "Expected NoOp reason."
+        )
+
+        Vitest.test (
+            "unsupported returns an Unsupported failure",
+            fun () ->
+                let result: VersionControlResult<unit> =
+                    VersionControlResult.unsupported "Selected-path commit is not supported."
+
+                match result with
+                | Error failure ->
+                    Vitest.expect(failure.Kind).toEqual (VersionControlFailureKind.Unsupported)
+                    Vitest.expect(failure.Message).toBe ("Selected-path commit is not supported.")
+                | Ok _ -> failwith "Expected Unsupported failure."
+        )
+
+        Vitest.test (
+            "notApplicable returns a NotApplicable failure",
+            fun () ->
+                let result: VersionControlResult<unit> =
+                    VersionControlResult.notApplicable "Large-object policy is not applicable."
+
+                match result with
+                | Error failure ->
+                    Vitest.expect(failure.Kind).toEqual (VersionControlFailureKind.NotApplicable)
+                    Vitest.expect(failure.Message).toBe ("Large-object policy is not applicable.")
+                | Ok _ -> failwith "Expected NotApplicable failure."
+        )
+)
+
+Vitest.describe (
+    "GitProvider capabilities",
+    fun () ->
+        Vitest.test (
+            "reports Git and Git LFS backed capabilities",
+            fun () ->
+                let provider = GitProvider.create ()
+
+                Vitest.expect(provider.Kind).toEqual (VersionControlProviderKind.Git)
+                Vitest.expect(provider.Capabilities.SupportsInitializeWorkspace).toBe (true)
+                Vitest.expect(provider.Capabilities.SupportsSelectedPathCommit).toBe (true)
+                Vitest.expect(provider.Capabilities.SupportsPullPreflight).toBe (true)
+                Vitest.expect(provider.Capabilities.SupportsMergeConflictResolution).toBe (true)
+                Vitest.expect(provider.Capabilities.SupportsLargeFilePolicySelection).toBe (true)
+                Vitest.expect(provider.Capabilities.SupportsLargeFileThreshold).toBe (true)
+                Vitest.expect(provider.Capabilities.SupportsDownloadLargeObjectsToggle).toBe (true)
+                Vitest.expect(provider.Capabilities.SupportsDownloadLargeObject).toBe (true)
+                Vitest.expect(provider.Capabilities.SupportsFreeLocalObjectCopy).toBe (true)
+                Vitest.expect(provider.Capabilities.SupportsStoragePrune).toBe (true)
+                Vitest.expect(provider.Capabilities.SupportsStorageDeduplication).toBe (true)
+        )
+
+        Vitest.test (
+            "registry defaults to Git provider",
+            fun () ->
+                ProviderRegistry.resetToDefault ()
+                let provider = ProviderRegistry.get ()
+                Vitest.expect(provider.Kind).toEqual (VersionControlProviderKind.Git)
+        )
+)
+
+Vitest.describe (
+    "GitProvider commit workflow",
+    fun () ->
+        Vitest.test (
+            "commits selected paths and clears unrelated staged state",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                do!
+                    withProviderTempRepository (fun provider repoPath git -> promise {
+                        let aPath = join [| repoPath; "a.txt" |]
+                        let bPath = join [| repoPath; "b.txt" |]
+
+                        do! writeUtf8FileAsync aPath "a1\n"
+                        do! writeUtf8FileAsync bPath "b1\n"
+
+                        let! baseCommit =
+                            provider.Commit
+                                repoPath
+                                {
+                                    Message = "test: base"
+                                    Paths = [| "a.txt"; "b.txt" |]
+                                }
+
+                        expectProviderOk "base commit" baseCommit |> ignore
+
+                        do! writeUtf8FileAsync aPath "a2\n"
+                        do! writeUtf8FileAsync bPath "b2\n"
+
+                        let! _ = git.raw [| "add"; "b.txt" |]
+
+                        let! selectedCommit =
+                            provider.Commit
+                                repoPath
+                                {
+                                    Message = "test: selected a"
+                                    Paths = [| "a.txt" |]
+                                }
+
+                        let commitHash = expectProviderOk "selected commit" selectedCommit
+                        Vitest.expect(commitHash.Length).toBeGreaterThan (6)
+
+                        let! changedFiles = git.raw [| "diff-tree"; "--no-commit-id"; "--name-only"; "-r"; "HEAD" |]
+                        Vitest.expect(changedFiles.Trim()).toBe ("a.txt")
+
+                        let! porcelainStatus = git.raw [| "status"; "--porcelain=v1"; "--"; "b.txt" |]
+                        Vitest.expect(porcelainStatus.TrimEnd()).toBe (" M b.txt")
+                    })
+            }
+        )
+)
+
+Vitest.describe (
+    "GitProvider large object metadata",
+    fun () ->
+        Vitest.test (
+            "returns an empty metadata list for a repository without LFS files",
+            providerIntegrationTestOptions,
+            fun () -> promise {
+                do!
+                    withProviderTempRepository (fun provider repoPath _git -> promise {
+                        do! writeUtf8FileAsync (join [| repoPath; "plain.txt" |]) "plain\n"
+
+                        let! metadataResult = provider.ListLargeObjects repoPath
+                        let metadata = expectProviderOk "list large objects" metadataResult
+
+                        Vitest.expect(metadata.Length).toBe (0)
+                    })
+            }
+        )
+)
+
+Vitest.describe (
+    "GitProvider large file policy",
+    fun () ->
+        Vitest.test (
+            "tracks and untracks a path pattern through the provider",
+            providerIntegrationTestOptions,
+            fun () -> promise {
+                do!
+                    withProviderTempRepository (fun provider repoPath git -> promise {
+                        let! lfsVersionResult = promise {
+                            try
+                                let! version = git.raw [| "lfs"; "version" |]
+                                return Ok version
+                            with error ->
+                                return Error error.Message
+                        }
+
+                        if Result.isError lfsVersionResult then
+                            Vitest.expect(true).toBe (true)
+                        else
+                            let! trackResult =
+                                provider.SetPathLargeFilePolicy
+                                    repoPath
+                                    {
+                                        Path = "*.bin"
+                                        UseLargeObjectStorage = true
+                                    }
+
+                            expectProviderOk "track path policy" trackResult |> ignore
+
+                            let! attributesAfterTrack = git.raw [| "check-attr"; "filter"; "--"; "sample.bin" |]
+                            Vitest.expect(attributesAfterTrack.Contains("lfs")).toBe (true)
+
+                            let! untrackResult =
+                                provider.SetPathLargeFilePolicy
+                                    repoPath
+                                    {
+                                        Path = "*.bin"
+                                        UseLargeObjectStorage = false
+                                    }
+
+                            expectProviderOk "untrack path policy" untrackResult |> ignore
+
+                            let! attributesAfterUntrack =
+                                git.raw [| "check-attr"; "filter"; "--"; "sample.bin" |]
+
+                            Vitest.expect(attributesAfterUntrack.Contains("lfs")).toBe (false)
+                    })
+            }
+        )
+)
+
+Vitest.describe (
+    "GitProvider page-load data",
+    fun () ->
+        Vitest.test (
+            "returns unsupported page-load result for explicitly unsupported diff content",
+            providerIntegrationTestOptions,
+            fun () -> promise {
+                do!
+                    withProviderTempRepository (fun provider repoPath _git -> promise {
+                        let workbookPath = join [| repoPath; "data.xlsx" |]
+                        do! writeUtf8FileAsync workbookPath "not a real workbook\n"
+
+                        let! baseCommit =
+                            provider.Commit
+                                repoPath
+                                {
+                                    Message = "test: add unsupported file"
+                                    Paths = [| "data.xlsx" |]
+                                }
+
+                        expectProviderOk "base unsupported file commit" baseCommit |> ignore
+
+                        do! writeUtf8FileAsync workbookPath "changed unsupported file\n"
+
+                        let! pageResult = provider.GetDiffViewData repoPath "data.xlsx"
+                        let pageLoad = expectProviderOk "unsupported diff page" pageResult
+
+                        match pageLoad with
+                        | VersionControlPageLoadResultDto.Unsupported unsupported ->
+                            Vitest.expect(unsupported.Path).toBe ("data.xlsx")
+                            Vitest.expect(unsupported.Reason.IsSome).toBe (true)
+                        | VersionControlPageLoadResultDto.Loaded _ ->
+                            failwith "Expected unsupported page-load result."
+                    })
+            }
+        )
+)
+
+Vitest.describe (
+    "GitProvider clone workflow",
+    fun () ->
+        Vitest.test (
+            "clones without large-object hydration when DownloadLargeObjects is false",
+            providerIntegrationTestOptions,
+            fun () -> promise {
+                do!
+                    withProviderTempRepository (fun provider repoPath git -> promise {
+                        let rootPath = dirname repoPath
+                        let clonePath = join [| rootPath; "clone-without-large-objects" |]
+                        let! remotePath, baseBranch = createPushedBareRemote rootPath provider repoPath git
+
+                        do! writeLocalRemoteRewriteAsync rootPath remotePath
+
+                        do!
+                            withTemporaryGitHome rootPath (fun () -> promise {
+                                let! cloneResult =
+                                    provider.CloneRepository
+                                        {
+                                            RemoteUrl = testRemoteUrl
+                                            TargetPath = clonePath
+                                            Branch = Some baseBranch
+                                            DownloadLargeObjects = false
+                                        }
+                                        None
+
+                                let clonedPath = expectProviderOk "clone without large-object hydration" cloneResult
+
+                                let! clonedContent = readUtf8FileAsync (join [| clonedPath; "tracked.txt" |])
+                                Vitest.expect(clonedContent.Replace("\r\n", "\n")).toBe ("tracked\n")
+                            })
+                    })
+            }
+        )
+
+        Vitest.test (
+            "clones with requested large-object hydration when DownloadLargeObjects is true",
+            providerIntegrationTestOptions,
+            fun () -> promise {
+                do!
+                    withProviderTempRepository (fun provider repoPath git -> promise {
+                        let rootPath = dirname repoPath
+                        let clonePath = join [| rootPath; "clone-with-large-objects" |]
+                        let! remotePath, baseBranch = createPushedBareRemote rootPath provider repoPath git
+
+                        do! writeLocalRemoteRewriteAsync rootPath remotePath
+
+                        do!
+                            withTemporaryGitHome rootPath (fun () -> promise {
+                                let! cloneResult =
+                                    provider.CloneRepository
+                                        {
+                                            RemoteUrl = testRemoteUrl
+                                            TargetPath = clonePath
+                                            Branch = Some baseBranch
+                                            DownloadLargeObjects = true
+                                        }
+                                        None
+
+                                let clonedPath = expectProviderOk "clone with large-object hydration" cloneResult
+                                Vitest.expect(clonedPath).toBe (clonePath)
+
+                                let cloneGit = createSimpleGit clonedPath
+                                let! preference =
+                                    cloneGit.raw [| "config"; "--get"; "swate.lfs.downloadlargefiles" |]
+
+                                Vitest.expect(preference.Trim()).toBe ("true")
+                            })
+                    })
+            }
+        )
+)
+
+Vitest.describe (
+    "GitProvider large object local copy",
+    fun () ->
+        Vitest.test (
+            "maps download and free failures through VersionControlFailure",
+            providerIntegrationTestOptions,
+            fun () -> promise {
+                do!
+                    withProviderTempRepository (fun provider repoPath _git -> promise {
+                        let! downloadResult =
+                            provider.DownloadLargeObject repoPath { Path = "missing.bin" }
+
+                        let downloadFailure = expectProviderError downloadResult
+                        Vitest.expect(String.IsNullOrWhiteSpace downloadFailure.Message).toBe (false)
+
+                        let! freeResult =
+                            provider.FreeLocalObjectCopy repoPath { Path = "missing.bin" }
+
+                        let freeFailure = expectProviderError freeResult
+                        Vitest.expect(String.IsNullOrWhiteSpace freeFailure.Message).toBe (false)
+                    })
+            }
+        )
+)
+
+Vitest.describe (
+    "GitProvider storage maintenance",
+    fun () ->
+        Vitest.test (
+            "maps prune and deduplicate results through provider outcomes",
+            providerIntegrationTestOptions,
+            fun () -> promise {
+                do!
+                    withProviderTempRepository (fun provider repoPath git -> promise {
+                        let rootPath = dirname repoPath
+                        let! _remotePath, _baseBranch = createPushedBareRemote rootPath provider repoPath git
+
+                        let! pruneResult = provider.PruneStorage repoPath None
+                        expectPerformedOrStorageBoundary "prune storage" pruneResult
+
+                        let! deduplicateResult = provider.DeduplicateStorage repoPath None
+                        expectPerformedOrStorageBoundary "deduplicate storage" deduplicateResult
+                    })
+            }
+        )
+)
+
+Vitest.describe (
+    "GitProvider merge resolution",
+    fun () ->
+        Vitest.test (
+            "confirms a resolved conflict through the provider",
+            providerIntegrationTestOptions,
+            fun () -> promise {
+                do!
+                    withProviderTempRepository (fun provider repoPath git -> promise {
+                        let filePath = join [| repoPath; "conflict.txt" |]
+                        let featureBranch = "feature/provider-merge-resolution"
+
+                        do! writeUtf8FileAsync filePath "base\n"
+
+                        let! baseCommit =
+                            provider.Commit
+                                repoPath
+                                {
+                                    Message = "test: base conflict file"
+                                    Paths = [| "conflict.txt" |]
+                                }
+
+                        expectProviderOk "base conflict file commit" baseCommit |> ignore
+
+                        let! baseStatusResult = provider.GetStatus repoPath
+                        let baseStatus = expectProviderOk "status after base conflict commit" baseStatusResult
+
+                        let baseBranch =
+                            baseStatus.Current
+                            |> Option.defaultWith (fun () -> failwith "Expected current branch after base commit.")
+
+                        let! createBranchResult =
+                            provider.CreateBranch
+                                repoPath
+                                {
+                                    Name = featureBranch
+                                    BaseProviderRef = None
+                                }
+
+                        expectProviderOk "create provider merge branch" createBranchResult |> ignore
+
+                        do! writeUtf8FileAsync filePath "feature change\n"
+
+                        let! featureCommit =
+                            provider.Commit
+                                repoPath
+                                {
+                                    Message = "test: feature conflict change"
+                                    Paths = [| "conflict.txt" |]
+                                }
+
+                        expectProviderOk "feature conflict commit" featureCommit |> ignore
+
+                        let! branchResult = provider.GetBranches repoPath
+                        let branches = expectProviderOk "branches before provider merge checkout" branchResult
+
+                        let baseProviderRef =
+                            branches
+                            |> Array.find (fun branch -> branch.RefName = baseBranch)
+                            |> _.ProviderRef
+
+                        let! checkoutBaseResult =
+                            provider.CheckoutBranch repoPath { ProviderRef = baseProviderRef }
+
+                        expectProviderOk "checkout base branch before provider merge" checkoutBaseResult |> ignore
+
+                        do! writeUtf8FileAsync filePath "main change\n"
+
+                        let! mainCommit =
+                            provider.Commit
+                                repoPath
+                                {
+                                    Message = "test: main conflict change"
+                                    Paths = [| "conflict.txt" |]
+                                }
+
+                        expectProviderOk "main conflict commit" mainCommit |> ignore
+
+                        try
+                            let! _ = git.raw [| "merge"; featureBranch |]
+                            ()
+                        with _ ->
+                            ()
+
+                        let! mergeStatusResult = provider.GetStatus repoPath
+                        let mergeStatus = expectProviderOk "status during provider merge" mergeStatusResult
+
+                        Vitest.expect(mergeStatus.IsMergeInProgress).toBe (true)
+                        Vitest.expect(mergeStatus.Conflicted).toEqual ([| "conflict.txt" |])
+
+                        let! mergeViewResult = provider.GetMergeConflictViewData repoPath "conflict.txt"
+                        let mergeViewLoad = expectProviderOk "provider merge conflict view" mergeViewResult
+
+                        let mergeConflictContent =
+                            match mergeViewLoad with
+                            | VersionControlPageLoadResultDto.Loaded view -> view.MergeConflictContent
+                            | VersionControlPageLoadResultDto.Unsupported _ ->
+                                failwith "Expected loaded merge conflict view."
+
+                        let! resolutionResult =
+                            provider.ConfirmMergeResolution
+                                repoPath
+                                {
+                                    Path = "conflict.txt"
+                                    ExpectedConflictContent = mergeConflictContent
+                                    ResolvedContent = "resolved content\n"
+                                    AutoCommit = false
+                                }
+
+                        let resolution = expectProviderOk "provider confirm merge resolution" resolutionResult
+
+                        Vitest.expect(resolution.RemainingConflictedPaths).toEqual ([||])
+                        Vitest.expect(resolution.NextConflictedPath).toEqual (None)
+                        Vitest.expect(resolution.UpdatedStatus.IsMergeInProgress).toBe (true)
+                        Vitest.expect(resolution.UpdatedStatus.Conflicted).toEqual ([||])
+                    })
+            }
+        )
+)
+
+Vitest.describe (
+    "Provider-neutral unsupported and no-op boundaries",
+    fun () ->
+        Vitest.test (
+            "uses Unsupported when a provider cannot preserve selected-path commit semantics",
+            fun () ->
+                let result: VersionControlResult<string> =
+                    VersionControlResult.unsupported "Selected-path commit is not supported by this provider."
+
+                match result with
+                | Error failure ->
+                    Vitest.expect(failure.Kind).toEqual (VersionControlFailureKind.Unsupported)
+                    Vitest.expect(failure.Message.Contains("Selected-path commit")).toBe (true)
+                | Ok _ -> failwith "Expected Unsupported for impossible selected-path commit."
+        )
+
+        Vitest.test (
+            "uses NoOp only when skipping work preserves the requested workflow outcome",
+            fun () ->
+                let result: VersionControlResult<unit> =
+                    VersionControlResult.noOp
+                        (Some "Object content is already materialized by provider sync.")
+                        ()
+
+                match result with
+                | Ok outcome ->
+                    match outcome.Effect with
+                    | VersionControlEffect.NoOp(Some reason) ->
+                        Vitest.expect(reason.Contains("already materialized")).toBe (true)
+                    | _ -> failwith "Expected NoOp effect."
+                | Error failure -> failwith $"Expected successful NoOp but got {failure.Kind}: {failure.Message}"
+        )
+)

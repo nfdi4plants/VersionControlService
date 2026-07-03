@@ -28,3 +28,6 @@ module NodePath =
 
     [<Import("join", "path")>]
     let join ([<ParamSeq>] paths: string[]) : string = jsNative
+
+    [<Import("dirname", "path")>]
+    let dirname (path: string) : string = jsNative

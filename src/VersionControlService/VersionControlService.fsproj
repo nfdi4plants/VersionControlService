@@ -3,11 +3,17 @@
     <TargetFramework>net10.0</TargetFramework>
     <DefineConstants>FABLE_COMPILER</DefineConstants>
     <DefineConstants>FABLE_COMPILER_JAVASCRIPT</DefineConstants>
+    <PackageId>VersionControlService</PackageId>
+    <Version>0.0.1</Version>
+    <Authors>nfdi4plants</Authors>
+    <Description>Fable-transpilable Git version control service extracted from Swate.</Description>
+    <PackageTags>fsharp;fable;git;version-control</PackageTags>
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="Support\PathHelpers.fs" />
     <Compile Include="Contracts\FileSystem.fs" />
     <Compile Include="Contracts\Git.fs" />
+    <Compile Include="Contracts\VersionControl.fs" />
     <Compile Include="Runtime\Node\FileSystem.fs" />
     <Compile Include="Runtime\Node\Path.fs" />
     <Compile Include="Runtime\Node\Interop.fs" />
@@ -22,10 +28,21 @@
     <Compile Include="Git\GitInternals.fs" />
     <Compile Include="Git\GitService.fs" />
     <Compile Include="Git\GitProvisioningService.fs" />
+    <Compile Include="Git\GitProvider.fs" />
+    <Compile Include="VersionControlProviderRegistry.fs" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="ARCtrl.Javascript" />
     <PackageReference Include="Fable.Core" />
     <PackageReference Include="YAMLicious" />
+  </ItemGroup>
+  <ItemGroup>
+    <Content Include="VersionControlService.fsproj" Pack="true" PackagePath="fable\" />
+    <Content Include="Support\**\*.fs" Pack="true" PackagePath="fable\Support\%(RecursiveDir)" />
+    <Content Include="Contracts\**\*.fs" Pack="true" PackagePath="fable\Contracts\%(RecursiveDir)" />
+    <Content Include="Runtime\Node\*.fs" Pack="true" PackagePath="fable\Runtime\Node\" />
+    <Content Include="Bindings\**\*.fs" Pack="true" PackagePath="fable\Bindings\%(RecursiveDir)" />
+    <Content Include="Git\**\*.fs" Pack="true" PackagePath="fable\Git\%(RecursiveDir)" />
+    <Content Include="VersionControlProviderRegistry.fs" Pack="true" PackagePath="fable\" />
   </ItemGroup>
 </Project>
