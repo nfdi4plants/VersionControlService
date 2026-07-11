@@ -6,6 +6,7 @@
   <ItemGroup>
     <Compile Include="PathsTests.fs" />
     <Compile Include="OperationResultTests.fs" />
+    <Compile Include="ContractShapeTests.fs" />
     <Compile Include="PortableConsumerTests.fs" />
   </ItemGroup>
   <ItemGroup>

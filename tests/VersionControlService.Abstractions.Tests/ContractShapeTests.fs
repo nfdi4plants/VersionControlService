@@ -1,0 +1,293 @@
+module VersionControlService.Abstractions.Tests.ContractShapeTests
+
+open Expecto
+open VersionControlService.Abstractions
+
+/// Fake providers shared by the shape and portable-consumer tests. They implement
+/// only what they support: absent services are None, never stubs.
+module FakeProvider =
+
+    let providerId (name: string) =
+        match ProviderId.tryCreate name with
+        | Ok id -> id
+        | Error message -> failwith message
+
+    let providerRef (name: string) =
+        match ProviderRef.tryCreate name with
+        | Ok reference -> reference
+        | Error message -> failwith message
+
+    let fakeLocation (id: ProviderId) : RepositoryLocation = {
+        ProviderId = id
+        DisplayName = None
+        ProviderLocation = "fake://repository"
+        ConnectionProfileId = None
+    }
+
+    /// Minimal well-behaved in-memory core for contract-shape tests.
+    let createCore () : CoreVersionControl =
+        let mutable version = 1
+        let mutable revisionCounter = 0
+        let currentToken () = $"fake-v{version}"
+
+        let status () = {
+            CurrentRef = None
+            WorkspaceVersion = currentToken ()
+            Changes = [||]
+            ActiveConflictSession = None
+            Synchronization = None
+        }
+
+        {
+            GetStatus = fun _ -> async { return OperationResult.succeeded (status ()) }
+            ListRefs = fun _ -> async { return OperationResult.succeeded [||] }
+            CreateRef =
+                fun request _ -> async {
+                    version <- version + 1
+
+                    return
+                        OperationResult.succeeded {
+                            Name = request.Name
+                            ProviderRef = providerRef request.Name
+                            Kind = LocalRef
+                            IsCurrent = request.SwitchTo
+                        }
+                }
+            PreflightSwitchRef =
+                fun _ _ -> async { return OperationResult.succeeded { PathsAtRisk = [||]; IsSafe = true } }
+            SwitchRef =
+                fun _ _ -> async {
+                    version <- version + 1
+                    return OperationResult.succeeded (status ())
+                }
+            CreateRevision =
+                fun request _ -> async {
+                    if request.ExpectedWorkspaceVersion <> currentToken () then
+                        return
+                            OperationResult.failed (
+                                OperationFailure.create Concurrency "precondition_failed" "Stale workspace version."
+                            )
+                    else
+                        version <- version + 1
+                        revisionCounter <- revisionCounter + 1
+
+                        match RevisionId.tryCreate $"fake-rev-{revisionCounter}" with
+                        | Ok revisionId -> return OperationResult.succeeded revisionId
+                        | Error message -> return failwith message
+                }
+            RestorePaths =
+                fun _ _ -> async {
+                    version <- version + 1
+                    return OperationResult.succeeded ()
+                }
+            GetDiffSummary = fun _ -> async { return OperationResult.succeeded { Entries = [||] } }
+        }
+
+    let createSynchronization () : SynchronizationService =
+        let state = {
+            BaseRevision = None
+            WorkspaceRevision = None
+            TargetRevision = None
+            LocalRevisionCount = None
+            TargetRevisionCount = None
+            RemoteChangedPaths = None
+            Relationship = NoTarget
+        }
+
+        {
+            Refresh = fun _ -> async { return OperationResult.succeeded state }
+            PreviewUpdate =
+                fun _ -> async {
+                    return
+                        OperationResult.succeeded {
+                            ChangedPaths = [||]
+                            OverlappingPaths = [||]
+                            HasDataLossRisk = false
+                            WouldCreateConflictSession = false
+                        }
+                }
+            Update = fun _ _ -> async { return OperationResult.noOp (Some "no target configured") state }
+            Publish = fun _ _ -> async { return OperationResult.noOp (Some "no target configured") state }
+        }
+
+    let createBrowser () : RepositoryBrowserService = {
+        GetRepositoryWebUrl = fun _ -> async { return OperationResult.succeeded None }
+    }
+
+    let createBinding (id: ProviderId) (workspaceRoot: string) (location: RepositoryLocation) : WorkspaceBinding = {
+        SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
+        ProviderId = id
+        WorkspaceRoot = workspaceRoot
+        ProviderStateRef = None
+        Location = location
+        ConnectionProfileId = location.ConnectionProfileId
+    }
+
+    let createFactory (id: ProviderId) (buildSession: WorkspaceDescriptor -> WorkspaceSession) : ProviderFactory = {
+        Id = id
+        Probe = fun _ -> async { return NotDetected }
+        VerifyLocation =
+            fun request _ -> async {
+                return
+                    OperationResult.succeeded {
+                        Location = request.Location
+                        GrantedIntents = request.Intents
+                        DeniedIntents = [||]
+                    }
+            }
+        Initialize =
+            fun request _ -> async {
+                let location = request.Location |> Option.defaultValue (fakeLocation id)
+                return OperationResult.succeeded (createBinding id request.TargetPath location)
+            }
+        Clone =
+            fun request _ -> async {
+                return OperationResult.succeeded (createBinding id request.TargetPath request.Location)
+            }
+        Bind =
+            fun request _ -> async {
+                return OperationResult.succeeded (createBinding id request.WorkspaceRoot request.Location)
+            }
+        Open =
+            fun binding _ -> async {
+                let descriptor = {
+                    ProviderId = binding.ProviderId
+                    WorkspaceRoot = binding.WorkspaceRoot
+                    Location = Some binding.Location
+                }
+
+                return OperationResult.succeeded (buildSession descriptor)
+            }
+        CheckDependencies = fun _ -> async { return OperationResult.succeeded [||] }
+    }
+
+let private expectSucceeded (operationName: string) (result: OperationResult<'T>) : 'T =
+    match result with
+    | Succeeded outcome -> outcome.Value
+    | PartiallySucceeded _ -> failtest $"{operationName} unexpectedly returned partial success."
+    | Failed failure -> failtest $"{operationName} failed ({failure.Category}/{failure.Code}): {failure.Message}"
+
+/// The consumer-side feature discovery pattern: check presence once, enable UI.
+let private discoverFeatures (session: WorkspaceSession) = [
+    if session.Synchronization.IsSome then
+        "synchronization"
+    if session.TextDiff.IsSome then
+        "text-diff"
+    if session.ConflictResolution.IsSome then
+        "conflicts"
+    if session.ObjectMaterialization.IsSome then
+        "materialization"
+    if session.StoragePolicy.IsSome then
+        "storage-policy"
+    if session.Maintenance.IsSome then
+        "maintenance"
+    if session.RepositoryBrowser.IsSome then
+        "browser"
+]
+
+let private openSession (factory: ProviderFactory) =
+    async {
+        let context = OperationContext.detached "contract-shape"
+        let location = FakeProvider.fakeLocation factory.Id
+
+        let! bindResult =
+            factory.Bind
+                {
+                    WorkspaceRoot = "/fake/workspace"
+                    Location = location
+                }
+                context
+
+        let binding = expectSucceeded "bind" bindResult
+        let! openResult = factory.Open binding context
+        return expectSucceeded "open" openResult
+    }
+
+[<Tests>]
+let contractShapeTests =
+    testList "ContractShapes" [
+        testCaseAsync "a core-only provider implements no optional service"
+        <| async {
+            let id = FakeProvider.providerId "fake.coreonly"
+
+            let factory =
+                FakeProvider.createFactory id (fun descriptor ->
+                    WorkspaceSession.createCoreOnly descriptor (FakeProvider.createCore ()))
+
+            let! session = openSession factory
+
+            Expect.equal (discoverFeatures session) [] "No optional feature is discovered."
+
+            let context = OperationContext.detached "core-only-status"
+            let! statusResult = session.Core.GetStatus context
+            let status = expectSucceeded "core status" statusResult
+
+            Expect.equal status.WorkspaceVersion "fake-v1" "The core works without any optional service."
+        }
+
+        testCaseAsync "a synchronization provider needs no object-storage extension"
+        <| async {
+            let id = FakeProvider.providerId "fake.sync"
+
+            let factory =
+                FakeProvider.createFactory id (fun descriptor -> {
+                    WorkspaceSession.createCoreOnly descriptor (FakeProvider.createCore ()) with
+                        Synchronization = Some(FakeProvider.createSynchronization ())
+                })
+
+            let! session = openSession factory
+
+            Expect.equal (discoverFeatures session) [ "synchronization" ] "Only synchronization is discovered."
+
+            match session.Synchronization with
+            | Some synchronization ->
+                let! refreshResult = synchronization.Refresh(OperationContext.detached "sync-refresh")
+                let state = expectSucceeded "refresh" refreshResult
+                Expect.equal state.Relationship NoTarget "Truthful state without invented counters."
+            | None -> failtest "Expected the synchronization service."
+        }
+
+        testCaseAsync "an unknown external provider ID with one optional extension round-trips"
+        <| async {
+            let id = FakeProvider.providerId "vendor.example-vcs"
+
+            let factory =
+                FakeProvider.createFactory id (fun descriptor -> {
+                    WorkspaceSession.createCoreOnly descriptor (FakeProvider.createCore ()) with
+                        RepositoryBrowser = Some(FakeProvider.createBrowser ())
+                })
+
+            Expect.equal (ProviderId.value factory.Id) "vendor.example-vcs" "External ID round-trips unchanged."
+
+            let! session = openSession factory
+            Expect.equal (discoverFeatures session) [ "browser" ] "Only the browser extension is discovered."
+        }
+
+        testCaseAsync "stale workspace versions are rejected with the stable concurrency code"
+        <| async {
+            let id = FakeProvider.providerId "fake.concurrency"
+
+            let factory =
+                FakeProvider.createFactory id (fun descriptor ->
+                    WorkspaceSession.createCoreOnly descriptor (FakeProvider.createCore ()))
+
+            let! session = openSession factory
+            let context = OperationContext.detached "stale-mutation"
+
+            let! revisionResult =
+                session.Core.CreateRevision
+                    {
+                        Message = "stale attempt"
+                        Paths = [||]
+                        ExpectedWorkspaceVersion = "fake-v999"
+                    }
+                    context
+
+            match revisionResult with
+            | Failed failure ->
+                Expect.equal failure.Category Concurrency "Stale mutations fail with Concurrency."
+                Expect.equal failure.Code "precondition_failed" "The stable code is precondition_failed."
+            | Succeeded _
+            | PartiallySucceeded _ -> failtest "Expected the stale mutation to fail."
+        }
+    ]

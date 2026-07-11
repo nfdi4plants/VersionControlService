@@ -3,60 +3,68 @@ module VersionControlService.Abstractions.Tests.PortableConsumerTests
 open System.IO
 open Expecto
 open VersionControlService.Abstractions
+open VersionControlService.Abstractions.Tests.ContractShapeTests
 
-let private fakeProviderId =
-    match ProviderId.tryCreate "fake.portable" with
-    | Ok providerId -> providerId
-    | Error message -> failwith message
+let private fakeProviderId = FakeProvider.providerId "fake.portable"
 
-/// A fake provider whose long operation runs 50 steps, reports progress each step,
-/// and observes cancellation between steps.
-let private createFakeFactory () : ProviderFactory =
-    let createSession descriptor = {
-        Descriptor = descriptor
-        GetWorkspaceVersion =
-            fun context -> async {
-                let mutable canceled = false
-                let mutable step = 0
-
-                while not canceled && step < 50 do
-                    do! Async.Sleep 1
-                    step <- step + 1
-
-                    context.ReportProgress {
-                        PhaseCode = "fake-step"
-                        Item = None
-                        Completed = Some step
-                        Total = Some 50
-                        DisplayMessage = None
-                    }
-
-                    if context.Cancellation.IsCancellationRequested() then
-                        canceled <- true
-
-                if canceled then
-                    return OperationResult.canceled $"The fake operation stopped after {step} steps."
-                else
-                    return OperationResult.succeeded "fake-version-1"
-            }
-    }
+/// A core whose diff summary is a 50-step long operation that reports progress each
+/// step and observes cancellation between steps.
+let private createLongOperationCore () : CoreVersionControl =
+    let baseCore = FakeProvider.createCore ()
 
     {
-        Id = fakeProviderId
-        Open = fun descriptor _context -> async { return OperationResult.succeeded (createSession descriptor) }
+        baseCore with
+            GetDiffSummary =
+                fun context -> async {
+                    let mutable canceled = false
+                    let mutable step = 0
+
+                    while not canceled && step < 50 do
+                        do! Async.Sleep 1
+                        step <- step + 1
+
+                        context.ReportProgress {
+                            PhaseCode = "fake-step"
+                            Item = None
+                            Completed = Some step
+                            Total = Some 50
+                            DisplayMessage = None
+                        }
+
+                        if context.Cancellation.IsCancellationRequested() then
+                            canceled <- true
+
+                    if canceled then
+                        return OperationResult.canceled $"The fake operation stopped after {step} steps."
+                    else
+                        return OperationResult.succeeded { Entries = [||] }
+                }
     }
 
-let private fakeDescriptor = {
-    ProviderId = fakeProviderId
-    WorkspaceRoot = "/fake/workspace"
-    Location = None
-}
+let private createFakeFactory () : ProviderFactory =
+    FakeProvider.createFactory fakeProviderId (fun descriptor ->
+        WorkspaceSession.createCoreOnly descriptor (createLongOperationCore ()))
 
 let private expectSucceeded (operationName: string) (result: OperationResult<'T>) : 'T =
     match result with
     | Succeeded outcome -> outcome.Value
     | PartiallySucceeded _ -> failtest $"{operationName} unexpectedly returned partial success."
     | Failed failure -> failtest $"{operationName} failed ({failure.Category}/{failure.Code}): {failure.Message}"
+
+let private openFakeSession (factory: ProviderFactory) (context: OperationContext) =
+    async {
+        let! bindResult =
+            factory.Bind
+                {
+                    WorkspaceRoot = "/fake/workspace"
+                    Location = FakeProvider.fakeLocation factory.Id
+                }
+                context
+
+        let binding = expectSucceeded "bind" bindResult
+        let! openResult = factory.Open binding context
+        return expectSucceeded "open session" openResult
+    }
 
 let private findRepositoryRoot () =
     let rec walkUp (directory: DirectoryInfo) =
@@ -77,13 +85,11 @@ let portableConsumerTests =
             let factory = createFakeFactory ()
             let context = OperationContext.detached "portable-open"
 
-            let! openResult = factory.Open fakeDescriptor context
-            let session = expectSucceeded "open session" openResult
+            let! session = openFakeSession factory context
+            let! statusResult = session.Core.GetStatus context
+            let status = expectSucceeded "get status" statusResult
 
-            let! versionResult = session.GetWorkspaceVersion context
-            let version = expectSucceeded "get workspace version" versionResult
-
-            Expect.equal version "fake-version-1" "The fake session returns its workspace version."
+            Expect.equal status.WorkspaceVersion "fake-v1" "The fake session returns its workspace version."
         }
 
         testCaseAsync "cancellation reaches and stops a fake long operation in .NET"
@@ -103,12 +109,10 @@ let portableConsumerTests =
                             source.Cancel()
                     | None -> ())
 
-            let! openResult = factory.Open fakeDescriptor context
-            let session = expectSucceeded "open session" openResult
+            let! session = openFakeSession factory context
+            let! diffResult = session.Core.GetDiffSummary context
 
-            let! versionResult = session.GetWorkspaceVersion context
-
-            match versionResult with
+            match diffResult with
             | Failed failure ->
                 Expect.equal failure.Category Canceled "Cancellation produces a structured canceled failure."
                 Expect.equal failure.Code "operation_canceled" "The canceled failure carries its stable code."
@@ -128,11 +132,9 @@ let portableConsumerTests =
                 OperationContext.create "portable-progress" OperationCancellation.none (fun progress ->
                     progressPhases.Add progress.PhaseCode)
 
-            let! openResult = factory.Open fakeDescriptor context
-            let session = expectSucceeded "open session" openResult
-
-            let! versionResult = session.GetWorkspaceVersion context
-            expectSucceeded "get workspace version" versionResult |> ignore
+            let! session = openFakeSession factory context
+            let! diffResult = session.Core.GetDiffSummary context
+            expectSucceeded "get diff summary" diffResult |> ignore
 
             Expect.equal progressPhases.Count 50 "Every step reported progress."
             Expect.allEqual progressPhases "fake-step" "All progress reports carry the stable phase code."
