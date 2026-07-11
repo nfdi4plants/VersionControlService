@@ -4,6 +4,8 @@
     <IsPackable>false</IsPackable>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="PathsTests.fs" />
+    <Compile Include="OperationResultTests.fs" />
     <Compile Include="PortableConsumerTests.fs" />
   </ItemGroup>
   <ItemGroup>

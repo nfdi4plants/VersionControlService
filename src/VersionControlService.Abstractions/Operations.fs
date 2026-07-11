@@ -123,6 +123,16 @@ type OperationEffect =
     | Performed
     | NoOp of reason: string option
 
+/// Whether the operation's result is visible on the configured publication target.
+type PublicationState =
+    /// The operation has no publication semantics.
+    | PublicationNotApplicable
+    /// Revisions exist locally (or on a provider-owned workspace branch) but are
+    /// not yet visible on the logical target; publish can be retried.
+    | LocalOnly
+    /// The result is visible on the logical target.
+    | Published
+
 /// Successful (or partially successful) operation payload.
 type OperationOutcome<'T> = {
     Value: 'T
@@ -133,6 +143,7 @@ type OperationOutcome<'T> = {
     ResultingRevision: RevisionId option
     /// Opaque optimistic-concurrency token observed after the operation.
     ResultingWorkspaceVersion: string option
+    Publication: PublicationState
 }
 
 /// Distinguishes no change, success, partial success, and failure without message parsing.
@@ -140,6 +151,29 @@ type OperationResult<'T> =
     | Succeeded of OperationOutcome<'T>
     | PartiallySucceeded of OperationOutcome<'T> * OperationFailure
     | Failed of OperationFailure
+
+/// Removes credential material from provider text before it enters messages,
+/// details, progress output, or serialized data.
+module Redaction =
+
+    open System.Text.RegularExpressions
+
+    let private replacements = [
+        // URL credentials: https://user:secret@host or https://token@host
+        Regex(@"://[^/@\s]+@", RegexOptions.None), "://[REDACTED]@"
+        // Authorization / token headers keep the field name, lose the value.
+        Regex(@"(authorization\s*:)[^\r\n]+", RegexOptions.IgnoreCase), "$1 [REDACTED]"
+        Regex(@"(private-token\s*:)[^\r\n]+", RegexOptions.IgnoreCase), "$1 [REDACTED]"
+        Regex(@"(x-access-token\s*:)[^\r\n]+", RegexOptions.IgnoreCase), "$1 [REDACTED]"
+    ]
+
+    /// Redacts likely credential material; clean text passes through unchanged.
+    let redact (text: string) : string =
+        if isNull text then
+            text
+        else
+            replacements
+            |> List.fold (fun (current: string) (pattern: Regex, replacement) -> pattern.Replace(current, replacement)) text
 
 module OperationOutcome =
 
@@ -150,6 +184,7 @@ module OperationOutcome =
         AffectedPaths = [||]
         ResultingRevision = None
         ResultingWorkspaceVersion = None
+        Publication = PublicationNotApplicable
     }
 
     let noOp (reason: string option) (value: 'T) : OperationOutcome<'T> = {
@@ -159,6 +194,7 @@ module OperationOutcome =
         AffectedPaths = [||]
         ResultingRevision = None
         ResultingWorkspaceVersion = None
+        Publication = PublicationNotApplicable
     }
 
 module OperationFailure =
@@ -174,6 +210,16 @@ module OperationFailure =
         Details = [||]
     }
 
+    /// Creates a failure whose message is passed through the redaction guard.
+    let createRedacted (category: FailureCategory) (code: string) (message: string) : OperationFailure =
+        create category code (Redaction.redact message)
+
+    /// Attaches diagnostic detail lines, redacting each line.
+    let withDetails (details: string[]) (failure: OperationFailure) : OperationFailure = {
+        failure with
+            Details = details |> Array.map Redaction.redact
+    }
+
 module OperationResult =
 
     let succeeded (value: 'T) : OperationResult<'T> =
@@ -183,6 +229,22 @@ module OperationResult =
         Succeeded(OperationOutcome.noOp reason value)
 
     let failed (failure: OperationFailure) : OperationResult<'T> = Failed failure
+
+    /// Partial success always describes changed state and carries a recovery action,
+    /// so consumers can never observe an ambiguous partially-completed operation.
+    let partiallySucceeded
+        (outcome: OperationOutcome<'T>)
+        (failure: OperationFailure)
+        (recovery: RecoveryAction)
+        : OperationResult<'T> =
+        PartiallySucceeded(
+            outcome,
+            {
+                failure with
+                    StateChanged = true
+                    RecoveryAction = Some recovery
+            }
+        )
 
     let validationFailed (code: string) (message: string) : OperationResult<'T> =
         Failed(OperationFailure.create Validation code message)

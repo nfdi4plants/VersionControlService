@@ -4,6 +4,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="Identifiers.fs" />
+    <Compile Include="Paths.fs" />
     <Compile Include="Operations.fs" />
     <Compile Include="Providers.fs" />
   </ItemGroup>
