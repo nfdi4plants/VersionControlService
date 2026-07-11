@@ -285,6 +285,12 @@ let private utf8Buffer (text: string) : obj = jsNative
 [<Emit("Buffer.byteLength($0, 'utf8')")>]
 let private utf8ByteLength (text: string) : int = jsNative
 
+[<Emit("Date.now()")>]
+let private nowMilliseconds () : float = jsNative
+
+[<Emit("console.log($0)")>]
+let private consoleLog (_message: string) : unit = jsNative
+
 let private runSimpleGitResult
     (operation: ISimpleGit -> JS.Promise<'T>)
     (git: ISimpleGit)
@@ -687,28 +693,185 @@ Vitest.describe (
                                 $"many/file-{indexText}-{repeatedNamePart}.txt"
                         |]
 
+                        // GIT-007 measurement: record per-phase timings without weakening assertions.
+                        let creationStart = nowMilliseconds ()
+
                         for pathSpec in pathSpecs do
                             let filePath = join [| context.RepoPath; pathSpec |]
                             do! writeUtf8FileAsync filePath $"content for {pathSpec}\n"
 
+                        let creationEnd = nowMilliseconds ()
+
                         let! stageResult = GitService.stagePaths context.RepoPath pathSpecs
                         expectOk "stage many long paths" stageResult |> ignore
+                        let firstStageEnd = nowMilliseconds ()
 
                         let! unstageResult = GitService.unstagePaths context.RepoPath pathSpecs
                         expectOk "unstage many long paths" unstageResult |> ignore
+                        let unstageEnd = nowMilliseconds ()
 
                         let! restageResult = GitService.stagePaths context.RepoPath pathSpecs
                         expectOk "restage many long paths" restageResult |> ignore
+                        let restageEnd = nowMilliseconds ()
 
                         let! commitResult = GitService.commit context.RepoPath "test: commit many selected files"
                         Vitest.expect((expectOk "commit many selected files" commitResult).Length).toBeGreaterThan (6)
+                        let commitEnd = nowMilliseconds ()
 
                         let! status =
                             unwrapResultAsync
                                 (GitService.getStatus context.RepoPath)
                                 (expectOk "git status after many-path commit")
 
+                        let statusEnd = nowMilliseconds ()
+
+                        consoleLog (
+                            "GIT-007 400-path phase timings (ms): "
+                            + $"create={creationEnd - creationStart} "
+                            + $"stage1={firstStageEnd - creationEnd} "
+                            + $"unstage={unstageEnd - firstStageEnd} "
+                            + $"stage2={restageEnd - unstageEnd} "
+                            + $"commit={commitEnd - restageEnd} "
+                            + $"status={statusEnd - commitEnd}"
+                        )
+
                         Vitest.expect(status.IsClean).toBe (true)
+                    })
+            }
+        )
+
+        Vitest.test (
+            "stage and unstage avoid command-line length limits",
+            gitServiceIntegrationTestOptions,
+            fun () -> promise {
+                do!
+                    withTempRepository (fun context -> promise {
+                        let directoryPath = join [| context.RepoPath; "bulk" |]
+                        do! ensureDirectoryAsync directoryPath
+
+                        // 600 repository-relative paths of exactly 120 characters put a single
+                        // argv path list well past the Windows ~32K command-line limit without
+                        // approaching the per-component filename limit.
+                        let pathSpecs = [|
+                            for index in 0..599 ->
+                                let prefix = $"""bulk/file-{index.ToString "0000"}-"""
+                                let padding = String.replicate (120 - prefix.Length - 4) "x"
+                                $"{prefix}{padding}.txt"
+                        |]
+
+                        for pathSpec in pathSpecs do
+                            Vitest.expect(pathSpec.Length).toBe (120)
+
+                        for pathSpec in pathSpecs do
+                            do! writeUtf8FileAsync (join [| context.RepoPath; pathSpec |]) $"content for {pathSpec}\n"
+
+                        let! stageResult = GitService.stagePaths context.RepoPath pathSpecs
+                        expectOk "stage 600 long paths" stageResult |> ignore
+
+                        let! stagedList = context.Git.raw [| "diff"; "--cached"; "--name-only" |]
+                        Vitest.expect(splitNonEmptyLines(stagedList).Length).toBe (600)
+
+                        let! unstageResult = GitService.unstagePaths context.RepoPath pathSpecs
+                        expectOk "unstage 600 long paths" unstageResult |> ignore
+
+                        let! unstagedList = context.Git.raw [| "diff"; "--cached"; "--name-only" |]
+                        Vitest.expect(splitNonEmptyLines(unstagedList).Length).toBe (0)
+                    })
+            }
+        )
+
+        Vitest.test (
+            "linked worktree keeps merge state after the last conflict is staged",
+            gitServiceIntegrationTestOptions,
+            fun () -> promise {
+                do!
+                    withTempRepository (fun context -> promise {
+                        let filePath = join [| context.RepoPath; "conflict.txt" |]
+
+                        do! writeUtf8FileAsync filePath "base\n"
+                        let! _ = context.Git.raw [| "add"; "-A" |]
+                        let! _ = context.Git.raw [| "commit"; "-m"; "test: base" |]
+                        let! currentBranch = context.Git.raw [| "branch"; "--show-current" |]
+                        let baseBranch = currentBranch.Trim()
+
+                        // Divergent branch with a conflicting change.
+                        let! _ = context.Git.raw [| "checkout"; "-b"; "feature" |]
+                        do! writeUtf8FileAsync filePath "feature\n"
+                        let! _ = context.Git.raw [| "add"; "conflict.txt" |]
+                        let! _ = context.Git.raw [| "commit"; "-m"; "test: feature change" |]
+                        let! _ = context.Git.raw [| "checkout"; baseBranch |]
+                        do! writeUtf8FileAsync filePath "main\n"
+                        let! _ = context.Git.raw [| "add"; "conflict.txt" |]
+                        let! _ = context.Git.raw [| "commit"; "-m"; "test: main change" |]
+
+                        // Linked worktree on a new branch from the base branch.
+                        let worktreePath = join [| context.RootPath; "linked-worktree" |]
+
+                        let! _ =
+                            context.Git.raw [| "worktree"; "add"; "-b"; "worktree-merge"; worktreePath; baseBranch |]
+
+                        let worktreeGit = createSimpleGit worktreePath
+                        do! configureRepositoryAsync worktreeGit
+
+                        // Start a conflicting merge inside the linked worktree.
+                        let! _ = runSimpleGitResult (fun git -> git.raw [| "merge"; "feature" |]) worktreeGit
+
+                        let! conflictedStatus = worktreeGit.raw [| "status"; "--porcelain=v1" |]
+
+                        if not (conflictedStatus.Contains "UU conflict.txt") then
+                            failwith $"Expected the merge to stop with a conflict but status was: {conflictedStatus}"
+
+                        // Resolve and stage the last conflict without committing.
+                        do! writeUtf8FileAsync (join [| worktreePath; "conflict.txt" |]) "resolved\n"
+                        let! _ = worktreeGit.raw [| "add"; "conflict.txt" |]
+
+                        let! status =
+                            unwrapResultAsync (GitService.getStatus worktreePath) (expectOk "status in linked worktree")
+
+                        Vitest.expect(status.Conflicted).toEqual ([||])
+                        Vitest.expect(status.IsMergeInProgress).toBe (true)
+                    })
+            }
+        )
+
+        Vitest.test (
+            "diff summary includes staged-only changes once",
+            gitServiceIntegrationTestOptions,
+            fun () -> promise {
+                do!
+                    withTempRepository (fun context -> promise {
+                        let stagedOnlyPath = join [| context.RepoPath; "staged-only.txt" |]
+                        let mixedPath = join [| context.RepoPath; "mixed.txt" |]
+
+                        do! writeUtf8FileAsync stagedOnlyPath "staged base\n"
+                        do! writeUtf8FileAsync mixedPath "mixed base\n"
+                        let! _ = context.Git.raw [| "add"; "-A" |]
+                        let! _ = context.Git.raw [| "commit"; "-m"; "test: base" |]
+
+                        // A staged-only modification must appear in the diff summary.
+                        do! writeUtf8FileAsync stagedOnlyPath "staged base\nstaged line\n"
+                        let! _ = context.Git.raw [| "add"; "staged-only.txt" |]
+
+                        let! stagedSummary =
+                            unwrapResultAsync
+                                (GitService.getDiffSummary context.RepoPath)
+                                (expectOk "diff summary with staged-only change")
+
+                        Vitest.expect(stagedSummary.Changed).toBe (1)
+                        Vitest.expect(stagedSummary.Insertions).toBe (1)
+                        Vitest.expect(stagedSummary.Deletions).toBe (0)
+
+                        // A path with staged and unstaged changes is counted once.
+                        do! writeUtf8FileAsync mixedPath "mixed base\nmixed staged line\n"
+                        let! _ = context.Git.raw [| "add"; "mixed.txt" |]
+                        do! writeUtf8FileAsync mixedPath "mixed base\nmixed staged line\nmixed unstaged line\n"
+
+                        let! mixedSummary =
+                            unwrapResultAsync
+                                (GitService.getDiffSummary context.RepoPath)
+                                (expectOk "diff summary with mixed changes")
+
+                        Vitest.expect(mixedSummary.Changed).toBe (2)
                     })
             }
         )

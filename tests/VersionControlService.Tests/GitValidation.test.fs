@@ -130,6 +130,23 @@ Vitest.describe (
 
         for testName, value in invalidCases do
             Vitest.test (testName, fun () -> GitService.ensureValidBranchLikeName "Branch name" value |> expectError)
+
+        Vitest.test (
+            "branch validation delegates invalid forms to Git",
+            fun () ->
+                // git check-ref-format --branch rejects every one of these forms.
+                let invalidForms = [| ".foo"; "foo/.bar"; "foo//bar" |]
+
+                for invalidForm in invalidForms do
+                    GitService.ensureValidBranchLikeName "Branch name" invalidForm |> expectError
+
+                // Valid Unicode and slash-separated names must stay accepted.
+                GitService.ensureValidBranchLikeName "Branch name" "feature/x"
+                |> expectOk "feature/x"
+
+                GitService.ensureValidBranchLikeName "Branch name" "füür-β"
+                |> expectOk "füür-β"
+        )
 )
 
 Vitest.describe (

@@ -347,6 +347,181 @@ Vitest.describe (
                     })
             }
         )
+
+        Vitest.test (
+            "commits literal selected paths",
+            providerIntegrationTestOptions,
+            fun () -> promise {
+                do!
+                    withProviderTempRepository (fun provider repoPath git -> promise {
+                        let bracketRelativePath = "a[1].txt"
+                        let plainRelativePath = "a1.txt"
+                        let bracketPath = join [| repoPath; bracketRelativePath |]
+                        let plainPath = join [| repoPath; plainRelativePath |]
+
+                        do! writeUtf8FileAsync bracketPath "bracket-base\n"
+                        do! writeUtf8FileAsync plainPath "plain-base\n"
+
+                        // Base commit through raw git so the fixture does not depend on provider pathspec behavior.
+                        let! _ = git.raw [| "add"; "-A" |]
+                        let! _ = git.raw [| "commit"; "-m"; "test: literal base" |]
+
+                        do! writeUtf8FileAsync bracketPath "bracket-changed\n"
+                        do! writeUtf8FileAsync plainPath "plain-changed\n"
+
+                        let! selectedCommit =
+                            provider.Commit
+                                repoPath
+                                {
+                                    Message = "test: select bracket file only"
+                                    Paths = [| bracketRelativePath |]
+                                }
+
+                        expectProviderOk "literal selected commit" selectedCommit |> ignore
+
+                        let! changedFiles = git.raw [| "diff-tree"; "--no-commit-id"; "--name-only"; "-r"; "HEAD" |]
+
+                        let committedPaths =
+                            changedFiles.Replace("\r\n", "\n").Split('\n')
+                            |> Array.map _.Trim()
+                            |> Array.filter (fun line -> line <> "")
+
+                        Vitest.expect(committedPaths).toEqual ([| bracketRelativePath |])
+
+                        let! plainStatus = git.raw [| "status"; "--porcelain=v1"; "--"; plainRelativePath |]
+                        Vitest.expect(plainStatus.TrimEnd()).toBe ($" M {plainRelativePath}")
+
+                        // Wildcard characters are literal filenames, not pathspecs: requesting "*.txt"
+                        // when no file has that exact name must not commit glob matches.
+                        let! headBeforeWildcard = git.raw [| "rev-parse"; "HEAD" |]
+
+                        let! wildcardCommit =
+                            provider.Commit
+                                repoPath
+                                {
+                                    Message = "test: wildcard is not a pathspec"
+                                    Paths = [| "*.txt" |]
+                                }
+
+                        match wildcardCommit with
+                        | Ok _ ->
+                            failwith
+                                "Expected the wildcard-named commit to fail because no file is literally named '*.txt'."
+                        | Error _ -> ()
+
+                        let! headAfterWildcard = git.raw [| "rev-parse"; "HEAD" |]
+                        Vitest.expect(headAfterWildcard.Trim()).toBe (headBeforeWildcard.Trim())
+                    })
+            }
+        )
+
+        Vitest.test (
+            "failed selected commit preserves unrelated staged state",
+            providerIntegrationTestOptions,
+            fun () -> promise {
+                do!
+                    withProviderTempRepository (fun provider repoPath git -> promise {
+                        let bPath = join [| repoPath; "b.txt" |]
+
+                        do! writeUtf8FileAsync bPath "b-base\n"
+                        let! _ = git.raw [| "add"; "-A" |]
+                        let! _ = git.raw [| "commit"; "-m"; "test: base" |]
+
+                        do! writeUtf8FileAsync bPath "b-staged\n"
+                        let! _ = git.raw [| "add"; "b.txt" |]
+
+                        let! headBefore = git.raw [| "rev-parse"; "HEAD" |]
+
+                        let! commitResult =
+                            provider.Commit
+                                repoPath
+                                {
+                                    Message = "test: outside path must fail"
+                                    Paths = [| "../outside.txt" |]
+                                }
+
+                        expectProviderError commitResult |> ignore
+
+                        // Unrelated staged state must be preserved by the failed operation.
+                        let! bStatus = git.raw [| "status"; "--porcelain=v1"; "--"; "b.txt" |]
+                        Vitest.expect(bStatus.TrimEnd()).toBe ("M  b.txt")
+
+                        let! headAfter = git.raw [| "rev-parse"; "HEAD" |]
+                        Vitest.expect(headAfter.Trim()).toBe (headBefore.Trim())
+
+                        let! workingContent = readUtf8FileAsync bPath
+                        Vitest.expect(workingContent).toBe ("b-staged\n")
+                    })
+            }
+        )
+)
+
+Vitest.describe (
+    "GitProvider checkout tracking",
+    fun () ->
+        Vitest.test (
+            "checkout preserves the exact upstream provider ref",
+            providerIntegrationTestOptions,
+            fun () -> promise {
+                do!
+                    withProviderTempRepository (fun provider repoPath git -> promise {
+                        let rootPath = dirname repoPath
+                        let filePath = join [| repoPath; "shared.txt" |]
+
+                        do! writeUtf8FileAsync filePath "base\n"
+                        let! _ = git.raw [| "add"; "-A" |]
+                        let! _ = git.raw [| "commit"; "-m"; "test: base" |]
+                        let! currentBranch = git.raw [| "branch"; "--show-current" |]
+                        let baseBranch = currentBranch.Trim()
+
+                        let originPath = join [| rootPath; "origin.git" |]
+                        let upstreamPath = join [| rootPath; "upstream.git" |]
+                        let! _ = git.raw [| "init"; "--bare"; $"--initial-branch={baseBranch}"; originPath |]
+                        let! _ = git.raw [| "init"; "--bare"; $"--initial-branch={baseBranch}"; upstreamPath |]
+                        let! _ = git.raw [| "remote"; "add"; "origin"; originPath |]
+                        let! _ = git.raw [| "remote"; "add"; "upstream"; upstreamPath |]
+                        let! _ = git.raw [| "push"; "origin"; baseBranch |]
+                        let! _ = git.raw [| "push"; "upstream"; baseBranch |]
+
+                        // origin/feature and upstream/feature diverge with different tips.
+                        let! _ = git.raw [| "checkout"; "-b"; "feature" |]
+                        do! writeUtf8FileAsync filePath "origin version\n"
+                        let! _ = git.raw [| "add"; "shared.txt" |]
+                        let! _ = git.raw [| "commit"; "-m"; "test: origin feature" |]
+                        let! _ = git.raw [| "push"; "origin"; "feature" |]
+
+                        do! writeUtf8FileAsync filePath "upstream version\n"
+                        let! _ = git.raw [| "add"; "shared.txt" |]
+                        let! _ = git.raw [| "commit"; "-m"; "test: upstream feature" |]
+                        let! _ = git.raw [| "push"; "upstream"; "feature" |]
+
+                        let! _ = git.raw [| "fetch"; "origin" |]
+                        let! _ = git.raw [| "fetch"; "upstream" |]
+
+                        let! upstreamTip = git.raw [| "rev-parse"; "refs/remotes/upstream/feature" |]
+
+                        let! _ = git.raw [| "checkout"; baseBranch |]
+                        let! _ = git.raw [| "branch"; "-D"; "feature" |]
+
+                        let! branchesResult = provider.GetBranches repoPath
+                        let branches = expectProviderOk "branches with two remotes" branchesResult
+
+                        let upstreamBranch =
+                            branches |> Array.find (fun branch -> branch.RefName = "upstream/feature")
+
+                        let! checkoutResult =
+                            provider.CheckoutBranch repoPath { ProviderRef = upstreamBranch.ProviderRef }
+
+                        expectProviderOk "checkout upstream feature" checkoutResult |> ignore
+
+                        let! localTip = git.raw [| "rev-parse"; "feature" |]
+                        Vitest.expect(localTip.Trim()).toBe (upstreamTip.Trim())
+
+                        let! trackedUpstream = git.raw [| "rev-parse"; "--abbrev-ref"; "feature@{upstream}" |]
+                        Vitest.expect(trackedUpstream.Trim()).toBe ("upstream/feature")
+                    })
+            }
+        )
 )
 
 Vitest.describe (
