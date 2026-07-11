@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="PortableConsumerTests.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- The portable consumer references only the abstractions package: no Fable.Core,
+         no Node bindings, no SimpleGit, no Git/lakeFS implementation projects. -->
+    <ProjectReference Include="..\..\src\VersionControlService.Abstractions\VersionControlService.Abstractions.fsproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Expecto" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="YoloDev.Expecto.TestSdk" />
+  </ItemGroup>
+</Project>

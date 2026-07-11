@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="PortableConsumer.test.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- The Fable consumer references only the abstractions project plus the Fable test
+         toolchain (Fable.Core arrives through the Vitest bindings package). -->
+    <ProjectReference Include="..\..\src\VersionControlService.Abstractions\VersionControlService.Abstractions.fsproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Fable.Core" />
+    <PackageReference Include="Vitest" />
+  </ItemGroup>
+</Project>
