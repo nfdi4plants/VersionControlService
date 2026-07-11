@@ -10,8 +10,10 @@
     <Compile Include="ProviderContractSuite.fs" />
     <Compile Include="GitProviderContract.test.fs" />
     <Compile Include="GitProvider.test.fs" />
+    <Compile Include="ProviderResolver.test.fs" />
   </ItemGroup>
   <ItemGroup>
+    <ProjectReference Include="..\..\src\VersionControlService.Abstractions\VersionControlService.Abstractions.fsproj" />
     <ProjectReference Include="..\..\src\VersionControlService\VersionControlService.fsproj" />
   </ItemGroup>
   <ItemGroup>

@@ -30,6 +30,10 @@
     <Compile Include="Git\GitProvisioningService.fs" />
     <Compile Include="Git\GitProvider.fs" />
     <Compile Include="VersionControlProviderRegistry.fs" />
+    <Compile Include="Resolution\ProviderResolver.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\VersionControlService.Abstractions\VersionControlService.Abstractions.fsproj" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="ARCtrl.Javascript" />
