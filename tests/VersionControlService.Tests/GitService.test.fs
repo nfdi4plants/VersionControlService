@@ -1097,6 +1097,209 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "v2 status and tree preserve newline and Unicode paths",
+            gitServiceIntegrationTestOptions,
+            fun () -> promise {
+                do!
+                    withTempRepository (fun context -> promise {
+                        do! writeUtf8FileAsync (join [| context.RepoPath; "seed.txt" |]) "seed\n"
+                        let! _ = context.Git.raw [| "add"; "-A" |]
+                        let! _ = context.Git.raw [| "commit"; "-m"; "test: base" |]
+
+                        let providerId =
+                            match VersionControlService.Abstractions.ProviderId.tryCreate "git" with
+                            | Ok id -> id
+                            | Error message -> failwith message
+
+                        let binding: VersionControlService.Abstractions.WorkspaceBinding = {
+                            SchemaVersion = VersionControlService.Abstractions.WorkspaceBinding.CurrentSchemaVersion
+                            ProviderId = providerId
+                            WorkspaceRoot = context.RepoPath
+                            ProviderStateRef = None
+                            Location = {
+                                ProviderId = providerId
+                                DisplayName = None
+                                ProviderLocation = context.RepoPath
+                                ConnectionProfileId = None
+                            }
+                            ConnectionProfileId = None
+                        }
+
+                        let session =
+                            GitWorkspaceSession.createSession GitWorkspaceSession.GitSessionHooks.none binding
+
+                        // Unicode paths must round-trip byte-exactly through status
+                        // (core.quotePath octal quoting must never leak into paths).
+                        let unicodeName = "über café.txt"
+                        do! writeUtf8FileAsync (join [| context.RepoPath; unicodeName |]) "unicode content\n"
+
+                        let! statusResult =
+                            Async.StartAsPromise (
+                                session.Core.GetStatus(
+                                    VersionControlService.Abstractions.OperationContext.detached "v2-nul-status"
+                                )
+                            )
+
+                        let status =
+                            match statusResult with
+                            | VersionControlService.Abstractions.Succeeded outcome -> outcome.Value
+                            | _ -> failwith "Expected v2 status to succeed."
+
+                        let statusPaths =
+                            status.Changes
+                            |> Microsoft.FSharp.Collections.Array.map (fun change ->
+                                VersionControlService.Abstractions.RepositoryPath.value change.Path)
+
+                        Vitest.expect(statusPaths |> Microsoft.FSharp.Collections.Array.contains unicodeName).toBe (true)
+
+                        // A newline file name inside a seeded tree must never corrupt
+                        // diff parsing: the dirty file "line" is unrelated to the
+                        // seeded "line\nbreak.txt" and must not appear at risk.
+                        let! headCommit = context.Git.raw [| "rev-parse"; "HEAD" |]
+
+                        do! writeUtf8FileAsync (join [| context.RepoPath; "newline-content.tmp" |]) "newline content\n"
+                        let! blobHash = context.Git.raw [| "hash-object"; "-w"; "--"; "newline-content.tmp" |]
+
+                        let newlinePath = "line\nbreak.txt"
+
+                        let! _ =
+                            context.Git.raw [|
+                                "-c"
+                                "core.protectNTFS=false"
+                                "update-index"
+                                "--add"
+                                "--cacheinfo"
+                                $"100644,{blobHash.Trim()},{newlinePath}"
+                            |]
+
+                        let! treeId = context.Git.raw [| "write-tree" |]
+
+                        let! commitId =
+                            context.Git.raw [|
+                                "commit-tree"
+                                treeId.Trim()
+                                "-p"
+                                headCommit.Trim()
+                                "-m"
+                                "seed: newline path"
+                            |]
+
+                        let! _ = context.Git.raw [| "branch"; "newline-ref"; commitId.Trim() |]
+                        // Reset the poisoned real index back to HEAD.
+                        let! _ = context.Git.raw [| "read-tree"; "HEAD" |]
+
+                        do! writeUtf8FileAsync (join [| context.RepoPath; "line" |]) "unrelated dirty file\n"
+
+                        let newlineRef =
+                            match VersionControlService.Abstractions.ProviderRef.tryCreate "git-local:newline-ref" with
+                            | Ok reference -> reference
+                            | Error message -> failwith message
+
+                        let! freshStatus =
+                            Async.StartAsPromise (
+                                session.Core.GetStatus(
+                                    VersionControlService.Abstractions.OperationContext.detached "v2-nul-status-2"
+                                )
+                            )
+
+                        let freshVersion =
+                            match freshStatus with
+                            | VersionControlService.Abstractions.Succeeded outcome -> outcome.Value.WorkspaceVersion
+                            | _ -> failwith "Expected v2 status to succeed."
+
+                        let! preflightResult =
+                            Async.StartAsPromise(
+                                session.Core.PreflightSwitchRef
+                                    {
+                                        TargetRef = newlineRef
+                                        ExpectedWorkspaceVersion = freshVersion
+                                    }
+                                    (VersionControlService.Abstractions.OperationContext.detached "v2-nul-preflight")
+                            )
+
+                        match preflightResult with
+                        | VersionControlService.Abstractions.Succeeded outcome ->
+                            let atRisk =
+                                outcome.Value.PathsAtRisk
+                                |> Microsoft.FSharp.Collections.Array.map
+                                    VersionControlService.Abstractions.RepositoryPath.value
+
+                            Vitest.expect(atRisk |> Microsoft.FSharp.Collections.Array.contains "line").toBe (false)
+                        | _ -> failwith "Expected the newline-path preflight to succeed."
+
+                        // A genuinely at-risk Unicode path must be detected byte-exactly:
+                        // core.quotePath octal quoting in diff output must never hide it.
+                        do! writeUtf8FileAsync (join [| context.RepoPath; "unicode-risk.tmp" |]) "remote version\n"
+                        let! riskBlob = context.Git.raw [| "hash-object"; "-w"; "--"; "unicode-risk.tmp" |]
+
+                        let! _ =
+                            context.Git.raw [|
+                                "update-index"
+                                "--add"
+                                "--cacheinfo"
+                                $"100644,{riskBlob.Trim()},{unicodeName}"
+                            |]
+
+                        let! riskTree = context.Git.raw [| "write-tree" |]
+
+                        let! riskCommit =
+                            context.Git.raw [|
+                                "commit-tree"
+                                riskTree.Trim()
+                                "-p"
+                                headCommit.Trim()
+                                "-m"
+                                "seed: unicode risk"
+                            |]
+
+                        let! _ = context.Git.raw [| "branch"; "unicode-risk-ref"; riskCommit.Trim() |]
+                        let! _ = context.Git.raw [| "read-tree"; "HEAD" |]
+
+                        let unicodeRiskRef =
+                            match
+                                VersionControlService.Abstractions.ProviderRef.tryCreate "git-local:unicode-risk-ref"
+                            with
+                            | Ok reference -> reference
+                            | Error message -> failwith message
+
+                        let! riskStatus =
+                            Async.StartAsPromise (
+                                session.Core.GetStatus(
+                                    VersionControlService.Abstractions.OperationContext.detached "v2-nul-status-3"
+                                )
+                            )
+
+                        let riskVersion =
+                            match riskStatus with
+                            | VersionControlService.Abstractions.Succeeded outcome -> outcome.Value.WorkspaceVersion
+                            | _ -> failwith "Expected v2 status to succeed."
+
+                        let! riskPreflight =
+                            Async.StartAsPromise(
+                                session.Core.PreflightSwitchRef
+                                    {
+                                        TargetRef = unicodeRiskRef
+                                        ExpectedWorkspaceVersion = riskVersion
+                                    }
+                                    (VersionControlService.Abstractions.OperationContext.detached "v2-nul-preflight-2")
+                            )
+
+                        match riskPreflight with
+                        | VersionControlService.Abstractions.Succeeded outcome ->
+                            let atRisk =
+                                outcome.Value.PathsAtRisk
+                                |> Microsoft.FSharp.Collections.Array.map
+                                    VersionControlService.Abstractions.RepositoryPath.value
+
+                            Vitest
+                                .expect(atRisk |> Microsoft.FSharp.Collections.Array.contains unicodeName)
+                                .toBe (true)
+                        | _ -> failwith "Expected the unicode-risk preflight to succeed."
+                    })
+            }
+        )
+
+        Vitest.test (
             "v2 linked worktree resolves Git state paths",
             gitServiceIntegrationTestOptions,
             fun () -> promise {

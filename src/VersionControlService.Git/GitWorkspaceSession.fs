@@ -619,14 +619,25 @@ let private preflightSwitchRef (state: SessionState) (request: SwitchRefRequest)
         | Error failure -> return Failed failure
         | Ok _ ->
             let! changedBetween =
-                runGitChecked state.Hooks state.RepoPath [| "diff"; "--name-only"; "HEAD"; targetName |] None context
+                runGitChecked
+                    state.Hooks
+                    state.RepoPath
+                    [|
+                        "diff"
+                        "--name-only"
+                        "-z"
+                        "HEAD"
+                        targetName
+                    |]
+                    None
+                    context
 
             match changedBetween with
             | Error failure -> return Failed failure
             | Ok diffOutput ->
                 let differingPaths =
-                    diffOutput.StdOut.Replace("\r\n", "\n").Split('\n')
-                    |> Array.filter (fun line -> line.Trim() <> "")
+                    diffOutput.StdOut.Split '\000'
+                    |> Array.filter (fun entry -> entry <> "")
                     |> Set.ofArray
 
                 let! statusResult = awaitGit (GitService.getStatus state.RepoPath)
@@ -889,14 +900,25 @@ let private synchronizationState (state: SessionState) (context: OperationContex
                 | Some mergeBase, Some target when mergeBase <> target ->
                     async {
                         let! diff =
-                            runGit state.Hooks state.RepoPath [| "diff"; "--name-only"; mergeBase; target |] None context
+                            runGit
+                                state.Hooks
+                                state.RepoPath
+                                [|
+                                    "diff"
+                                    "--name-only"
+                                    "-z"
+                                    mergeBase
+                                    target
+                                |]
+                                None
+                                context
 
                         match diff with
                         | Ok output when output.ExitCode = 0 ->
                             return
                                 Some(
-                                    output.StdOut.Replace("\r\n", "\n").Split('\n')
-                                    |> Array.filter (fun line -> line.Trim() <> "")
+                                    output.StdOut.Split '\000'
+                                    |> Array.filter (fun entry -> entry <> "")
                                     |> Array.choose (tryCreateRepositoryPath >> Result.toOption)
                                 )
                         | _ -> return None
