@@ -10,6 +10,7 @@ open VersionControlService.Abstractions
 open VersionControlService.Contracts.Git
 
 module GitService = VersionControlService.Git.GitService
+module GitRefs = VersionControlService.Git.GitRefs
 module GitProvisioningService = VersionControlService.Git.GitProvisioningService
 module NodeProcess = VersionControlService.Runtime.Node.Process
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
@@ -82,11 +83,12 @@ let private awaitGit (operation: JS.Promise<GitService.GitResult<'T>>) : Async<R
     }
 
 /// Direct git process invocation honoring the RunProcess hook.
-let private runGit
+let private runGitEnv
     (hooks: GitSessionHooks)
     (repoPath: string)
     (arguments: string[])
     (stdinData: string option)
+    (environment: (string * string)[])
     (context: OperationContext)
     : Async<Result<NodeProcess.ProcessOutput, OperationFailure>> =
     async {
@@ -94,6 +96,7 @@ let private runGit
             NodeProcess.ProcessRequest.create "git" arguments with
                 WorkingDirectory = Some repoPath
                 StdinData = stdinData
+                Environment = environment
                 ProgressPhase = "git"
         }
 
@@ -105,6 +108,9 @@ let private runGit
         | PartiallySucceeded(_, failure)
         | Failed failure -> return Error failure
     }
+
+let private runGit hooks repoPath arguments stdinData context =
+    runGitEnv hooks repoPath arguments stdinData [||] context
 
 /// runGit that fails when git exits nonzero.
 let private runGitChecked hooks repoPath arguments stdinData context =
@@ -547,6 +553,15 @@ let private listRefs (state: SessionState) (context: OperationContext) =
 
 let private createRef (state: SessionState) (request: CreateRefRequest) (context: OperationContext) =
     async {
+        let refRunner: GitRefs.GitRunner =
+            fun arguments stdinData -> runGit state.Hooks state.RepoPath arguments stdinData context
+
+        let! nameValidation = GitRefs.validateBranchName refRunner request.Name
+
+        match nameValidation with
+        | Error failure -> return Failed failure
+        | Ok _ ->
+
         let baseRef =
             request.BaseRef
             |> Option.map (fun reference ->
@@ -635,29 +650,99 @@ let private preflightSwitchRef (state: SessionState) (request: SwitchRefRequest)
 
 let private switchRef (state: SessionState) (request: SwitchRefRequest) (context: OperationContext) =
     async {
-        let checkoutRequest: GitCheckoutBranchRequest =
-            match refNameOfProviderRef request.TargetRef with
-            | Choice2Of2 remoteRef ->
-                let localName =
-                    match remoteRef.Split '/' with
-                    | segments when segments.Length >= 2 -> String.Join("/", segments |> Array.skip 1)
-                    | _ -> remoteRef
+        let refRunner: GitRefs.GitRunner =
+            fun arguments stdinData -> runGit state.Hooks state.RepoPath arguments stdinData context
 
-                {
-                    Name = localName
-                    StartPoint = Some remoteRef
-                }
-            | Choice1Of2 localName ->
-                {
-                    Name = localName
-                    StartPoint = None
-                }
+        // Large objects stay as pointers during branch switches (Swate behavior).
+        let checkoutEnvironment = [| "GIT_LFS_SKIP_SMUDGE", "1" |]
 
-        let! result = awaitGit (GitService.checkoutBranch state.RepoPath checkoutRequest)
+        let checkout (arguments: string[]) =
+            async {
+                let! output = runGitEnv state.Hooks state.RepoPath arguments None checkoutEnvironment context
 
-        match result with
-        | Error failure -> return Failed failure
-        | Ok() -> return! getWorkspaceStatus state context
+                match output with
+                | Error failure -> return Error failure
+                | Ok result when result.ExitCode <> 0 ->
+                    return
+                        Error(
+                            OperationFailure.createRedacted
+                                ProviderError
+                                "checkout_failed"
+                                $"Switching refs failed: {result.StdErr}"
+                        )
+                | Ok _ -> return Ok()
+            }
+
+        let localBranchExists (name: string) =
+            async {
+                let! output =
+                    runGit
+                        state.Hooks
+                        state.RepoPath
+                        [|
+                            "rev-parse"
+                            "--verify"
+                            "--quiet"
+                            $"refs/heads/{name}"
+                        |]
+                        None
+                        context
+
+                match output with
+                | Ok result -> return result.ExitCode = 0
+                | Error _ -> return false
+            }
+
+        match refNameOfProviderRef request.TargetRef with
+        | Choice2Of2 remoteRef ->
+            // The exact selected remote ref is preserved: the local branch tracks
+            // precisely the requested remote, never a silently substituted origin.
+            let localName =
+                match remoteRef.Split '/' with
+                | segments when segments.Length >= 2 -> String.Join("/", segments |> Array.skip 1)
+                | _ -> remoteRef
+
+            let! nameValidation = GitRefs.validateBranchName refRunner localName
+
+            match nameValidation with
+            | Error failure -> return Failed failure
+            | Ok _ ->
+                let! exists = localBranchExists localName
+
+                let! checkoutResult =
+                    if exists then
+                        checkout [| "checkout"; localName |]
+                    else
+                        checkout [|
+                            "checkout"
+                            "-b"
+                            localName
+                            "--track"
+                            remoteRef
+                        |]
+
+                match checkoutResult with
+                | Error failure -> return Failed failure
+                | Ok() -> return! getWorkspaceStatus state context
+        | Choice1Of2 localName ->
+            let! nameValidation = GitRefs.validateBranchName refRunner localName
+
+            match nameValidation with
+            | Error failure -> return Failed failure
+            | Ok _ ->
+                let! exists = localBranchExists localName
+
+                if not exists then
+                    return
+                        Failed(
+                            OperationFailure.create NotFound "ref_not_found" $"Ref '{localName}' does not exist."
+                        )
+                else
+                    let! checkoutResult = checkout [| "checkout"; localName |]
+
+                    match checkoutResult with
+                    | Error failure -> return Failed failure
+                    | Ok() -> return! getWorkspaceStatus state context
     }
 
 let private getDiffSummary (state: SessionState) (context: OperationContext) =
