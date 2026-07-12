@@ -1268,6 +1268,179 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "v2 selected revision cancellation is state-safe across the ref update",
+            providerIntegrationTestOptions,
+            fun () -> promise {
+                let! rootPath = createTempDirectoryAsync ()
+
+                try
+                    // Scenario 1: cancellation at the deterministic pre-update-ref barrier.
+                    let preSource = OperationCancellation.Source()
+
+                    let preHooks: GitWorkspaceSession.GitSessionHooks = {
+                        RunProcess = None
+                        Barrier =
+                            Some(fun _root point _context ->
+                                async {
+                                    if point = "selected-revision-pre-update-ref" then
+                                        preSource.Cancel()
+                                })
+                    }
+
+                    let preFactory = GitWorkspaceSession.createFactory preHooks
+                    let preRepoPath = join [| rootPath; "pre-cancel" |]
+
+                    let! preInit =
+                        Async.StartAsPromise(
+                            preFactory.Initialize
+                                {
+                                    TargetPath = preRepoPath
+                                    Location = None
+                                }
+                                (v2Context "v2-cancel-init")
+                        )
+
+                    let preBinding = expectV2Value "pre-cancel initialize" preInit
+                    let preGit = createSimpleGit preBinding.WorkspaceRoot
+                    let! _ = preGit.raw [| "config"; "user.name"; "VCS Tests" |]
+                    let! _ = preGit.raw [| "config"; "user.email"; "tests@example.org" |]
+
+                    do! writeUtf8FileAsync (join [| preBinding.WorkspaceRoot; "base.txt" |]) "base\n"
+                    let! _ = preGit.raw [| "add"; "-A" |]
+                    let! _ = preGit.raw [| "commit"; "-m"; "test: base" |]
+
+                    // Unrelated staged state that must survive the canceled transaction.
+                    do! writeUtf8FileAsync (join [| preBinding.WorkspaceRoot; "b.txt" |]) "staged\n"
+                    let! _ = preGit.raw [| "add"; "b.txt" |]
+                    do! writeUtf8FileAsync (join [| preBinding.WorkspaceRoot; "selected.txt" |]) "selected\n"
+
+                    let! preOpen = Async.StartAsPromise(preFactory.Open preBinding (v2Context "v2-cancel-open"))
+                    let preSession = expectV2Value "pre-cancel open" preOpen
+
+                    let! headBefore = preGit.raw [| "rev-parse"; "HEAD" |]
+                    let! indexBefore = preGit.raw [| "status"; "--porcelain=v1" |]
+
+                    let preContext =
+                        OperationContext.create "v2-cancel-pre" preSource.Cancellation ignore
+
+                    let! preStatusResult = Async.StartAsPromise(preSession.Core.GetStatus(v2Context "v2-cancel-status"))
+                    let preStatus = expectV2Value "pre-cancel status" preStatusResult
+
+                    let! preResult =
+                        Async.StartAsPromise(
+                            preSession.Core.CreateRevision
+                                {
+                                    Message = "test: canceled before ref update"
+                                    Paths = [| v2RepositoryPath "selected.txt" |]
+                                    ExpectedWorkspaceVersion = preStatus.WorkspaceVersion
+                                }
+                                preContext
+                        )
+
+                    let preFailure = expectV2Failure "pre-update-ref canceled revision" preResult
+                    Vitest.expect(preFailure.Category).toEqual (Canceled)
+                    Vitest.expect(preFailure.StateChanged).toBe (false)
+
+                    // HEAD, the real index, and the working tree stay unchanged.
+                    let! headAfter = preGit.raw [| "rev-parse"; "HEAD" |]
+                    Vitest.expect(headAfter.Trim()).toBe (headBefore.Trim())
+
+                    let! indexAfter = preGit.raw [| "status"; "--porcelain=v1" |]
+                    Vitest.expect(indexAfter).toBe (indexBefore)
+
+                    // No transient transaction state is left behind.
+                    let! gitDirListing =
+                        fsPromisesDynamic?readdir (join [| preBinding.WorkspaceRoot; ".git" |])
+                        |> unbox<JS.Promise<string[]>>
+
+                    let leftoverIndexes =
+                        gitDirListing
+                        |> Array.filter (fun entry -> entry.StartsWith "vcs-selected-index")
+
+                    Vitest.expect(leftoverIndexes).toEqual ([||])
+
+                    // Scenario 2: cancellation after the compare-and-swap ref update.
+                    let postSource = OperationCancellation.Source()
+
+                    let postHooks: GitWorkspaceSession.GitSessionHooks = {
+                        RunProcess = None
+                        Barrier =
+                            Some(fun _root point _context ->
+                                async {
+                                    if point = "selected-revision-post-update-ref" then
+                                        postSource.Cancel()
+                                })
+                    }
+
+                    let postFactory = GitWorkspaceSession.createFactory postHooks
+                    let postRepoPath = join [| rootPath; "post-cancel" |]
+
+                    let! postInit =
+                        Async.StartAsPromise(
+                            postFactory.Initialize
+                                {
+                                    TargetPath = postRepoPath
+                                    Location = None
+                                }
+                                (v2Context "v2-post-init")
+                        )
+
+                    let postBinding = expectV2Value "post-cancel initialize" postInit
+                    let postGit = createSimpleGit postBinding.WorkspaceRoot
+                    let! _ = postGit.raw [| "config"; "user.name"; "VCS Tests" |]
+                    let! _ = postGit.raw [| "config"; "user.email"; "tests@example.org" |]
+
+                    do! writeUtf8FileAsync (join [| postBinding.WorkspaceRoot; "base.txt" |]) "base\n"
+                    let! _ = postGit.raw [| "add"; "-A" |]
+                    let! _ = postGit.raw [| "commit"; "-m"; "test: base" |]
+                    do! writeUtf8FileAsync (join [| postBinding.WorkspaceRoot; "selected.txt" |]) "selected\n"
+
+                    let! postOpen = Async.StartAsPromise(postFactory.Open postBinding (v2Context "v2-post-open"))
+                    let postSession = expectV2Value "post-cancel open" postOpen
+
+                    let postContext =
+                        OperationContext.create "v2-cancel-post" postSource.Cancellation ignore
+
+                    let! postStatusResult = Async.StartAsPromise(postSession.Core.GetStatus(v2Context "v2-post-status"))
+                    let postStatus = expectV2Value "post-cancel status" postStatusResult
+
+                    let! postResult =
+                        Async.StartAsPromise(
+                            postSession.Core.CreateRevision
+                                {
+                                    Message = "test: canceled after ref update"
+                                    Paths = [| v2RepositoryPath "selected.txt" |]
+                                    ExpectedWorkspaceVersion = postStatus.WorkspaceVersion
+                                }
+                                postContext
+                        )
+
+                    match postResult with
+                    | PartiallySucceeded(outcome, failure) ->
+                        Vitest.expect(outcome.ResultingRevision.IsSome).toBe (true)
+                        Vitest.expect(failure.StateChanged).toBe (true)
+                        Vitest.expect(failure.RecoveryAction.IsSome).toBe (true)
+
+                        // The created revision is at HEAD.
+                        let! postHead = postGit.raw [| "rev-parse"; "HEAD" |]
+
+                        let createdRevision =
+                            outcome.ResultingRevision |> Option.map RevisionId.value |> Option.get
+
+                        Vitest.expect(postHead.Trim()).toBe (createdRevision)
+                    | Succeeded _ -> failwith "Expected post-update-ref cancellation to report partial success."
+                    | Failed failure ->
+                        failwith
+                            $"Expected partial success after the ref update but got {failure.Code}: {failure.Message}"
+
+                    do! removeDirectoryAsync rootPath
+                with error ->
+                    do! removeDirectoryAsync rootPath
+                    return raise error
+            }
+        )
+
+        Vitest.test (
             "v2 validates refs and preserves exact upstream",
             providerIntegrationTestOptions,
             fun () -> promise {

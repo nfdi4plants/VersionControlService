@@ -368,6 +368,15 @@ let private createRevision (state: SessionState) (request: CreateRevisionRequest
         if request.Paths.Length = 0 then
             return OperationResult.validationFailed "no_paths_selected" "Select at least one path."
         else
+            // Deterministic interruption point before the transaction starts; the
+            // canceled state is then observed by the process adapter before any
+            // git command runs.
+            do! barrier state.Hooks state.RepoPath "transfer-start" context
+
+            if context.Cancellation.IsCancellationRequested() then
+                return OperationResult.canceled "The selected revision was canceled before the transaction started."
+            else
+
             // Isolated literal transaction: temporary index, commit-tree, and a
             // compare-and-swap ref update. Selected paths are exact literal names
             // over NUL stdin (spike 3: direct process adapter).
