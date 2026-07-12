@@ -1207,6 +1207,67 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "v2 workspace versions are stable and reject stale mutations",
+            providerIntegrationTestOptions,
+            fun () -> promise {
+                do!
+                    withV2GitWorkspace (fun session repoPath git -> promise {
+                        do! writeUtf8FileAsync (join [| repoPath; "base.txt" |]) "base\n"
+                        let! _ = git.raw [| "add"; "-A" |]
+                        let! _ = git.raw [| "commit"; "-m"; "test: base" |]
+
+                        // Pure reads over an unchanged workspace return the same token.
+                        let! firstStatus = v2Status session
+                        let! secondStatus = v2Status session
+                        Vitest.expect(secondStatus.WorkspaceVersion).toBe (firstStatus.WorkspaceVersion)
+
+                        // A workspace change yields a different token.
+                        do! writeUtf8FileAsync (join [| repoPath; "f.txt" |]) "content\n"
+                        let! thirdStatus = v2Status session
+                        Vitest.expect(thirdStatus.WorkspaceVersion = firstStatus.WorkspaceVersion).toBe (false)
+
+                        // A stale mutation never reaches the provider.
+                        let! headBefore = git.raw [| "rev-parse"; "HEAD" |]
+
+                        let! staleResult =
+                            Async.StartAsPromise(
+                                session.Core.CreateRevision
+                                    {
+                                        Message = "test: stale mutation"
+                                        Paths = [| v2RepositoryPath "f.txt" |]
+                                        ExpectedWorkspaceVersion = firstStatus.WorkspaceVersion
+                                    }
+                                    (v2Context "v2-stale-mutation")
+                            )
+
+                        let failure = expectV2Failure "v2 stale mutation" staleResult
+                        Vitest.expect(failure.Category).toEqual (Concurrency)
+                        Vitest.expect(failure.Code).toBe ("precondition_failed")
+
+                        let! headAfterStale = git.raw [| "rev-parse"; "HEAD" |]
+                        Vitest.expect(headAfterStale.Trim()).toBe (headBefore.Trim())
+
+                        let! fStatus = git.raw [| "status"; "--porcelain=v1"; "--"; "f.txt" |]
+                        Vitest.expect(fStatus.TrimEnd()).toBe ("?? f.txt")
+
+                        // The fresh token proceeds.
+                        let! retryResult =
+                            Async.StartAsPromise(
+                                session.Core.CreateRevision
+                                    {
+                                        Message = "test: fresh mutation"
+                                        Paths = [| v2RepositoryPath "f.txt" |]
+                                        ExpectedWorkspaceVersion = thirdStatus.WorkspaceVersion
+                                    }
+                                    (v2Context "v2-fresh-mutation")
+                            )
+
+                        expectV2Value "v2 fresh mutation" retryResult |> ignore
+                    })
+            }
+        )
+
+        Vitest.test (
             "v2 validates refs and preserves exact upstream",
             providerIntegrationTestOptions,
             fun () -> promise {

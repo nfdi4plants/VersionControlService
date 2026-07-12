@@ -152,20 +152,126 @@ let private toFileChange (isConflicted: bool) (file: GitFileStatusDto) : FileCha
             Kind = kind
         }
 
+/// Cooperative in-process mutation lock: JS is single-threaded, so a busy flag
+/// with async polling serializes session mutations without blocking reads.
+type MutationLock() =
+    let mutable busy = false
+
+    member _.Acquire() : Async<unit> =
+        async {
+            while busy do
+                do! Async.Sleep 5
+
+            busy <- true
+        }
+
+    member _.Release() = busy <- false
+
 /// Session-internal mutable state shared by all operations of one open session.
 type private SessionState = {
     RepoPath: string
     Hooks: GitSessionHooks
+    Lock: MutationLock
 }
 
 // ---------------------------------------------------------------------------
 // Status and workspace version
 // ---------------------------------------------------------------------------
 
-/// Shell workspace version: deliberately unstable (Date-based) until the
-/// workspace-version cycle (8.3) derives a stable token and adds the session lock.
-let private workspaceVersion (_state: SessionState) (_status: GitStatusDto) : Async<string> =
-    async { return $"unstable-{nowMilliseconds ()}" }
+let private stableHash (text: string) =
+    let mutable hash = 5381
+
+    for character in text do
+        hash <- ((hash <<< 5) + hash + int character) &&& 0x7FFFFFFF
+
+    hash
+
+/// Stable opaque workspace-version token derived from HEAD, an identity over
+/// index/worktree state, and the active merge/conflict state. Pure reads over an
+/// unchanged workspace return the same token; the token guards in-process,
+/// per-session races only — external processes can invalidate it at any time,
+/// which is why mutations revalidate it under the session lock.
+let private computeWorkspaceVersion (state: SessionState) (context: OperationContext) : Async<string> =
+    async {
+        let! headOutput =
+            runGit state.Hooks state.RepoPath [| "rev-parse"; "--verify"; "--quiet"; "HEAD" |] None context
+
+        let headPart =
+            match headOutput with
+            | Ok output when output.ExitCode = 0 -> output.StdOut.Trim()
+            | _ -> "unborn"
+
+        let! statusOutput =
+            runGit
+                state.Hooks
+                state.RepoPath
+                [|
+                    "status"
+                    "--porcelain=v2"
+                    "-z"
+                    "--untracked-files=all"
+                |]
+                None
+                context
+
+        let statusPart =
+            match statusOutput with
+            | Ok output when output.ExitCode = 0 -> stableHash output.StdOut
+            | _ -> -1
+
+        let! mergeHeadOutput =
+            runGit state.Hooks state.RepoPath [| "rev-parse"; "--git-path"; "MERGE_HEAD" |] None context
+
+        let mergePart =
+            match mergeHeadOutput with
+            | Ok output when output.ExitCode = 0 ->
+                let mergeHeadPath = output.StdOut.Trim()
+
+                let resolvedPath =
+                    if
+                        mergeHeadPath.StartsWith "/"
+                        || (mergeHeadPath.Length >= 2 && mergeHeadPath[1] = ':')
+                    then
+                        mergeHeadPath
+                    else
+                        NodePath.join [| state.RepoPath; mergeHeadPath |]
+
+                if NodeFileSystem.existsSync resolvedPath then "merge" else "none"
+            | _ -> "none"
+
+        return $"git:{headPart}:{statusPart}:{mergePart}"
+    }
+
+/// Serializes a mutation and revalidates the expected workspace version under the
+/// lock, so a stale request never reaches provider state.
+let private withValidatedMutation
+    (state: SessionState)
+    (expectedVersion: string)
+    (context: OperationContext)
+    (body: unit -> Async<OperationResult<'T>>)
+    : Async<OperationResult<'T>> =
+    async {
+        do! state.Lock.Acquire()
+
+        try
+            let! currentVersion = computeWorkspaceVersion state context
+
+            if currentVersion <> expectedVersion then
+                return
+                    Failed(
+                        OperationFailure.create
+                            Concurrency
+                            "precondition_failed"
+                            "The expected workspace version is stale; refresh status and retry."
+                    )
+            else
+                return! body ()
+        finally
+            state.Lock.Release()
+    }
+
+let private workspaceVersion (state: SessionState) (_status: GitStatusDto) : Async<string> =
+    computeWorkspaceVersion state (OperationContext.detached "workspace-version")
 
 let private toWorkspaceStatus (state: SessionState) (status: GitStatusDto) (context: OperationContext) =
     async {
@@ -900,16 +1006,29 @@ let createSession (hooks: GitSessionHooks) (binding: WorkspaceBinding) : Workspa
     let state = {
         RepoPath = binding.WorkspaceRoot
         Hooks = hooks
+        Lock = MutationLock()
     }
 
     let core: CoreVersionControl = {
         GetStatus = fun context -> getWorkspaceStatus state context
         ListRefs = fun context -> listRefs state context
-        CreateRef = fun request context -> createRef state request context
+        CreateRef =
+            fun request context ->
+                withValidatedMutation state request.ExpectedWorkspaceVersion context (fun () ->
+                    createRef state request context)
         PreflightSwitchRef = fun request context -> preflightSwitchRef state request context
-        SwitchRef = fun request context -> switchRef state request context
-        CreateRevision = fun request context -> createRevision state request context
-        RestorePaths = fun request context -> restorePaths state request context
+        SwitchRef =
+            fun request context ->
+                withValidatedMutation state request.ExpectedWorkspaceVersion context (fun () ->
+                    switchRef state request context)
+        CreateRevision =
+            fun request context ->
+                withValidatedMutation state request.ExpectedWorkspaceVersion context (fun () ->
+                    createRevision state request context)
+        RestorePaths =
+            fun request context ->
+                withValidatedMutation state request.ExpectedWorkspaceVersion context (fun () ->
+                    restorePaths state request context)
         GetDiffSummary = fun context -> getDiffSummary state context
     }
 
@@ -925,8 +1044,14 @@ let createSession (hooks: GitSessionHooks) (binding: WorkspaceBinding) : Workspa
                 Some {
                     Refresh = fun context -> refresh state context
                     PreviewUpdate = fun context -> previewUpdate state context
-                    Update = fun request context -> update state request context
-                    Publish = fun request context -> publish state request context
+                    Update =
+                        fun request context ->
+                            withValidatedMutation state request.ExpectedWorkspaceVersion context (fun () ->
+                                update state request context)
+                    Publish =
+                        fun request context ->
+                            withValidatedMutation state request.ExpectedWorkspaceVersion context (fun () ->
+                                publish state request context)
                 }
             ConflictResolution = Some(createConflictService state)
             TextDiff = Some(createTextDiff state)
