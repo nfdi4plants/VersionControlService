@@ -136,6 +136,32 @@ let createGitHarness () : ProviderTestHarness =
         return ()
     }
 
+    /// Moves the local current branch by one plumbing commit, like another process.
+    let advanceLocalBranch (workspaceRoot: string) = promise {
+        let! branchRef = runGitIn workspaceRoot [||] [| "symbolic-ref"; "-q"; "HEAD" |] None
+        let! tree = runGitIn workspaceRoot [||] [| "rev-parse"; "HEAD^{tree}" |] None
+        let! head = runGitIn workspaceRoot [||] [| "rev-parse"; "HEAD" |] None
+
+        let! dummy =
+            runGitIn
+                workspaceRoot
+                [||]
+                [|
+                    "commit-tree"
+                    tree.Trim()
+                    "-p"
+                    head.Trim()
+                    "-m"
+                    "race: concurrent local advance"
+                |]
+                None
+
+        let! _ =
+            runGitIn workspaceRoot [||] [| "update-ref"; branchRef.Trim(); dummy.Trim() |] None
+
+        return ()
+    }
+
     let hooks: GitWorkspaceSession.GitSessionHooks = {
         RunProcess = None
         Barrier =
@@ -143,11 +169,19 @@ let createGitHarness () : ProviderTestHarness =
                 async {
                     match barriersByRoot.TryGetValue root with
                     | true, barriers ->
-                        if point = "publish-precheck-done" || point = "finalize-precheck-done" then
+                        if point = "publish-precheck-done" then
                             match barriers.RaceMutations with
                             | Some mutations ->
                                 barriers.RaceMutations <- None
                                 do! Async.AwaitPromise(advanceBare barriers.BarePath mutations)
+                            | None -> ()
+                        elif point = "finalize-precheck-done" then
+                            // Git's finalize destination is the local branch, so the
+                            // armed race moves the local ref, not the bare target.
+                            match barriers.RaceMutations with
+                            | Some _ ->
+                                barriers.RaceMutations <- None
+                                do! Async.AwaitPromise(advanceLocalBranch root)
                             | None -> ()
                         elif point = "transfer-start" && barriers.SlowTransfer then
                             barriers.SlowTransfer <- false

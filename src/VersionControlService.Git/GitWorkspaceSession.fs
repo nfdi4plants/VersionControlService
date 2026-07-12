@@ -11,6 +11,7 @@ open VersionControlService.Contracts.Git
 
 module GitService = VersionControlService.Git.GitService
 module GitRefs = VersionControlService.Git.GitRefs
+module GitConflictSession = VersionControlService.Git.GitConflictSession
 module GitProvisioningService = VersionControlService.Git.GitProvisioningService
 module NodeProcess = VersionControlService.Runtime.Node.Process
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
@@ -178,6 +179,10 @@ type private SessionState = {
     RepoPath: string
     Hooks: GitSessionHooks
     Lock: MutationLock
+    /// Active conflict-session identity and rotating handle version.
+    mutable ConflictSession: (string * int) option
+    /// Monotonic counter so re-opened merges never reuse a closed session ID.
+    mutable ConflictGeneration: int
 }
 
 // ---------------------------------------------------------------------------
@@ -364,74 +369,62 @@ let private resolveGitStatePath (state: SessionState) (name: string) (context: O
         | _ -> return None
     }
 
-/// Active merge state as a provider-managed conflict-session summary. Present
-/// whenever MERGE_HEAD exists — including after the last conflict was staged.
-let private getMergeConflictSummary (state: SessionState) (context: OperationContext) =
+/// The active merge target revision, resolved through Git state paths.
+let private tryGetMergeHead (state: SessionState) (context: OperationContext) =
     async {
         let! mergeHeadPath = resolveGitStatePath state "MERGE_HEAD" context
 
         match mergeHeadPath with
         | Some path when NodeFileSystem.existsSync path ->
-            let mergeHead =
-                (NodeFileSystem.readFileSync path NodeFileSystem.TextEncoding.Utf8).Trim()
+            return Some((NodeFileSystem.readFileSync path NodeFileSystem.TextEncoding.Utf8).Trim())
+        | _ -> return None
+    }
 
-            let! unmergedOutput =
-                runGit
-                    state.Hooks
-                    state.RepoPath
-                    [|
-                        "diff"
-                        "--name-only"
-                        "--diff-filter=U"
-                        "-z"
-                    |]
-                    None
-                    context
+let private conflictRunner (state: SessionState) (context: OperationContext) : GitConflictSession.GitRunner =
+    fun arguments stdinData -> runGit state.Hooks state.RepoPath arguments stdinData context
+
+/// Active merge state as a provider-managed conflict session. Present whenever
+/// MERGE_HEAD exists — including after the last conflict was staged. The handle
+/// version rotates on every successful nonterminal resolution and the session ID
+/// changes when a merge is reopened after finalize/cancel.
+let private getMergeConflictSummary (state: SessionState) (context: OperationContext) =
+    async {
+        let! mergeHead = tryGetMergeHead state context
+
+        match mergeHead with
+        | None ->
+            state.ConflictSession <- None
+            return None
+        | Some mergeHeadValue ->
+            let sessionId, version =
+                match state.ConflictSession with
+                | Some(sessionId, version) -> sessionId, version
+                | None ->
+                    state.ConflictGeneration <- state.ConflictGeneration + 1
+                    let shortHead = mergeHeadValue.Substring(0, min 8 mergeHeadValue.Length)
+                    let created = $"merge-{shortHead}-{state.ConflictGeneration}", 1
+                    state.ConflictSession <- Some created
+                    created
+
+            let runner = conflictRunner state context
+            let! unmergedResult = GitConflictSession.listUnmergedPaths runner
 
             let unmergedPaths =
-                match unmergedOutput with
-                | Ok result when result.ExitCode = 0 ->
-                    result.StdOut.Split '\000'
-                    |> Array.filter (fun entry -> entry <> "")
-                    |> Array.choose (tryCreateRepositoryPath >> Result.toOption)
-                | _ -> [||]
+                match unmergedResult with
+                | Ok paths -> paths
+                | Error _ -> [||]
 
-            let items =
-                unmergedPaths
-                |> Array.map (fun conflictPath -> {
-                    Path = conflictPath
-                    Candidates = [|
-                        {
-                            CandidateId = "workspace"
-                            Label = "Workspace version"
-                            Revision = None
-                            Preview = None
-                        }
-                        {
-                            CandidateId = "target"
-                            Label = "Target version"
-                            Revision = Some(mkRevisionId mergeHead)
-                            Preview = None
-                        }
-                        {
-                            CandidateId = "base"
-                            Label = "Base version"
-                            Revision = None
-                            Preview = None
-                        }
-                    |]
-                    SupportsResolvedContent = true
-                })
+            let! items =
+                GitConflictSession.buildConflictItems runner (Some(mkRevisionId mergeHeadValue)) unmergedPaths
 
             return
                 Some {
                     Handle = {
-                        SessionId = $"merge-{mergeHead}"
-                        Version = "1"
+                        SessionId = sessionId
+                        Version = string version
                     }
                     Items = items
                 }
-        | _ -> return None
     }
 
 let private getWorkspaceStatus (state: SessionState) (context: OperationContext) =
@@ -1338,18 +1331,318 @@ let private publish (state: SessionState) (request: PublishRequest) (context: Op
     }
 
 // ---------------------------------------------------------------------------
-// Conflict sessions (shell: none active until the Task 9 conflict cycle)
+// Conflict sessions over the real Git merge state
 // ---------------------------------------------------------------------------
 
-let private noActiveSessionFailure () =
-    OperationFailure.create NotFound "no_conflict_session" "No conflict session is active."
+/// Validates the opaque handle and the independently observed workspace version
+/// BEFORE any provider state changes. Stale, foreign, or closed handles are
+/// rejected with Concurrency/precondition_failed/refresh_conflict_session.
+let private validateConflictHandle
+    (state: SessionState)
+    (handle: ConflictSessionHandle)
+    (expectedWorkspaceVersion: string)
+    (context: OperationContext)
+    : Async<Result<string, OperationFailure>> =
+    async {
+        let! mergeHead = tryGetMergeHead state context
 
-let private createConflictService (state: SessionState) : ConflictResolutionService = {
-    GetActiveSession = fun _ -> async { return OperationResult.succeeded None }
-    Resolve = fun _ _ -> async { return Failed(noActiveSessionFailure ()) }
-    Finalize = fun _ _ -> async { return Failed(noActiveSessionFailure ()) }
-    Cancel = fun _ _ -> async { return Failed(noActiveSessionFailure ()) }
-}
+        match mergeHead, state.ConflictSession with
+        | Some mergeHeadValue, Some(sessionId, version) when
+            sessionId = handle.SessionId && string version = handle.Version
+            ->
+            let! currentVersion = computeWorkspaceVersion state context
+
+            if currentVersion <> expectedWorkspaceVersion then
+                return Error(GitConflictSession.handleRejection ())
+            else
+                return Ok mergeHeadValue
+        | _ -> return Error(GitConflictSession.handleRejection ())
+    }
+
+let private rotateConflictHandle (state: SessionState) : ConflictSessionHandle =
+    match state.ConflictSession with
+    | Some(sessionId, version) ->
+        state.ConflictSession <- Some(sessionId, version + 1)
+
+        {
+            SessionId = sessionId
+            Version = string (version + 1)
+        }
+    | None -> failwith "No conflict session is active."
+
+let private createConflictService (state: SessionState) : ConflictResolutionService =
+    let stagePath (path: RepositoryPath) (context: OperationContext) =
+        async {
+            let payload = GitPathTransport.nulDelimitedLiteralPathspecs [| path |]
+
+            let! result =
+                runGit
+                    state.Hooks
+                    state.RepoPath
+                    [| "add"; yield! GitPathTransport.pathspecFromStdinArguments |]
+                    (Some payload)
+                    context
+
+            match result with
+            | Ok output when output.ExitCode = 0 -> return Ok()
+            | Ok output ->
+                return
+                    Error(
+                        OperationFailure.createRedacted
+                            ProviderError
+                            "git_failure"
+                            $"Staging the resolved path failed: {output.StdErr}"
+                    )
+            | Error failure -> return Error failure
+        }
+
+    {
+        GetActiveSession =
+            fun context -> async {
+                let! summary = getMergeConflictSummary state context
+                return OperationResult.succeeded summary
+            }
+        Resolve =
+            fun request context -> async {
+                let! validation = validateConflictHandle state request.Handle request.ExpectedWorkspaceVersion context
+
+                match validation with
+                | Error failure -> return Failed failure
+                | Ok _ ->
+                    let runner = conflictRunner state context
+                    let! unmergedResult = GitConflictSession.listUnmergedPaths runner
+
+                    match unmergedResult with
+                    | Error failure -> return Failed failure
+                    | Ok unmergedPaths ->
+                        let pathValue = RepositoryPath.value request.Path
+
+                        if not (unmergedPaths |> Array.contains pathValue) then
+                            return
+                                Failed(
+                                    OperationFailure.create
+                                        NotFound
+                                        "conflict_item_not_found"
+                                        $"No unresolved conflict exists for the selected path."
+                                )
+                        else
+                            let resolveContent () =
+                                async {
+                                    match request.Resolution with
+                                    | SupplyResolvedContent content -> return Ok(Some content)
+                                    | PickCandidate "workspace" ->
+                                        let! content = GitConflictSession.readStageContent runner 2 pathValue
+                                        return Ok content
+                                    | PickCandidate "target" ->
+                                        let! content = GitConflictSession.readStageContent runner 3 pathValue
+                                        return Ok content
+                                    | PickCandidate "base" ->
+                                        let! content = GitConflictSession.readStageContent runner 1 pathValue
+                                        return Ok content
+                                    | PickCandidate _ ->
+                                        return
+                                            Error(
+                                                OperationFailure.create
+                                                    Validation
+                                                    "unknown_candidate"
+                                                    "The candidate ID is not part of this conflict item."
+                                            )
+                                }
+
+                            let! contentResult = resolveContent ()
+
+                            match contentResult with
+                            | Error failure -> return Failed failure
+                            | Ok None ->
+                                return
+                                    Failed(
+                                        OperationFailure.create
+                                            Validation
+                                            "candidate_content_unavailable"
+                                            "The selected candidate has no content for this path."
+                                    )
+                            | Ok(Some content) ->
+                                let absolutePath = NodePath.join [| state.RepoPath; pathValue |]
+                                NodeFileSystem.writeFileSync absolutePath content NodeFileSystem.TextEncoding.Utf8
+
+                                let! staged = stagePath request.Path context
+
+                                match staged with
+                                | Error failure -> return Failed failure
+                                | Ok() ->
+                                    let refreshedHandle = rotateConflictHandle state
+                                    let! summary = getMergeConflictSummary state context
+
+                                    return
+                                        OperationResult.succeeded {
+                                            RefreshedHandle = refreshedHandle
+                                            RemainingItems =
+                                                summary
+                                                |> Option.map _.Items
+                                                |> Option.defaultValue [||]
+                                        }
+            }
+        Finalize =
+            fun request context -> async {
+                let! validation = validateConflictHandle state request.Handle request.ExpectedWorkspaceVersion context
+
+                match validation with
+                | Error failure -> return Failed failure
+                | Ok mergeHead ->
+                    let runner = conflictRunner state context
+                    let! unmergedResult = GitConflictSession.listUnmergedPaths runner
+
+                    match unmergedResult with
+                    | Error failure -> return Failed failure
+                    | Ok unmergedPaths when unmergedPaths.Length > 0 ->
+                        return
+                            Failed {
+                                OperationFailure.create
+                                    Validation
+                                    "conflicts_unresolved"
+                                    "Every conflict item must be resolved before finalizing." with
+                                    AffectedPaths = unmergedPaths
+                            }
+                    | Ok _ ->
+                        // Pre-check the destination head, then commit under a
+                        // compare-and-swap ref update.
+                        let! branchOutput =
+                            runGit state.Hooks state.RepoPath [| "symbolic-ref"; "-q"; "HEAD" |] None context
+
+                        match branchOutput with
+                        | Error failure -> return Failed failure
+                        | Ok branchResult when branchResult.ExitCode <> 0 ->
+                            return
+                                Failed(
+                                    OperationFailure.create
+                                        Validation
+                                        "detached_head"
+                                        "Finalizing requires a current branch."
+                                )
+                        | Ok branchResult ->
+                            let branchRef = branchResult.StdOut.Trim()
+                            let! expectedHead = revParse state "HEAD" context
+
+                            match expectedHead with
+                            | None ->
+                                return
+                                    Failed(
+                                        OperationFailure.create
+                                            ProviderError
+                                            "git_failure"
+                                            "The current head could not be resolved."
+                                    )
+                            | Some expectedHeadValue ->
+                                do! barrier state.Hooks state.RepoPath "finalize-precheck-done" context
+
+                                let! treeResult =
+                                    runGitChecked state.Hooks state.RepoPath [| "write-tree" |] None context
+
+                                match treeResult with
+                                | Error failure -> return Failed failure
+                                | Ok treeOutput ->
+                                    let message =
+                                        request.Message |> Option.defaultValue "merge: finalize conflict session"
+
+                                    let! commitResult =
+                                        runGitChecked
+                                            state.Hooks
+                                            state.RepoPath
+                                            [|
+                                                "commit-tree"
+                                                treeOutput.StdOut.Trim()
+                                                "-p"
+                                                expectedHeadValue
+                                                "-p"
+                                                mergeHead
+                                                "-m"
+                                                message
+                                            |]
+                                            None
+                                            context
+
+                                    match commitResult with
+                                    | Error failure -> return Failed failure
+                                    | Ok commitOutput ->
+                                        let newCommit = commitOutput.StdOut.Trim()
+
+                                        let! updateResult =
+                                            runGit
+                                                state.Hooks
+                                                state.RepoPath
+                                                [|
+                                                    "update-ref"
+                                                    branchRef
+                                                    newCommit
+                                                    expectedHeadValue
+                                                |]
+                                                None
+                                                context
+
+                                        match updateResult with
+                                        | Error failure -> return Failed failure
+                                        | Ok updateOutput when updateOutput.ExitCode <> 0 ->
+                                            // The destination advanced between the
+                                            // pre-check and the ref update: report the
+                                            // race with revision evidence; the session
+                                            // stays live for refresh-and-retry.
+                                            let! observedHead = revParse state "HEAD" context
+
+                                            return
+                                                Failed {
+                                                    OperationFailure.create
+                                                        Concurrency
+                                                        "precondition_failed"
+                                                        "The destination advanced between the finalize pre-check and verification." with
+                                                        RevisionEvidence = [|
+                                                            "expected_destination", mkRevisionId expectedHeadValue
+                                                            yield!
+                                                                observedHead
+                                                                |> Option.map (fun value ->
+                                                                    "observed_destination", mkRevisionId value)
+                                                                |> Option.toList
+                                                        |]
+                                                        RecoveryAction =
+                                                            Some {
+                                                                Code = ConflictRecovery.RefreshConflictSession
+                                                                Instructions =
+                                                                    Some
+                                                                        "Refresh the conflict session and deliberately retry."
+                                                            }
+                                                }
+                                        | Ok _ ->
+                                            // Close the merge state and the session.
+                                            for stateFile in [ "MERGE_HEAD"; "MERGE_MSG"; "MERGE_MODE" ] do
+                                                let! statePath = resolveGitStatePath state stateFile context
+
+                                                match statePath with
+                                                | Some path when NodeFileSystem.existsSync path ->
+                                                    try
+                                                        NodeFileSystem.unlinkSync path
+                                                    with _ ->
+                                                        ()
+                                                | _ -> ()
+
+                                            state.ConflictSession <- None
+                                            return OperationResult.succeeded (Some(mkRevisionId newCommit))
+            }
+        Cancel =
+            fun request context -> async {
+                let! validation = validateConflictHandle state request.Handle request.ExpectedWorkspaceVersion context
+
+                match validation with
+                | Error failure -> return Failed failure
+                | Ok _ ->
+                    let! abortResult =
+                        runGitChecked state.Hooks state.RepoPath [| "merge"; "--abort" |] None context
+
+                    match abortResult with
+                    | Error failure -> return Failed failure
+                    | Ok _ ->
+                        state.ConflictSession <- None
+                        return OperationResult.succeeded ()
+            }
+    }
 
 // ---------------------------------------------------------------------------
 // Optional extensions available from the shell
@@ -1390,6 +1683,8 @@ let createSession (hooks: GitSessionHooks) (binding: WorkspaceBinding) : Workspa
         RepoPath = binding.WorkspaceRoot
         Hooks = hooks
         Lock = MutationLock()
+        ConflictSession = None
+        ConflictGeneration = 0
     }
 
     let core: CoreVersionControl = {

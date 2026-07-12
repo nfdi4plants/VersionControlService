@@ -22,6 +22,7 @@
     <Compile Include="Git\GitProvider.fs" />
     <Compile Include="GitPathTransport.fs" />
     <Compile Include="GitRefs.fs" />
+    <Compile Include="GitConflictSession.fs" />
     <Compile Include="GitSelectedRevision.fs" />
     <Compile Include="GitWorkspaceSession.fs" />
   </ItemGroup>

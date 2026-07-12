@@ -151,9 +151,271 @@ let private versionFakingRunner (fakeVersion: string) : GitWorkspaceSession.GitS
     Barrier = None
 }
 
+let private conflictService (session: WorkspaceSession) =
+    match session.ConflictResolution with
+    | Some service -> service
+    | None -> failwith "Expected the Git conflict-resolution service."
+
+let private sessionStatus (session: WorkspaceSession) = promise {
+    let! result = Async.StartAsPromise(session.Core.GetStatus(ctx "sync-status"))
+    return expectValue "status" result
+}
+
 Vitest.describe (
     "GitWorkspaceSession v2 synchronization",
     fun () ->
+        Vitest.test (
+            "v2 conflicting update opens a versioned conflict session and rejects stale tokens before verified finalize",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                // A barrier that can advance the local branch between the finalize
+                // pre-check and the compare-and-swap ref update.
+                let mutable armFinalizeRace = false
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunProcess = None
+                    Barrier =
+                        Some(fun root point _context ->
+                            async {
+                                if point = "finalize-precheck-done" && armFinalizeRace then
+                                    armFinalizeRace <- false
+
+                                    // Another process advances the branch through plumbing:
+                                    // a dummy commit on top of HEAD, then the ref moves.
+                                    let runRaw (arguments: string[]) = async {
+                                        let request = {
+                                            NodeProcess.ProcessRequest.create "git" arguments with
+                                                WorkingDirectory = Some root
+                                        }
+
+                                        let! result =
+                                            NodeProcess.run request (OperationContext.detached "race-move")
+
+                                        match result with
+                                        | Succeeded outcome -> return outcome.Value.StdOut.Trim()
+                                        | _ -> return failwith "race plumbing failed"
+                                    }
+
+                                    let! tree = runRaw [| "rev-parse"; "HEAD^{tree}" |]
+                                    let! head = runRaw [| "rev-parse"; "HEAD" |]
+
+                                    let! dummy =
+                                        runRaw [|
+                                            "commit-tree"
+                                            tree
+                                            "-p"
+                                            head
+                                            "-m"
+                                            "race: concurrent advance"
+                                        |]
+
+                                    let! _ = runRaw [| "update-ref"; "refs/heads/main"; dummy |]
+                                    return ()
+                            })
+                }
+
+                let! root, workPath, barePath, session = createSyncFixture hooks
+
+                try
+                    // Real conflict: committed local change vs target change.
+                    do! advanceTarget root barePath [ "base.txt", "target version\n" ]
+                    do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) "workspace version\n"
+
+                    let! saveStatus = sessionStatus session
+
+                    let! saveResult =
+                        Async.StartAsPromise(
+                            session.Core.CreateRevision
+                                {
+                                    Message = "local conflicting change"
+                                    Paths = [| mkPath "base.txt" |]
+                                    ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+                                }
+                                (ctx "conflict-save")
+                        )
+
+                    expectValue "local revision" saveResult |> ignore
+
+                    let! updateStatus = sessionStatus session
+
+                    let! updateResult =
+                        Async.StartAsPromise(
+                            (syncService session).Update
+                                { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
+                                (ctx "conflict-update")
+                        )
+
+                    let updateFailure =
+                        match updateResult with
+                        | Failed failure -> failure
+                        | PartiallySucceeded(_, failure) -> failure
+                        | Succeeded _ -> failwith "Expected the conflicting update to report conflicts."
+
+                    Vitest.expect(updateFailure.Code).toBe ("conflicts_detected")
+
+                    let conflicts = conflictService session
+                    let! sessionResult = Async.StartAsPromise(conflicts.GetActiveSession(ctx "conflict-session"))
+
+                    let summary =
+                        match expectValue "active session" sessionResult with
+                        | Some summary -> summary
+                        | None -> failwith "Expected an active conflict session."
+
+                    Vitest.expect(summary.Items.Length).toBe (1)
+
+                    let candidateIds = summary.Items[0].Candidates |> Array.map _.CandidateId
+                    Vitest.expect(candidateIds |> Array.contains "workspace").toBe (true)
+                    Vitest.expect(candidateIds |> Array.contains "target").toBe (true)
+                    Vitest.expect(summary.Items[0].SupportsResolvedContent).toBe (true)
+
+                    // A stale workspace version is rejected before any mutation.
+                    let! headBefore = runGitIn workPath [| "rev-parse"; "HEAD" |]
+
+                    let! staleResolve =
+                        Async.StartAsPromise(
+                            conflicts.Resolve
+                                {
+                                    Handle = summary.Handle
+                                    ExpectedWorkspaceVersion = "not-the-current-token"
+                                    Path = mkPath "base.txt"
+                                    Resolution = PickCandidate "target"
+                                }
+                                (ctx "stale-resolve")
+                        )
+
+                    let staleFailure =
+                        match staleResolve with
+                        | Failed failure -> failure
+                        | _ -> failwith "Expected the stale resolve to fail."
+
+                    Vitest.expect(staleFailure.Category).toEqual (Concurrency)
+                    Vitest.expect(staleFailure.Code).toBe ("precondition_failed")
+
+                    Vitest
+                        .expect(staleFailure.RecoveryAction |> Option.map _.Code)
+                        .toEqual (Some "refresh_conflict_session")
+
+                    let! headAfterStale = runGitIn workPath [| "rev-parse"; "HEAD" |]
+                    Vitest.expect(headAfterStale.Trim()).toBe (headBefore.Trim())
+
+                    // A live resolution rotates the handle; replaying the old handle fails.
+                    let! resolveStatus = sessionStatus session
+
+                    let! resolveResult =
+                        Async.StartAsPromise(
+                            conflicts.Resolve
+                                {
+                                    Handle = summary.Handle
+                                    ExpectedWorkspaceVersion = resolveStatus.WorkspaceVersion
+                                    Path = mkPath "base.txt"
+                                    Resolution = PickCandidate "target"
+                                }
+                                (ctx "live-resolve")
+                        )
+
+                    let resolution = expectValue "live resolve" resolveResult
+                    Vitest.expect(resolution.RefreshedHandle.Version = summary.Handle.Version).toBe (false)
+                    Vitest.expect(resolution.RemainingItems.Length).toBe (0)
+
+                    let! replayStatus = sessionStatus session
+
+                    let! replayResolve =
+                        Async.StartAsPromise(
+                            conflicts.Resolve
+                                {
+                                    Handle = summary.Handle
+                                    ExpectedWorkspaceVersion = replayStatus.WorkspaceVersion
+                                    Path = mkPath "base.txt"
+                                    Resolution = PickCandidate "workspace"
+                                }
+                                (ctx "replay-resolve")
+                        )
+
+                    match replayResolve with
+                    | Failed failure -> Vitest.expect(failure.Code).toBe ("precondition_failed")
+                    | _ -> failwith "Expected the replayed stale handle to be rejected."
+
+                    // Deterministic finalize race: the destination advances after the
+                    // pre-check; finalize reports revision evidence and stays live.
+                    armFinalizeRace <- true
+                    let! raceStatus = sessionStatus session
+
+                    let! racedFinalize =
+                        Async.StartAsPromise(
+                            conflicts.Finalize
+                                {
+                                    Handle = resolution.RefreshedHandle
+                                    ExpectedWorkspaceVersion = raceStatus.WorkspaceVersion
+                                    Message = Some "finalize during race"
+                                }
+                                (ctx "raced-finalize")
+                        )
+
+                    let raceFailure =
+                        match racedFinalize with
+                        | Failed failure -> failure
+                        | PartiallySucceeded(_, failure) -> failure
+                        | Succeeded _ -> failwith "Expected the raced finalize to fail structurally."
+
+                    Vitest.expect(raceFailure.Category).toEqual (Concurrency)
+                    Vitest.expect(raceFailure.RevisionEvidence.Length >= 2).toBe (true)
+
+                    // Refresh supplies the live handle; the deliberate retry succeeds.
+                    let! refreshedSession = Async.StartAsPromise(conflicts.GetActiveSession(ctx "refresh-session"))
+
+                    let liveSummary =
+                        match expectValue "refreshed session" refreshedSession with
+                        | Some value -> value
+                        | None -> failwith "Expected the session to stay live after the raced finalize."
+
+                    let! retryStatus = sessionStatus session
+
+                    let! retryFinalize =
+                        Async.StartAsPromise(
+                            conflicts.Finalize
+                                {
+                                    Handle = liveSummary.Handle
+                                    ExpectedWorkspaceVersion = retryStatus.WorkspaceVersion
+                                    Message = Some "finalize after refresh"
+                                }
+                                (ctx "retry-finalize")
+                        )
+
+                    let mergedRevision = expectValue "verified finalize" retryFinalize
+                    Vitest.expect(mergedRevision.IsSome).toBe (true)
+
+                    // The session is closed: replaying finalize is rejected without mutation.
+                    let! closedSession = Async.StartAsPromise(conflicts.GetActiveSession(ctx "closed-session"))
+                    Vitest.expect((expectValue "closed session" closedSession).IsNone).toBe (true)
+
+                    let! finalStatus = sessionStatus session
+
+                    let! replayFinalize =
+                        Async.StartAsPromise(
+                            conflicts.Finalize
+                                {
+                                    Handle = liveSummary.Handle
+                                    ExpectedWorkspaceVersion = finalStatus.WorkspaceVersion
+                                    Message = None
+                                }
+                                (ctx "replay-finalize")
+                        )
+
+                    match replayFinalize with
+                    | Failed failure -> Vitest.expect(failure.Code).toBe ("precondition_failed")
+                    | _ -> failwith "Expected the closed-handle finalize replay to be rejected."
+
+                    // The picked target content is materialized in the workspace.
+                    let! merged = tryReadUtf8FileAsync (join [| workPath; "base.txt" |])
+                    Vitest.expect(merged).toEqual (Some "target version\n")
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
         Vitest.test (
             "v2 preview includes dirty workspace and requires Git 2.38",
             TestOptions(timeout = 120000),

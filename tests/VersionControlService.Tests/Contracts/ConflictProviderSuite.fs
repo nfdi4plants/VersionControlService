@@ -15,8 +15,9 @@ let private expectHandleRejection (operationName: string) (result: OperationResu
         .expect(failure.RecoveryAction |> Option.map _.Code)
         .toEqual (Some ConflictRecovery.RefreshConflictSession)
 
-/// Opens a real conflict: the target and the workspace change base.txt differently,
-/// then Update reports conflicts and opens a provider-managed session.
+/// Opens a real conflict: the target and the workspace change base.txt differently
+/// (the workspace side saved as a revision, matching the Swate save-then-update
+/// flow), then Update reports conflicts and opens a provider-managed session.
 let private openConflict (harness: ProviderTestHarness) = promise {
     let! workspace = harness.CreateWorkspace()
 
@@ -29,6 +30,20 @@ let private openConflict (harness: ProviderTestHarness) = promise {
         |]
 
     do! workspace.WriteFile "base.txt" "workspace version\n"
+    let! saveStatus = getStatus workspace
+
+    let! saveResult =
+        run (
+            workspace.Session.Core.CreateRevision
+                {
+                    Message = "workspace conflicting change"
+                    Paths = [| mkPath "base.txt" |]
+                    ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+                }
+                (ctx "conflict-save")
+        )
+
+    expectPerformed "workspace conflicting revision" saveResult |> ignore
     let! status = getStatus workspace
 
     let! updateResult =

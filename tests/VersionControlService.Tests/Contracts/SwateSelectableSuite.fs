@@ -143,7 +143,23 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 do! workspace.WriteFile "base.txt" "my version\n"
 
-                // Preview first, exactly like the Swate update flow.
+                // Save the local change first, exactly like the Swate save-then-update flow.
+                let! saveStatus = getStatus workspace
+
+                let! saveResult =
+                    run (
+                        workspace.Session.Core.CreateRevision
+                            {
+                                Message = "save my conflicting version"
+                                Paths = [| mkPath "base.txt" |]
+                                ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+                            }
+                            (ctx "swate-conflict-save")
+                    )
+
+                expectPerformed "conflicting save" saveResult |> ignore
+
+                // Preview before updating.
                 let! previewResult = run ((syncService workspace.Session).PreviewUpdate(ctx "swate-preview"))
                 let preview = expectValue "preview" previewResult
                 Vitest.expect(preview.WouldCreateConflictSession).toBe (true)
@@ -281,6 +297,20 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     |]
 
                 do! workspace.WriteFile "base.txt" "our text\n"
+                let! saveStatus = getStatus workspace
+
+                let! saveResult =
+                    run (
+                        workspace.Session.Core.CreateRevision
+                            {
+                                Message = "save our text"
+                                Paths = [| mkPath "base.txt" |]
+                                ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+                            }
+                            (ctx "swate-text-save")
+                    )
+
+                expectPerformed "text save" saveResult |> ignore
                 let! status = getStatus workspace
 
                 let! updateResult =
