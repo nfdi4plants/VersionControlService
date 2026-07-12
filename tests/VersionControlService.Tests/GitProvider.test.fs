@@ -1526,6 +1526,54 @@ Vitest.describe (
 )
 
 Vitest.describe (
+    "GitWorkspaceSession v2 optional LFS services",
+    fun () ->
+        Vitest.test (
+            "v2 core Git opens without Git LFS",
+            providerIntegrationTestOptions,
+            fun () -> promise {
+                do!
+                    withV2GitWorkspace (fun session repoPath git -> promise {
+                        // The LFS-backed services are advertised as optional records...
+                        Vitest.expect(session.ObjectMaterialization.IsSome).toBe (true)
+                        Vitest.expect(session.StoragePolicy.IsSome).toBe (true)
+                        Vitest.expect(session.Maintenance.IsSome).toBe (true)
+
+                        // ...while core Git works without any LFS involvement.
+                        do! writeUtf8FileAsync (join [| repoPath; "core.txt" |]) "core content\n"
+                        let! status = v2Status session
+
+                        let! revisionResult =
+                            Async.StartAsPromise(
+                                session.Core.CreateRevision
+                                    {
+                                        Message = "test: core without LFS"
+                                        Paths = [| v2RepositoryPath "core.txt" |]
+                                        ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                    }
+                                    (v2Context "v2-core-no-lfs")
+                            )
+
+                        expectV2Value "core revision without LFS" revisionResult |> ignore
+
+                        // Core dependency diagnostics never require Git LFS.
+                        let! dependenciesResult =
+                            Async.StartAsPromise(v2Factory.CheckDependencies(v2Context "v2-core-deps"))
+
+                        let dependencies = expectV2Value "check dependencies" dependenciesResult
+
+                        Vitest
+                            .expect(
+                                dependencies
+                                |> Array.exists (fun entry -> entry.Component.ToLowerInvariant().Contains "lfs")
+                            )
+                            .toBe (false)
+                    })
+            }
+        )
+)
+
+Vitest.describe (
     "GitWorkspaceSession v2 submodule boundaries",
     fun () ->
         Vitest.test (

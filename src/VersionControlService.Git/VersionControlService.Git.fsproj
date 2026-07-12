@@ -24,6 +24,7 @@
     <Compile Include="GitCredentialStrategy.fs" />
     <Compile Include="GitRefs.fs" />
     <Compile Include="GitConflictSession.fs" />
+    <Compile Include="GitLfsExtensions.fs" />
     <Compile Include="GitSelectedRevision.fs" />
     <Compile Include="GitWorkspaceSession.fs" />
   </ItemGroup>

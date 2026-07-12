@@ -13,6 +13,7 @@ module GitService = VersionControlService.Git.GitService
 module GitRefs = VersionControlService.Git.GitRefs
 module GitConflictSession = VersionControlService.Git.GitConflictSession
 module GitCredentialStrategy = VersionControlService.Git.GitCredentialStrategy
+module GitLfsExtensions = VersionControlService.Git.GitLfsExtensions
 module GitProvisioningService = VersionControlService.Git.GitProvisioningService
 module NodeProcess = VersionControlService.Runtime.Node.Process
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
@@ -1764,6 +1765,12 @@ let createSessionWithCredentials
                 }
             ConflictResolution = Some(createConflictService state)
             TextDiff = Some(createTextDiff state)
+            // Git LFS is optional: the services exist because the Git provider
+            // supports them; their operations report their own dependency status
+            // when git-lfs is not installed. Core Git never requires LFS.
+            ObjectMaterialization = Some(GitLfsExtensions.createObjectMaterialization state.RepoPath)
+            StoragePolicy = Some(GitLfsExtensions.createStoragePolicy state.RepoPath)
+            Maintenance = Some(GitLfsExtensions.createMaintenance state.RepoPath)
             RepositoryBrowser = Some(createBrowser state)
     }
 
