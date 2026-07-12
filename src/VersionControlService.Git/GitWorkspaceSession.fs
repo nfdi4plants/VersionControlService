@@ -290,12 +290,19 @@ let private createRevision (state: SessionState) (request: CreateRevisionRequest
                 match unstageResult with
                 | Error failure -> return Failed failure
                 | Ok() ->
-                    // Selected paths are exact literal file names: :(literal) pathspec
-                    // magic disables wildcard/bracket expansion.
-                    let literalSpecs = request.Paths |> Array.map GitPathTransport.literalPathspec
+                    // Selected paths are exact literal file names (:(literal) magic) and
+                    // travel over NUL-delimited stdin so selection size is never bounded
+                    // by platform command-line length limits (spike 3: direct process
+                    // adapter, because simple-git cannot feed stdin).
+                    let stdinPayload = GitPathTransport.nulDelimitedLiteralPathspecs request.Paths
 
                     let! stageOutput =
-                        runGit state.Hooks state.RepoPath [| "add"; "--"; yield! literalSpecs |] None context
+                        runGit
+                            state.Hooks
+                            state.RepoPath
+                            [| "add"; yield! GitPathTransport.pathspecFromStdinArguments |]
+                            (Some stdinPayload)
+                            context
 
                     let stageResult =
                         match stageOutput with

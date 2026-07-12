@@ -878,6 +878,115 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "v2 selected paths use stdin instead of command-line arguments",
+            gitServiceIntegrationTestOptions,
+            fun () -> promise {
+                do!
+                    withTempRepository (fun context -> promise {
+                        do! writeUtf8FileAsync (join [| context.RepoPath; "seed.txt" |]) "seed\n"
+                        let! _ = context.Git.raw [| "add"; "-A" |]
+                        let! _ = context.Git.raw [| "commit"; "-m"; "test: base" |]
+
+                        let selectedNames = [| "spy-a.txt"; "spy-b[1].txt"; "spy-c.txt" |]
+
+                        for name in selectedNames do
+                            do! writeUtf8FileAsync (join [| context.RepoPath; name |]) $"content {name}\n"
+
+                        // Injected process spy: records every v2 git invocation.
+                        let observedCommands = ResizeArray<string[] * string option>()
+
+                        let hooks = {
+                            GitWorkspaceSession.GitSessionHooks.none with
+                                RunProcess =
+                                    Some(fun request processContext ->
+                                        async {
+                                            observedCommands.Add(request.Arguments, request.StdinData)
+
+                                            return!
+                                                VersionControlService.Runtime.Node.Process.run request processContext
+                                        })
+                        }
+
+                        let providerId =
+                            match VersionControlService.Abstractions.ProviderId.tryCreate "git" with
+                            | Ok id -> id
+                            | Error message -> failwith message
+
+                        let binding: VersionControlService.Abstractions.WorkspaceBinding = {
+                            SchemaVersion = VersionControlService.Abstractions.WorkspaceBinding.CurrentSchemaVersion
+                            ProviderId = providerId
+                            WorkspaceRoot = context.RepoPath
+                            ProviderStateRef = None
+                            Location = {
+                                ProviderId = providerId
+                                DisplayName = None
+                                ProviderLocation = context.RepoPath
+                                ConnectionProfileId = None
+                            }
+                            ConnectionProfileId = None
+                        }
+
+                        let session = GitWorkspaceSession.createSession hooks binding
+
+                        let statusContext =
+                            VersionControlService.Abstractions.OperationContext.detached "v2-spy-status"
+
+                        let! statusResult = Async.StartAsPromise(session.Core.GetStatus statusContext)
+
+                        let status =
+                            match statusResult with
+                            | VersionControlService.Abstractions.Succeeded outcome -> outcome.Value
+                            | _ -> failwith "Expected v2 status to succeed."
+
+                        let selectedPaths =
+                            selectedNames
+                            |> Microsoft.FSharp.Collections.Array.map (fun name ->
+                                match VersionControlService.Abstractions.RepositoryPath.tryCreate name with
+                                | Ok path -> path
+                                | Error message -> failwith message)
+
+                        let! revisionResult =
+                            Async.StartAsPromise(
+                                session.Core.CreateRevision
+                                    {
+                                        Message = "test: stdin transport"
+                                        Paths = selectedPaths
+                                        ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                    }
+                                    (VersionControlService.Abstractions.OperationContext.detached "v2-spy-revision")
+                            )
+
+                        match revisionResult with
+                        | VersionControlService.Abstractions.Succeeded _ -> ()
+                        | _ -> failwith "Expected the spied revision to succeed."
+
+                        Vitest.expect(observedCommands.Count > 0).toBe (true)
+
+                        // No selected path may travel on a command line.
+                        for arguments, _ in observedCommands do
+                            for argument in arguments do
+                                for name in selectedNames do
+                                    if argument.Contains name then
+                                        failwith $"Selected path '{name}' appeared on argv: {argument}"
+
+                        // At least one command received the whole selection over NUL stdin.
+                        let stdinCarriers =
+                            observedCommands
+                            |> Seq.filter (fun (_, stdinData) ->
+                                match stdinData with
+                                | Some data ->
+                                    selectedNames
+                                    |> Microsoft.FSharp.Collections.Array.forall (fun name -> data.Contains name)
+                                    && data.Contains "\000"
+                                | None -> false)
+                            |> Seq.length
+
+                        Vitest.expect(stdinCarriers > 0).toBe (true)
+                    })
+            }
+        )
+
+        Vitest.test (
             "v2 linked worktree resolves Git state paths",
             gitServiceIntegrationTestOptions,
             fun () -> promise {
