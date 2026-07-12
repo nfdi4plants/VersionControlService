@@ -338,6 +338,96 @@ let private toWorkspaceStatus (state: SessionState) (status: GitStatusDto) (cont
         }
     }
 
+/// Resolves a repository state path (MERGE_HEAD, ...) through Git itself so
+/// linked worktrees report the right location instead of `<root>/.git/<name>`.
+let private resolveGitStatePath (state: SessionState) (name: string) (context: OperationContext) =
+    async {
+        let! output = runGit state.Hooks state.RepoPath [| "rev-parse"; "--git-path"; name |] None context
+
+        match output with
+        | Ok result when result.ExitCode = 0 ->
+            let rawPath = result.StdOut.Trim()
+
+            let absolutePath =
+                if rawPath.StartsWith "/" || (rawPath.Length >= 2 && rawPath[1] = ':') then
+                    rawPath
+                else
+                    NodePath.join [| state.RepoPath; rawPath |]
+
+            return Some absolutePath
+        | _ -> return None
+    }
+
+/// Active merge state as a provider-managed conflict-session summary. Present
+/// whenever MERGE_HEAD exists — including after the last conflict was staged.
+let private getMergeConflictSummary (state: SessionState) (context: OperationContext) =
+    async {
+        let! mergeHeadPath = resolveGitStatePath state "MERGE_HEAD" context
+
+        match mergeHeadPath with
+        | Some path when NodeFileSystem.existsSync path ->
+            let mergeHead =
+                (NodeFileSystem.readFileSync path NodeFileSystem.TextEncoding.Utf8).Trim()
+
+            let! unmergedOutput =
+                runGit
+                    state.Hooks
+                    state.RepoPath
+                    [|
+                        "diff"
+                        "--name-only"
+                        "--diff-filter=U"
+                        "-z"
+                    |]
+                    None
+                    context
+
+            let unmergedPaths =
+                match unmergedOutput with
+                | Ok result when result.ExitCode = 0 ->
+                    result.StdOut.Split '\000'
+                    |> Array.filter (fun entry -> entry <> "")
+                    |> Array.choose (tryCreateRepositoryPath >> Result.toOption)
+                | _ -> [||]
+
+            let items =
+                unmergedPaths
+                |> Array.map (fun conflictPath -> {
+                    Path = conflictPath
+                    Candidates = [|
+                        {
+                            CandidateId = "workspace"
+                            Label = "Workspace version"
+                            Revision = None
+                            Preview = None
+                        }
+                        {
+                            CandidateId = "target"
+                            Label = "Target version"
+                            Revision = Some(mkRevisionId mergeHead)
+                            Preview = None
+                        }
+                        {
+                            CandidateId = "base"
+                            Label = "Base version"
+                            Revision = None
+                            Preview = None
+                        }
+                    |]
+                    SupportsResolvedContent = true
+                })
+
+            return
+                Some {
+                    Handle = {
+                        SessionId = $"merge-{mergeHead}"
+                        Version = "1"
+                    }
+                    Items = items
+                }
+        | _ -> return None
+    }
+
 let private getWorkspaceStatus (state: SessionState) (context: OperationContext) =
     async {
         let! statusResult = awaitGit (GitService.getStatus state.RepoPath)
@@ -346,7 +436,13 @@ let private getWorkspaceStatus (state: SessionState) (context: OperationContext)
         | Error failure -> return Failed failure
         | Ok status ->
             let! workspaceStatus = toWorkspaceStatus state status context
-            return OperationResult.succeeded workspaceStatus
+            let! conflictSummary = getMergeConflictSummary state context
+
+            return
+                OperationResult.succeeded {
+                    workspaceStatus with
+                        ActiveConflictSession = conflictSummary
+                }
     }
 
 // ---------------------------------------------------------------------------
