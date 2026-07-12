@@ -745,41 +745,78 @@ let private switchRef (state: SessionState) (request: SwitchRefRequest) (context
                     | Ok() -> return! getWorkspaceStatus state context
     }
 
+/// Parses `git diff --name-status -z` output: NUL-delimited tokens of
+/// (status, path) pairs, with renames carrying (status, oldPath, newPath).
+let private parseNameStatusZ (output: string) : DiffEntry[] =
+    let tokens = output.Split '\000' |> Array.filter (fun token -> token <> "")
+    let entries = ResizeArray<DiffEntry>()
+    let mutable index = 0
+
+    while index < tokens.Length - 1 do
+        let status = tokens[index]
+
+        if status.StartsWith "R" || status.StartsWith "C" then
+            if index + 2 < tokens.Length then
+                match tryCreateRepositoryPath tokens[index + 2], tryCreateRepositoryPath tokens[index + 1] with
+                | Ok newPath, oldPath ->
+                    entries.Add {
+                        Path = newPath
+                        OldPath = oldPath |> Result.toOption
+                        Kind = RenamedChange
+                        LineInsertions = None
+                        LineDeletions = None
+                    }
+                | Error _, _ -> ()
+
+            index <- index + 3
+        else
+            match tryCreateRepositoryPath tokens[index + 1] with
+            | Ok path ->
+                let kind =
+                    match status with
+                    | "A" -> AddedChange
+                    | "D" -> DeletedChange
+                    | "U" -> ConflictedChange
+                    | _ -> ModifiedChange
+
+                entries.Add {
+                    Path = path
+                    OldPath = None
+                    Kind = kind
+                    LineInsertions = None
+                    LineDeletions = None
+                }
+            | Error _ -> ()
+
+            index <- index + 2
+
+    entries.ToArray()
+
 let private getDiffSummary (state: SessionState) (context: OperationContext) =
     async {
-        // Shell: unstaged-only diff (recorded GIT-005 behavior); the Task 9 diff
-        // cycle unions staged and unstaged changes.
-        let! result = runGitChecked state.Hooks state.RepoPath [| "diff"; "--name-status" |] None context
+        // The object-level summary is the union of staged (index vs HEAD) and
+        // unstaged (worktree vs index) changes, each path counted once. Line
+        // counts stay optional.
+        let! unstagedResult =
+            runGitChecked state.Hooks state.RepoPath [| "diff"; "--name-status"; "-z" |] None context
 
-        match result with
+        match unstagedResult with
         | Error failure -> return Failed failure
-        | Ok output ->
+        | Ok unstagedOutput ->
+            let! stagedResult =
+                runGit state.Hooks state.RepoPath [| "diff"; "--cached"; "--name-status"; "-z" |] None context
+
+            let stagedEntries =
+                match stagedResult with
+                // `diff --cached` fails on an unborn branch; treat that as no staged diff.
+                | Ok output when output.ExitCode = 0 -> parseNameStatusZ output.StdOut
+                | _ -> [||]
+
+            let unstagedEntries = parseNameStatusZ unstagedOutput.StdOut
+
             let entries =
-                output.StdOut.Replace("\r\n", "\n").Split('\n')
-                |> Array.filter (fun line -> line.Trim() <> "")
-                |> Array.choose (fun line ->
-                    let parts = line.Split '\t'
-
-                    if parts.Length < 2 then
-                        None
-                    else
-                        match tryCreateRepositoryPath parts[1] with
-                        | Error _ -> None
-                        | Ok path ->
-                            let kind =
-                                match parts[0].Trim() with
-                                | "A" -> AddedChange
-                                | "D" -> DeletedChange
-                                | status when status.StartsWith "R" -> RenamedChange
-                                | _ -> ModifiedChange
-
-                            Some {
-                                Path = path
-                                OldPath = None
-                                Kind = kind
-                                LineInsertions = None
-                                LineDeletions = None
-                            })
+                Array.append stagedEntries unstagedEntries
+                |> Array.distinctBy (fun entry -> RepositoryPath.value entry.Path)
 
             return OperationResult.succeeded { Entries = entries }
     }
