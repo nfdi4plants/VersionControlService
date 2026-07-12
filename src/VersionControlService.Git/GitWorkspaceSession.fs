@@ -368,83 +368,39 @@ let private createRevision (state: SessionState) (request: CreateRevisionRequest
         if request.Paths.Length = 0 then
             return OperationResult.validationFailed "no_paths_selected" "Select at least one path."
         else
-            // v1 flow (defect record): unstage everything staged, stage the selected
-            // paths as raw pathspecs, then commit. The Task 8 cycles replace this with
-            // literal transport and an isolated transaction.
-            let pathValues = request.Paths |> Array.map RepositoryPath.value
+            // Isolated literal transaction: temporary index, commit-tree, and a
+            // compare-and-swap ref update. Selected paths are exact literal names
+            // over NUL stdin (spike 3: direct process adapter).
+            let runner: GitSelectedRevision.GitRunner =
+                fun arguments stdinData environment ->
+                    async {
+                        let processRequest = {
+                            NodeProcess.ProcessRequest.create "git" arguments with
+                                WorkingDirectory = Some state.RepoPath
+                                StdinData = stdinData
+                                Environment = environment
+                                ProgressPhase = "git"
+                        }
 
-            let! statusResult = awaitGit (GitService.getStatus state.RepoPath)
+                        let runProcess = state.Hooks.RunProcess |> Option.defaultValue NodeProcess.run
+                        let! result = runProcess processRequest context
 
-            match statusResult with
-            | Error failure -> return Failed failure
-            | Ok status ->
-                let stagedPaths =
-                    status.Files
-                    |> Array.filter (fun file ->
-                        not (String.IsNullOrWhiteSpace file.Index)
-                        && file.Index <> " "
-                        && file.Index <> "?")
-                    |> Array.map _.Path
-                    |> Array.distinct
+                        match result with
+                        | Succeeded outcome -> return Ok outcome.Value
+                        | PartiallySucceeded(_, failure)
+                        | Failed failure -> return Error failure
+                    }
 
-                let! unstageResult =
-                    if stagedPaths.Length = 0 then
-                        async { return Ok() }
-                    else
-                        awaitGit (GitService.unstagePaths state.RepoPath stagedPaths)
+            let transactionBarrier point = barrier state.Hooks state.RepoPath point context
 
-                match unstageResult with
-                | Error failure -> return Failed failure
-                | Ok() ->
-                    // Selected paths are exact literal file names (:(literal) magic) and
-                    // travel over NUL-delimited stdin so selection size is never bounded
-                    // by platform command-line length limits (spike 3: direct process
-                    // adapter, because simple-git cannot feed stdin).
-                    let stdinPayload = GitPathTransport.nulDelimitedLiteralPathspecs request.Paths
-
-                    let! stageOutput =
-                        runGit
-                            state.Hooks
-                            state.RepoPath
-                            [| "add"; yield! GitPathTransport.pathspecFromStdinArguments |]
-                            (Some stdinPayload)
-                            context
-
-                    let stageResult =
-                        match stageOutput with
-                        | Error failure -> Error failure
-                        | Ok output when output.ExitCode = 0 -> Ok()
-                        | Ok output when output.StdErr.Contains "did not match any files" ->
-                            Error {
-                                OperationFailure.create
-                                    NotFound
-                                    "path_not_found"
-                                    "A selected path does not exist in the workspace." with
-                                    AffectedPaths = pathValues
-                            }
-                        | Ok output ->
-                            Error(
-                                OperationFailure.createRedacted
-                                    ProviderError
-                                    "git_failure"
-                                    $"Staging the selected paths failed: {output.StdErr}"
-                            )
-
-                    match stageResult with
-                    | Error failure -> return Failed failure
-                    | Ok() ->
-                        let! commitResult = awaitGit (GitService.commit state.RepoPath request.Message)
-
-                        match commitResult with
-                        | Error failure -> return Failed failure
-                        | Ok commitHash ->
-                            return
-                                Succeeded {
-                                    OperationOutcome.performed (mkRevisionId commitHash) with
-                                        AffectedPaths = pathValues
-                                        ResultingRevision = Some(mkRevisionId commitHash)
-                                        Publication = LocalOnly
-                                }
+            return!
+                GitSelectedRevision.createRevision
+                    runner
+                    transactionBarrier
+                    state.RepoPath
+                    request.Message
+                    request.Paths
+                    context
     }
 
 let private restorePaths (state: SessionState) (request: RestoreRequest) (context: OperationContext) =

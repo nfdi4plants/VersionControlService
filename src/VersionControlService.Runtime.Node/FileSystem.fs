@@ -36,6 +36,9 @@ let mkdirSync (path: string) (options: MkdirOptions) : unit = jsNative
 [<Import("existsSync", "fs")>]
 let existsSync (path: string) : bool = jsNative
 
+[<Import("statSync", "fs")>]
+let statSync (path: string) : Stats = jsNative
+
 [<Import("readFileSync", "fs")>]
 let readFileSync (path: string) (encoding: TextEncoding) : string = jsNative
 
