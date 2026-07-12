@@ -20,6 +20,49 @@ type TransactionBarrier = string -> Async<unit>
 let private failedRun (operation: string) (output: NodeProcess.ProcessOutput) =
     OperationFailure.createRedacted ProviderError "git_failure" $"{operation} failed: {output.StdErr}"
 
+/// Repository-relative roots of gitlink (submodule) entries in the index.
+let listGitlinkRoots (runGit: GitRunner) : Async<Result<string[], OperationFailure>> =
+    async {
+        let! output = runGit [| "ls-files"; "-z"; "--stage" |] None [||]
+
+        match output with
+        | Error failure -> return Error failure
+        | Ok result when result.ExitCode <> 0 -> return Error(failedRun "git ls-files --stage" result)
+        | Ok result ->
+            return
+                result.StdOut.Split '\000'
+                |> Array.filter (fun entry -> entry.StartsWith "160000 ")
+                |> Array.choose (fun entry ->
+                    match entry.Split '\t' with
+                    | [| _; path |] -> Some path
+                    | _ -> None)
+                |> Ok
+    }
+
+/// Rejects selections that touch a submodule: paths inside a gitlink and the
+/// gitlink itself are outside the selected-revision contract.
+let private validateSubmoduleBoundary
+    (gitlinkRoots: string[])
+    (paths: RepositoryPath[])
+    : Result<unit, OperationFailure> =
+    let violations =
+        paths
+        |> Array.map RepositoryPath.value
+        |> Array.filter (fun pathValue ->
+            gitlinkRoots
+            |> Array.exists (fun root -> pathValue = root || pathValue.StartsWith(root + "/")))
+
+    if violations.Length > 0 then
+        Error {
+            OperationFailure.create
+                Validation
+                "submodule_internal_path"
+                "Selected paths must not touch a submodule; gitlink entries are never created or modified." with
+                AffectedPaths = violations
+        }
+    else
+        Ok()
+
 /// Metadata checks before the transaction commits: batched file sizes via stat,
 /// then ONE `git check-attr --stdin -z filter` call carrying every oversized
 /// selected path over NUL stdin — never per-path processes or argv path lists.
@@ -165,6 +208,16 @@ let createRevision
                                 AffectedPaths = missing
                         }
                 else
+
+                let! gitlinkRootsResult = listGitlinkRoots runGit
+
+                match gitlinkRootsResult with
+                | Error failure -> return Failed failure
+                | Ok gitlinkRoots ->
+
+                match validateSubmoduleBoundary gitlinkRoots paths with
+                | Error failure -> return Failed failure
+                | Ok() ->
                     let! metadataResult = checkSelectedMetadata runGit repoPath paths
 
                     match metadataResult with

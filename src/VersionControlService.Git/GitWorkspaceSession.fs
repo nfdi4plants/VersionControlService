@@ -444,9 +444,33 @@ let private getWorkspaceStatus (state: SessionState) (context: OperationContext)
             let! workspaceStatus = toWorkspaceStatus state status context
             let! conflictSummary = getMergeConflictSummary state context
 
+            // Submodule-internal changes are never workspace changes: entries at or
+            // under a gitlink root are filtered from the reported change list.
+            let selectedRevisionRunner: GitSelectedRevision.GitRunner =
+                fun arguments stdinData environment ->
+                    runGitEnv state.Hooks state.RepoPath arguments stdinData environment context
+
+            let! gitlinkRootsResult = GitSelectedRevision.listGitlinkRoots selectedRevisionRunner
+
+            let gitlinkRoots =
+                match gitlinkRootsResult with
+                | Ok roots -> roots
+                | Error _ -> [||]
+
+            let filteredChanges =
+                workspaceStatus.Changes
+                |> Array.filter (fun change ->
+                    let pathValue = RepositoryPath.value change.Path
+
+                    not (
+                        gitlinkRoots
+                        |> Array.exists (fun root -> pathValue = root || pathValue.StartsWith(root + "/"))
+                    ))
+
             return
                 OperationResult.succeeded {
                     workspaceStatus with
+                        Changes = filteredChanges
                         ActiveConflictSession = conflictSummary
                 }
     }

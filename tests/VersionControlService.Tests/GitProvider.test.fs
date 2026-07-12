@@ -1526,6 +1526,127 @@ Vitest.describe (
 )
 
 Vitest.describe (
+    "GitWorkspaceSession v2 submodule boundaries",
+    fun () ->
+        Vitest.test (
+            "v2 rejects submodule-internal selections",
+            providerIntegrationTestOptions,
+            fun () -> promise {
+                do!
+                    withV2GitWorkspace (fun session repoPath git -> promise {
+                        // Base commit plus a child repository added as a submodule.
+                        do! writeUtf8FileAsync (join [| repoPath; "base.txt" |]) "base\n"
+                        let! _ = git.raw [| "add"; "-A" |]
+                        let! _ = git.raw [| "commit"; "-m"; "test: base" |]
+
+                        let childPath = join [| dirname repoPath; "child-repo" |]
+                        let! _ = git.raw [| "init"; "-b"; "main"; childPath |]
+                        let childGit = createSimpleGit childPath
+                        let! _ = childGit.raw [| "config"; "user.name"; "VCS Tests" |]
+                        let! _ = childGit.raw [| "config"; "user.email"; "tests@example.org" |]
+                        do! writeUtf8FileAsync (join [| childPath; "inner.txt" |]) "inner base\n"
+                        let! _ = childGit.raw [| "add"; "-A" |]
+                        let! _ = childGit.raw [| "commit"; "-m"; "test: child base" |]
+
+                        // simple-git blocks protocol.* configuration, so the fixture
+                        // uses the direct process runner for the submodule add.
+                        let runGitDirect (arguments: string[]) = promise {
+                            let request = {
+                                VersionControlService.Runtime.Node.Process.ProcessRequest.create "git" arguments with
+                                    WorkingDirectory = Some repoPath
+                            }
+
+                            let! result =
+                                Async.StartAsPromise(
+                                    VersionControlService.Runtime.Node.Process.run
+                                        request
+                                        (v2Context "v2-submodule-fixture")
+                                )
+
+                            match result with
+                            | Succeeded outcome when outcome.Value.ExitCode = 0 -> return outcome.Value.StdOut
+                            | Succeeded outcome -> return failwith $"fixture git failed: {outcome.Value.StdErr}"
+                            | _ -> return failwith "fixture git invocation failed"
+                        }
+
+                        let! _ =
+                            runGitDirect [|
+                                "-c"
+                                "protocol.file.allow=always"
+                                "submodule"
+                                "add"
+                                childPath.Replace("\\", "/")
+                                "sub"
+                            |]
+
+                        let! _ = git.raw [| "commit"; "-m"; "test: add submodule" |]
+
+                        // Selecting a path inside the submodule fails structurally.
+                        let! status = v2Status session
+
+                        let! innerResult =
+                            Async.StartAsPromise(
+                                session.Core.CreateRevision
+                                    {
+                                        Message = "test: submodule-internal selection"
+                                        Paths = [| v2RepositoryPath "sub/inner.txt" |]
+                                        ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                    }
+                                    (v2Context "v2-submodule-internal")
+                            )
+
+                        let innerFailure = expectV2Failure "submodule-internal selection" innerResult
+                        Vitest.expect(innerFailure.Category).toEqual (Validation)
+                        Vitest.expect(innerFailure.Code).toBe ("submodule_internal_path")
+
+                        // Selecting the gitlink itself never creates or modifies gitlink entries.
+                        do! writeUtf8FileAsync (join [| repoPath; "sub"; "inner.txt" |]) "inner changed\n"
+                        let! _ = childGit.raw [| "-C"; join [| repoPath; "sub" |]; "add"; "-A" |]
+
+                        let! _ =
+                            git.raw [|
+                                "-C"
+                                join [| repoPath; "sub" |]
+                                "commit"
+                                "-m"
+                                "test: advance submodule"
+                            |]
+
+                        let! headBefore = git.raw [| "rev-parse"; "HEAD" |]
+                        let! freshStatus = v2Status session
+
+                        let! gitlinkResult =
+                            Async.StartAsPromise(
+                                session.Core.CreateRevision
+                                    {
+                                        Message = "test: gitlink selection"
+                                        Paths = [| v2RepositoryPath "sub" |]
+                                        ExpectedWorkspaceVersion = freshStatus.WorkspaceVersion
+                                    }
+                                    (v2Context "v2-gitlink")
+                            )
+
+                        let gitlinkFailure = expectV2Failure "gitlink selection" gitlinkResult
+                        Vitest.expect(gitlinkFailure.Code).toBe ("submodule_internal_path")
+
+                        let! headAfter = git.raw [| "rev-parse"; "HEAD" |]
+                        Vitest.expect(headAfter.Trim()).toBe (headBefore.Trim())
+
+                        // Status never reports submodule-internal changes as workspace changes.
+                        let! dirtyStatus = v2Status session
+
+                        let changePaths =
+                            dirtyStatus.Changes
+                            |> Array.map (fun change -> RepositoryPath.value change.Path)
+
+                        Vitest.expect(changePaths |> Array.contains "sub").toBe (false)
+                        Vitest.expect(changePaths |> Array.exists (fun path -> path.StartsWith "sub/")).toBe (false)
+                    })
+            }
+        )
+)
+
+Vitest.describe (
     "Provider registry workspace detection",
     fun () ->
         Vitest.test (
