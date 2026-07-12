@@ -111,6 +111,9 @@ type OperationFailure = {
     RecoveryAction: RecoveryAction option
     /// Redacted provider detail lines for diagnostics.
     Details: string[]
+    /// Structured revision evidence for concurrency/race outcomes, e.g.
+    /// ("expected_target", rev) and ("observed_target", rev).
+    RevisionEvidence: (string * RevisionId)[]
 }
 
 type OperationWarning = {
@@ -208,6 +211,7 @@ module OperationFailure =
         AffectedPaths = [||]
         RecoveryAction = None
         Details = [||]
+        RevisionEvidence = [||]
     }
 
     /// Creates a failure whose message is passed through the redaction guard.

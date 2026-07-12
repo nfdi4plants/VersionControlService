@@ -7,10 +7,18 @@
     <Compile Include="Scaffold.test.fs" />
     <Compile Include="GitService.test.fs" />
     <Compile Include="GitValidation.test.fs" />
-    <Compile Include="ProviderContractSuite.fs" />
+    <Compile Include="Contracts\ProviderHarness.fs" />
+    <Compile Include="Contracts\CoreProviderSuite.fs" />
+    <Compile Include="Contracts\SynchronizationProviderSuite.fs" />
+    <Compile Include="Contracts\ConflictProviderSuite.fs" />
+    <Compile Include="Contracts\ProvisioningProviderSuite.fs" />
+    <Compile Include="Contracts\OperationalProviderSuite.fs" />
+    <Compile Include="Contracts\ExtensionProviderSuites.fs" />
+    <Compile Include="Contracts\SwateSelectableSuite.fs" />
     <Compile Include="GitProviderContract.test.fs" />
     <Compile Include="GitProvider.test.fs" />
     <Compile Include="ProviderResolver.test.fs" />
+    <Compile Include="ConformanceSuiteDiscovery.test.fs" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\VersionControlService.Abstractions\VersionControlService.Abstractions.fsproj" />
