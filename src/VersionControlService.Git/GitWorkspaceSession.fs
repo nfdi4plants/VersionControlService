@@ -290,7 +290,32 @@ let private createRevision (state: SessionState) (request: CreateRevisionRequest
                 match unstageResult with
                 | Error failure -> return Failed failure
                 | Ok() ->
-                    let! stageResult = awaitGit (GitService.stagePaths state.RepoPath pathValues)
+                    // Selected paths are exact literal file names: :(literal) pathspec
+                    // magic disables wildcard/bracket expansion.
+                    let literalSpecs = request.Paths |> Array.map GitPathTransport.literalPathspec
+
+                    let! stageOutput =
+                        runGit state.Hooks state.RepoPath [| "add"; "--"; yield! literalSpecs |] None context
+
+                    let stageResult =
+                        match stageOutput with
+                        | Error failure -> Error failure
+                        | Ok output when output.ExitCode = 0 -> Ok()
+                        | Ok output when output.StdErr.Contains "did not match any files" ->
+                            Error {
+                                OperationFailure.create
+                                    NotFound
+                                    "path_not_found"
+                                    "A selected path does not exist in the workspace." with
+                                    AffectedPaths = pathValues
+                            }
+                        | Ok output ->
+                            Error(
+                                OperationFailure.createRedacted
+                                    ProviderError
+                                    "git_failure"
+                                    $"Staging the selected paths failed: {output.StdErr}"
+                            )
 
                     match stageResult with
                     | Error failure -> return Failed failure
