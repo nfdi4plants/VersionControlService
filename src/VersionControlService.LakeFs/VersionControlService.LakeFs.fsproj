@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <PackageId>VersionControlService.LakeFs</PackageId>
+    <Description>lakeFS provider for VersionControlService: API client, local workspace index, and provider-owned workspace branches.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="LakeFsTypes.fs" />
+    <Compile Include="LakeFsApi.fs" />
+    <Compile Include="LakeFsCredentials.fs" />
+    <Compile Include="LakeFsWorkspaceIndex.fs" />
+    <Compile Include="LakeFsProviderFactory.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\VersionControlService.Abstractions\VersionControlService.Abstractions.fsproj" />
+    <ProjectReference Include="..\VersionControlService.Runtime.Node\VersionControlService.Runtime.Node.fsproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Fable.Core" />
+  </ItemGroup>
+  <ItemGroup>
+    <Content Include="*.fsproj; *.fs" PackagePath="fable\" />
+  </ItemGroup>
+</Project>
