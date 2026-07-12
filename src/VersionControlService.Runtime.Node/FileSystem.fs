@@ -1,4 +1,4 @@
-module internal VersionControlService.Runtime.Node.FileSystem
+module VersionControlService.Runtime.Node.FileSystem
 
 open Fable.Core
 

@@ -14,10 +14,6 @@
     <Compile Include="Contracts\FileSystem.fs" />
     <Compile Include="Contracts\Git.fs" />
     <Compile Include="Contracts\VersionControl.fs" />
-    <Compile Include="Runtime\Node\FileSystem.fs" />
-    <Compile Include="Runtime\Node\Path.fs" />
-    <Compile Include="Runtime\Node\Interop.fs" />
-    <Compile Include="Bindings\SimpleGit.fs" />
     <Compile Include="Support\FileSystemIO.fs" />
     <Compile Include="Git\JsonDecoder.fs" />
     <Compile Include="Git\GitCommandResolver.fs" />
@@ -34,6 +30,7 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\VersionControlService.Abstractions\VersionControlService.Abstractions.fsproj" />
+    <ProjectReference Include="..\VersionControlService.Runtime.Node\VersionControlService.Runtime.Node.fsproj" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="ARCtrl.Javascript" />
@@ -44,8 +41,6 @@
     <Content Include="VersionControlService.fsproj" Pack="true" PackagePath="fable\" />
     <Content Include="Support\**\*.fs" Pack="true" PackagePath="fable\Support\%(RecursiveDir)" />
     <Content Include="Contracts\**\*.fs" Pack="true" PackagePath="fable\Contracts\%(RecursiveDir)" />
-    <Content Include="Runtime\Node\*.fs" Pack="true" PackagePath="fable\Runtime\Node\" />
-    <Content Include="Bindings\**\*.fs" Pack="true" PackagePath="fable\Bindings\%(RecursiveDir)" />
     <Content Include="Git\**\*.fs" Pack="true" PackagePath="fable\Git\%(RecursiveDir)" />
     <Content Include="VersionControlProviderRegistry.fs" Pack="true" PackagePath="fable\" />
   </ItemGroup>

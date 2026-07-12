@@ -1,4 +1,4 @@
-module internal VersionControlService.Runtime.Node.Interop
+module VersionControlService.Runtime.Node.Interop
 
 open Fable.Core
 open Fable.Core.JsInterop
