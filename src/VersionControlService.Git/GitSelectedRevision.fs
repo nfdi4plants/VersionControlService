@@ -20,9 +20,9 @@ type TransactionBarrier = string -> Async<unit>
 let private failedRun (operation: string) (output: NodeProcess.ProcessOutput) =
     OperationFailure.createRedacted ProviderError "git_failure" $"{operation} failed: {output.StdErr}"
 
-/// Per-path metadata checks before the transaction commits: file sizes via stat
-/// plus a `git check-attr filter` probe for every oversized selected path.
-/// Deliberately sequential and argv-based until the metadata-batching cycle.
+/// Metadata checks before the transaction commits: batched file sizes via stat,
+/// then ONE `git check-attr --stdin -z filter` call carrying every oversized
+/// selected path over NUL stdin — never per-path processes or argv path lists.
 let private checkSelectedMetadata
     (runGit: GitRunner)
     (repoPath: string)
@@ -42,42 +42,52 @@ let private checkSelectedMetadata
             | _ -> 1
 
         let thresholdBytes = float thresholdMb * 1024.0 * 1024.0
-        let warnings = ResizeArray<OperationWarning>()
-        let mutable failure: OperationFailure option = None
 
-        for path in paths do
-            if failure.IsNone then
-                let pathValue = RepositoryPath.value path
+        let oversizedPaths =
+            paths
+            |> Array.map RepositoryPath.value
+            |> Array.filter (fun pathValue ->
                 let absolutePath = NodePath.join [| repoPath; pathValue |]
 
-                let sizeBytes =
-                    try
-                        if NodeFileSystem.existsSync absolutePath then
-                            Some (NodeFileSystem.statSync absolutePath).size
-                        else
-                            None
-                    with _ ->
-                        None
+                try
+                    NodeFileSystem.existsSync absolutePath
+                    && (NodeFileSystem.statSync absolutePath).size > thresholdBytes
+                with _ ->
+                    false)
 
-                match sizeBytes with
-                | Some size when size > thresholdBytes ->
-                    let! attrOutput = runGit [| "check-attr"; "filter"; "--"; pathValue |] None [||]
+        if oversizedPaths.Length = 0 then
+            return Ok [||]
+        else
+            let stdinPayload = String.concat "\000" oversizedPaths
 
-                    match attrOutput with
-                    | Error attrFailure -> failure <- Some attrFailure
-                    | Ok output when output.ExitCode <> 0 -> failure <- Some(failedRun "git check-attr" output)
-                    | Ok output ->
-                        if not (output.StdOut.Contains "filter: lfs") then
-                            warnings.Add {
-                                Code = "oversized_object_not_tracked"
-                                Message =
-                                    $"'{pathValue}' exceeds {thresholdMb} MB and is not tracked by large-object storage."
-                            }
-                | _ -> ()
+            let! attrOutput =
+                runGit [| "check-attr"; "--stdin"; "-z"; "filter" |] (Some stdinPayload) [||]
 
-        match failure with
-        | Some value -> return Error value
-        | None -> return Ok(warnings.ToArray())
+            match attrOutput with
+            | Error attrFailure -> return Error attrFailure
+            | Ok output when output.ExitCode <> 0 -> return Error(failedRun "git check-attr" output)
+            | Ok output ->
+                // -z output is NUL-delimited (path, attribute, value) triples.
+                let fields = output.StdOut.Split '\000'
+
+                let lfsTrackedPaths =
+                    [|
+                        for index in 0 .. 3 .. fields.Length - 3 do
+                            if fields[index + 1] = "filter" && fields[index + 2] = "lfs" then
+                                fields[index]
+                    |]
+                    |> Set.ofArray
+
+                let warnings =
+                    oversizedPaths
+                    |> Array.filter (fun pathValue -> not (lfsTrackedPaths.Contains pathValue))
+                    |> Array.map (fun pathValue -> {
+                        Code = "oversized_object_not_tracked"
+                        Message =
+                            $"'{pathValue}' exceeds {thresholdMb} MB and is not tracked by large-object storage."
+                    })
+
+                return Ok warnings
     }
 
 /// Creates a revision from exact selected paths without touching the real index

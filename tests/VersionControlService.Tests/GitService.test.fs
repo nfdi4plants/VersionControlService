@@ -987,6 +987,116 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "v2 batches selected-path metadata checks",
+            gitServiceIntegrationTestOptions,
+            fun () -> promise {
+                do!
+                    withTempRepository (fun context -> promise {
+                        do! writeUtf8FileAsync (join [| context.RepoPath; "seed.txt" |]) "seed\n"
+                        let! _ = context.Git.raw [| "add"; "-A" |]
+                        let! _ = context.Git.raw [| "commit"; "-m"; "test: base" |]
+
+                        // Three oversized files trip the metadata (attribute) checks.
+                        let oversizedNames = [| "big-a.bin"; "big-b.bin"; "big-c.bin" |]
+                        let oversizedContent = String.replicate 1_200_000 "x"
+
+                        for name in oversizedNames do
+                            do! writeUtf8FileAsync (join [| context.RepoPath; name |]) oversizedContent
+
+                        let observedCommands = ResizeArray<string[] * string option>()
+
+                        let hooks = {
+                            GitWorkspaceSession.GitSessionHooks.none with
+                                RunProcess =
+                                    Some(fun request processContext ->
+                                        async {
+                                            observedCommands.Add(request.Arguments, request.StdinData)
+
+                                            return!
+                                                VersionControlService.Runtime.Node.Process.run request processContext
+                                        })
+                        }
+
+                        let providerId =
+                            match VersionControlService.Abstractions.ProviderId.tryCreate "git" with
+                            | Ok id -> id
+                            | Error message -> failwith message
+
+                        let binding: VersionControlService.Abstractions.WorkspaceBinding = {
+                            SchemaVersion = VersionControlService.Abstractions.WorkspaceBinding.CurrentSchemaVersion
+                            ProviderId = providerId
+                            WorkspaceRoot = context.RepoPath
+                            ProviderStateRef = None
+                            Location = {
+                                ProviderId = providerId
+                                DisplayName = None
+                                ProviderLocation = context.RepoPath
+                                ConnectionProfileId = None
+                            }
+                            ConnectionProfileId = None
+                        }
+
+                        let session = GitWorkspaceSession.createSession hooks binding
+
+                        let! statusResult =
+                            Async.StartAsPromise (
+                                session.Core.GetStatus(
+                                    VersionControlService.Abstractions.OperationContext.detached "v2-batch-status"
+                                )
+                            )
+
+                        let status =
+                            match statusResult with
+                            | VersionControlService.Abstractions.Succeeded outcome -> outcome.Value
+                            | _ -> failwith "Expected v2 status to succeed."
+
+                        let selectedPaths =
+                            oversizedNames
+                            |> Microsoft.FSharp.Collections.Array.map (fun name ->
+                                match VersionControlService.Abstractions.RepositoryPath.tryCreate name with
+                                | Ok path -> path
+                                | Error message -> failwith message)
+
+                        let! revisionResult =
+                            Async.StartAsPromise(
+                                session.Core.CreateRevision
+                                    {
+                                        Message = "test: batched metadata"
+                                        Paths = selectedPaths
+                                        ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                    }
+                                    (VersionControlService.Abstractions.OperationContext.detached "v2-batch-revision")
+                            )
+
+                        match revisionResult with
+                        | VersionControlService.Abstractions.Succeeded _ -> ()
+                        | _ -> failwith "Expected the batched-metadata revision to succeed."
+
+                        let checkAttrCommands =
+                            observedCommands
+                            |> Seq.filter (fun (arguments, _) ->
+                                arguments |> Microsoft.FSharp.Collections.Array.contains "check-attr")
+                            |> Seq.toArray
+
+                        // Exactly one batched check-attr call with every path on stdin.
+                        Vitest.expect(checkAttrCommands.Length).toBe (1)
+
+                        for arguments, stdinData in checkAttrCommands do
+                            for argument in arguments do
+                                for name in oversizedNames do
+                                    if argument.Contains name then
+                                        failwith $"Selected path '{name}' appeared on check-attr argv: {argument}"
+
+                            match stdinData with
+                            | Some data ->
+                                for name in oversizedNames do
+                                    Vitest.expect(data.Contains name).toBe (true)
+                            | None -> failwith "Expected the check-attr call to receive paths over stdin."
+                    })
+            }
+        )
+
+        Vitest.test (
             "v2 linked worktree resolves Git state paths",
             gitServiceIntegrationTestOptions,
             fun () -> promise {
