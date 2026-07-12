@@ -417,6 +417,159 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "v2 cancellation stops refresh update publish and clone with structured canceled results",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                // Deterministic interruption: the transfer-start barrier cancels the
+                // armed operation's context before its transfer runs.
+                let mutable armCancel: OperationCancellation.Source option = None
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunProcess = None
+                    Barrier =
+                        Some(fun _root point _context ->
+                            async {
+                                if point = "transfer-start" then
+                                    match armCancel with
+                                    | Some source ->
+                                        armCancel <- None
+                                        source.Cancel()
+                                    | None -> ()
+                            })
+                }
+
+                let! root, workPath, barePath, session = createSyncFixture hooks
+
+                try
+                    let expectCanceled (operationName: string) (result: OperationResult<'T>) =
+                        match result with
+                        | Failed failure ->
+                            Vitest.expect(failure.Category).toEqual (Canceled)
+                            Vitest.expect(failure.StateChanged).toBe (false)
+                        | Succeeded _
+                        | PartiallySucceeded _ -> failwith $"Expected {operationName} to report a canceled failure."
+
+                    let cancelableContext (name: string) =
+                        let source = OperationCancellation.Source()
+                        armCancel <- Some source
+                        OperationContext.create name source.Cancellation ignore
+
+                    // Refresh.
+                    do! advanceTarget root barePath [ "refresh-cancel.txt", "content\n" ]
+                    let! refreshResult = Async.StartAsPromise((syncService session).Refresh(cancelableContext "c-refresh"))
+                    expectCanceled "canceled refresh" refreshResult
+
+                    // Update: the target change never reaches the workspace.
+                    let! updateStatus = sessionStatus session
+
+                    let! updateResult =
+                        Async.StartAsPromise(
+                            (syncService session).Update
+                                { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
+                                (cancelableContext "c-update")
+                        )
+
+                    expectCanceled "canceled update" updateResult
+                    let! updateFile = tryReadUtf8FileAsync (join [| workPath; "refresh-cancel.txt" |])
+                    Vitest.expect(updateFile).toEqual (None)
+
+                    // Publish: the bare target head never moves.
+                    do! writeUtf8FileAsync (join [| workPath; "publish-cancel.txt" |]) "content\n"
+                    let! saveStatus = sessionStatus session
+
+                    let! saveResult =
+                        Async.StartAsPromise(
+                            session.Core.CreateRevision
+                                {
+                                    Message = "revision awaiting canceled publish"
+                                    Paths = [| mkPath "publish-cancel.txt" |]
+                                    ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+                                }
+                                (ctx "c-save")
+                        )
+
+                    expectValue "revision before canceled publish" saveResult |> ignore
+
+                    let! bareHeadBefore = runGitIn barePath [| "rev-parse"; "main" |]
+                    let! publishStatus = sessionStatus session
+
+                    let! publishResult =
+                        Async.StartAsPromise(
+                            (syncService session).Publish
+                                {
+                                    ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                    ExpectedTargetRevision = None
+                                }
+                                (cancelableContext "c-publish")
+                        )
+
+                    expectCanceled "canceled publish" publishResult
+                    let! bareHeadAfter = runGitIn barePath [| "rev-parse"; "main" |]
+                    Vitest.expect(bareHeadAfter.Trim()).toBe (bareHeadBefore.Trim())
+
+                    // Clone: cancellation before the transfer leaves no target directory.
+                    let cloneSource = OperationCancellation.Source()
+                    cloneSource.Cancel()
+                    let clonePath = join [| root; "canceled-clone" |]
+                    let factory = GitWorkspaceSession.createFactory hooks
+
+                    let! cloneResult =
+                        Async.StartAsPromise(
+                            factory.Clone
+                                {
+                                    Location = {
+                                        ProviderId = gitProviderId
+                                        DisplayName = None
+                                        ProviderLocation = barePath
+                                        ConnectionProfileId = None
+                                    }
+                                    TargetPath = clonePath
+                                    TargetRef = None
+                                    MaterializeAllObjects = false
+                                }
+                                (OperationContext.create "c-clone" cloneSource.Cancellation ignore)
+                        )
+
+                    expectCanceled "canceled clone" cloneResult
+
+                    let! cloneExists = tryReadUtf8FileAsync (join [| clonePath; "base.txt" |])
+                    Vitest.expect(cloneExists).toEqual (None)
+
+                    // After all cancellations the operations still work: incorporate
+                    // the target's earlier advance, then publish cleanly.
+                    let! retryUpdateStatus = sessionStatus session
+
+                    let! retryUpdate =
+                        Async.StartAsPromise(
+                            (syncService session).Update
+                                { ExpectedWorkspaceVersion = retryUpdateStatus.WorkspaceVersion }
+                                (ctx "retry-update")
+                        )
+
+                    expectValue "update after cancellations" retryUpdate |> ignore
+
+                    let! retryStatus = sessionStatus session
+
+                    let! retryPublish =
+                        Async.StartAsPromise(
+                            (syncService session).Publish
+                                {
+                                    ExpectedWorkspaceVersion = retryStatus.WorkspaceVersion
+                                    ExpectedTargetRevision = None
+                                }
+                                (ctx "retry-publish")
+                        )
+
+                    expectValue "publish after cancellations" retryPublish |> ignore
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
             "v2 preview includes dirty workspace and requires Git 2.38",
             TestOptions(timeout = 120000),
             fun () -> promise {
