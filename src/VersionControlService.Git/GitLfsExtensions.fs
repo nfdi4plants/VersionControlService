@@ -36,25 +36,37 @@ let private wrapUnit (operation: JS.Promise<GitService.GitResult<unit>>) : Async
 let createObjectMaterialization (repoPath: string) : ObjectMaterializationService = {
     ListObjects =
         fun _ -> async {
-            // v1 behavior (recorded GIT-014): listing errors currently surface as
-            // an empty successful list; the listing-failures cycle preserves them.
-            let! filesByPath = Async.AwaitPromise(GitLfsService.tryGetLsFilesByRelativePath repoPath)
+            // Operational failures stay classified failures — never an empty
+            // successful list that hides them (GIT-014).
+            let! listingResult = Async.AwaitPromise(GitLfsService.readLsFilesByRelativePath repoPath)
 
-            let objects =
-                filesByPath.Values
-                |> Seq.choose (fun file ->
-                    match RepositoryPath.tryCreate file.name with
-                    | Ok path ->
-                        Some {
-                            Path = path
-                            IsMaterialized = file.downloaded
-                            SizeBytes = Some file.size
-                            ObjectId = Some file.oid
-                        }
-                    | Error _ -> None)
-                |> Seq.toArray
+            match listingResult with
+            | Error message ->
+                let category = categoryOfKind (GitService.classifyFailureKind message)
 
-            return OperationResult.succeeded objects
+                return
+                    Failed(
+                        OperationFailure.createRedacted
+                            category
+                            "lfs_listing_failed"
+                            $"Listing large objects failed: {message}"
+                    )
+            | Ok filesByPath ->
+                let objects =
+                    filesByPath.Values
+                    |> Seq.choose (fun file ->
+                        match RepositoryPath.tryCreate file.name with
+                        | Ok path ->
+                            Some {
+                                Path = path
+                                IsMaterialized = file.downloaded
+                                SizeBytes = Some file.size
+                                ObjectId = Some file.oid
+                            }
+                        | Error _ -> None)
+                    |> Seq.toArray
+
+                return OperationResult.succeeded objects
         }
     Materialize = fun path _ -> wrapUnit (GitService.downloadLfsFile repoPath (RepositoryPath.value path))
     Dematerialize = fun path _ -> wrapUnit (GitService.freeLocalLfsCopy repoPath (RepositoryPath.value path))

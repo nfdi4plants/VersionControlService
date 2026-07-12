@@ -1883,8 +1883,10 @@ let createFactoryWithCredentials
                     request.Location.ProviderLocation
                     request.Location.ConnectionProfileId
 
+            // Large objects stay as pointers during the Git transfer; hydration is a
+            // separate step so its failure can be reported as partial success.
             let! result =
-                runGit
+                runGitEnv
                     hooks
                     "."
                     [|
@@ -1894,6 +1896,7 @@ let createFactoryWithCredentials
                         request.TargetPath
                     |]
                     None
+                    [| "GIT_LFS_SKIP_SMUDGE", "1" |]
                     context
 
             match result with
@@ -1914,7 +1917,51 @@ let createFactoryWithCredentials
                         Failed(
                             OperationFailure.createRedacted ProviderError "clone_failed" $"Clone failed: {combined}"
                         )
-            | Ok _ -> return OperationResult.succeeded (bindingFor request.TargetPath request.Location)
+            | Ok _ ->
+                let binding = bindingFor request.TargetPath request.Location
+
+                if not request.MaterializeAllObjects then
+                    return OperationResult.succeeded binding
+                else
+                    // Git transfer succeeded; object hydration failing afterwards is
+                    // partial success with a retry action, never an overall error
+                    // that hides the changed workspace.
+                    let! hydration =
+                        runGit
+                            hooks
+                            request.TargetPath
+                            [| yield! authArguments; "lfs"; "pull" |]
+                            None
+                            context
+
+                    match hydration with
+                    | Ok hydrationOutput when hydrationOutput.ExitCode = 0 ->
+                        return OperationResult.succeeded binding
+                    | Ok hydrationOutput ->
+                        return
+                            OperationResult.partiallySucceeded
+                                (OperationOutcome.performed binding)
+                                (OperationFailure.createRedacted
+                                    DependencyMissing
+                                    "hydration_failed"
+                                    $"Large-object hydration failed after a successful clone: {hydrationOutput.StdErr}")
+                                {
+                                    Code = "retry_materialization"
+                                    Instructions =
+                                        Some
+                                            "Retry downloading large objects once the object store is reachable."
+                                }
+                    | Error hydrationFailure ->
+                        return
+                            OperationResult.partiallySucceeded
+                                (OperationOutcome.performed binding)
+                                hydrationFailure
+                                {
+                                    Code = "retry_materialization"
+                                    Instructions =
+                                        Some
+                                            "Retry downloading large objects once the object store is reachable."
+                                }
         }
     Bind =
         fun request context -> async {

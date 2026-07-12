@@ -19,6 +19,7 @@
     <Compile Include="GitProvider.test.fs" />
     <Compile Include="GitSynchronization.test.fs" />
     <Compile Include="GitCredentials.test.fs" />
+    <Compile Include="GitPartialSuccess.test.fs" />
     <Compile Include="ProviderResolver.test.fs" />
     <Compile Include="NodeRuntime.test.fs" />
     <Compile Include="ConformanceSuiteDiscovery.test.fs" />

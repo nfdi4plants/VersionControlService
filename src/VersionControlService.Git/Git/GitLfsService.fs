@@ -213,7 +213,7 @@ let private extractLsFilesFailureMessage (result: GitSpawnResult) =
 
     redactToken message
 
-let private readLsFilesByRelativePath
+let readLsFilesByRelativePath
     (repoRoot: string)
     : JS.Promise<Result<Dictionary<string, GitLfsLsFileInfo>, string>> =
     promise {
