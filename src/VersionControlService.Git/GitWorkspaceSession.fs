@@ -1018,12 +1018,37 @@ let private previewUpdate (state: SessionState) (context: OperationContext) =
                     changed
                     |> Array.filter (fun path -> dirtyPaths.Contains(RepositoryPath.value path))
 
+                // Committed-side conflicts between diverged histories via
+                // `merge-tree --write-tree` (Git 2.38+): exit code 1 = conflicts.
+                let! committedConflicts =
+                    match syncState.Relationship, syncState.TargetRevision with
+                    | Diverged, Some target ->
+                        async {
+                            let! mergeTree =
+                                runGit
+                                    state.Hooks
+                                    state.RepoPath
+                                    [|
+                                        "merge-tree"
+                                        "--write-tree"
+                                        "HEAD"
+                                        RevisionId.value target
+                                    |]
+                                    None
+                                    context
+
+                            match mergeTree with
+                            | Ok output -> return output.ExitCode <> 0
+                            | Error _ -> return false
+                        }
+                    | _ -> async { return false }
+
                 return
                     OperationResult.succeeded {
                         ChangedPaths = changed
                         OverlappingPaths = overlapping
                         HasDataLossRisk = overlapping.Length > 0
-                        WouldCreateConflictSession = overlapping.Length > 0
+                        WouldCreateConflictSession = overlapping.Length > 0 || committedConflicts
                     }
     }
 
@@ -1435,14 +1460,32 @@ let createFactory (hooks: GitSessionHooks) : ProviderFactory = {
 
             match gitVersion with
             | Ok output when output.ExitCode = 0 ->
+                let versionText = output.StdOut.Trim()
+
+                // Synchronization preview uses `merge-tree --write-tree`,
+                // documented from Git 2.38 — older versions are incompatible.
+                let versionMatch =
+                    System.Text.RegularExpressions.Regex.Match(versionText, @"(\d+)\.(\d+)")
+
+                let compatible =
+                    versionMatch.Success
+                    && (let major = int versionMatch.Groups[1].Value
+                        let minor = int versionMatch.Groups[2].Value
+                        major > 2 || (major = 2 && minor >= 38))
+
                 return
                     OperationResult.succeeded [|
                         {
                             Component = "git"
                             Installed = true
-                            Version = Some(output.StdOut.Trim())
-                            Compatible = true
-                            Remediation = None
+                            Version = Some versionText
+                            Compatible = compatible
+                            Remediation =
+                                if compatible then
+                                    None
+                                else
+                                    Some
+                                        "Install Git 2.38 or newer: synchronization preview requires `git merge-tree --write-tree`."
                         }
                     |]
             | _ ->

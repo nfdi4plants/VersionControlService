@@ -273,7 +273,19 @@ let createGitHarness () : ProviderTestHarness =
                 tempRoots.Add root
                 let linkedPath = join [| root; "linked" |]
                 let barePath = anchor.Binding.Location.ProviderLocation
-                let! _ = runGitIn root [||] [| "clone"; barePath; linkedPath |] None
+
+                let! _ =
+                    runGitIn
+                        root
+                        [||]
+                        [|
+                            "clone"
+                            "-c"
+                            "core.autocrlf=false"
+                            barePath
+                            linkedPath
+                        |]
+                        None
                 do! configureUser linkedPath
 
                 let location = {

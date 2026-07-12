@@ -17,6 +17,7 @@
     <Compile Include="Contracts\SwateSelectableSuite.fs" />
     <Compile Include="GitProviderContract.test.fs" />
     <Compile Include="GitProvider.test.fs" />
+    <Compile Include="GitSynchronization.test.fs" />
     <Compile Include="ProviderResolver.test.fs" />
     <Compile Include="NodeRuntime.test.fs" />
     <Compile Include="ConformanceSuiteDiscovery.test.fs" />
