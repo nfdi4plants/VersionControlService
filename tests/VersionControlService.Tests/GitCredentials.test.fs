@@ -280,4 +280,88 @@ Vitest.describe (
                     return raise error
             }
         )
+
+        Vitest.test (
+            "v2 publish never creates a remote repository",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root = createTempDirectoryAsync ()
+
+                // A provisioning spy that must never be invoked by core publish.
+                let mutable provisioningCalls = 0
+
+                VersionControlService.Git.GitTokenProvider.RemoteProvisioning.setProvider {
+                    CreateProject =
+                        fun _ -> promise {
+                            provisioningCalls <- provisioningCalls + 1
+                            return Error "provisioning must not run"
+                        }
+                }
+
+                try
+                    try
+                        let workPath = join [| root; "work" |]
+                        let! _ = runGitIn root [| "init"; "-b"; "main"; workPath |]
+                        let! _ = runGitIn workPath [| "config"; "user.name"; "VCS Cred Tests" |]
+                        let! _ = runGitIn workPath [| "config"; "user.email"; "cred@example.org" |]
+                        do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) "base\n"
+                        let! _ = runGitIn workPath [| "add"; "-A" |]
+                        let! _ = runGitIn workPath [| "commit"; "-m"; "init: base" |]
+
+                        // The configured target does not exist.
+                        let missingRemote = join [| root; "missing-remote.git" |]
+                        let! _ = runGitIn workPath [| "remote"; "add"; "origin"; missingRemote |]
+
+                        let binding: WorkspaceBinding = {
+                            SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
+                            ProviderId = gitProviderId
+                            WorkspaceRoot = workPath
+                            ProviderStateRef = None
+                            Location = {
+                                ProviderId = gitProviderId
+                                DisplayName = None
+                                ProviderLocation = missingRemote
+                                ConnectionProfileId = None
+                            }
+                            ConnectionProfileId = None
+                        }
+
+                        let session =
+                            GitWorkspaceSession.createSession GitWorkspaceSession.GitSessionHooks.none binding
+
+                        let syncService =
+                            match session.Synchronization with
+                            | Some service -> service
+                            | None -> failwith "Expected the synchronization service."
+
+                        let! statusResult = Async.StartAsPromise(session.Core.GetStatus(ctx "prov-status"))
+                        let status = expectValue "status" statusResult
+
+                        let! publishResult =
+                            Async.StartAsPromise(
+                                syncService.Publish
+                                    {
+                                        ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                        ExpectedTargetRevision = None
+                                    }
+                                    (ctx "prov-publish")
+                            )
+
+                        // Publish fails structurally — and never provisions a project.
+                        match publishResult with
+                        | Failed failure -> Vitest.expect(failure.Retryable).toBe (true)
+                        | Succeeded _
+                        | PartiallySucceeded _ -> failwith "Expected publish to a missing remote to fail."
+
+                        Vitest.expect(provisioningCalls).toBe (0)
+
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+                finally
+                    VersionControlService.Git.GitTokenProvider.RemoteProvisioning.setProvider
+                        VersionControlService.Git.GitTokenProvider.RemoteProvisioning.defaultProvider
+            }
+        )
 )
