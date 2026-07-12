@@ -21,6 +21,7 @@
     <Compile Include="Git\GitProvisioningService.fs" />
     <Compile Include="Git\GitProvider.fs" />
     <Compile Include="GitPathTransport.fs" />
+    <Compile Include="GitCredentialStrategy.fs" />
     <Compile Include="GitRefs.fs" />
     <Compile Include="GitConflictSession.fs" />
     <Compile Include="GitSelectedRevision.fs" />

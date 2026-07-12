@@ -12,6 +12,7 @@ open VersionControlService.Contracts.Git
 module GitService = VersionControlService.Git.GitService
 module GitRefs = VersionControlService.Git.GitRefs
 module GitConflictSession = VersionControlService.Git.GitConflictSession
+module GitCredentialStrategy = VersionControlService.Git.GitCredentialStrategy
 module GitProvisioningService = VersionControlService.Git.GitProvisioningService
 module NodeProcess = VersionControlService.Runtime.Node.Process
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
@@ -179,11 +180,24 @@ type private SessionState = {
     RepoPath: string
     Hooks: GitSessionHooks
     Lock: MutationLock
+    /// The bound repository location and its connection profile.
+    Location: RepositoryLocation
+    ConnectionProfileId: string option
+    /// Injected credential resolution; never global state.
+    Credentials: GitCredentialStrategy.GitCredentialStrategy
     /// Active conflict-session identity and rotating handle version.
     mutable ConflictSession: (string * int) option
     /// Monotonic counter so re-opened merges never reuse a closed session ID.
     mutable ConflictGeneration: int
 }
+
+/// Scoped credential `-c` arguments for this session's remote host, resolved
+/// through the injected strategy (empty for anonymous/SSH/local flows).
+let private credentialArguments (state: SessionState) : Async<string[]> =
+    GitCredentialStrategy.resolveAuthArguments
+        state.Credentials
+        state.Location.ProviderLocation
+        state.ConnectionProfileId
 
 // ---------------------------------------------------------------------------
 // Status and workspace version
@@ -1099,7 +1113,10 @@ let private refresh (state: SessionState) (context: OperationContext) =
         if originExists then
             do! barrier state.Hooks state.RepoPath "transfer-start" context
 
-            let! fetchResult = runGitChecked state.Hooks state.RepoPath [| "fetch"; "origin" |] None context
+            let! authArguments = credentialArguments state
+
+            let! fetchResult =
+                runGitChecked state.Hooks state.RepoPath [| yield! authArguments; "fetch"; "origin" |] None context
 
             match fetchResult with
             | Error failure -> return Failed { failure with Retryable = true }
@@ -1277,8 +1294,15 @@ let private publish (state: SessionState) (request: PublishRequest) (context: Op
                     do! barrier state.Hooks state.RepoPath "publish-precheck-done" context
                     do! barrier state.Hooks state.RepoPath "transfer-start" context
 
+                    let! authArguments = credentialArguments state
+
                     let! pushResult =
-                        runGit state.Hooks state.RepoPath [| "push"; "origin"; branch |] None context
+                        runGit
+                            state.Hooks
+                            state.RepoPath
+                            [| yield! authArguments; "push"; "origin"; branch |]
+                            None
+                            context
 
                     match pushResult with
                     | Error failure -> return Failed failure
@@ -1678,11 +1702,18 @@ let private createBrowser (state: SessionState) : RepositoryBrowserService = {
 // Session and factory
 // ---------------------------------------------------------------------------
 
-let createSession (hooks: GitSessionHooks) (binding: WorkspaceBinding) : WorkspaceSession =
+let createSessionWithCredentials
+    (hooks: GitSessionHooks)
+    (credentials: GitCredentialStrategy.GitCredentialStrategy)
+    (binding: WorkspaceBinding)
+    : WorkspaceSession =
     let state = {
         RepoPath = binding.WorkspaceRoot
         Hooks = hooks
         Lock = MutationLock()
+        Location = binding.Location
+        ConnectionProfileId = binding.ConnectionProfileId
+        Credentials = credentials
         ConflictSession = None
         ConflictGeneration = 0
     }
@@ -1736,6 +1767,10 @@ let createSession (hooks: GitSessionHooks) (binding: WorkspaceBinding) : Workspa
             RepositoryBrowser = Some(createBrowser state)
     }
 
+/// Session with the anonymous credential strategy.
+let createSession (hooks: GitSessionHooks) (binding: WorkspaceBinding) : WorkspaceSession =
+    createSessionWithCredentials hooks GitCredentialStrategy.anonymous binding
+
 let private probe (workspacePath: string) : Async<ProbeResult> =
     async {
         try
@@ -1765,15 +1800,32 @@ let private localLocation (providerLocation: string) : RepositoryLocation = {
     ConnectionProfileId = None
 }
 
-let createFactory (hooks: GitSessionHooks) : ProviderFactory = {
+let createFactoryWithCredentials
+    (hooks: GitSessionHooks)
+    (credentials: GitCredentialStrategy.GitCredentialStrategy)
+    : ProviderFactory =
+    {
     Id = gitProviderId
     Probe = probe
     VerifyLocation =
         fun request context -> async {
-            // Shell: reachability only; per-intent verification arrives with the
-            // credential/provisioning task.
+            let! authArguments =
+                GitCredentialStrategy.resolveAuthArguments
+                    credentials
+                    request.Location.ProviderLocation
+                    request.Location.ConnectionProfileId
+
             let! result =
-                runGit hooks "." [| "ls-remote"; request.Location.ProviderLocation |] None context
+                runGit
+                    hooks
+                    "."
+                    [|
+                        yield! authArguments
+                        "ls-remote"
+                        request.Location.ProviderLocation
+                    |]
+                    None
+                    context
 
             match result with
             | Ok output when output.ExitCode = 0 ->
@@ -1784,10 +1836,21 @@ let createFactory (hooks: GitSessionHooks) : ProviderFactory = {
                         DeniedIntents = [||]
                     }
             | Ok output ->
+                // Classify the failure so consumers can recover: authentication
+                // and authorization problems keep their categories instead of
+                // collapsing into a generic network error.
+                let category =
+                    match GitService.classifyFailureKind output.StdErr with
+                    | GitFailureKind.Unauthorized -> Authentication
+                    | GitFailureKind.Forbidden -> Authorization
+                    | GitFailureKind.Network -> Network
+                    | GitFailureKind.Timeout -> Timeout
+                    | _ -> NotFound
+
                 return
                     Failed(
                         OperationFailure.createRedacted
-                            Network
+                            category
                             "location_unreachable"
                             $"The repository location is not reachable: {output.StdErr}"
                     )
@@ -1807,11 +1870,18 @@ let createFactory (hooks: GitSessionHooks) : ProviderFactory = {
         }
     Clone =
         fun request context -> async {
+            let! authArguments =
+                GitCredentialStrategy.resolveAuthArguments
+                    credentials
+                    request.Location.ProviderLocation
+                    request.Location.ConnectionProfileId
+
             let! result =
                 runGit
                     hooks
                     "."
                     [|
+                        yield! authArguments
                         "clone"
                         request.Location.ProviderLocation
                         request.TargetPath
@@ -1877,7 +1947,10 @@ let createFactory (hooks: GitSessionHooks) : ProviderFactory = {
                 let! _ = runGit hooks request.WorkspaceRoot [| "fetch"; "origin" |] None context
                 return OperationResult.succeeded (bindingFor request.WorkspaceRoot request.Location)
         }
-    Open = fun binding _ -> async { return OperationResult.succeeded (createSession hooks binding) }
+    Open =
+        fun binding _ -> async {
+            return OperationResult.succeeded (createSessionWithCredentials hooks credentials binding)
+        }
     CheckDependencies =
         fun context -> async {
             let! gitVersion = runGit hooks "." [| "--version" |] None context
@@ -1924,4 +1997,8 @@ let createFactory (hooks: GitSessionHooks) : ProviderFactory = {
                         }
                     |]
         }
-}
+    }
+
+/// Factory with the anonymous credential strategy.
+let createFactory (hooks: GitSessionHooks) : ProviderFactory =
+    createFactoryWithCredentials hooks GitCredentialStrategy.anonymous

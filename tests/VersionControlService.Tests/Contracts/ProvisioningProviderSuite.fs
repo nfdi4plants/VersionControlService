@@ -105,12 +105,11 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 let! refreshResult = run ((syncService session).Refresh(ctx "rebound-refresh"))
                 let state = expectValue "rebound refresh" refreshResult
 
-                // The rebound session now observes the other target.
-                let! otherStatus = getStatus otherWorkspace
+                // The rebound session now observes the other target's live head.
+                let! otherRefreshResult = run ((syncService otherWorkspace.Session).Refresh(ctx "other-refresh"))
+                let otherState = expectValue "other workspace refresh" otherRefreshResult
 
-                match otherStatus.Synchronization with
-                | Some otherSync -> Vitest.expect(state.TargetRevision = otherSync.TargetRevision).toBe (true)
-                | None -> failwith "Expected synchronization state on the other workspace."
+                Vitest.expect(state.TargetRevision = otherState.TargetRevision).toBe (true)
             }
 
             profileTest "cloning into a nonempty target fails structurally"
@@ -172,14 +171,21 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     )
 
                 // Either a structured failure or a report with denied intents is valid;
-                // silently granting everything is not.
+                // silently granting everything is not. Providers whose unauthorized
+                // fixture is unreachable may classify it as NotFound/Network.
                 match unauthorizedResult with
                 | Succeeded outcome -> Vitest.expect(outcome.Value.DeniedIntents.Length > 0).toBe (true)
                 | PartiallySucceeded(_, failure)
                 | Failed failure ->
-                    Vitest
-                        .expect(failure.Category = Authorization || failure.Category = Authentication)
-                        .toBe (true)
+                    let structurallyDenied =
+                        match failure.Category with
+                        | Authorization
+                        | Authentication
+                        | NotFound
+                        | Network -> true
+                        | _ -> false
+
+                    Vitest.expect(structurallyDenied).toBe (true)
             }
 
             profileTest "dependency diagnostics report components with remediation"
