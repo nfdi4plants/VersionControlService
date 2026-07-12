@@ -12,6 +12,9 @@ open Vitest
 module GitProvider = VersionControlService.Git.GitProvider
 module ProviderRegistry = VersionControlService.VersionControlProviderRegistry
 module GitTokenProvider = VersionControlService.Git.GitTokenProvider
+module GitWorkspaceSession = VersionControlService.Git.GitWorkspaceSession
+
+open VersionControlService.Abstractions
 
 let private fsPromisesDynamic: obj = importAll "fs/promises"
 let private osDynamic: obj = importAll "os"
@@ -1018,6 +1021,271 @@ Vitest.describe (
                                 | Error failure ->
                                     failwith $"verify remote access failed ({failure.Kind}): {failure.Message}"
                             })
+                    })
+            }
+        )
+)
+
+// ---------------------------------------------------------------------------
+// v2 session ports of the Task 1 regression record. The v1 originals above stay
+// unchanged as the frozen defect record.
+// ---------------------------------------------------------------------------
+
+let private v2Factory =
+    GitWorkspaceSession.createFactory GitWorkspaceSession.GitSessionHooks.none
+
+let private v2Context (name: string) = OperationContext.detached name
+
+let private expectV2Value (operationName: string) (result: OperationResult<'T>) : 'T =
+    match result with
+    | Succeeded outcome -> outcome.Value
+    | PartiallySucceeded(_, failure) ->
+        failwith $"{operationName} unexpectedly returned partial success ({failure.Code})."
+    | Failed failure -> failwith $"{operationName} failed ({failure.Category}/{failure.Code}): {failure.Message}"
+
+let private expectV2Failure (operationName: string) (result: OperationResult<'T>) : OperationFailure =
+    match result with
+    | Failed failure -> failure
+    | Succeeded _
+    | PartiallySucceeded _ -> failwith $"Expected {operationName} to fail."
+
+let private v2RepositoryPath (value: string) =
+    match RepositoryPath.tryCreate value with
+    | Ok path -> path
+    | Error message -> failwith message
+
+let private v2ProviderRef (value: string) =
+    match ProviderRef.tryCreate value with
+    | Ok reference -> reference
+    | Error message -> failwith message
+
+let private v2Status (session: WorkspaceSession) : JS.Promise<WorkspaceStatus> = promise {
+    let! result = Async.StartAsPromise(session.Core.GetStatus(v2Context "v2-status"))
+    return expectV2Value "v2 status" result
+}
+
+let private withV2GitWorkspace (testBody: WorkspaceSession -> string -> ISimpleGit -> JS.Promise<unit>) = promise {
+    let! rootPath = createTempDirectoryAsync ()
+
+    try
+        let repoPath = join [| rootPath; "repo" |]
+
+        let! initResult =
+            Async.StartAsPromise(
+                v2Factory.Initialize
+                    {
+                        TargetPath = repoPath
+                        Location = None
+                    }
+                    (v2Context "v2-init")
+            )
+
+        let binding = expectV2Value "v2 initialize" initResult
+        let git = createSimpleGit binding.WorkspaceRoot
+
+        let! _ = git.raw [| "config"; "user.name"; "VersionControlService Tests" |]
+        let! _ = git.raw [| "config"; "user.email"; "provider-tests@example.org" |]
+        let! _ = git.raw [| "config"; "core.autocrlf"; "false" |]
+
+        let! openResult = Async.StartAsPromise(v2Factory.Open binding (v2Context "v2-open"))
+        let session = expectV2Value "v2 open" openResult
+
+        do! testBody session binding.WorkspaceRoot git
+        do! removeDirectoryAsync rootPath
+    with error ->
+        do! removeDirectoryAsync rootPath
+        return raise error
+}
+
+Vitest.describe (
+    "GitWorkspaceSession v2 regression ports",
+    fun () ->
+        Vitest.test (
+            "v2 commits literal selected paths",
+            providerIntegrationTestOptions,
+            fun () -> promise {
+                do!
+                    withV2GitWorkspace (fun session repoPath git -> promise {
+                        do! writeUtf8FileAsync (join [| repoPath; "a[1].txt" |]) "bracket-base\n"
+                        do! writeUtf8FileAsync (join [| repoPath; "a1.txt" |]) "plain-base\n"
+                        let! _ = git.raw [| "add"; "-A" |]
+                        let! _ = git.raw [| "commit"; "-m"; "test: literal base" |]
+
+                        do! writeUtf8FileAsync (join [| repoPath; "a[1].txt" |]) "bracket-changed\n"
+                        do! writeUtf8FileAsync (join [| repoPath; "a1.txt" |]) "plain-changed\n"
+
+                        let! status = v2Status session
+
+                        let! revisionResult =
+                            Async.StartAsPromise(
+                                session.Core.CreateRevision
+                                    {
+                                        Message = "test: select bracket file only"
+                                        Paths = [| v2RepositoryPath "a[1].txt" |]
+                                        ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                    }
+                                    (v2Context "v2-literal")
+                            )
+
+                        expectV2Value "v2 literal selected revision" revisionResult |> ignore
+
+                        let! changedFiles = git.raw [| "diff-tree"; "--no-commit-id"; "--name-only"; "-r"; "HEAD" |]
+
+                        let committedPaths =
+                            changedFiles.Replace("\r\n", "\n").Split('\n')
+                            |> Array.map _.Trim()
+                            |> Array.filter (fun line -> line <> "")
+
+                        Vitest.expect(committedPaths).toEqual ([| "a[1].txt" |])
+
+                        let! plainStatus = git.raw [| "status"; "--porcelain=v1"; "--"; "a1.txt" |]
+                        Vitest.expect(plainStatus.TrimEnd()).toBe (" M a1.txt")
+
+                        // Wildcard characters are literal file names, never pathspecs.
+                        let! headBefore = git.raw [| "rev-parse"; "HEAD" |]
+                        let! freshStatus = v2Status session
+
+                        let! wildcardResult =
+                            Async.StartAsPromise(
+                                session.Core.CreateRevision
+                                    {
+                                        Message = "test: wildcard is not a pathspec"
+                                        Paths = [| v2RepositoryPath "*.txt" |]
+                                        ExpectedWorkspaceVersion = freshStatus.WorkspaceVersion
+                                    }
+                                    (v2Context "v2-wildcard")
+                            )
+
+                        expectV2Failure "v2 wildcard selected revision" wildcardResult |> ignore
+
+                        let! headAfter = git.raw [| "rev-parse"; "HEAD" |]
+                        Vitest.expect(headAfter.Trim()).toBe (headBefore.Trim())
+                    })
+            }
+        )
+
+        Vitest.test (
+            "v2 failed selected revision preserves unrelated staged state",
+            providerIntegrationTestOptions,
+            fun () -> promise {
+                do!
+                    withV2GitWorkspace (fun session repoPath git -> promise {
+                        do! writeUtf8FileAsync (join [| repoPath; "b.txt" |]) "b-base\n"
+                        let! _ = git.raw [| "add"; "-A" |]
+                        let! _ = git.raw [| "commit"; "-m"; "test: base" |]
+
+                        do! writeUtf8FileAsync (join [| repoPath; "b.txt" |]) "b-staged\n"
+                        let! _ = git.raw [| "add"; "b.txt" |]
+
+                        let! headBefore = git.raw [| "rev-parse"; "HEAD" |]
+                        let! status = v2Status session
+
+                        let! revisionResult =
+                            Async.StartAsPromise(
+                                session.Core.CreateRevision
+                                    {
+                                        Message = "test: missing selected path must fail"
+                                        Paths = [| v2RepositoryPath "missing.txt" |]
+                                        ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                    }
+                                    (v2Context "v2-failed-revision")
+                            )
+
+                        expectV2Failure "v2 selected revision with missing path" revisionResult |> ignore
+
+                        // Unrelated staged state must be preserved by the failed operation.
+                        let! bStatus = git.raw [| "status"; "--porcelain=v1"; "--"; "b.txt" |]
+                        Vitest.expect(bStatus.TrimEnd()).toBe ("M  b.txt")
+
+                        let! headAfter = git.raw [| "rev-parse"; "HEAD" |]
+                        Vitest.expect(headAfter.Trim()).toBe (headBefore.Trim())
+
+                        let! workingContent = readUtf8FileAsync (join [| repoPath; "b.txt" |])
+                        Vitest.expect(workingContent).toBe ("b-staged\n")
+                    })
+            }
+        )
+
+        Vitest.test (
+            "v2 validates refs and preserves exact upstream",
+            providerIntegrationTestOptions,
+            fun () -> promise {
+                do!
+                    withV2GitWorkspace (fun session repoPath git -> promise {
+                        let rootPath = dirname repoPath
+                        let filePath = join [| repoPath; "shared.txt" |]
+
+                        do! writeUtf8FileAsync filePath "base\n"
+                        let! _ = git.raw [| "add"; "-A" |]
+                        let! _ = git.raw [| "commit"; "-m"; "test: base" |]
+                        let! currentBranch = git.raw [| "branch"; "--show-current" |]
+                        let baseBranch = currentBranch.Trim()
+
+                        let originPath = join [| rootPath; "origin.git" |]
+                        let upstreamPath = join [| rootPath; "upstream.git" |]
+                        let! _ = git.raw [| "init"; "--bare"; $"--initial-branch={baseBranch}"; originPath |]
+                        let! _ = git.raw [| "init"; "--bare"; $"--initial-branch={baseBranch}"; upstreamPath |]
+                        let! _ = git.raw [| "remote"; "add"; "origin"; originPath |]
+                        let! _ = git.raw [| "remote"; "add"; "upstream"; upstreamPath |]
+                        let! _ = git.raw [| "push"; "origin"; baseBranch |]
+                        let! _ = git.raw [| "push"; "upstream"; baseBranch |]
+
+                        let! _ = git.raw [| "checkout"; "-b"; "feature" |]
+                        do! writeUtf8FileAsync filePath "origin version\n"
+                        let! _ = git.raw [| "add"; "shared.txt" |]
+                        let! _ = git.raw [| "commit"; "-m"; "test: origin feature" |]
+                        let! _ = git.raw [| "push"; "origin"; "feature" |]
+
+                        do! writeUtf8FileAsync filePath "upstream version\n"
+                        let! _ = git.raw [| "add"; "shared.txt" |]
+                        let! _ = git.raw [| "commit"; "-m"; "test: upstream feature" |]
+                        let! _ = git.raw [| "push"; "upstream"; "feature" |]
+
+                        let! _ = git.raw [| "fetch"; "origin" |]
+                        let! _ = git.raw [| "fetch"; "upstream" |]
+                        let! upstreamTip = git.raw [| "rev-parse"; "refs/remotes/upstream/feature" |]
+
+                        let! _ = git.raw [| "checkout"; baseBranch |]
+                        let! _ = git.raw [| "branch"; "-D"; "feature" |]
+
+                        let! status = v2Status session
+
+                        let! switchResult =
+                            Async.StartAsPromise(
+                                session.Core.SwitchRef
+                                    {
+                                        TargetRef = v2ProviderRef "git-remote:upstream/feature"
+                                        ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                    }
+                                    (v2Context "v2-switch-upstream")
+                            )
+
+                        expectV2Value "v2 switch to upstream feature" switchResult |> ignore
+
+                        let! localTip = git.raw [| "rev-parse"; "feature" |]
+                        Vitest.expect(localTip.Trim()).toBe (upstreamTip.Trim())
+
+                        let! trackedUpstream = git.raw [| "rev-parse"; "--abbrev-ref"; "feature@{upstream}" |]
+                        Vitest.expect(trackedUpstream.Trim()).toBe ("upstream/feature")
+
+                        // Authoritative ref validation: git itself rejects these forms.
+                        for invalidName in [ ".foo"; "foo/.bar"; "foo//bar" ] do
+                            let! freshStatus = v2Status session
+
+                            let! createResult =
+                                Async.StartAsPromise(
+                                    session.Core.CreateRef
+                                        {
+                                            Name = invalidName
+                                            BaseRef = None
+                                            SwitchTo = false
+                                            ExpectedWorkspaceVersion = freshStatus.WorkspaceVersion
+                                        }
+                                        (v2Context "v2-invalid-ref")
+                                )
+
+                            let failure = expectV2Failure $"v2 create ref '{invalidName}'" createResult
+                            Vitest.expect(failure.Category).toEqual (Validation)
                     })
             }
         )

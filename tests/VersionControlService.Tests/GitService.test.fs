@@ -12,6 +12,7 @@ open VersionControlService.Tests.NodePath
 open Vitest
 
 module GitService = VersionControlService.Git.GitService
+module GitWorkspaceSession = VersionControlService.Git.GitWorkspaceSession
 module GitProvisioningService = VersionControlService.Git.GitProvisioningService
 module GitAuthAdapter = VersionControlService.Git.GitAuthAdapter
 module GitLfsAdapter = VersionControlService.Git.GitLfsAdapter
@@ -872,6 +873,155 @@ Vitest.describe (
                                 (expectOk "diff summary with mixed changes")
 
                         Vitest.expect(mixedSummary.Changed).toBe (2)
+                    })
+            }
+        )
+
+        Vitest.test (
+            "v2 linked worktree resolves Git state paths",
+            gitServiceIntegrationTestOptions,
+            fun () -> promise {
+                do!
+                    withTempRepository (fun context -> promise {
+                        let filePath = join [| context.RepoPath; "conflict.txt" |]
+
+                        do! writeUtf8FileAsync filePath "base\n"
+                        let! _ = context.Git.raw [| "add"; "-A" |]
+                        let! _ = context.Git.raw [| "commit"; "-m"; "test: base" |]
+                        let! currentBranch = context.Git.raw [| "branch"; "--show-current" |]
+                        let baseBranch = currentBranch.Trim()
+
+                        let! _ = context.Git.raw [| "checkout"; "-b"; "feature" |]
+                        do! writeUtf8FileAsync filePath "feature\n"
+                        let! _ = context.Git.raw [| "add"; "conflict.txt" |]
+                        let! _ = context.Git.raw [| "commit"; "-m"; "test: feature change" |]
+                        let! _ = context.Git.raw [| "checkout"; baseBranch |]
+                        do! writeUtf8FileAsync filePath "main\n"
+                        let! _ = context.Git.raw [| "add"; "conflict.txt" |]
+                        let! _ = context.Git.raw [| "commit"; "-m"; "test: main change" |]
+
+                        let worktreePath = join [| context.RootPath; "v2-linked-worktree" |]
+
+                        let! _ =
+                            context.Git.raw [| "worktree"; "add"; "-b"; "v2-worktree-merge"; worktreePath; baseBranch |]
+
+                        let worktreeGit = createSimpleGit worktreePath
+                        do! configureRepositoryAsync worktreeGit
+
+                        let! _ = runSimpleGitResult (fun git -> git.raw [| "merge"; "feature" |]) worktreeGit
+                        let! conflictedStatus = worktreeGit.raw [| "status"; "--porcelain=v1" |]
+
+                        if not (conflictedStatus.Contains "UU conflict.txt") then
+                            failwith $"Expected the merge to stop with a conflict but status was: {conflictedStatus}"
+
+                        // Resolve and stage the last conflict without committing.
+                        do! writeUtf8FileAsync (join [| worktreePath; "conflict.txt" |]) "resolved\n"
+                        let! _ = worktreeGit.raw [| "add"; "conflict.txt" |]
+
+                        // A v2 session over the linked worktree must resolve Git state
+                        // paths through Git and still report the active merge.
+                        let providerId =
+                            match VersionControlService.Abstractions.ProviderId.tryCreate "git" with
+                            | Ok id -> id
+                            | Error message -> failwith message
+
+                        let binding: VersionControlService.Abstractions.WorkspaceBinding = {
+                            SchemaVersion = VersionControlService.Abstractions.WorkspaceBinding.CurrentSchemaVersion
+                            ProviderId = providerId
+                            WorkspaceRoot = worktreePath
+                            ProviderStateRef = None
+                            Location = {
+                                ProviderId = providerId
+                                DisplayName = None
+                                ProviderLocation = worktreePath
+                                ConnectionProfileId = None
+                            }
+                            ConnectionProfileId = None
+                        }
+
+                        let session =
+                            GitWorkspaceSession.createSession GitWorkspaceSession.GitSessionHooks.none binding
+
+                        let! statusResult =
+                            Async.StartAsPromise (
+                                session.Core.GetStatus(
+                                    VersionControlService.Abstractions.OperationContext.detached "v2-worktree-status"
+                                )
+                            )
+
+                        match statusResult with
+                        | VersionControlService.Abstractions.Succeeded outcome ->
+                            Vitest.expect(outcome.Value.ActiveConflictSession.IsSome).toBe (true)
+                        | VersionControlService.Abstractions.PartiallySucceeded _
+                        | VersionControlService.Abstractions.Failed _ ->
+                            failwith "Expected v2 status to succeed in the linked worktree."
+                    })
+            }
+        )
+
+        Vitest.test (
+            "v2 diff summary unions staged and unstaged changes",
+            gitServiceIntegrationTestOptions,
+            fun () -> promise {
+                do!
+                    withTempRepository (fun context -> promise {
+                        let stagedOnlyPath = join [| context.RepoPath; "staged-only.txt" |]
+                        let mixedPath = join [| context.RepoPath; "mixed.txt" |]
+
+                        do! writeUtf8FileAsync stagedOnlyPath "staged base\n"
+                        do! writeUtf8FileAsync mixedPath "mixed base\n"
+                        let! _ = context.Git.raw [| "add"; "-A" |]
+                        let! _ = context.Git.raw [| "commit"; "-m"; "test: base" |]
+
+                        do! writeUtf8FileAsync stagedOnlyPath "staged base\nstaged line\n"
+                        let! _ = context.Git.raw [| "add"; "staged-only.txt" |]
+
+                        do! writeUtf8FileAsync mixedPath "mixed base\nmixed staged line\n"
+                        let! _ = context.Git.raw [| "add"; "mixed.txt" |]
+                        do! writeUtf8FileAsync mixedPath "mixed base\nmixed staged line\nmixed unstaged line\n"
+
+                        let providerId =
+                            match VersionControlService.Abstractions.ProviderId.tryCreate "git" with
+                            | Ok id -> id
+                            | Error message -> failwith message
+
+                        let binding: VersionControlService.Abstractions.WorkspaceBinding = {
+                            SchemaVersion = VersionControlService.Abstractions.WorkspaceBinding.CurrentSchemaVersion
+                            ProviderId = providerId
+                            WorkspaceRoot = context.RepoPath
+                            ProviderStateRef = None
+                            Location = {
+                                ProviderId = providerId
+                                DisplayName = None
+                                ProviderLocation = context.RepoPath
+                                ConnectionProfileId = None
+                            }
+                            ConnectionProfileId = None
+                        }
+
+                        let session =
+                            GitWorkspaceSession.createSession GitWorkspaceSession.GitSessionHooks.none binding
+
+                        let! diffResult =
+                            Async.StartAsPromise (
+                                session.Core.GetDiffSummary(
+                                    VersionControlService.Abstractions.OperationContext.detached "v2-diff-summary"
+                                )
+                            )
+
+                        match diffResult with
+                        | VersionControlService.Abstractions.Succeeded outcome ->
+                            let paths =
+                                outcome.Value.Entries
+                                |> Microsoft.FSharp.Collections.Array.map (fun entry ->
+                                    VersionControlService.Abstractions.RepositoryPath.value entry.Path)
+                                |> Microsoft.FSharp.Collections.Array.sort
+
+                            // Union of staged and unstaged changes, each path once.
+                            Vitest.expect(paths).toEqual ([| "mixed.txt"; "staged-only.txt" |])
+                        | VersionControlService.Abstractions.PartiallySucceeded _
+                        | VersionControlService.Abstractions.Failed _ ->
+                            failwith "Expected the v2 diff summary to succeed."
                     })
             }
         )

@@ -2,6 +2,7 @@
   <Folder Name="/src/">
     <Project Path="src/VersionControlService.Abstractions/VersionControlService.Abstractions.fsproj" />
     <Project Path="src/VersionControlService.Runtime.Node/VersionControlService.Runtime.Node.fsproj" />
+    <Project Path="src/VersionControlService.Git/VersionControlService.Git.fsproj" />
     <Project Path="src/VersionControlService/VersionControlService.fsproj" />
   </Folder>
   <Folder Name="/tests/">
