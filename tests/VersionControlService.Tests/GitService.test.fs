@@ -1300,6 +1300,152 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "v2 materialization reports path collisions and invalid names structurally",
+            gitServiceIntegrationTestOptions,
+            fun () -> promise {
+                do!
+                    withTempRepository (fun context -> promise {
+                        do! writeUtf8FileAsync (join [| context.RepoPath; "seed.txt" |]) "seed\n"
+                        let! _ = context.Git.raw [| "add"; "-A" |]
+                        let! _ = context.Git.raw [| "commit"; "-m"; "test: base" |]
+                        let! headCommit = context.Git.raw [| "rev-parse"; "HEAD" |]
+
+                        let seedRef (refName: string) (paths: string list) = promise {
+                            do! writeUtf8FileAsync (join [| context.RepoPath; "seed-content.tmp" |]) "seeded content\n"
+                            let! blobHash = context.Git.raw [| "hash-object"; "-w"; "--"; "seed-content.tmp" |]
+
+                            for path in paths do
+                                let! _ =
+                                    context.Git.raw [|
+                                        "-c"
+                                        "core.protectNTFS=false"
+                                        "update-index"
+                                        "--add"
+                                        "--cacheinfo"
+                                        $"100644,{blobHash.Trim()},{path}"
+                                    |]
+
+                                ()
+
+                            let! treeId = context.Git.raw [| "write-tree" |]
+
+                            let! commitId =
+                                context.Git.raw [|
+                                    "commit-tree"
+                                    treeId.Trim()
+                                    "-p"
+                                    headCommit.Trim()
+                                    "-m"
+                                    $"seed: {refName}"
+                                |]
+
+                            let! _ = context.Git.raw [| "branch"; refName; commitId.Trim() |]
+                            let! _ = context.Git.raw [| "read-tree"; "HEAD" |]
+                            return ()
+                        }
+
+                        do! seedRef "case-collision-ref" [ "Case.txt"; "case.txt" ]
+                        do! seedRef "invalid-name-ref" [ "bad<name>.txt" ]
+
+                        let providerId =
+                            match VersionControlService.Abstractions.ProviderId.tryCreate "git" with
+                            | Ok id -> id
+                            | Error message -> failwith message
+
+                        let binding: VersionControlService.Abstractions.WorkspaceBinding = {
+                            SchemaVersion = VersionControlService.Abstractions.WorkspaceBinding.CurrentSchemaVersion
+                            ProviderId = providerId
+                            WorkspaceRoot = context.RepoPath
+                            ProviderStateRef = None
+                            Location = {
+                                ProviderId = providerId
+                                DisplayName = None
+                                ProviderLocation = context.RepoPath
+                                ConnectionProfileId = None
+                            }
+                            ConnectionProfileId = None
+                        }
+
+                        let session =
+                            GitWorkspaceSession.createSession GitWorkspaceSession.GitSessionHooks.none binding
+
+                        let switchTo (refName: string) = promise {
+                            let reference =
+                                match
+                                    VersionControlService.Abstractions.ProviderRef.tryCreate $"git-local:{refName}"
+                                with
+                                | Ok value -> value
+                                | Error message -> failwith message
+
+                            let! status =
+                                Async.StartAsPromise (
+                                    session.Core.GetStatus(
+                                        VersionControlService.Abstractions.OperationContext.detached
+                                            "v2-collision-status"
+                                    )
+                                )
+
+                            let version =
+                                match status with
+                                | VersionControlService.Abstractions.Succeeded outcome ->
+                                    outcome.Value.WorkspaceVersion
+                                | _ -> failwith "Expected v2 status to succeed."
+
+                            return!
+                                Async.StartAsPromise(
+                                    session.Core.SwitchRef
+                                        {
+                                            TargetRef = reference
+                                            ExpectedWorkspaceVersion = version
+                                        }
+                                        (VersionControlService.Abstractions.OperationContext.detached
+                                            "v2-collision-switch")
+                                )
+                        }
+
+                        // Case-only collisions on a case-insensitive filesystem must fail
+                        // structurally instead of silently overwriting either object.
+                        let! caseResult = switchTo "case-collision-ref"
+
+                        let caseFailure =
+                            match caseResult with
+                            | VersionControlService.Abstractions.Failed failure -> failure
+                            | VersionControlService.Abstractions.PartiallySucceeded(_, failure) -> failure
+                            | VersionControlService.Abstractions.Succeeded _ ->
+                                failwith "Expected the case-collision switch to fail structurally."
+
+                        Vitest.expect(caseFailure.Code).toBe ("path_collision")
+
+                        let affected = caseFailure.AffectedPaths |> Microsoft.FSharp.Collections.Array.sort
+                        Vitest.expect(affected).toEqual ([| "Case.txt"; "case.txt" |])
+
+                        // The failed switch left the workspace on the original branch.
+                        let! branchAfter = context.Git.raw [| "branch"; "--show-current" |]
+                        Vitest.expect(branchAfter.Trim() = "case-collision-ref").toBe (false)
+
+                        // Windows-invalid names fail structurally, never throw.
+                        let! invalidResult = switchTo "invalid-name-ref"
+
+                        let invalidFailure =
+                            match invalidResult with
+                            | VersionControlService.Abstractions.Failed failure -> failure
+                            | VersionControlService.Abstractions.PartiallySucceeded(_, failure) -> failure
+                            | VersionControlService.Abstractions.Succeeded _ ->
+                                failwith "Expected the invalid-name switch to fail structurally."
+
+                        Vitest.expect(invalidFailure.Code).toBe ("unrepresentable_path")
+
+                        Vitest
+                            .expect(
+                                invalidFailure.AffectedPaths
+                                |> Microsoft.FSharp.Collections.Array.contains "bad<name>.txt"
+                            )
+                            .toBe (true)
+                    })
+            }
+        )
+
+        Vitest.test (
             "v2 linked worktree resolves Git state paths",
             gitServiceIntegrationTestOptions,
             fun () -> promise {

@@ -326,6 +326,8 @@ let createGitHarness () : ProviderTestHarness =
                             workPath
                             environment
                             [|
+                                "-c"
+                                "core.protectNTFS=false"
                                 "update-index"
                                 "--add"
                                 "--cacheinfo"

@@ -683,6 +683,125 @@ let private preflightSwitchRef (state: SessionState) (request: SwitchRefRequest)
                         }
     }
 
+[<Emit("process.platform")>]
+let private nodePlatform: string = jsNative
+
+[<Emit("$0.normalize('NFC')")>]
+let private normalizeNfc (_text: string) : string = jsNative
+
+let private windowsReservedBaseNames =
+    set [
+        "con"
+        "prn"
+        "aux"
+        "nul"
+        "com1"
+        "com2"
+        "com3"
+        "com4"
+        "com5"
+        "com6"
+        "com7"
+        "com8"
+        "com9"
+        "lpt1"
+        "lpt2"
+        "lpt3"
+        "lpt4"
+        "lpt5"
+        "lpt6"
+        "lpt7"
+        "lpt8"
+        "lpt9"
+    ]
+
+let private isWindowsInvalidName (path: string) =
+    path.Split '/'
+    |> Array.exists (fun segment ->
+        let baseName = (segment.Split '.').[0].ToLowerInvariant()
+
+        windowsReservedBaseNames.Contains baseName
+        || segment.EndsWith "."
+        || segment.EndsWith " "
+        || segment |> Seq.exists (fun character -> int character < 32 || "<>:\"|?*".Contains(string character)))
+
+/// Guards materialization: provider keys are byte-exact, but the local filesystem
+/// may alias case-different (Windows, macOS) or normalization-equivalent (macOS)
+/// names, and Windows rejects reserved/invalid names. Detected problems are
+/// structured failures attributed to the affected paths — never silent overwrites
+/// or thrown exceptions.
+let private checkMaterializationSafety
+    (state: SessionState)
+    (targetName: string)
+    (context: OperationContext)
+    : Async<Result<unit, OperationFailure>> =
+    async {
+        let! treeOutput =
+            runGit
+                state.Hooks
+                state.RepoPath
+                [|
+                    "ls-tree"
+                    "-r"
+                    "--name-only"
+                    "-z"
+                    targetName
+                |]
+                None
+                context
+
+        match treeOutput with
+        | Error failure -> return Error failure
+        | Ok output when output.ExitCode <> 0 ->
+            return
+                Error(
+                    OperationFailure.createRedacted
+                        ProviderError
+                        "git_failure"
+                        $"Listing the target tree failed: {output.StdErr}"
+                )
+        | Ok output ->
+            let paths = output.StdOut.Split '\000' |> Array.filter (fun entry -> entry <> "")
+
+            let aliasKey (path: string) =
+                match nodePlatform with
+                | "win32" -> path.ToLowerInvariant()
+                | "darwin" -> (normalizeNfc path).ToLowerInvariant()
+                | _ -> path
+
+            let collisions =
+                paths
+                |> Array.groupBy aliasKey
+                |> Array.filter (fun (_, group) -> group.Length > 1)
+                |> Array.collect snd
+
+            if collisions.Length > 0 then
+                return
+                    Error {
+                        OperationFailure.create
+                            Validation
+                            "path_collision"
+                            "Distinct repository paths alias to one local file on this filesystem." with
+                            AffectedPaths = collisions
+                    }
+            elif nodePlatform = "win32" then
+                let invalidNames = paths |> Array.filter isWindowsInvalidName
+
+                if invalidNames.Length > 0 then
+                    return
+                        Error {
+                            OperationFailure.create
+                                Validation
+                                "unrepresentable_path"
+                                "A repository path cannot be represented on the local filesystem." with
+                                AffectedPaths = invalidNames
+                        }
+                else
+                    return Ok()
+            else
+                return Ok()
+    }
+
 let private switchRef (state: SessionState) (request: SwitchRefRequest) (context: OperationContext) =
     async {
         let refRunner: GitRefs.GitRunner =
@@ -742,23 +861,28 @@ let private switchRef (state: SessionState) (request: SwitchRefRequest) (context
             match nameValidation with
             | Error failure -> return Failed failure
             | Ok _ ->
-                let! exists = localBranchExists localName
+                let! materializationSafety = checkMaterializationSafety state remoteRef context
 
-                let! checkoutResult =
-                    if exists then
-                        checkout [| "checkout"; localName |]
-                    else
-                        checkout [|
-                            "checkout"
-                            "-b"
-                            localName
-                            "--track"
-                            remoteRef
-                        |]
-
-                match checkoutResult with
+                match materializationSafety with
                 | Error failure -> return Failed failure
-                | Ok() -> return! getWorkspaceStatus state context
+                | Ok() ->
+                    let! exists = localBranchExists localName
+
+                    let! checkoutResult =
+                        if exists then
+                            checkout [| "checkout"; localName |]
+                        else
+                            checkout [|
+                                "checkout"
+                                "-b"
+                                localName
+                                "--track"
+                                remoteRef
+                            |]
+
+                    match checkoutResult with
+                    | Error failure -> return Failed failure
+                    | Ok() -> return! getWorkspaceStatus state context
         | Choice1Of2 localName ->
             let! nameValidation = GitRefs.validateBranchName refRunner localName
 
@@ -773,11 +897,16 @@ let private switchRef (state: SessionState) (request: SwitchRefRequest) (context
                             OperationFailure.create NotFound "ref_not_found" $"Ref '{localName}' does not exist."
                         )
                 else
-                    let! checkoutResult = checkout [| "checkout"; localName |]
+                    let! materializationSafety = checkMaterializationSafety state localName context
 
-                    match checkoutResult with
+                    match materializationSafety with
                     | Error failure -> return Failed failure
-                    | Ok() -> return! getWorkspaceStatus state context
+                    | Ok() ->
+                        let! checkoutResult = checkout [| "checkout"; localName |]
+
+                        match checkoutResult with
+                        | Error failure -> return Failed failure
+                        | Ok() -> return! getWorkspaceStatus state context
     }
 
 /// Parses `git diff --name-status -z` output: NUL-delimited tokens of
