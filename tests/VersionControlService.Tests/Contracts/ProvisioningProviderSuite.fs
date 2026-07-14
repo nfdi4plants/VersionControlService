@@ -22,13 +22,14 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
             profileTest "initializes a new workspace and opens a session"
             <| fun () -> promise {
                 let! targetPath = harness.CreateLocalPath()
+                let! location = harness.CreateLocation()
 
                 let! initializeResult =
                     run (
                         harness.Factory.Initialize
                             {
                                 TargetPath = targetPath
-                                Location = None
+                                Location = Some location
                             }
                             (ctx "initialize")
                     )

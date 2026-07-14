@@ -22,6 +22,8 @@
     <Compile Include="GitPartialSuccess.test.fs" />
     <Compile Include="LakeFsApi.test.fs" />
     <Compile Include="LakeFsWorkspaceIndex.test.fs" />
+    <Compile Include="LakeFsProviderContract.test.fs" />
+    <Compile Include="LakeFsIntegration.test.fs" />
     <Compile Include="ProviderResolver.test.fs" />
     <Compile Include="NodeRuntime.test.fs" />
     <Compile Include="ConformanceSuiteDiscovery.test.fs" />

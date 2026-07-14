@@ -10,6 +10,7 @@
     <Compile Include="LakeFsCredentials.fs" />
     <Compile Include="LakeFsWorkspaceIndex.fs" />
     <Compile Include="LakeFsProviderFactory.fs" />
+    <Compile Include="LakeFsWorkspaceSession.fs" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\VersionControlService.Abstractions\VersionControlService.Abstractions.fsproj" />
