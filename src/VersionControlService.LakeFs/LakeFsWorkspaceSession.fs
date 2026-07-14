@@ -13,6 +13,7 @@ module LakeFsCredentials = VersionControlService.LakeFs.LakeFsCredentials
 module LakeFsIndex = VersionControlService.LakeFs.LakeFsWorkspaceIndex
 module LakeFsObjectTransfer = VersionControlService.LakeFs.LakeFsObjectTransfer
 module LakeFsSelectedRevision = VersionControlService.LakeFs.LakeFsSelectedRevision
+module LakeFsSynchronization = VersionControlService.LakeFs.LakeFsSynchronization
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodePath = VersionControlService.Runtime.Node.Path
 
@@ -1408,17 +1409,13 @@ let private refresh (state: SessionState) (context: OperationContext) =
             | Ok head ->
                 let! changed = targetChangedPaths state context
 
-                let remoteChanged =
-                    match changed with
-                    | Ok paths ->
-                        Some(paths |> List.choose (RepositoryPath.tryCreate >> Result.toOption) |> List.toArray)
-                    | Error _ -> None
-
-                return
-                    OperationResult.succeeded {
-                        synchronizationState state (Some head) with
-                            RemoteChangedPaths = remoteChanged
-                    }
+                match changed with
+                | Error failure -> return Failed failure
+                | Ok paths ->
+                    return
+                        synchronizationState state (Some head)
+                        |> LakeFsSynchronization.withRemoteChangedPaths paths
+                        |> OperationResult.succeeded
     }
 
 let private previewUpdate (state: SessionState) (context: OperationContext) =
@@ -1454,23 +1451,9 @@ let private previewUpdate (state: SessionState) (context: OperationContext) =
                         }
                     | _ -> async { return Set.empty }
 
-                let changedSet = Set.ofList changedPaths
-                let overlapping = Set.intersect changedSet (Set.union dirtyPaths localCommitted)
-
                 return
-                    OperationResult.succeeded {
-                        ChangedPaths =
-                            changedPaths
-                            |> List.choose (RepositoryPath.tryCreate >> Result.toOption)
-                            |> List.toArray
-                        OverlappingPaths =
-                            overlapping
-                            |> Set.toList
-                            |> List.choose (RepositoryPath.tryCreate >> Result.toOption)
-                            |> List.toArray
-                        HasDataLossRisk = not (Set.isEmpty (Set.intersect changedSet dirtyPaths))
-                        WouldCreateConflictSession = not (Set.isEmpty overlapping)
-                    }
+                    LakeFsSynchronization.createPreview changedPaths dirtyPaths localCommitted
+                    |> OperationResult.succeeded
     }
 
 /// Builds the conflict item contents for overlapping paths from base, workspace

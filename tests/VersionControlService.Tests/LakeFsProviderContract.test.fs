@@ -746,3 +746,110 @@ Vitest.describe (
             }
         )
 )
+
+Vitest.describe (
+    "lakeFS synchronization cycles",
+    fun () ->
+        Vitest.test (
+            "lakeFS refresh and preview report paginated local target and overlap paths",
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
+            fun () -> promise {
+                if not (integrationEnabled ()) then
+                    return failwith "lakeFS integration skipped: Docker not available"
+
+                let harness = createLakeFsHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let synchronization =
+                        workspace.Session.Synchronization
+                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization services.")
+
+                    let localPaths = Array.init 105 (fun number -> $"local/object-{number:D3}.txt")
+
+                    for number, path in localPaths |> Array.indexed do
+                        do! workspace.WriteFile path $"local object {number}\n"
+
+                    let! localStatusResult =
+                        workspace.Session.Core.GetStatus(context "refresh-preview-local-status")
+                        |> Async.StartAsPromise
+
+                    let localStatus = expectOperationValue "local status" localStatusResult
+                    let! localRevisionResult =
+                        workspace.Session.Core.CreateRevision
+                            {
+                                Message = "create paginated local revision"
+                                Paths = localPaths |> Array.map repositoryPath
+                                ExpectedWorkspaceVersion = localStatus.WorkspaceVersion
+                            }
+                            (context "refresh-preview-local-revision")
+                        |> Async.StartAsPromise
+
+                    expectOperationValue "paginated local revision" localRevisionResult |> ignore
+
+                    let remoteMutations = [|
+                        for number in 0..103 do
+                            {
+                                Path = $"remote/object-{number:D3}.txt"
+                                Content = Some $"remote object {number}\n"
+                            }
+
+                        {
+                            Path = "local/object-104.txt"
+                            Content = Some "target overlap content\n"
+                        }
+                    |]
+
+                    do! harness.AdvanceTarget workspace remoteMutations
+
+                    let beforeRead =
+                        match LakeFsWorkspaceIndex.load workspace.Binding.WorkspaceRoot with
+                        | LakeFsWorkspaceIndex.Loaded index -> index
+                        | _ -> failwith "Expected an index before refresh/preview."
+
+                    let! refreshResult =
+                        synchronization.Refresh(context "refresh-preview-refresh")
+                        |> Async.StartAsPromise
+
+                    let refreshed = expectOperationValue "paginated refresh" refreshResult
+                    Vitest.expect(refreshed.Relationship).toEqual (RevisionRelationship.Diverged)
+                    Vitest.expect(refreshed.LocalRevisionCount).toEqual (None)
+                    Vitest.expect(refreshed.TargetRevisionCount).toEqual (None)
+
+                    let refreshedPaths =
+                        refreshed.RemoteChangedPaths
+                        |> Option.defaultWith (fun () -> failwith "Expected refreshed remote paths.")
+                        |> Array.map RepositoryPath.value
+
+                    Vitest.expect(refreshedPaths.Length).toBe 105
+                    Vitest.expect(refreshedPaths).toContain "remote/object-103.txt"
+                    Vitest.expect(refreshedPaths).toContain "local/object-104.txt"
+
+                    let! previewResult =
+                        synchronization.PreviewUpdate(context "refresh-preview-preview")
+                        |> Async.StartAsPromise
+
+                    let preview = expectOperationValue "paginated preview" previewResult
+                    let changedPaths = preview.ChangedPaths |> Array.map RepositoryPath.value
+                    let overlapPaths = preview.OverlappingPaths |> Array.map RepositoryPath.value
+                    Vitest.expect(changedPaths.Length).toBe 105
+                    Vitest.expect(changedPaths).toContain "remote/object-103.txt"
+                    Vitest.expect(overlapPaths).toEqual ([| "local/object-104.txt" |])
+                    Vitest.expect(preview.HasDataLossRisk).toBe false
+                    Vitest.expect(preview.WouldCreateConflictSession).toBe true
+
+                    let afterRead =
+                        match LakeFsWorkspaceIndex.load workspace.Binding.WorkspaceRoot with
+                        | LakeFsWorkspaceIndex.Loaded index -> index
+                        | _ -> failwith "Expected an index after refresh/preview."
+
+                    Vitest.expect(afterRead.Generation).toBe (beforeRead.Generation)
+                    Vitest.expect(afterRead.BaseRevision).toEqual (beforeRead.BaseRevision)
+                    Vitest.expect(afterRead.WorkspaceRevision).toEqual (beforeRead.WorkspaceRevision)
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+)

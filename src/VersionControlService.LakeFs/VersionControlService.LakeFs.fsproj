@@ -12,6 +12,7 @@
     <Compile Include="LakeFsProviderFactory.fs" />
     <Compile Include="LakeFsObjectTransfer.fs" />
     <Compile Include="LakeFsSelectedRevision.fs" />
+    <Compile Include="LakeFsSynchronization.fs" />
     <Compile Include="LakeFsWorkspaceSession.fs" />
   </ItemGroup>
   <ItemGroup>
