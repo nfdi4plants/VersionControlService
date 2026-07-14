@@ -10,6 +10,8 @@
     <Compile Include="LakeFsCredentials.fs" />
     <Compile Include="LakeFsWorkspaceIndex.fs" />
     <Compile Include="LakeFsProviderFactory.fs" />
+    <Compile Include="LakeFsObjectTransfer.fs" />
+    <Compile Include="LakeFsSelectedRevision.fs" />
     <Compile Include="LakeFsWorkspaceSession.fs" />
   </ItemGroup>
   <ItemGroup>

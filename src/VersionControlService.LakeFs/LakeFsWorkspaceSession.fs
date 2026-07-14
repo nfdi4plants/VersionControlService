@@ -11,6 +11,8 @@ open VersionControlService.LakeFs.LakeFsTypes
 module LakeFsApi = VersionControlService.LakeFs.LakeFsApi
 module LakeFsCredentials = VersionControlService.LakeFs.LakeFsCredentials
 module LakeFsIndex = VersionControlService.LakeFs.LakeFsWorkspaceIndex
+module LakeFsObjectTransfer = VersionControlService.LakeFs.LakeFsObjectTransfer
+module LakeFsSelectedRevision = VersionControlService.LakeFs.LakeFsSelectedRevision
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodePath = VersionControlService.Runtime.Node.Path
 
@@ -461,41 +463,26 @@ let private createRevision (state: SessionState) (request: CreateRevisionRequest
                                     (mkRevisionId currentRevision)
                         else
                             // Act: stream only the selected changes to the workspace branch.
-                            let mutable transferFailure: OperationFailure option = None
+                            let selectedTransfers: LakeFsObjectTransfer.SelectedObjectTransfer[] =
+                                changed
+                                |> Array.map (fun (pathValue, content, objectState) -> {
+                                    Path = pathValue
+                                    ObjectKey = objectKey state pathValue
+                                    Content = content
+                                    IsDeletion = objectState = LakeFsIndex.DeletedObject
+                                })
 
-                            for pathValue, content, objectState in changed do
-                                if transferFailure.IsNone then
-                                    match objectState, content with
-                                    | LakeFsIndex.DeletedObject, _ ->
-                                        let! deletion =
-                                            LakeFsApi.deleteObject
-                                                resolved
-                                                state.Index.Repository
-                                                state.Index.WorkspaceBranch
-                                                (objectKey state pathValue)
-                                                context
+                            let! transferResult =
+                                LakeFsObjectTransfer.transferSelected
+                                    resolved
+                                    state.Index.Repository
+                                    state.Index.WorkspaceBranch
+                                    selectedTransfers
+                                    context
 
-                                        match deletion with
-                                        | Error failure -> transferFailure <- Some failure
-                                        | Ok() -> ()
-                                    | _, Some fileContent ->
-                                        let! upload =
-                                            LakeFsApi.uploadObject
-                                                resolved
-                                                state.Index.Repository
-                                                state.Index.WorkspaceBranch
-                                                (objectKey state pathValue)
-                                                fileContent
-                                                context
-
-                                        match upload with
-                                        | Error failure -> transferFailure <- Some failure
-                                        | Ok() -> ()
-                                    | _, None -> ()
-
-                            match transferFailure with
-                            | Some failure -> return Failed failure
-                            | None ->
+                            match transferResult with
+                            | Error failure -> return Failed failure
+                            | Ok() ->
                                 let expectedParent = state.Index.WorkspaceRevision
 
                                 let! committed =
@@ -521,7 +508,9 @@ let private createRevision (state: SessionState) (request: CreateRevisionRequest
                                                     }
                                         }
                                 | Ok commit ->
-                                    // Verify: branch head is the returned commit with the expected parent.
+                                    do! barrier state "selected-revision-commit-done" context
+
+                                    // Verify only after the commit is visible to concurrent writers.
                                     let! branchAfter =
                                         LakeFsApi.getBranch
                                             resolved
@@ -529,102 +518,113 @@ let private createRevision (state: SessionState) (request: CreateRevisionRequest
                                             state.Index.WorkspaceBranch
                                             context
 
+                                    let! commitAfter =
+                                        LakeFsApi.getCommit
+                                            resolved
+                                            state.Index.Repository
+                                            commit.Id
+                                            context
+
                                     let verified =
-                                        match branchAfter with
-                                        | Ok branch ->
-                                            branch.CommitId = commit.Id
-                                            && (match expectedParent with
-                                                | Some parent -> commit.Parents |> Array.contains parent
-                                                | None -> true)
-                                        | Error _ -> false
+                                        match branchAfter, commitAfter with
+                                        | Ok branch, Ok observedCommit ->
+                                            LakeFsSelectedRevision.verifiesExpectedParentAndHead
+                                                expectedParent
+                                                observedCommit
+                                                branch
+                                        | _ -> false
 
-                                    // Update index entries for the selected paths only.
-                                    let updatedEntries =
-                                        let withoutSelected =
-                                            state.Index.Entries
-                                            |> Array.filter (fun entry ->
-                                                not (
-                                                    changed
-                                                    |> Array.exists (fun (pathValue, _, _) ->
-                                                        pathValue = entry.Path)
-                                                ))
+                                    let affectedPaths =
+                                        changed |> Array.map (fun (pathValue, _, _) -> pathValue)
 
-                                        let newEntries =
-                                            changed
-                                            |> Array.choose (fun (pathValue, content, objectState) ->
-                                                match objectState, content with
-                                                | LakeFsIndex.DeletedObject, _ -> None
-                                                | _, Some fileContent ->
-                                                    Some {
-                                                        LakeFsIndex.Path = pathValue
-                                                        LakeFsIndex.BaseChecksum = ""
-                                                        LakeFsIndex.LocalHash =
-                                                            LakeFsIndex.hashContent fileContent
-                                                        LakeFsIndex.LocalSize = float fileContent.Length
-                                                        LakeFsIndex.LocalMtimeMs = 0.0
-                                                    }
-                                                | _, None -> None)
+                                    if verified then
+                                        // Advance the durable index only after both parent and head verify.
+                                        let updatedEntries =
+                                            let withoutSelected =
+                                                state.Index.Entries
+                                                |> Array.filter (fun entry ->
+                                                    not (
+                                                        changed
+                                                        |> Array.exists (fun (pathValue, _, _) ->
+                                                            pathValue = entry.Path)
+                                                    ))
 
-                                        Array.append withoutSelected newEntries
+                                            let newEntries =
+                                                changed
+                                                |> Array.choose (fun (pathValue, content, objectState) ->
+                                                    match objectState, content with
+                                                    | LakeFsIndex.DeletedObject, _ -> None
+                                                    | _, Some fileContent ->
+                                                        Some {
+                                                            LakeFsIndex.Path = pathValue
+                                                            LakeFsIndex.BaseChecksum = ""
+                                                            LakeFsIndex.LocalHash =
+                                                                LakeFsIndex.hashContent fileContent
+                                                            LakeFsIndex.LocalSize = float fileContent.Length
+                                                            LakeFsIndex.LocalMtimeMs = 0.0
+                                                        }
+                                                    | _, None -> None)
 
-                                    state.Index <- {
-                                        state.Index with
-                                            Entries = updatedEntries
-                                            WorkspaceRevision = Some commit.Id
-                                    }
+                                            Array.append withoutSelected newEntries
 
-                                    match saveIndex state with
-                                    | Error failure -> return Failed { failure with StateChanged = true }
-                                    | Ok() ->
+                                        state.Index <- {
+                                            state.Index with
+                                                Entries = updatedEntries
+                                                WorkspaceRevision = Some commit.Id
+                                        }
+
+                                        match saveIndex state with
+                                        | Error failure -> return Failed { failure with StateChanged = true }
+                                        | Ok() ->
+                                            return
+                                                Succeeded {
+                                                    OperationOutcome.performed (mkRevisionId commit.Id) with
+                                                        AffectedPaths = affectedPaths
+                                                        ResultingRevision = Some(mkRevisionId commit.Id)
+                                                        ResultingWorkspaceVersion = Some(workspaceVersion state)
+                                                        Publication = LocalOnly
+                                                }
+                                    else
+                                        let observedHead =
+                                            match branchAfter with
+                                            | Ok branch -> Some branch.CommitId
+                                            | Error _ -> None
+
                                         let outcome = {
                                             OperationOutcome.performed (mkRevisionId commit.Id) with
-                                                AffectedPaths =
-                                                    changed |> Array.map (fun (pathValue, _, _) -> pathValue)
+                                                AffectedPaths = affectedPaths
                                                 ResultingRevision = Some(mkRevisionId commit.Id)
                                                 ResultingWorkspaceVersion = Some(workspaceVersion state)
                                                 Publication = LocalOnly
                                         }
 
-                                        if verified then
-                                            return Succeeded outcome
-                                        else
-                                            let! observedHead =
-                                                LakeFsApi.getBranch
-                                                    resolved
-                                                    state.Index.Repository
-                                                    state.Index.WorkspaceBranch
-                                                    context
-
-                                            return
-                                                OperationResult.partiallySucceeded
-                                                    outcome
-                                                    {
-                                                        OperationFailure.create
-                                                            Concurrency
-                                                            "precondition_failed"
-                                                            "The workspace branch advanced during commit verification." with
-                                                            RevisionEvidence = [|
-                                                                yield!
-                                                                    expectedParent
-                                                                    |> Option.map (fun parent ->
-                                                                        "expected_parent", mkRevisionId parent)
-                                                                    |> Option.toList
-                                                                yield!
-                                                                    (match observedHead with
-                                                                     | Ok branch ->
-                                                                         [|
-                                                                             "observed_head",
-                                                                             mkRevisionId branch.CommitId
-                                                                         |]
-                                                                     | Error _ -> [||])
-                                                            |]
-                                                    }
-                                                    {
-                                                        Code = "review_and_retry"
-                                                        Instructions =
-                                                            Some
-                                                                "Review the observed workspace-branch head, refresh, and retry."
-                                                    }
+                                        return
+                                            OperationResult.partiallySucceeded
+                                                outcome
+                                                {
+                                                    OperationFailure.create
+                                                        Concurrency
+                                                        "precondition_failed"
+                                                        "The workspace branch advanced during commit verification." with
+                                                        RevisionEvidence = [|
+                                                            yield!
+                                                                expectedParent
+                                                                |> Option.map (fun parent ->
+                                                                    "expected_parent", mkRevisionId parent)
+                                                                |> Option.toList
+                                                            yield!
+                                                                observedHead
+                                                                |> Option.map (fun head ->
+                                                                    "observed_head", mkRevisionId head)
+                                                                |> Option.toList
+                                                        |]
+                                                }
+                                                {
+                                                    Code = "review_and_retry"
+                                                    Instructions =
+                                                        Some
+                                                            "Review the observed workspace-branch head, refresh, and retry."
+                                                }
     }
 
 let private restorePaths (state: SessionState) (request: RestoreRequest) (context: OperationContext) =
@@ -1619,15 +1619,9 @@ let private createSessionFromState (state: SessionState) : WorkspaceSession =
                     )
                 )
         CreateRevision =
-            fun _ _ ->
-                async.Return(
-                    OperationResult.failed (
-                        OperationFailure.create
-                            ProviderError
-                            "lakefs_selected_revision_pending"
-                            "lakeFS selected revisions are not implemented yet."
-                    )
-                )
+            fun request context ->
+                withValidatedMutation state request.ExpectedWorkspaceVersion (fun () ->
+                    createRevision state request context)
         RestorePaths =
             fun _ _ ->
                 async.Return(

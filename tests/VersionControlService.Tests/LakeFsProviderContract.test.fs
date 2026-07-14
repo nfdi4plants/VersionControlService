@@ -8,9 +8,11 @@ open VersionControlService.LakeFs.LakeFsTypes
 open VersionControlService.Tests.Contracts
 open VersionControlService.Tests.Contracts.ProviderHarness
 open VersionControlService.Tests.NodePath
+open Vitest
 
 module LakeFsApi = VersionControlService.LakeFs.LakeFsApi
 module LakeFsCredentials = VersionControlService.LakeFs.LakeFsCredentials
+module LakeFsWorkspaceIndex = VersionControlService.LakeFs.LakeFsWorkspaceIndex
 module LakeFsWorkspaceSession = VersionControlService.LakeFs.LakeFsWorkspaceSession
 
 [<Emit("process.env[$0] ?? null")>]
@@ -169,7 +171,11 @@ let createLakeFsHarness () : ProviderTestHarness =
         ConnectionProfileId = location.ConnectionProfileId
     }
 
-    let advanceTarget (location: RepositoryLocation) (mutations: TargetMutation[]) = promise {
+    let advanceRef
+        (location: RepositoryLocation)
+        (reference: string)
+        (mutations: TargetMutation[])
+        = promise {
         let parsed = parseLocation location
 
         for mutation in mutations do
@@ -179,7 +185,7 @@ let createLakeFsHarness () : ProviderTestHarness =
                     LakeFsApi.uploadObject
                         (connection ())
                         parsed.Repository
-                        parsed.TargetRef
+                        reference
                         mutation.Path
                         content
                         (context "harness-advance-upload")
@@ -187,7 +193,7 @@ let createLakeFsHarness () : ProviderTestHarness =
                     LakeFsApi.deleteObject
                         (connection ())
                         parsed.Repository
-                        parsed.TargetRef
+                        reference
                         mutation.Path
                         (context "harness-advance-delete")
                 |> Async.StartAsPromise
@@ -198,13 +204,17 @@ let createLakeFsHarness () : ProviderTestHarness =
             LakeFsApi.commit
                 (connection ())
                 parsed.Repository
-                parsed.TargetRef
-                "external: target advance"
+                reference
+                $"external: {reference} advance"
                 (context "harness-advance-commit")
             |> Async.StartAsPromise
 
         committed |> expectApi "advance target commit" |> ignore
     }
+
+    let advanceTarget (location: RepositoryLocation) (mutations: TargetMutation[]) =
+        let parsed = parseLocation location
+        advanceRef location parsed.TargetRef mutations
 
     let hooks: LakeFsWorkspaceSession.LakeFsSessionHooks = {
         Barrier =
@@ -216,6 +226,22 @@ let createLakeFsHarness () : ProviderTestHarness =
                         | Some mutations ->
                             control.RaceMutations <- None
                             do! Async.AwaitPromise(advanceTarget control.Location mutations)
+                        | None -> ()
+
+                    if point = "selected-revision-commit-done" then
+                        match control.RaceMutations with
+                        | Some mutations ->
+                            control.RaceMutations <- None
+
+                            match LakeFsWorkspaceIndex.load root with
+                            | LakeFsWorkspaceIndex.Loaded index ->
+                                do!
+                                    Async.AwaitPromise(
+                                        advanceRef control.Location index.WorkspaceBranch mutations
+                                    )
+                            | LakeFsWorkspaceIndex.Missing
+                            | LakeFsWorkspaceIndex.Corrupt _ ->
+                                failwith "Expected a persisted workspace index for the selected-revision race."
                         | None -> ()
 
                     if point = "transfer-start" && control.SlowTransfer then
@@ -424,3 +450,156 @@ let private registrations = [|
     ExtensionProviderSuites.register lakeFsHarness
     SwateSelectableSuite.register lakeFsHarness
 |]
+
+let private expectOperationValue operation = function
+    | Succeeded outcome -> outcome.Value
+    | PartiallySucceeded(_, failure)
+    | Failed failure -> failwith $"{operation} failed ({failure.Category}/{failure.Code}): {failure.Message}"
+
+let private repositoryPath value =
+    RepositoryPath.tryCreate value |> Result.defaultWith failwith
+
+Vitest.describe (
+    "lakeFS selected revision cycles",
+    fun () ->
+        Vitest.test (
+            "lakeFS selected revision preserves unrelated local changes and verifies commit head",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                if not (integrationEnabled ()) then
+                    return failwith "lakeFS integration skipped: Docker not available"
+
+                let harness = createLakeFsHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let! initialStatusResult =
+                        workspace.Session.Core.GetStatus(context "selected-revision-status")
+                        |> Async.StartAsPromise
+
+                    let initialStatus = expectOperationValue "initial status" initialStatusResult
+                    let initialIndex =
+                        match VersionControlService.LakeFs.LakeFsWorkspaceIndex.load workspace.Binding.WorkspaceRoot with
+                        | VersionControlService.LakeFs.LakeFsWorkspaceIndex.Loaded index -> index
+                        | _ -> failwith "Expected a persisted workspace index."
+
+                    let parsed = parseLocation workspace.Binding.Location
+                    let! targetBeforeResult =
+                        LakeFsApi.getBranch
+                            (connection ())
+                            parsed.Repository
+                            parsed.TargetRef
+                            (context "selected-revision-target-before")
+                        |> Async.StartAsPromise
+
+                    let targetBefore = targetBeforeResult |> expectApi "read target before selected revision"
+
+                    do! workspace.WriteFile "selected[1].txt" "selected content\n"
+                    do! workspace.WriteFile "unselected.txt" "unselected content\n"
+
+                    let! statusBeforeRevisionResult =
+                        workspace.Session.Core.GetStatus(context "selected-revision-dirty-status")
+                        |> Async.StartAsPromise
+
+                    let statusBeforeRevision = expectOperationValue "dirty status" statusBeforeRevisionResult
+
+                    let! revisionResult =
+                        workspace.Session.Core.CreateRevision
+                            {
+                                Message = "save selected literal path"
+                                Paths = [| repositoryPath "selected[1].txt" |]
+                                ExpectedWorkspaceVersion = statusBeforeRevision.WorkspaceVersion
+                            }
+                            (context "selected-revision-create")
+                        |> Async.StartAsPromise
+
+                    let revision = expectOperationValue "selected revision" revisionResult
+                    let revisionText = RevisionId.value revision
+
+                    let! targetAfterResult =
+                        LakeFsApi.getBranch
+                            (connection ())
+                            parsed.Repository
+                            parsed.TargetRef
+                            (context "selected-revision-target-after")
+                        |> Async.StartAsPromise
+
+                    let targetAfter = targetAfterResult |> expectApi "read target after selected revision"
+                    Vitest.expect(targetAfter.CommitId).toBe (targetBefore.CommitId)
+
+                    let! workspaceBranchResult =
+                        LakeFsApi.getBranch
+                            (connection ())
+                            parsed.Repository
+                            initialIndex.WorkspaceBranch
+                            (context "selected-revision-workspace-head")
+                        |> Async.StartAsPromise
+
+                    let workspaceBranch = workspaceBranchResult |> expectApi "read workspace branch"
+                    Vitest.expect(workspaceBranch.CommitId).toBe (revisionText)
+
+                    let! commitResult =
+                        LakeFsApi.getCommit
+                            (connection ())
+                            parsed.Repository
+                            revisionText
+                            (context "selected-revision-commit")
+                        |> Async.StartAsPromise
+
+                    let commit = commitResult |> expectApi "read selected commit"
+                    Vitest.expect(commit.Parents).toContain (initialIndex.WorkspaceRevision.Value)
+
+                    let! statusAfterResult =
+                        workspace.Session.Core.GetStatus(context "selected-revision-status-after")
+                        |> Async.StartAsPromise
+
+                    let statusAfter = expectOperationValue "status after selected revision" statusAfterResult
+                    Vitest.expect(statusAfter.Changes |> Array.map (fun change -> RepositoryPath.value change.Path)).toEqual ([| "unselected.txt" |])
+
+                    do! workspace.WriteFile "selected[1].txt" "selected content after race\n"
+                    let! raceStatusResult =
+                        workspace.Session.Core.GetStatus(context "selected-revision-race-status")
+                        |> Async.StartAsPromise
+
+                    let raceStatus = expectOperationValue "race status" raceStatusResult
+                    let indexBeforeRace =
+                        match VersionControlService.LakeFs.LakeFsWorkspaceIndex.load workspace.Binding.WorkspaceRoot with
+                        | VersionControlService.LakeFs.LakeFsWorkspaceIndex.Loaded index -> index
+                        | _ -> failwith "Expected an index before the race."
+
+                    do!
+                        harness.ArmDestinationRace workspace [|
+                            { Path = "racer.txt"; Content = Some "concurrent branch content\n" }
+                        |]
+
+                    let! racedRevision =
+                        workspace.Session.Core.CreateRevision
+                            {
+                                Message = "race selected revision"
+                                Paths = [| repositoryPath "selected[1].txt" |]
+                                ExpectedWorkspaceVersion = raceStatus.WorkspaceVersion
+                            }
+                            (context "selected-revision-race")
+                        |> Async.StartAsPromise
+
+                    match racedRevision with
+                    | Succeeded _ -> failwith "A moved workspace branch must not be reported as clean success."
+                    | PartiallySucceeded(_, failure)
+                    | Failed failure ->
+                        Vitest.expect(failure.Category).toEqual (FailureCategory.Concurrency)
+                        Vitest.expect(failure.Code).toBe "precondition_failed"
+
+                    let indexAfterRace =
+                        match VersionControlService.LakeFs.LakeFsWorkspaceIndex.load workspace.Binding.WorkspaceRoot with
+                        | VersionControlService.LakeFs.LakeFsWorkspaceIndex.Loaded index -> index
+                        | _ -> failwith "Expected an index after the race."
+
+                    Vitest.expect(indexAfterRace.WorkspaceRevision).toEqual (indexBeforeRace.WorkspaceRevision)
+                    Vitest.expect(indexAfterRace.Generation).toBe (indexBeforeRace.Generation)
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+)
