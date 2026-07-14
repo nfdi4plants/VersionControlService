@@ -12,15 +12,20 @@ type SelectedObjectTransfer = {
     IsDeletion: bool
 }
 
+type SelectedTransferResult =
+    | TransferCompleted of completedPaths: string[]
+    | TransferFailed of failure: OperationFailure * completedPaths: string[]
+
 let transferSelected
     (connection: LakeFsConnection)
     (repository: string)
     (workspaceBranch: string)
     (objects: SelectedObjectTransfer[])
     (context: OperationContext)
-    : Async<Result<unit, OperationFailure>> =
+    : Async<SelectedTransferResult> =
     async {
         let mutable failure: OperationFailure option = None
+        let completed = ResizeArray<string>()
 
         for selected in objects do
             if failure.IsNone then
@@ -48,8 +53,11 @@ let transferSelected
                             )
 
                 match result with
-                | Ok() -> ()
+                | Ok() -> completed.Add selected.Path
                 | Error transferFailure -> failure <- Some transferFailure
 
-        return failure |> Option.map Error |> Option.defaultValue (Ok())
+        return
+            match failure with
+            | Some transferFailure -> TransferFailed(transferFailure, completed.ToArray())
+            | None -> TransferCompleted(completed.ToArray())
     }

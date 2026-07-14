@@ -137,7 +137,8 @@ let createLakeFsHarness () : ProviderTestHarness =
     let repositories = ResizeArray<string>()
     let controls = Collections.Generic.Dictionary<string, WorkspaceControl>()
     let mutable counter = 0
-    let mutable publishBroken = false
+    let mutable publishShouldBreak = false
+    let mutable failNextConnection = false
 
     let nextId () =
         counter <- counter + 1
@@ -146,7 +147,10 @@ let createLakeFsHarness () : ProviderTestHarness =
     let credentials: LakeFsCredentials.LakeFsCredentialStrategy = {
         ResolveConnection =
             fun profileId -> async {
-                if publishBroken || profileId = Some "unauthorized" then
+                if profileId = Some "unauthorized" then
+                    return Ok { connection () with SecretAccessKey = "invalid-secret" }
+                elif failNextConnection then
+                    failNextConnection <- false
                     return Ok { connection () with SecretAccessKey = "invalid-secret" }
                 else
                     return Ok(connection ())
@@ -221,6 +225,10 @@ let createLakeFsHarness () : ProviderTestHarness =
             Some(fun root point operationContext -> async {
                 match controls.TryGetValue root with
                 | true, control ->
+                    if point = "publish-connect" && publishShouldBreak then
+                        publishShouldBreak <- false
+                        failNextConnection <- true
+
                     if point = "publish-precheck-done" || point = "update-precheck-done" || point = "finalize-precheck-done" then
                         match control.RaceMutations with
                         | Some mutations ->
@@ -242,6 +250,25 @@ let createLakeFsHarness () : ProviderTestHarness =
                             | LakeFsWorkspaceIndex.Missing
                             | LakeFsWorkspaceIndex.Corrupt _ ->
                                 failwith "Expected a persisted workspace index for the selected-revision race."
+                        | None -> ()
+
+                    if
+                        point = "selected-revision-upload-done"
+                        && operationContext.Cancellation.IsCancellationRequested()
+                    then
+                        match control.RaceMutations with
+                        | Some mutations ->
+                            control.RaceMutations <- None
+
+                            match LakeFsWorkspaceIndex.load root with
+                            | LakeFsWorkspaceIndex.Loaded index ->
+                                do!
+                                    Async.AwaitPromise(
+                                        advanceRef control.Location index.WorkspaceBranch mutations
+                                    )
+                            | LakeFsWorkspaceIndex.Missing
+                            | LakeFsWorkspaceIndex.Corrupt _ ->
+                                failwith "Expected a persisted workspace index for interruption recovery."
                         | None -> ()
 
                     if point = "transfer-start" && control.SlowTransfer then
@@ -406,12 +433,13 @@ let createLakeFsHarness () : ProviderTestHarness =
             }
         BreakPublish =
             fun _ -> promise {
-                publishBroken <- true
+                publishShouldBreak <- true
                 return ()
             }
         RestorePublish =
             fun _ -> promise {
-                publishBroken <- false
+                publishShouldBreak <- false
+                failNextConnection <- false
                 return ()
             }
         ArmDestinationRace =
