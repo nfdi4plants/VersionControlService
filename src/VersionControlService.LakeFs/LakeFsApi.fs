@@ -489,16 +489,23 @@ let getCommit
                 }
     }
 
-let merge
+let mergeWithStrategy
     (connection: LakeFsConnection)
     (repository: string)
     (sourceRef: string)
     (destinationBranch: string)
     (message: string)
+    (strategy: string option)
     (context: OperationContext)
     : Async<Result<LakeFsMergeResult, OperationFailure>> =
     async {
-        let payload = jsonStringify (createObj [ "message" ==> message ])
+        let payload =
+            jsonStringify (
+                createObj [
+                    "message" ==> message
+                    yield! strategy |> Option.map (fun value -> "strategy" ==> value) |> Option.toList
+                ]
+            )
 
         let! result =
             requestChecked
@@ -519,3 +526,13 @@ let merge
                     Reference = unbox<string> parsed?reference
                 }
     }
+
+let merge
+    (connection: LakeFsConnection)
+    (repository: string)
+    (sourceRef: string)
+    (destinationBranch: string)
+    (message: string)
+    (context: OperationContext)
+    : Async<Result<LakeFsMergeResult, OperationFailure>> =
+    mergeWithStrategy connection repository sourceRef destinationBranch message None context

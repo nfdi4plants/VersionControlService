@@ -14,6 +14,7 @@ module LakeFsIndex = VersionControlService.LakeFs.LakeFsWorkspaceIndex
 module LakeFsObjectTransfer = VersionControlService.LakeFs.LakeFsObjectTransfer
 module LakeFsSelectedRevision = VersionControlService.LakeFs.LakeFsSelectedRevision
 module LakeFsSynchronization = VersionControlService.LakeFs.LakeFsSynchronization
+module LakeFsConflictSession = VersionControlService.LakeFs.LakeFsConflictSession
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodePath = VersionControlService.Runtime.Node.Path
 
@@ -57,28 +58,13 @@ let private mkProviderRef (value: string) =
     | Ok reference -> reference
     | Error message -> failwith message
 
-type private ConflictItemState = {
-    ItemPath: string
-    BaseContent: string option
-    WorkspaceContent: string option
-    TargetContent: string option
-    mutable ResolvedContent: string option
-}
-
-type private ConflictState = {
-    SessionId: string
-    mutable HandleVersion: int
-    Items: ConflictItemState list
-    TargetRevisionAtOpen: string
-}
-
 type private SessionState = {
     Binding: WorkspaceBinding
     Location: LakeFsLocation
     Credentials: LakeFsCredentials.LakeFsCredentialStrategy
     Hooks: LakeFsSessionHooks
     mutable Index: LakeFsIndex.WorkspaceIndex
-    mutable Conflict: ConflictState option
+    mutable Conflict: LakeFsConflictSession.State option
     mutable ConflictGeneration: int
     mutable Busy: bool
 }
@@ -307,51 +293,10 @@ let private reloadIndex (state: SessionState) =
         Error(OperationFailure.createRedacted ProviderError "workspace_index_corrupt" message)
 
 let private conflictSummary (state: SessionState) : ConflictSessionSummary option =
-    state.Conflict
-    |> Option.map (fun conflict -> {
-        Handle = {
-            SessionId = conflict.SessionId
-            Version = string conflict.HandleVersion
-        }
-        Items =
-            conflict.Items
-            |> List.filter (fun item -> item.ResolvedContent.IsNone)
-            |> List.choose (fun item ->
-                match RepositoryPath.tryCreate item.ItemPath with
-                | Error _ -> None
-                | Ok path ->
-                    Some {
-                        Path = path
-                        Candidates = [|
-                            {
-                                CandidateId = "workspace"
-                                Label = "Workspace version"
-                                Revision = state.Index.WorkspaceRevision |> Option.map mkRevisionId
-                                Preview = item.WorkspaceContent |> Option.map TextPreview
-                            }
-                            {
-                                CandidateId = "target"
-                                Label = "Target version"
-                                Revision = Some(mkRevisionId conflict.TargetRevisionAtOpen)
-                                Preview = item.TargetContent |> Option.map TextPreview
-                            }
-                            yield!
-                                match item.BaseContent with
-                                | Some baseContent ->
-                                    [|
-                                        {
-                                            CandidateId = "base"
-                                            Label = "Base version"
-                                            Revision = state.Index.BaseRevision |> Option.map mkRevisionId
-                                            Preview = Some(TextPreview baseContent)
-                                        }
-                                    |]
-                                | None -> [||]
-                        |]
-                        SupportsResolvedContent = true
-                    })
-            |> List.toArray
-    })
+    LakeFsConflictSession.summary
+        (state.Index.BaseRevision |> Option.map mkRevisionId)
+        (state.Index.WorkspaceRevision |> Option.map mkRevisionId)
+        state.Conflict
 
 let private synchronizationState (state: SessionState) (targetHead: string option) : SynchronizationState =
     let baseRevision = state.Index.BaseRevision
@@ -1471,9 +1416,9 @@ let private buildConflictItems
     (overlapping: string list)
     (targetHead: string)
     (context: OperationContext)
-    : Async<ConflictItemState list> =
+    : Async<LakeFsConflictSession.ItemState list> =
     async {
-        let items = ResizeArray<ConflictItemState>()
+        let items = ResizeArray<LakeFsConflictSession.ItemState>()
 
         for path in overlapping do
             let key = objectKey state path
@@ -1555,14 +1500,7 @@ let private update (state: SessionState) (request: UpdateRequest) (context: Oper
                                 let! items = buildConflictItems state resolved overlapping head context
 
                                 state.ConflictGeneration <- state.ConflictGeneration + 1
-
-                                state.Conflict <-
-                                    Some {
-                                        SessionId = $"lakefs-conflict-{head}-{state.ConflictGeneration}"
-                                        HandleVersion = 1
-                                        Items = items
-                                        TargetRevisionAtOpen = head
-                                    }
+                                state.Conflict <- Some(LakeFsConflictSession.create head items)
 
                                 return
                                     OperationResult.partiallySucceeded
@@ -1955,27 +1893,10 @@ let private publish (state: SessionState) (request: PublishRequest) (context: Op
 // ---------------------------------------------------------------------------
 
 let private handleRejection () =
-    {
-        OperationFailure.create
-            Concurrency
-            "precondition_failed"
-            "The conflict-session handle is stale, foreign, or closed." with
-            RecoveryAction =
-                Some {
-                    Code = ConflictRecovery.RefreshConflictSession
-                    Instructions = Some "Refresh the conflict session and deliberately retry with the live handle."
-                }
-    }
+    LakeFsConflictSession.rejection ()
 
 let private validateHandle (state: SessionState) (handle: ConflictSessionHandle) (expectedVersion: string) =
-    match state.Conflict with
-    | Some conflict when
-        conflict.SessionId = handle.SessionId
-        && string conflict.HandleVersion = handle.Version
-        && workspaceVersion state = expectedVersion
-        ->
-        Ok conflict
-    | _ -> Error(handleRejection ())
+    LakeFsConflictSession.validate state.Conflict handle (workspaceVersion state) expectedVersion
 
 let private createConflictService (state: SessionState) : ConflictResolutionService = {
     GetActiveSession = fun _ -> async { return OperationResult.succeeded (conflictSummary state) }
@@ -1984,58 +1905,25 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
             match validateHandle state request.Handle request.ExpectedWorkspaceVersion with
             | Error failure -> return Failed failure
             | Ok conflict ->
-                let pathValue = RepositoryPath.value request.Path
-
-                match
-                    conflict.Items
-                    |> List.tryFind (fun item -> item.ItemPath = pathValue && item.ResolvedContent.IsNone)
-                with
-                | None ->
+                match LakeFsConflictSession.resolve conflict request.Path request.Resolution with
+                | Error failure -> return Failed failure
+                | Ok() ->
                     return
-                        Failed(
-                            OperationFailure.create
-                                NotFound
-                                "conflict_item_not_found"
-                                "No unresolved conflict exists for the selected path."
-                        )
-                | Some item ->
-                    let resolvedContent =
-                        match request.Resolution with
-                        | SupplyResolvedContent content -> Some content
-                        | PickCandidate "workspace" -> item.WorkspaceContent
-                        | PickCandidate "target" -> item.TargetContent
-                        | PickCandidate "base" -> item.BaseContent
-                        | PickCandidate _ -> None
-
-                    match resolvedContent with
-                    | None ->
-                        return
-                            Failed(
-                                OperationFailure.create
-                                    Validation
-                                    "unknown_candidate"
-                                    "The candidate ID is not part of this conflict item."
-                            )
-                    | Some content ->
-                        item.ResolvedContent <- Some content
-                        conflict.HandleVersion <- conflict.HandleVersion + 1
-
-                        return
-                            OperationResult.succeeded {
-                                RefreshedHandle = {
-                                    SessionId = conflict.SessionId
-                                    Version = string conflict.HandleVersion
-                                }
-                                RemainingItems =
-                                    conflictSummary state |> Option.map _.Items |> Option.defaultValue [||]
+                        OperationResult.succeeded {
+                            RefreshedHandle = {
+                                SessionId = conflict.SessionId
+                                Version = string conflict.HandleVersion
                             }
+                            RemainingItems =
+                                conflictSummary state |> Option.map _.Items |> Option.defaultValue [||]
+                        }
         }
     Finalize =
         fun request context -> async {
             match validateHandle state request.Handle request.ExpectedWorkspaceVersion with
             | Error failure -> return Failed failure
             | Ok conflict ->
-                if conflict.Items |> List.exists (fun item -> item.ResolvedContent.IsNone) then
+                if LakeFsConflictSession.hasUnresolvedItems conflict then
                     return
                         Failed(
                             OperationFailure.create
@@ -2071,12 +1959,13 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                             // step, then upload each per-path resolution on top. This
                             // is custom orchestration, not native per-path merging.
                             let! merged =
-                                LakeFsApi.merge
+                                LakeFsApi.mergeWithStrategy
                                     resolved
                                     state.Index.Repository
                                     state.Index.TargetRef
                                     state.Index.WorkspaceBranch
                                     "merge: finalize conflict session"
+                                    (Some "dest-wins")
                                     context
 
                             match merged with
@@ -2087,7 +1976,7 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                 for item in conflict.Items do
                                     if uploadFailure.IsNone then
                                         match item.ResolvedContent with
-                                        | Some content ->
+                                        | Some(Some content) ->
                                             let! upload =
                                                 LakeFsApi.uploadObject
                                                     resolved
@@ -2098,6 +1987,19 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                     context
 
                                             match upload with
+                                            | Error failure -> uploadFailure <- Some failure
+                                            | Ok() -> ()
+                                        | Some None ->
+                                            let! deletion =
+                                                LakeFsApi.deleteObject
+                                                    resolved
+                                                    state.Index.Repository
+                                                    state.Index.WorkspaceBranch
+                                                    (objectKey state item.ItemPath)
+                                                    context
+
+                                            match deletion with
+                                            | Error failure when failure.Category = NotFound -> ()
                                             | Error failure -> uploadFailure <- Some failure
                                             | Ok() -> ()
                                         | None -> ()
@@ -2134,7 +2036,8 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                             // Materialize resolved content locally.
                                             for item in conflict.Items do
                                                 match item.ResolvedContent with
-                                                | Some content -> writeLocal state item.ItemPath content
+                                                | Some(Some content) -> writeLocal state item.ItemPath content
+                                                | Some None -> removeLocal state item.ItemPath
                                                 | None -> ()
 
                                             let! materialized =
@@ -2220,6 +2123,7 @@ let private createSessionFromState (state: SessionState) : WorkspaceSession =
                             withValidatedMutation state request.ExpectedWorkspaceVersion (fun () ->
                                 publish state request context)
                 }
+            ConflictResolution = Some(createConflictService state)
     }
 
 /// Opens a session: loads the index or creates the provider-owned workspace

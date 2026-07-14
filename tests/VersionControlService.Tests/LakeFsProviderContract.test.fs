@@ -385,7 +385,7 @@ let createLakeFsHarness () : ProviderTestHarness =
     {
         Name = "lakeFS"
         Factory = factory
-        ExpectedServices = [ "synchronization" ]
+        ExpectedServices = [ "conflicts"; "synchronization" ]
         CreateLocation = fun () -> createLocationWithProfile (Some "default")
         CreateUnauthorizedLocation = fun () -> createLocationWithProfile (Some "unauthorized")
         CreateLocalPath = createRoot
@@ -862,6 +862,251 @@ Vitest.describe (
                     Vitest.expect(afterRead.Generation).toBe (beforeRead.Generation)
                     Vitest.expect(afterRead.BaseRevision).toEqual (beforeRead.BaseRevision)
                     Vitest.expect(afterRead.WorkspaceRevision).toEqual (beforeRead.WorkspaceRevision)
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+)
+
+Vitest.describe (
+    "lakeFS conflict-session cycles",
+    fun () ->
+        Vitest.test (
+            "lakeFS conflict session exposes candidates supplied text resolution and stale-token rejection",
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
+            fun () -> promise {
+                if not (integrationEnabled ()) then
+                    return failwith "lakeFS integration skipped: Docker not available"
+
+                let harness = createLakeFsHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+
+                    do!
+                        harness.AdvanceTarget workspace [|
+                            { Path = "base.txt"; Content = Some "target base\n" }
+                            { Path = "second.txt"; Content = Some "target second\n" }
+                        |]
+
+                    let parsed = parseLocation workspace.Binding.Location
+                    let! targetBeforeResult =
+                        LakeFsApi.getBranch
+                            (connection ())
+                            parsed.Repository
+                            parsed.TargetRef
+                            (context "conflict-cycle-target-before")
+                        |> Async.StartAsPromise
+
+                    let targetBefore = targetBeforeResult |> expectApi "conflict target before"
+
+                    do! workspace.WriteFile "base.txt" "workspace base\n"
+                    do! workspace.WriteFile "second.txt" "workspace second\n"
+
+                    let! saveStatusResult =
+                        workspace.Session.Core.GetStatus(context "conflict-cycle-save-status")
+                        |> Async.StartAsPromise
+
+                    let saveStatus = expectOperationValue "conflict save status" saveStatusResult
+                    let! saveResult =
+                        workspace.Session.Core.CreateRevision
+                            {
+                                Message = "create conflicting workspace revision"
+                                Paths = [| repositoryPath "base.txt"; repositoryPath "second.txt" |]
+                                ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+                            }
+                            (context "conflict-cycle-save")
+                        |> Async.StartAsPromise
+
+                    expectOperationValue "conflicting workspace revision" saveResult |> ignore
+
+                    let! updateStatusResult =
+                        workspace.Session.Core.GetStatus(context "conflict-cycle-update-status")
+                        |> Async.StartAsPromise
+
+                    let updateStatus = expectOperationValue "conflict update status" updateStatusResult
+                    let synchronization =
+                        workspace.Session.Synchronization
+                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization services.")
+
+                    let! updateResult =
+                        synchronization.Update
+                            { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
+                            (context "conflict-cycle-update")
+                        |> Async.StartAsPromise
+
+                    let updateFailure =
+                        match updateResult with
+                        | Succeeded _ -> failwith "The conflicting update unexpectedly succeeded."
+                        | PartiallySucceeded(_, failure)
+                        | Failed failure -> failure
+
+                    Vitest.expect(updateFailure.Category).toEqual FailureCategory.Conflict
+                    Vitest.expect(updateFailure.Code).toBe "conflicts_detected"
+
+                    let conflicts =
+                        workspace.Session.ConflictResolution
+                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS conflict-resolution services.")
+
+                    let! sessionResult =
+                        conflicts.GetActiveSession(context "conflict-cycle-session")
+                        |> Async.StartAsPromise
+
+                    let summary =
+                        expectOperationValue "active conflict session" sessionResult
+                        |> Option.defaultWith (fun () -> failwith "Expected an active conflict session.")
+
+                    Vitest.expect(summary.Handle.SessionId.Length).toBeGreaterThan 20
+                    Vitest.expect(summary.Handle.Version.Length).toBeGreaterThan 0
+                    Vitest.expect(summary.Items.Length).toBe 2
+
+                    for item in summary.Items do
+                        let candidateIds = item.Candidates |> Array.map _.CandidateId
+                        Vitest.expect(candidateIds).toContain "workspace"
+                        Vitest.expect(candidateIds).toContain "target"
+                        Vitest.expect(item.SupportsResolvedContent).toBe true
+
+                    let firstItem =
+                        summary.Items
+                        |> Array.find (fun item -> RepositoryPath.value item.Path = "base.txt")
+
+                    let! resolutionStatusResult =
+                        workspace.Session.Core.GetStatus(context "conflict-cycle-resolution-status")
+                        |> Async.StartAsPromise
+
+                    let resolutionStatus = expectOperationValue "resolution status" resolutionStatusResult
+                    let! firstResolutionResult =
+                        conflicts.Resolve
+                            {
+                                Handle = summary.Handle
+                                ExpectedWorkspaceVersion = resolutionStatus.WorkspaceVersion
+                                Path = firstItem.Path
+                                Resolution = PickCandidate "target"
+                            }
+                            (context "conflict-cycle-first-resolution")
+                        |> Async.StartAsPromise
+
+                    let firstResolution = expectOperationValue "first conflict resolution" firstResolutionResult
+                    Vitest.expect(firstResolution.RefreshedHandle.SessionId).toBe summary.Handle.SessionId
+                    Vitest.expect(firstResolution.RefreshedHandle.Version).not.toBe summary.Handle.Version
+                    Vitest.expect(firstResolution.RemainingItems.Length).toBe 1
+
+                    let! afterFirstStatusResult =
+                        workspace.Session.Core.GetStatus(context "conflict-cycle-after-first-status")
+                        |> Async.StartAsPromise
+
+                    let afterFirstStatus = expectOperationValue "after first resolution status" afterFirstStatusResult
+                    let secondItem = firstResolution.RemainingItems[0]
+                    let! staleResult =
+                        conflicts.Resolve
+                            {
+                                Handle = summary.Handle
+                                ExpectedWorkspaceVersion = afterFirstStatus.WorkspaceVersion
+                                Path = secondItem.Path
+                                Resolution = PickCandidate "workspace"
+                            }
+                            (context "conflict-cycle-stale-resolution")
+                        |> Async.StartAsPromise
+
+                    let staleFailure =
+                        match staleResult with
+                        | Succeeded _
+                        | PartiallySucceeded _ -> failwith "A stale conflict handle unexpectedly mutated the session."
+                        | Failed failure -> failure
+
+                    Vitest.expect(staleFailure.Category).toEqual FailureCategory.Concurrency
+                    Vitest.expect(staleFailure.Code).toBe "precondition_failed"
+                    Vitest.expect(staleFailure.RecoveryAction |> Option.map _.Code).toEqual (Some ConflictRecovery.RefreshConflictSession)
+
+                    let! afterStaleSessionResult =
+                        conflicts.GetActiveSession(context "conflict-cycle-after-stale-session")
+                        |> Async.StartAsPromise
+
+                    let afterStaleSession =
+                        expectOperationValue "session after stale resolution" afterStaleSessionResult
+                        |> Option.defaultWith (fun () -> failwith "The stale request closed the live session.")
+
+                    Vitest.expect(afterStaleSession.Handle).toEqual firstResolution.RefreshedHandle
+                    Vitest.expect(afterStaleSession.Items.Length).toBe 1
+
+                    let! secondResolutionResult =
+                        conflicts.Resolve
+                            {
+                                Handle = firstResolution.RefreshedHandle
+                                ExpectedWorkspaceVersion = afterFirstStatus.WorkspaceVersion
+                                Path = secondItem.Path
+                                Resolution = SupplyResolvedContent "supplied second\n"
+                            }
+                            (context "conflict-cycle-supplied-resolution")
+                        |> Async.StartAsPromise
+
+                    let secondResolution = expectOperationValue "supplied conflict resolution" secondResolutionResult
+                    Vitest.expect(secondResolution.RemainingItems.Length).toBe 0
+
+                    let! finalizeStatusResult =
+                        workspace.Session.Core.GetStatus(context "conflict-cycle-finalize-status")
+                        |> Async.StartAsPromise
+
+                    let finalizeStatus = expectOperationValue "conflict finalize status" finalizeStatusResult
+                    let! finalizeResult =
+                        conflicts.Finalize
+                            {
+                                Handle = secondResolution.RefreshedHandle
+                                ExpectedWorkspaceVersion = finalizeStatus.WorkspaceVersion
+                                Message = Some "finalize versioned conflict session"
+                            }
+                            (context "conflict-cycle-finalize")
+                        |> Async.StartAsPromise
+
+                    expectOperationValue "finalize conflict session" finalizeResult |> ignore
+
+                    let! closedResult =
+                        conflicts.GetActiveSession(context "conflict-cycle-closed-session")
+                        |> Async.StartAsPromise
+
+                    Vitest.expect(expectOperationValue "closed conflict session" closedResult).toEqual None
+
+                    let! closedStatusResult =
+                        workspace.Session.Core.GetStatus(context "conflict-cycle-closed-status")
+                        |> Async.StartAsPromise
+
+                    let closedStatus = expectOperationValue "closed conflict status" closedStatusResult
+                    let! closedReplayResult =
+                        conflicts.Cancel
+                            {
+                                Handle = secondResolution.RefreshedHandle
+                                ExpectedWorkspaceVersion = closedStatus.WorkspaceVersion
+                            }
+                            (context "conflict-cycle-closed-replay")
+                        |> Async.StartAsPromise
+
+                    let closedFailure =
+                        match closedReplayResult with
+                        | Succeeded _
+                        | PartiallySucceeded _ -> failwith "A closed conflict handle unexpectedly succeeded."
+                        | Failed failure -> failure
+
+                    Vitest.expect(closedFailure.Category).toEqual FailureCategory.Concurrency
+                    Vitest.expect(closedFailure.Code).toBe "precondition_failed"
+                    Vitest.expect(closedFailure.RecoveryAction |> Option.map _.Code).toEqual (Some ConflictRecovery.RefreshConflictSession)
+
+                    let! mergedBase = workspace.ReadFile "base.txt"
+                    let! mergedSecond = workspace.ReadFile "second.txt"
+                    Vitest.expect(mergedBase).toEqual (Some "target base\n")
+                    Vitest.expect(mergedSecond).toEqual (Some "supplied second\n")
+
+                    let! targetAfterResult =
+                        LakeFsApi.getBranch
+                            (connection ())
+                            parsed.Repository
+                            parsed.TargetRef
+                            (context "conflict-cycle-target-after")
+                        |> Async.StartAsPromise
+
+                    let targetAfter = targetAfterResult |> expectApi "conflict target after"
+                    Vitest.expect(targetAfter.CommitId).toBe targetBefore.CommitId
                     do! harness.Cleanup()
                 with error ->
                     do! harness.Cleanup()
