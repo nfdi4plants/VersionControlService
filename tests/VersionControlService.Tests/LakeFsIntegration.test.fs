@@ -731,4 +731,192 @@ Vitest.describe (
                     return raise error
             }
         )
+
+        Vitest.test (
+            "lakeFS cleanup requires ownership and unchanged expected head",
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
+            fun () -> promise {
+                if not (integrationEnabled ()) then
+                    return failwith "lakeFS integration skipped: Docker not available"
+
+                let harness = createLakeFsHarness ()
+                let credentials = LakeFsCredentials.fixedConnection (connection ())
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let index =
+                        match LakeFsWorkspaceIndex.load workspace.Binding.WorkspaceRoot with
+                        | LakeFsWorkspaceIndex.Loaded index -> index
+                        | _ -> failwith "Expected an index before cleanup."
+
+                    let parsed =
+                        LakeFsTypes.LakeFsLocation.tryParse workspace.Binding.Location.ProviderLocation
+                        |> Result.defaultWith failwith
+
+                    // Closing a reusable session releases in-process resources but
+                    // does not discard the persisted workspace branch.
+                    do! workspace.Session.Close() |> Async.StartAsPromise
+                    let! afterCloseResult =
+                        LakeFsApi.getBranch
+                            (connection ())
+                            parsed.Repository
+                            index.WorkspaceBranch
+                            (OperationContext.detached "cleanup-after-close")
+                        |> Async.StartAsPromise
+
+                    afterCloseResult |> Result.defaultWith (fun failure -> failwith failure.Message) |> ignore
+
+                    let! foreignResult =
+                        LakeFsWorkspaceSession.cleanupOwnedWorkspaceBranch
+                            LakeFsWorkspaceSession.LakeFsSessionHooks.none
+                            credentials
+                            workspace.Binding
+                            "foreign-ownership-token"
+                            index.WorkspaceRevision
+                            (OperationContext.detached "cleanup-foreign-owner")
+                        |> Async.StartAsPromise
+
+                    let foreignFailure = expectFailure "foreign cleanup" foreignResult
+                    Vitest.expect(foreignFailure.Category).toEqual FailureCategory.Concurrency
+                    Vitest.expect(foreignFailure.Code).toBe "precondition_failed"
+
+                    let! stillOwnedResult =
+                        LakeFsApi.getBranch
+                            (connection ())
+                            parsed.Repository
+                            index.WorkspaceBranch
+                            (OperationContext.detached "cleanup-still-owned")
+                        |> Async.StartAsPromise
+
+                    stillOwnedResult |> Result.defaultWith (fun failure -> failwith failure.Message) |> ignore
+
+                    let raceHooks: LakeFsWorkspaceSession.LakeFsSessionHooks = {
+                        Barrier =
+                            Some(fun _ point context -> async {
+                                if point = "cleanup-precheck-done" then
+                                    let! uploaded =
+                                        LakeFsApi.uploadObject
+                                            (connection ())
+                                            parsed.Repository
+                                            index.WorkspaceBranch
+                                            "cleanup-racer.txt"
+                                            "cleanup racer content\n"
+                                            context
+
+                                    uploaded |> Result.defaultWith (fun failure -> failwith failure.Message) |> ignore
+
+                                    let! committed =
+                                        LakeFsApi.commit
+                                            (connection ())
+                                            parsed.Repository
+                                            index.WorkspaceBranch
+                                            "advance cleanup destination"
+                                            context
+
+                                    committed |> Result.defaultWith (fun failure -> failwith failure.Message) |> ignore
+                            })
+                    }
+
+                    let! racedResult =
+                        LakeFsWorkspaceSession.cleanupOwnedWorkspaceBranch
+                            raceHooks
+                            credentials
+                            workspace.Binding
+                            index.OwnershipToken
+                            index.WorkspaceRevision
+                            (OperationContext.detached "cleanup-raced-head")
+                        |> Async.StartAsPromise
+
+                    let racedFailure = expectFailure "raced cleanup" racedResult
+                    Vitest.expect(racedFailure.Category).toEqual FailureCategory.Concurrency
+                    let raceEvidence = racedFailure.RevisionEvidence |> Map.ofArray
+                    Vitest.expect(raceEvidence.ContainsKey "expected_head").toBe true
+                    Vitest.expect(raceEvidence.ContainsKey "observed_head").toBe true
+
+                    let! advancedResult =
+                        LakeFsApi.getBranch
+                            (connection ())
+                            parsed.Repository
+                            index.WorkspaceBranch
+                            (OperationContext.detached "cleanup-advanced-head")
+                        |> Async.StartAsPromise
+
+                    let advanced = advancedResult |> Result.defaultWith (fun failure -> failwith failure.Message)
+                    Vitest.expect(Some advanced.CommitId).not.toEqual index.WorkspaceRevision
+
+                    let! cleanedResult =
+                        LakeFsWorkspaceSession.cleanupOwnedWorkspaceBranch
+                            LakeFsWorkspaceSession.LakeFsSessionHooks.none
+                            credentials
+                            workspace.Binding
+                            index.OwnershipToken
+                            (Some advanced.CommitId)
+                            (OperationContext.detached "cleanup-owned-head")
+                        |> Async.StartAsPromise
+
+                    expectValue "owned cleanup" cleanedResult |> ignore
+
+                    let! missingResult =
+                        LakeFsWorkspaceSession.cleanupOwnedWorkspaceBranch
+                            LakeFsWorkspaceSession.LakeFsSessionHooks.none
+                            credentials
+                            workspace.Binding
+                            index.OwnershipToken
+                            (Some advanced.CommitId)
+                            (OperationContext.detached "cleanup-abandoned-branch")
+                        |> Async.StartAsPromise
+
+                    match missingResult with
+                    | Succeeded outcome ->
+                        match outcome.Effect with
+                        | NoOp _ -> ()
+                        | Performed -> failwith "Cleaning an already-absent branch must be a NoOp."
+                    | PartiallySucceeded(_, failure)
+                    | Failed failure -> failwith $"Absent-branch cleanup failed: {failure.Message}"
+
+                    let! permissionWorkspace = harness.CreateWorkspace()
+                    let permissionIndex =
+                        match LakeFsWorkspaceIndex.load permissionWorkspace.Binding.WorkspaceRoot with
+                        | LakeFsWorkspaceIndex.Loaded value -> value
+                        | _ -> failwith "Expected an index for permission cleanup."
+
+                    let permissionLocation =
+                        LakeFsTypes.LakeFsLocation.tryParse permissionWorkspace.Binding.Location.ProviderLocation
+                        |> Result.defaultWith failwith
+
+                    let unauthorized =
+                        LakeFsCredentials.fixedConnection {
+                            connection () with
+                                SecretAccessKey = "invalid-cleanup-secret"
+                        }
+
+                    let! permissionResult =
+                        LakeFsWorkspaceSession.cleanupOwnedWorkspaceBranch
+                            LakeFsWorkspaceSession.LakeFsSessionHooks.none
+                            unauthorized
+                            permissionWorkspace.Binding
+                            permissionIndex.OwnershipToken
+                            permissionIndex.WorkspaceRevision
+                            (OperationContext.detached "cleanup-permission-denied")
+                        |> Async.StartAsPromise
+
+                    let permissionFailure = expectFailure "permission cleanup" permissionResult
+                    Vitest.expect(permissionFailure.Category = FailureCategory.Authentication
+                                  || permissionFailure.Category = FailureCategory.Authorization).toBe true
+
+                    let! permissionBranchResult =
+                        LakeFsApi.getBranch
+                            (connection ())
+                            permissionLocation.Repository
+                            permissionIndex.WorkspaceBranch
+                            (OperationContext.detached "cleanup-permission-branch")
+                        |> Async.StartAsPromise
+
+                    permissionBranchResult |> Result.defaultWith (fun failure -> failwith failure.Message) |> ignore
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
 )

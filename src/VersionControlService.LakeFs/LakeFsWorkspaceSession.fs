@@ -2425,6 +2425,188 @@ let openSession
                     | Ok state -> return OperationResult.succeeded (createSessionFromState state)
     }
 
+let private cleanupPreconditionFailure message expectedHead observedHead =
+    {
+        OperationFailure.create Concurrency "precondition_failed" message with
+            RevisionEvidence = [|
+                yield!
+                    expectedHead
+                    |> Option.map (fun revision -> "expected_head", mkRevisionId revision)
+                    |> Option.toList
+                yield!
+                    observedHead
+                    |> Option.map (fun revision -> "observed_head", mkRevisionId revision)
+                    |> Option.toList
+            |]
+            RecoveryAction =
+                Some {
+                    Code = "review_workspace_branch"
+                    Instructions =
+                        Some "Refresh the owned workspace branch, verify its ownership and head, then retry deliberately."
+                }
+    }
+
+/// Deletes an expired binding's provider-owned workspace branch. Session Close is
+/// intentionally non-destructive; hosts call this lifecycle operation only when a
+/// binding is being discarded. lakeFS has no conditional branch delete, so the
+/// implementation checks the head immediately before deletion and verifies absence
+/// afterwards, reporting any observed race instead of claiming clean success.
+let cleanupOwnedWorkspaceBranch
+    (hooks: LakeFsSessionHooks)
+    (credentials: LakeFsCredentials.LakeFsCredentialStrategy)
+    (binding: WorkspaceBinding)
+    (ownershipToken: string)
+    (expectedHead: string option)
+    (context: OperationContext)
+    : Async<OperationResult<unit>> =
+    async {
+        match LakeFsLocation.tryParse binding.Location.ProviderLocation with
+        | Error message ->
+            return Failed(OperationFailure.create Validation "invalid_location" message)
+        | Ok location ->
+            match LakeFsIndex.load binding.WorkspaceRoot with
+            | LakeFsIndex.Missing ->
+                return OperationResult.noOp (Some "No lakeFS workspace index remains to clean up.") ()
+            | LakeFsIndex.Corrupt message ->
+                return Failed(OperationFailure.createRedacted ProviderError "workspace_index_corrupt" message)
+            | LakeFsIndex.Loaded index ->
+                let derivedBranch =
+                    if String.IsNullOrWhiteSpace ownershipToken then
+                        ""
+                    else
+                        workspaceBranchName binding.WorkspaceRoot ownershipToken
+
+                let ownsBranch =
+                    ownershipToken <> ""
+                    && ownershipToken = index.OwnershipToken
+                    && derivedBranch = index.WorkspaceBranch
+                    && location.Repository = index.Repository
+                    && location.TargetRef = index.TargetRef
+                    && location.Prefix = index.Prefix
+
+                if not ownsBranch then
+                    return
+                        Failed(
+                            cleanupPreconditionFailure
+                                "The persisted binding does not prove ownership of this lakeFS workspace branch."
+                                expectedHead
+                                None
+                        )
+                else
+                    match expectedHead with
+                    | None ->
+                        return
+                            Failed(
+                                cleanupPreconditionFailure
+                                    "Cleanup requires the caller-observed workspace-branch head."
+                                    None
+                                    index.WorkspaceRevision
+                            )
+                    | Some expected ->
+                        let! connection = credentials.ResolveConnection binding.ConnectionProfileId
+
+                        match connection with
+                        | Error message ->
+                            return
+                                Failed(
+                                    OperationFailure.createRedacted
+                                        Authentication
+                                        "connection_profile_unresolved"
+                                        message
+                                )
+                        | Ok resolved ->
+                            let! initialHead =
+                                LakeFsApi.getBranch
+                                    resolved
+                                    index.Repository
+                                    index.WorkspaceBranch
+                                    context
+
+                            match initialHead with
+                            | Error failure when failure.Category = NotFound ->
+                                return
+                                    OperationResult.noOp
+                                        (Some "The owned lakeFS workspace branch is already absent.")
+                                        ()
+                            | Error failure -> return Failed failure
+                            | Ok branch when branch.CommitId <> expected ->
+                                return
+                                    Failed(
+                                        cleanupPreconditionFailure
+                                            "The owned workspace branch moved before cleanup."
+                                            (Some expected)
+                                            (Some branch.CommitId)
+                                    )
+                            | Ok _ ->
+                                match hooks.Barrier with
+                                | Some hook ->
+                                    do! hook binding.WorkspaceRoot "cleanup-precheck-done" context
+                                | None -> ()
+
+                                let! finalHead =
+                                    LakeFsApi.getBranch
+                                        resolved
+                                        index.Repository
+                                        index.WorkspaceBranch
+                                        context
+
+                                match finalHead with
+                                | Error failure when failure.Category = NotFound ->
+                                    return
+                                        OperationResult.noOp
+                                            (Some "The owned lakeFS workspace branch is already absent.")
+                                            ()
+                                | Error failure -> return Failed failure
+                                | Ok branch when branch.CommitId <> expected ->
+                                    return
+                                        Failed(
+                                            cleanupPreconditionFailure
+                                                "The owned workspace branch advanced during cleanup verification."
+                                                (Some expected)
+                                                (Some branch.CommitId)
+                                        )
+                                | Ok _ ->
+                                    let! deleted =
+                                        LakeFsApi.deleteBranch
+                                            resolved
+                                            index.Repository
+                                            index.WorkspaceBranch
+                                            context
+
+                                    match deleted with
+                                    | Error failure -> return Failed failure
+                                    | Ok() ->
+                                        let! verified =
+                                            LakeFsApi.getBranch
+                                                resolved
+                                                index.Repository
+                                                index.WorkspaceBranch
+                                                context
+
+                                        match verified with
+                                        | Error failure when failure.Category = NotFound ->
+                                            return OperationResult.succeeded ()
+                                        | Error failure ->
+                                            return Failed { failure with StateChanged = true }
+                                        | Ok branch ->
+                                            return
+                                                OperationResult.partiallySucceeded
+                                                    (OperationOutcome.performed ())
+                                                    {
+                                                        cleanupPreconditionFailure
+                                                            "The workspace branch was recreated during cleanup verification."
+                                                            (Some expected)
+                                                            (Some branch.CommitId) with
+                                                            StateChanged = true
+                                                    }
+                                                    {
+                                                        Code = "review_workspace_branch"
+                                                        Instructions =
+                                                            Some
+                                                                "Review the recreated branch before retrying cleanup."
+                                                    }
+    }
+
 /// Factory whose Open builds real lakeFS sessions.
 let createFactory
     (hooks: LakeFsSessionHooks)
