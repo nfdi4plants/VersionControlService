@@ -240,4 +240,122 @@ Vitest.describe (
                     return raise error
             }
         )
+
+        Vitest.test (
+            "lakeFS update verifies destination head and merge parentage after a race",
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
+            fun () -> promise {
+                if not (integrationEnabled ()) then
+                    return failwith "lakeFS integration skipped: Docker not available"
+
+                let harness = createLakeFsHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let synchronization =
+                        workspace.Session.Synchronization
+                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization services.")
+
+                    do!
+                        harness.AdvanceTarget workspace [|
+                            { Path = "target-before-update.txt"; Content = Some "target content\n" }
+                        |]
+
+                    let before =
+                        match LakeFsWorkspaceIndex.load workspace.Binding.WorkspaceRoot with
+                        | LakeFsWorkspaceIndex.Loaded index -> index
+                        | _ -> failwith "Expected an index before the update race."
+
+                    let parsed = LakeFsTypes.LakeFsLocation.tryParse workspace.Binding.Location.ProviderLocation |> Result.defaultWith failwith
+                    let! targetResult =
+                        LakeFsApi.getBranch
+                            (connection ())
+                            parsed.Repository
+                            parsed.TargetRef
+                            (OperationContext.detached "update-race-target")
+                        |> Async.StartAsPromise
+
+                    let target = targetResult |> Result.defaultWith (fun failure -> failwith failure.Message)
+                    let! statusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "update-race-status")
+                        |> Async.StartAsPromise
+
+                    let status = expectValue "update race status" statusResult
+
+                    do!
+                        harness.ArmDestinationRace workspace [|
+                            { Path = "workspace-racer.txt"; Content = Some "workspace racer content\n" }
+                        |]
+
+                    let! updateResult =
+                        synchronization.Update
+                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                            (OperationContext.detached "update-race")
+                        |> Async.StartAsPromise
+
+                    let outcome, failure =
+                        match updateResult with
+                        | Succeeded _ -> failwith "A raced update must not report clean success."
+                        | Failed failure -> None, failure
+                        | PartiallySucceeded(outcome, failure) -> Some outcome, failure
+
+                    Vitest.expect(failure.Category).toEqual (FailureCategory.Concurrency)
+                    let evidence = failure.RevisionEvidence |> Map.ofArray
+                    Vitest.expect(evidence.ContainsKey "expected_workspace").toBe true
+                    Vitest.expect(evidence.ContainsKey "observed_workspace").toBe true
+                    Vitest.expect(evidence["expected_workspace"] |> RevisionId.value).toBe (before.WorkspaceRevision.Value)
+
+                    let! workspaceHeadResult =
+                        LakeFsApi.getBranch
+                            (connection ())
+                            parsed.Repository
+                            before.WorkspaceBranch
+                            (OperationContext.detached "update-race-workspace-head")
+                        |> Async.StartAsPromise
+
+                    let workspaceHead = workspaceHeadResult |> Result.defaultWith (fun error -> failwith error.Message)
+                    Vitest.expect(workspaceHead.CommitId).not.toBe (before.WorkspaceRevision.Value)
+
+                    let! mergeCommitResult =
+                        LakeFsApi.getCommit
+                            (connection ())
+                            parsed.Repository
+                            workspaceHead.CommitId
+                            (OperationContext.detached "update-race-merge-commit")
+                        |> Async.StartAsPromise
+
+                    let mergeCommit = mergeCommitResult |> Result.defaultWith (fun error -> failwith error.Message)
+                    Vitest.expect(mergeCommit.Parents).toContain (target.CommitId)
+
+                    let observedWorkspace = evidence["observed_workspace"] |> RevisionId.value
+                    Vitest.expect(mergeCommit.Parents).toContain observedWorkspace
+
+                    match outcome with
+                    | Some partial -> Vitest.expect(partial.ResultingRevision |> Option.map RevisionId.value).toEqual (Some workspaceHead.CommitId)
+                    | None -> failwith "The merge changed the workspace branch and must report partial success."
+
+                    let after =
+                        match LakeFsWorkspaceIndex.load workspace.Binding.WorkspaceRoot with
+                        | LakeFsWorkspaceIndex.Loaded index -> index
+                        | _ -> failwith "Expected an index after the update race."
+
+                    Vitest.expect(after.Generation).toBe (before.Generation)
+                    Vitest.expect(after.WorkspaceRevision).toEqual (before.WorkspaceRevision)
+
+                    let! targetAfterResult =
+                        LakeFsApi.getBranch
+                            (connection ())
+                            parsed.Repository
+                            parsed.TargetRef
+                            (OperationContext.detached "update-race-target-after")
+                        |> Async.StartAsPromise
+
+                    let targetAfter = targetAfterResult |> Result.defaultWith (fun error -> failwith error.Message)
+                    Vitest.expect(targetAfter.CommitId).toBe (target.CommitId)
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
 )

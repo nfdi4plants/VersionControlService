@@ -1137,6 +1137,7 @@ let private tryRefNameOfProviderRef (reference: ProviderRef) =
 let private resetOwnedWorkspaceBranch
     (state: SessionState)
     (resolved: LakeFsConnection)
+    (expectedCurrentHead: string option)
     (sourceRevision: string)
     (context: OperationContext)
     =
@@ -1150,7 +1151,7 @@ let private resetOwnedWorkspaceBranch
 
         match current with
         | Error failure -> return Error failure
-        | Ok observed when state.Index.WorkspaceRevision <> Some observed.CommitId ->
+        | Ok observed when expectedCurrentHead <> Some observed.CommitId ->
             return
                 Error {
                     OperationFailure.create
@@ -1159,7 +1160,7 @@ let private resetOwnedWorkspaceBranch
                         "The owned workspace branch moved before it could be reset." with
                         RevisionEvidence = [|
                             yield!
-                                state.Index.WorkspaceRevision
+                                expectedCurrentHead
                                 |> Option.map (fun revision -> "expected_head", mkRevisionId revision)
                                 |> Option.toList
                             "observed_head", mkRevisionId observed.CommitId
@@ -1225,7 +1226,13 @@ let private switchWorkspaceToRef
         match materialized with
         | Error failure -> return Error failure
         | Ok() ->
-            let! reset = resetOwnedWorkspaceBranch state resolved targetRevision context
+            let! reset =
+                resetOwnedWorkspaceBranch
+                    state
+                    resolved
+                    state.Index.WorkspaceRevision
+                    targetRevision
+                    context
 
             match reset with
             | Error failure -> return Error { failure with StateChanged = true }
@@ -1571,71 +1578,174 @@ let private update (state: SessionState) (request: UpdateRequest) (context: Oper
                             else
                                 // Act: merge the target into the workspace branch, then
                                 // verify the resulting head (client-side race window).
+                                let expectedWorkspace = state.Index.WorkspaceRevision
+                                let canFastForwardToTarget =
+                                    expectedWorkspace = state.Index.BaseRevision
+                                    && (classifyWorkspace state |> List.isEmpty)
+
                                 do! barrier state "update-precheck-done" context
 
-                                let! merged =
-                                    LakeFsApi.merge
+                                let! workspaceBeforeMerge =
+                                    LakeFsApi.getBranch
                                         resolved
                                         state.Index.Repository
-                                        state.Index.TargetRef
                                         state.Index.WorkspaceBranch
-                                        "update: incorporate target"
                                         context
 
-                                match merged with
-                                | Error failure when failure.Category = Conflict ->
-                                    return Failed failure
+                                match workspaceBeforeMerge with
                                 | Error failure -> return Failed failure
-                                | Ok mergeResult ->
-                                    let! branchAfter =
-                                        LakeFsApi.getBranch
+                                | Ok observedWorkspace ->
+                                    let! merged =
+                                        LakeFsApi.merge
                                             resolved
                                             state.Index.Repository
+                                            state.Index.TargetRef
                                             state.Index.WorkspaceBranch
+                                            "update: incorporate target"
                                             context
 
-                                    let verified =
-                                        match branchAfter with
-                                        | Ok branch -> branch.CommitId = mergeResult.Reference
-                                        | Error _ -> false
+                                    match merged with
+                                    | Error failure when failure.Category = Conflict ->
+                                        return Failed failure
+                                    | Error failure -> return Failed failure
+                                    | Ok mergeResult ->
+                                        let! branchAfter =
+                                            LakeFsApi.getBranch
+                                                resolved
+                                                state.Index.Repository
+                                                state.Index.WorkspaceBranch
+                                                context
 
-                                    let! materialized =
-                                        materializeRef state resolved state.Index.WorkspaceBranch context
+                                        let! mergeCommit =
+                                            LakeFsApi.getCommit
+                                                resolved
+                                                state.Index.Repository
+                                                mergeResult.Reference
+                                                context
 
-                                    match materialized with
-                                    | Error failure -> return Failed { failure with StateChanged = true }
-                                    | Ok() ->
-                                        state.Index <- {
-                                            state.Index with
-                                                BaseRevision = Some head
-                                                WorkspaceRevision = Some mergeResult.Reference
-                                        }
+                                        let verified =
+                                            match branchAfter, mergeCommit with
+                                            | Ok resultingBranch, Ok resultingCommit ->
+                                                let sourceVerified =
+                                                    mergeResult.Reference = head
+                                                    || resultingCommit.Parents |> Array.contains head
 
-                                        match saveIndex state with
-                                        | Error failure -> return Failed { failure with StateChanged = true }
-                                        | Ok() ->
-                                            let syncState = synchronizationState state (Some head)
+                                                let destinationVerified =
+                                                    mergeResult.Reference = observedWorkspace.CommitId
+                                                    || resultingCommit.Parents
+                                                       |> Array.contains observedWorkspace.CommitId
 
-                                            if verified then
-                                                return OperationResult.succeeded syncState
-                                            else
-                                                return
-                                                    OperationResult.partiallySucceeded
-                                                        (OperationOutcome.performed syncState)
-                                                        {
-                                                            OperationFailure.create
-                                                                Concurrency
-                                                                "precondition_failed"
-                                                                "The workspace branch advanced during update verification." with
-                                                                RevisionEvidence = [|
-                                                                    "expected_head", mkRevisionId mergeResult.Reference
-                                                                |]
-                                                        }
-                                                        {
-                                                            Code = "review_and_retry"
-                                                            Instructions =
-                                                                Some "Review the workspace branch, refresh, and retry."
-                                                        }
+                                                expectedWorkspace = Some observedWorkspace.CommitId
+                                                && resultingBranch.CommitId = mergeResult.Reference
+                                                && sourceVerified
+                                                && destinationVerified
+                                            | _ -> false
+
+                                        if not verified then
+                                            let observedResult =
+                                                match branchAfter with
+                                                | Ok branch -> Some branch.CommitId
+                                                | Error _ -> None
+
+                                            let observedState = {
+                                                state with
+                                                    Index = {
+                                                        state.Index with
+                                                            WorkspaceRevision =
+                                                                observedResult
+                                                                |> Option.orElse (Some mergeResult.Reference)
+                                                    }
+                                            }
+
+                                            let outcome = {
+                                                OperationOutcome.performed (
+                                                    synchronizationState observedState (Some head)
+                                                ) with
+                                                    ResultingRevision =
+                                                        Some(mkRevisionId mergeResult.Reference)
+                                                    Publication = LocalOnly
+                                            }
+
+                                            return
+                                                OperationResult.partiallySucceeded
+                                                    outcome
+                                                    {
+                                                        OperationFailure.create
+                                                            Concurrency
+                                                            "precondition_failed"
+                                                            "The workspace branch advanced during update verification." with
+                                                            RevisionEvidence = [|
+                                                                yield!
+                                                                    expectedWorkspace
+                                                                    |> Option.map (fun revision ->
+                                                                        "expected_workspace",
+                                                                        mkRevisionId revision)
+                                                                    |> Option.toList
+                                                                "observed_workspace",
+                                                                mkRevisionId observedWorkspace.CommitId
+                                                                "expected_target", mkRevisionId head
+                                                                yield!
+                                                                    observedResult
+                                                                    |> Option.map (fun revision ->
+                                                                        "observed_result",
+                                                                        mkRevisionId revision)
+                                                                    |> Option.toList
+                                                            |]
+                                                    }
+                                                    {
+                                                        Code = "review_and_retry"
+                                                        Instructions =
+                                                            Some
+                                                                "Review the observed workspace-branch merge, refresh, and retry deliberately."
+                                                    }
+                                        else
+                                            let! preparedWorkspace =
+                                                if canFastForwardToTarget then
+                                                    resetOwnedWorkspaceBranch
+                                                        state
+                                                        resolved
+                                                        (Some mergeResult.Reference)
+                                                        head
+                                                        context
+                                                else
+                                                    async.Return(Ok())
+
+                                            match preparedWorkspace with
+                                            | Error failure ->
+                                                return Failed { failure with StateChanged = true }
+                                            | Ok() ->
+                                                let materializationRef =
+                                                    if canFastForwardToTarget then
+                                                        head
+                                                    else
+                                                        state.Index.WorkspaceBranch
+
+                                                let! materialized =
+                                                    materializeRef state resolved materializationRef context
+
+                                                match materialized with
+                                                | Error failure ->
+                                                    return Failed { failure with StateChanged = true }
+                                                | Ok() ->
+                                                    let resultingWorkspace =
+                                                        if canFastForwardToTarget then
+                                                            head
+                                                        else
+                                                            mergeResult.Reference
+
+                                                    state.Index <- {
+                                                        state.Index with
+                                                            BaseRevision = Some head
+                                                            WorkspaceRevision = Some resultingWorkspace
+                                                    }
+
+                                                    match saveIndex state with
+                                                    | Error failure ->
+                                                        return Failed { failure with StateChanged = true }
+                                                    | Ok() ->
+                                                        return
+                                                            synchronizationState state (Some head)
+                                                            |> OperationResult.succeeded
     }
 
 let private publish (state: SessionState) (request: PublishRequest) (context: OperationContext) =

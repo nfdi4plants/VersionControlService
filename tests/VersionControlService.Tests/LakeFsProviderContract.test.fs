@@ -229,11 +229,27 @@ let createLakeFsHarness () : ProviderTestHarness =
                         publishShouldBreak <- false
                         failNextConnection <- true
 
-                    if point = "publish-precheck-done" || point = "update-precheck-done" || point = "finalize-precheck-done" then
+                    if point = "publish-precheck-done" then
                         match control.RaceMutations with
                         | Some mutations ->
                             control.RaceMutations <- None
                             do! Async.AwaitPromise(advanceTarget control.Location mutations)
+                        | None -> ()
+
+                    if point = "update-precheck-done" || point = "finalize-precheck-done" then
+                        match control.RaceMutations with
+                        | Some mutations ->
+                            control.RaceMutations <- None
+
+                            match LakeFsWorkspaceIndex.load root with
+                            | LakeFsWorkspaceIndex.Loaded index ->
+                                do!
+                                    Async.AwaitPromise(
+                                        advanceRef control.Location index.WorkspaceBranch mutations
+                                    )
+                            | LakeFsWorkspaceIndex.Missing
+                            | LakeFsWorkspaceIndex.Corrupt _ ->
+                                failwith "Expected a persisted workspace index for the destination race."
                         | None -> ()
 
                     if point = "selected-revision-commit-done" then
