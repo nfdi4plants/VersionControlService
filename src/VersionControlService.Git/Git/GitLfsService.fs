@@ -29,7 +29,9 @@ let private lfsLsFilesTimeoutMs = 15000
 
 let parseLsFiles (stdoutText: string) : GitLfsLsFileInfo[] =
     try
-        ARCtrl.Json.Decode.fromJsonString JsonDecoder.lsFilesResponseDecoder stdoutText
+        match Thoth.Json.JavaScript.Decode.fromString JsonDecoder.lsFilesResponseDecoder stdoutText with
+        | Ok files -> files
+        | Error message -> failwith message
     with ex ->
         let detail =
             if String.IsNullOrWhiteSpace ex.Message then
