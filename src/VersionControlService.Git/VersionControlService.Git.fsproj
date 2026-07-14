@@ -38,6 +38,6 @@
   </ItemGroup>
   <ItemGroup>
     <Content Include="VersionControlService.Git.fsproj" Pack="true" PackagePath="fable\" />
-    <Content Include="**\*.fs" Pack="true" PackagePath="fable\%(RecursiveDir)" />
+    <Content Include="**\*.fs" Exclude="bin\**;obj\**" Pack="true" PackagePath="fable\" />
   </ItemGroup>
 </Project>
