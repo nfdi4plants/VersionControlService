@@ -1785,77 +1785,105 @@ let private publish (state: SessionState) (request: PublishRequest) (context: Op
                             (Some "The target already has every local revision.")
                             (synchronizationState state (Some head))
                 else
+                    let expectedWorkspace = state.Index.WorkspaceRevision
                     do! barrier state "publish-precheck-done" context
                     do! barrier state "transfer-start" context
 
                     if context.Cancellation.IsCancellationRequested() then
                         return OperationResult.canceled "The publish was canceled."
                     else
-                        // Act: merge the workspace branch into the logical target.
-                        let! merged =
-                            LakeFsApi.merge
+                        let! targetBeforeMerge =
+                            LakeFsApi.getBranch
                                 resolved
                                 state.Index.Repository
-                                state.Index.WorkspaceBranch
                                 state.Index.TargetRef
-                                "publish: workspace revisions"
                                 context
 
-                        match merged with
-                        | Error failure ->
-                            // A failed publish leaves the workspace branch intact for retry.
-                            return
-                                Failed {
-                                    failure with
-                                        Retryable = true
-                                        RecoveryAction =
-                                            Some {
-                                                Code = "retry_publish"
-                                                Instructions =
-                                                    Some
-                                                        "The workspace branch still holds every revision; retry once the target is reachable."
-                                            }
-                                }
-                        | Ok mergeResult ->
-                            // Verify: re-read the target head and check parentage.
-                            let! branchAfter =
-                                LakeFsApi.getBranch resolved state.Index.Repository state.Index.TargetRef context
+                        match targetBeforeMerge with
+                        | Error failure -> return Failed { failure with Retryable = true }
+                        | Ok observedTarget ->
+                            // Act: merge the workspace branch into the logical target.
+                            let! merged =
+                                LakeFsApi.merge
+                                    resolved
+                                    state.Index.Repository
+                                    state.Index.WorkspaceBranch
+                                    state.Index.TargetRef
+                                    "publish: workspace revisions"
+                                    context
 
-                            let! mergeCommit =
-                                LakeFsApi.getCommit resolved state.Index.Repository mergeResult.Reference context
+                            match merged with
+                            | Error failure ->
+                                // A failed publish leaves the workspace branch intact for retry.
+                                return
+                                    Failed {
+                                        failure with
+                                            Retryable = true
+                                            RecoveryAction =
+                                                Some {
+                                                    Code = "retry_publish"
+                                                    Instructions =
+                                                        Some
+                                                            "The workspace branch still holds every revision; retry once the target is reachable."
+                                                }
+                                    }
+                            | Ok mergeResult ->
+                                // Verify the destination and both sides of the merge before
+                                // advancing the persisted workspace state.
+                                let! branchAfter =
+                                    LakeFsApi.getBranch
+                                        resolved
+                                        state.Index.Repository
+                                        state.Index.TargetRef
+                                        context
 
-                            let verified =
-                                match branchAfter, mergeCommit with
-                                | Ok branch, Ok commit ->
-                                    branch.CommitId = mergeResult.Reference
-                                    && (commit.Parents |> Array.contains head
-                                        || commit.Parents.Length = 0
-                                        || mergeResult.Reference = head)
-                                | _ -> false
+                                let! mergeCommit =
+                                    LakeFsApi.getCommit
+                                        resolved
+                                        state.Index.Repository
+                                        mergeResult.Reference
+                                        context
 
-                            state.Index <- {
-                                state.Index with
-                                    BaseRevision = Some mergeResult.Reference
-                                    WorkspaceRevision = Some mergeResult.Reference
-                            }
+                                let verified =
+                                    match branchAfter, mergeCommit, expectedWorkspace with
+                                    | Ok branch, Ok commit, Some workspaceRevision ->
+                                        let sourceVerified =
+                                            mergeResult.Reference = workspaceRevision
+                                            || commit.Parents |> Array.contains workspaceRevision
 
-                            match saveIndex state with
-                            | Error failure -> return Failed { failure with StateChanged = true }
-                            | Ok() ->
-                                let outcome = {
-                                    OperationOutcome.performed (synchronizationState state (Some mergeResult.Reference)) with
-                                        Publication = Published
-                                        ResultingRevision = Some(mkRevisionId mergeResult.Reference)
-                                        ResultingWorkspaceVersion = Some(workspaceVersion state)
-                                }
+                                        let destinationVerified =
+                                            mergeResult.Reference = observedTarget.CommitId
+                                            || commit.Parents |> Array.contains observedTarget.CommitId
 
-                                if verified then
-                                    return Succeeded outcome
-                                else
-                                    let observedHead =
+                                        head = observedTarget.CommitId
+                                        && branch.CommitId = mergeResult.Reference
+                                        && sourceVerified
+                                        && destinationVerified
+                                    | _ -> false
+
+                                if not verified then
+                                    let resultingTarget =
                                         match branchAfter with
                                         | Ok branch -> Some branch.CommitId
                                         | Error _ -> None
+
+                                    let observedState = {
+                                        state with
+                                            Index = {
+                                                state.Index with
+                                                    BaseRevision = Some mergeResult.Reference
+                                            }
+                                    }
+
+                                    let outcome = {
+                                        OperationOutcome.performed (
+                                            synchronizationState
+                                                observedState
+                                                (resultingTarget |> Option.orElse (Some mergeResult.Reference))
+                                        ) with
+                                            Publication = Published
+                                            ResultingRevision = Some(mkRevisionId mergeResult.Reference)
+                                    }
 
                                     return
                                         OperationResult.partiallySucceeded
@@ -1867,18 +1895,59 @@ let private publish (state: SessionState) (request: PublishRequest) (context: Op
                                                     "The target advanced during publish verification." with
                                                     RevisionEvidence = [|
                                                         "expected_target", mkRevisionId head
+                                                        "observed_target", mkRevisionId observedTarget.CommitId
                                                         yield!
-                                                            observedHead
-                                                            |> Option.map (fun observed ->
-                                                                "observed_target", mkRevisionId observed)
+                                                            expectedWorkspace
+                                                            |> Option.map (fun revision ->
+                                                                "expected_workspace", mkRevisionId revision)
+                                                            |> Option.toList
+                                                        yield!
+                                                            resultingTarget
+                                                            |> Option.map (fun revision ->
+                                                                "observed_result", mkRevisionId revision)
                                                             |> Option.toList
                                                     |]
                                             }
                                             {
                                                 Code = "review_and_retry"
                                                 Instructions =
-                                                    Some "Review the observed target revision, refresh, and retry."
+                                                    Some
+                                                        "The owned workspace branch is preserved. Review the observed target revision, refresh, and retry deliberately."
                                             }
+                                else
+                                    let! preparedWorkspace =
+                                        if expectedWorkspace = Some mergeResult.Reference then
+                                            async.Return(Ok())
+                                        else
+                                            resetOwnedWorkspaceBranch
+                                                state
+                                                resolved
+                                                expectedWorkspace
+                                                mergeResult.Reference
+                                                context
+
+                                    match preparedWorkspace with
+                                    | Error failure ->
+                                        return Failed { failure with StateChanged = true }
+                                    | Ok() ->
+                                        state.Index <- {
+                                            state.Index with
+                                                BaseRevision = Some mergeResult.Reference
+                                                WorkspaceRevision = Some mergeResult.Reference
+                                        }
+
+                                        match saveIndex state with
+                                        | Error failure -> return Failed { failure with StateChanged = true }
+                                        | Ok() ->
+                                            return
+                                                Succeeded {
+                                                    OperationOutcome.performed (
+                                                        synchronizationState state (Some mergeResult.Reference)
+                                                    ) with
+                                                        Publication = Published
+                                                        ResultingRevision = Some(mkRevisionId mergeResult.Reference)
+                                                        ResultingWorkspaceVersion = Some(workspaceVersion state)
+                                                }
     }
 
 // ---------------------------------------------------------------------------

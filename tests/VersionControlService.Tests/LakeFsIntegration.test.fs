@@ -358,4 +358,143 @@ Vitest.describe (
                     return raise error
             }
         )
+
+        Vitest.test (
+            "lakeFS publish verifies target head and merge parentage after a race",
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
+            fun () -> promise {
+                if not (integrationEnabled ()) then
+                    return failwith "lakeFS integration skipped: Docker not available"
+
+                let harness = createLakeFsHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let synchronization =
+                        workspace.Session.Synchronization
+                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization services.")
+
+                    do! workspace.WriteFile "local-before-publish.txt" "local content\n"
+
+                    let! statusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "publish-race-status")
+                        |> Async.StartAsPromise
+
+                    let status = expectValue "publish race status" statusResult
+                    let! revisionResult =
+                        workspace.Session.Core.CreateRevision
+                            {
+                                Message = "local revision before publish race"
+                                Paths = [| repositoryPath "local-before-publish.txt" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (OperationContext.detached "publish-race-local-revision")
+                        |> Async.StartAsPromise
+
+                    expectValue "publish race local revision" revisionResult |> ignore
+
+                    let before =
+                        match LakeFsWorkspaceIndex.load workspace.Binding.WorkspaceRoot with
+                        | LakeFsWorkspaceIndex.Loaded index -> index
+                        | _ -> failwith "Expected an index before the publish race."
+
+                    let parsed =
+                        LakeFsTypes.LakeFsLocation.tryParse workspace.Binding.Location.ProviderLocation
+                        |> Result.defaultWith failwith
+
+                    let! targetResult =
+                        LakeFsApi.getBranch
+                            (connection ())
+                            parsed.Repository
+                            parsed.TargetRef
+                            (OperationContext.detached "publish-race-target")
+                        |> Async.StartAsPromise
+
+                    let target = targetResult |> Result.defaultWith (fun failure -> failwith failure.Message)
+
+                    let! publishStatusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "publish-race-publish-status")
+                        |> Async.StartAsPromise
+
+                    let publishStatus = expectValue "publish race publish status" publishStatusResult
+
+                    do!
+                        harness.ArmDestinationRace workspace [|
+                            { Path = "target-racer.txt"; Content = Some "target racer content\n" }
+                        |]
+
+                    let! publishResult =
+                        synchronization.Publish
+                            {
+                                ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                ExpectedTargetRevision = Some(RevisionId.tryCreate target.CommitId |> Result.defaultWith failwith)
+                            }
+                            (OperationContext.detached "publish-race")
+                        |> Async.StartAsPromise
+
+                    let outcome, failure =
+                        match publishResult with
+                        | Succeeded _ -> failwith "A raced publish must not report clean success."
+                        | Failed failure -> None, failure
+                        | PartiallySucceeded(outcome, failure) -> Some outcome, failure
+
+                    Vitest.expect(failure.Category).toEqual (FailureCategory.Concurrency)
+                    let evidence = failure.RevisionEvidence |> Map.ofArray
+                    Vitest.expect(evidence.ContainsKey "expected_target").toBe true
+                    Vitest.expect(evidence.ContainsKey "observed_target").toBe true
+                    Vitest.expect(evidence["expected_target"] |> RevisionId.value).toBe target.CommitId
+
+                    let! targetAfterResult =
+                        LakeFsApi.getBranch
+                            (connection ())
+                            parsed.Repository
+                            parsed.TargetRef
+                            (OperationContext.detached "publish-race-target-after")
+                        |> Async.StartAsPromise
+
+                    let targetAfter = targetAfterResult |> Result.defaultWith (fun failure -> failwith failure.Message)
+                    let! mergeCommitResult =
+                        LakeFsApi.getCommit
+                            (connection ())
+                            parsed.Repository
+                            targetAfter.CommitId
+                            (OperationContext.detached "publish-race-merge-commit")
+                        |> Async.StartAsPromise
+
+                    let mergeCommit = mergeCommitResult |> Result.defaultWith (fun failure -> failwith failure.Message)
+                    let observedTarget = evidence["observed_target"] |> RevisionId.value
+                    let expectedWorkspace = before.WorkspaceRevision |> Option.defaultWith (fun () -> failwith "Expected a workspace revision.")
+                    Vitest.expect(mergeCommit.Parents).toContain observedTarget
+                    Vitest.expect(mergeCommit.Parents).toContain expectedWorkspace
+
+                    match outcome with
+                    | Some partial ->
+                        Vitest.expect(partial.ResultingRevision |> Option.map RevisionId.value).toEqual (Some targetAfter.CommitId)
+                    | None -> failwith "The merge changed the target and must report partial success."
+
+                    let after =
+                        match LakeFsWorkspaceIndex.load workspace.Binding.WorkspaceRoot with
+                        | LakeFsWorkspaceIndex.Loaded index -> index
+                        | _ -> failwith "Expected an index after the publish race."
+
+                    Vitest.expect(after.Generation).toBe before.Generation
+                    Vitest.expect(after.BaseRevision).toEqual before.BaseRevision
+                    Vitest.expect(after.WorkspaceRevision).toEqual before.WorkspaceRevision
+
+                    let! workspaceHeadResult =
+                        LakeFsApi.getBranch
+                            (connection ())
+                            parsed.Repository
+                            before.WorkspaceBranch
+                            (OperationContext.detached "publish-race-workspace-after")
+                        |> Async.StartAsPromise
+
+                    let workspaceHead = workspaceHeadResult |> Result.defaultWith (fun failure -> failwith failure.Message)
+                    Vitest.expect(workspaceHead.CommitId).toBe expectedWorkspace
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
 )
