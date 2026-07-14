@@ -365,40 +365,86 @@ let private targetChangedPaths (state: SessionState) (context: OperationContext)
 
 let private getStatus (state: SessionState) (context: OperationContext) =
     async {
-        let changes =
-            classifyWorkspace state
-            |> List.choose (fun change ->
-                match RepositoryPath.tryCreate change.ChangePath with
-                | Error _ -> None
-                | Ok path ->
-                    let kind =
-                        match change.State with
-                        | LakeFsIndex.AddedObject -> AddedChange
-                        | LakeFsIndex.DeletedObject -> DeletedChange
-                        | _ -> ModifiedChange
+        let! connection = connect state
 
-                    Some {
-                        Path = path
-                        OldPath = None
-                        Kind = kind
-                    })
-            |> List.toArray
+        match connection with
+        | Error failure -> return Failed failure
+        | Ok resolved ->
+            let! targetBranch =
+                LakeFsApi.getBranch resolved state.Index.Repository state.Index.TargetRef context
 
-        // Target state is advisory here; a refresh reads it live.
-        return
-            OperationResult.succeeded {
-                CurrentRef =
-                    Some {
-                        Name = state.Index.TargetRef
-                        ProviderRef = mkProviderRef $"lakefs:{state.Index.TargetRef}"
-                        Kind = LocalRef
-                        IsCurrent = true
+            let! workspaceBranch =
+                LakeFsApi.getBranch resolved state.Index.Repository state.Index.WorkspaceBranch context
+
+            match targetBranch, workspaceBranch with
+            | Error failure, _
+            | _, Error failure -> return Failed failure
+            | Ok target, Ok workspace ->
+                let! remoteChanges =
+                    match state.Index.BaseRevision with
+                    | None -> async.Return(Ok [||])
+                    | Some baseRevision ->
+                        LakeFsApi.diffRefs
+                            resolved
+                            state.Index.Repository
+                            baseRevision
+                            state.Index.TargetRef
+                            context
+
+                match remoteChanges with
+                | Error failure -> return Failed failure
+                | Ok changedObjects ->
+                    let changes =
+                        classifyWorkspace state
+                        |> List.choose (fun change ->
+                            match RepositoryPath.tryCreate change.ChangePath with
+                            | Error _ -> None
+                            | Ok path ->
+                                let kind =
+                                    match change.State with
+                                    | LakeFsIndex.AddedObject -> AddedChange
+                                    | LakeFsIndex.DeletedObject -> DeletedChange
+                                    | _ -> ModifiedChange
+
+                                Some {
+                                    Path = path
+                                    OldPath = None
+                                    Kind = kind
+                                })
+                        |> List.toArray
+
+                    let observedState = {
+                        state with
+                            Index = {
+                                state.Index with
+                                    WorkspaceRevision = Some workspace.CommitId
+                            }
                     }
-                WorkspaceVersion = workspaceVersion state
-                Changes = changes
-                ActiveConflictSession = conflictSummary state
-                Synchronization = Some(synchronizationState state state.Index.BaseRevision)
-            }
+
+                    let remotePaths =
+                        changedObjects
+                        |> Array.choose (fun entry ->
+                            relativePathOfKey state entry.Path
+                            |> Option.bind (RepositoryPath.tryCreate >> Result.toOption))
+
+                    return
+                        OperationResult.succeeded {
+                            CurrentRef =
+                                Some {
+                                    Name = state.Index.TargetRef
+                                    ProviderRef = mkProviderRef $"lakefs:{state.Index.TargetRef}"
+                                    Kind = LocalRef
+                                    IsCurrent = true
+                                }
+                            WorkspaceVersion = workspaceVersion state
+                            Changes = changes
+                            ActiveConflictSession = conflictSummary state
+                            Synchronization =
+                                Some {
+                                    synchronizationState observedState (Some target.CommitId) with
+                                        RemoteChangedPaths = Some remotePaths
+                                }
+                        }
     }
 
 /// Uploads/deletes exactly the selected paths on the workspace branch, commits,
@@ -818,13 +864,126 @@ let private materializeRef
 // Refs
 // ---------------------------------------------------------------------------
 
-let private refNameOfProviderRef (reference: ProviderRef) =
+let private tryRefNameOfProviderRef (reference: ProviderRef) =
     let value = ProviderRef.value reference
 
-    if value.StartsWith "lakefs:" then
-        value.Substring "lakefs:".Length
+    if value.StartsWith "lakefs:" && value.Length > "lakefs:".Length then
+        Ok(value.Substring "lakefs:".Length)
     else
-        value
+        Error(
+            OperationFailure.create
+                Validation
+                "invalid_provider_ref"
+                "The provider ref is not a lakeFS ref."
+        )
+
+let private resetOwnedWorkspaceBranch
+    (state: SessionState)
+    (resolved: LakeFsConnection)
+    (sourceRevision: string)
+    (context: OperationContext)
+    =
+    async {
+        let! current =
+            LakeFsApi.getBranch
+                resolved
+                state.Index.Repository
+                state.Index.WorkspaceBranch
+                context
+
+        match current with
+        | Error failure -> return Error failure
+        | Ok observed when state.Index.WorkspaceRevision <> Some observed.CommitId ->
+            return
+                Error {
+                    OperationFailure.create
+                        Concurrency
+                        "precondition_failed"
+                        "The owned workspace branch moved before it could be reset." with
+                        RevisionEvidence = [|
+                            yield!
+                                state.Index.WorkspaceRevision
+                                |> Option.map (fun revision -> "expected_head", mkRevisionId revision)
+                                |> Option.toList
+                            "observed_head", mkRevisionId observed.CommitId
+                        |]
+                }
+        | Ok _ ->
+            let! deleted =
+                LakeFsApi.deleteBranch
+                    resolved
+                    state.Index.Repository
+                    state.Index.WorkspaceBranch
+                    context
+
+            match deleted with
+            | Error failure -> return Error failure
+            | Ok() ->
+                let! created =
+                    LakeFsApi.createBranch
+                        resolved
+                        state.Index.Repository
+                        state.Index.WorkspaceBranch
+                        sourceRevision
+                        context
+
+                match created with
+                | Error failure -> return Error { failure with StateChanged = true }
+                | Ok() ->
+                    let! recreated =
+                        LakeFsApi.getBranch
+                            resolved
+                            state.Index.Repository
+                            state.Index.WorkspaceBranch
+                            context
+
+                    match recreated with
+                    | Error failure -> return Error { failure with StateChanged = true }
+                    | Ok branch when branch.CommitId = sourceRevision -> return Ok()
+                    | Ok branch ->
+                        return
+                            Error {
+                                OperationFailure.create
+                                    Concurrency
+                                    "precondition_failed"
+                                    "The recreated workspace branch does not point at the selected revision." with
+                                    StateChanged = true
+                                    RevisionEvidence = [|
+                                        "expected_head", mkRevisionId sourceRevision
+                                        "observed_head", mkRevisionId branch.CommitId
+                                    |]
+                            }
+    }
+
+let private switchWorkspaceToRef
+    (state: SessionState)
+    (resolved: LakeFsConnection)
+    (targetName: string)
+    (targetRevision: string)
+    (context: OperationContext)
+    =
+    async {
+        let! materialized = materializeRef state resolved targetRevision context
+
+        match materialized with
+        | Error failure -> return Error failure
+        | Ok() ->
+            let! reset = resetOwnedWorkspaceBranch state resolved targetRevision context
+
+            match reset with
+            | Error failure -> return Error { failure with StateChanged = true }
+            | Ok() ->
+                state.Index <- {
+                    state.Index with
+                        TargetRef = targetName
+                        BaseRevision = Some targetRevision
+                        WorkspaceRevision = Some targetRevision
+                }
+
+                match saveIndex state with
+                | Error failure -> return Error { failure with StateChanged = true }
+                | Ok() -> return Ok()
+    }
 
 let private createRef (state: SessionState) (request: CreateRefRequest) (context: OperationContext) =
     async {
@@ -833,34 +992,48 @@ let private createRef (state: SessionState) (request: CreateRefRequest) (context
         match connection with
         | Error failure -> return Failed failure
         | Ok resolved ->
-            let source =
-                request.BaseRef
-                |> Option.map refNameOfProviderRef
-                |> Option.defaultValue state.Index.TargetRef
+            let sourceResult =
+                match request.BaseRef with
+                | None -> Ok state.Index.TargetRef
+                | Some reference -> tryRefNameOfProviderRef reference
 
-            let! created =
-                LakeFsApi.createBranch resolved state.Index.Repository request.Name source context
-
-            match created with
+            match sourceResult with
             | Error failure -> return Failed failure
-            | Ok() ->
-                let saveResult =
-                    if request.SwitchTo then
-                        state.Index <- { state.Index with TargetRef = request.Name }
-                        saveIndex state
-                    else
-                        Ok()
+            | Ok source ->
+                let! created =
+                    LakeFsApi.createBranch resolved state.Index.Repository request.Name source context
 
-                match saveResult with
+                match created with
                 | Error failure -> return Failed failure
                 | Ok() ->
-                    return
-                        OperationResult.succeeded {
-                            Name = request.Name
-                            ProviderRef = mkProviderRef $"lakefs:{request.Name}"
-                            Kind = LocalRef
-                            IsCurrent = request.SwitchTo
-                        }
+                    if not request.SwitchTo then
+                        return
+                            OperationResult.succeeded {
+                                Name = request.Name
+                                ProviderRef = mkProviderRef $"lakefs:{request.Name}"
+                                Kind = LocalRef
+                                IsCurrent = false
+                            }
+                    else
+                        let! createdBranch =
+                            LakeFsApi.getBranch resolved state.Index.Repository request.Name context
+
+                        match createdBranch with
+                        | Error failure -> return Failed { failure with StateChanged = true }
+                        | Ok branch ->
+                            let! switched =
+                                switchWorkspaceToRef state resolved request.Name branch.CommitId context
+
+                            match switched with
+                            | Error failure -> return Failed { failure with StateChanged = true }
+                            | Ok() ->
+                                return
+                                    OperationResult.succeeded {
+                                        Name = request.Name
+                                        ProviderRef = mkProviderRef $"lakefs:{request.Name}"
+                                        Kind = LocalRef
+                                        IsCurrent = true
+                                    }
     }
 
 let private preflightSwitchRef (state: SessionState) (request: SwitchRefRequest) (context: OperationContext) =
@@ -870,45 +1043,46 @@ let private preflightSwitchRef (state: SessionState) (request: SwitchRefRequest)
         match connection with
         | Error failure -> return Failed failure
         | Ok resolved ->
-            let targetName = refNameOfProviderRef request.TargetRef
-
-            let! branch = LakeFsApi.getBranch resolved state.Index.Repository targetName context
-
-            match branch with
+            match tryRefNameOfProviderRef request.TargetRef with
             | Error failure -> return Failed failure
-            | Ok _ ->
-                let dirtyPaths = classifyWorkspace state |> List.map _.ChangePath |> Set.ofList
+            | Ok targetName ->
+                let! branch = LakeFsApi.getBranch resolved state.Index.Repository targetName context
 
-                let! objects =
-                    LakeFsApi.listObjects resolved state.Index.Repository targetName state.Index.Prefix context
-
-                match objects with
+                match branch with
                 | Error failure -> return Failed failure
-                | Ok stats ->
-                    let targetContent =
-                        stats
-                        |> Array.choose (fun stat ->
-                            relativePathOfKey state stat.Path |> Option.map (fun p -> p, stat.Checksum))
-                        |> Map.ofArray
+                | Ok _ ->
+                    let dirtyPaths = classifyWorkspace state |> List.map _.ChangePath |> Set.ofList
 
-                    let entriesByPath =
-                        state.Index.Entries |> Array.map (fun entry -> entry.Path, entry) |> Map.ofArray
+                    let! objects =
+                        LakeFsApi.listObjects resolved state.Index.Repository targetName state.Index.Prefix context
 
-                    let atRisk =
-                        dirtyPaths
-                        |> Set.filter (fun path ->
-                            let currentChecksum =
-                                entriesByPath.TryFind path |> Option.map _.BaseChecksum
+                    match objects with
+                    | Error failure -> return Failed failure
+                    | Ok stats ->
+                        let targetContent =
+                            stats
+                            |> Array.choose (fun stat ->
+                                relativePathOfKey state stat.Path |> Option.map (fun p -> p, stat.Checksum))
+                            |> Map.ofArray
 
-                            targetContent.TryFind path <> currentChecksum)
-                        |> Set.toArray
-                        |> Array.choose (RepositoryPath.tryCreate >> Result.toOption)
+                        let entriesByPath =
+                            state.Index.Entries |> Array.map (fun entry -> entry.Path, entry) |> Map.ofArray
 
-                    return
-                        OperationResult.succeeded {
-                            PathsAtRisk = atRisk
-                            IsSafe = atRisk.Length = 0
-                        }
+                        let atRisk =
+                            dirtyPaths
+                            |> Set.filter (fun path ->
+                                let currentChecksum =
+                                    entriesByPath.TryFind path |> Option.map _.BaseChecksum
+
+                                targetContent.TryFind path <> currentChecksum)
+                            |> Set.toArray
+                            |> Array.choose (RepositoryPath.tryCreate >> Result.toOption)
+
+                        return
+                            OperationResult.succeeded {
+                                PathsAtRisk = atRisk
+                                IsSafe = atRisk.Length = 0
+                            }
     }
 
 let private switchRef (state: SessionState) (request: SwitchRefRequest) (context: OperationContext) =
@@ -918,26 +1092,18 @@ let private switchRef (state: SessionState) (request: SwitchRefRequest) (context
         match connection with
         | Error failure -> return Failed failure
         | Ok resolved ->
-            let targetName = refNameOfProviderRef request.TargetRef
-
-            let! branch = LakeFsApi.getBranch resolved state.Index.Repository targetName context
-
-            match branch with
+            match tryRefNameOfProviderRef request.TargetRef with
             | Error failure -> return Failed failure
-            | Ok targetBranch ->
-                let! materialized = materializeRef state resolved targetName context
+            | Ok targetName ->
+                let! branch = LakeFsApi.getBranch resolved state.Index.Repository targetName context
 
-                match materialized with
+                match branch with
                 | Error failure -> return Failed failure
-                | Ok() ->
-                    state.Index <- {
-                        state.Index with
-                            TargetRef = targetName
-                            BaseRevision = Some targetBranch.CommitId
-                            WorkspaceRevision = Some targetBranch.CommitId
-                    }
+                | Ok targetBranch ->
+                    let! switched =
+                        switchWorkspaceToRef state resolved targetName targetBranch.CommitId context
 
-                    match saveIndex state with
+                    match switched with
                     | Error failure -> return Failed failure
                     | Ok() -> return! getStatus state context
     }
@@ -1598,44 +1764,26 @@ let private createSessionFromState (state: SessionState) : WorkspaceSession =
         GetStatus = fun context -> getStatus state context
         ListRefs = fun context -> listRefs state context
         CreateRef =
-            fun _ _ ->
-                async.Return(
-                    OperationResult.failed (
-                        OperationFailure.create ProviderError "lakefs_core_pending" "lakeFS ref creation is not implemented yet."
-                    )
-                )
+            fun request context ->
+                withValidatedMutation state request.ExpectedWorkspaceVersion (fun () ->
+                    createRef state request context)
         PreflightSwitchRef =
-            fun _ _ ->
-                async.Return(
-                    OperationResult.failed (
-                        OperationFailure.create ProviderError "lakefs_core_pending" "lakeFS ref switching is not implemented yet."
-                    )
-                )
+            fun request context ->
+                withValidatedMutation state request.ExpectedWorkspaceVersion (fun () ->
+                    preflightSwitchRef state request context)
         SwitchRef =
-            fun _ _ ->
-                async.Return(
-                    OperationResult.failed (
-                        OperationFailure.create ProviderError "lakefs_core_pending" "lakeFS ref switching is not implemented yet."
-                    )
-                )
+            fun request context ->
+                withValidatedMutation state request.ExpectedWorkspaceVersion (fun () ->
+                    switchRef state request context)
         CreateRevision =
             fun request context ->
                 withValidatedMutation state request.ExpectedWorkspaceVersion (fun () ->
                     createRevision state request context)
         RestorePaths =
-            fun _ _ ->
-                async.Return(
-                    OperationResult.failed (
-                        OperationFailure.create ProviderError "lakefs_core_pending" "lakeFS restore is not implemented yet."
-                    )
-                )
-        GetDiffSummary =
-            fun _ ->
-                async.Return(
-                    OperationResult.failed (
-                        OperationFailure.create ProviderError "lakefs_core_pending" "lakeFS object diff is not implemented yet."
-                    )
-                )
+            fun request context ->
+                withValidatedMutation state request.ExpectedWorkspaceVersion (fun () ->
+                    restorePaths state request context)
+        GetDiffSummary = fun context -> getDiffSummary state context
     }
 
     {

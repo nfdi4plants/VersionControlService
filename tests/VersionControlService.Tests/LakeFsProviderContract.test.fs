@@ -603,3 +603,105 @@ Vitest.describe (
             }
         )
 )
+
+Vitest.describe (
+    "lakeFS core read cycles",
+    fun () ->
+        Vitest.test (
+            "lakeFS core reports status refs restore and paginated object diff",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                if not (integrationEnabled ()) then
+                    return failwith "lakeFS integration skipped: Docker not available"
+
+                let harness = createLakeFsHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let index =
+                        match LakeFsWorkspaceIndex.load workspace.Binding.WorkspaceRoot with
+                        | LakeFsWorkspaceIndex.Loaded value -> value
+                        | _ -> failwith "Expected a persisted workspace index."
+
+                    let remoteMutations =
+                        Array.init 105 (fun number -> {
+                            Path = $"paged/object-{number:D3}.txt"
+                            Content = Some $"remote object {number}\n"
+                        })
+
+                    do! harness.AdvanceTarget workspace remoteMutations
+
+                    let parsed = parseLocation workspace.Binding.Location
+                    let! targetResult =
+                        LakeFsApi.getBranch
+                            (connection ())
+                            parsed.Repository
+                            parsed.TargetRef
+                            (context "core-reads-target-head")
+                        |> Async.StartAsPromise
+
+                    let target = targetResult |> expectApi "read advanced target"
+                    let! statusResult =
+                        workspace.Session.Core.GetStatus(context "core-reads-status")
+                        |> Async.StartAsPromise
+
+                    let status = expectOperationValue "core read status" statusResult
+                    let synchronization = status.Synchronization |> Option.defaultWith (fun () -> failwith "Expected synchronization state.")
+                    Vitest.expect(synchronization.TargetRevision |> Option.map RevisionId.value).toEqual (Some target.CommitId)
+                    Vitest.expect(synchronization.Relationship).toEqual (RevisionRelationship.TargetAhead)
+
+                    let remotePaths =
+                        synchronization.RemoteChangedPaths
+                        |> Option.defaultWith (fun () -> failwith "Expected a paginated remote object diff.")
+                        |> Array.map RepositoryPath.value
+
+                    Vitest.expect(remotePaths.Length).toBe 105
+                    Vitest.expect(remotePaths).toContain "paged/object-104.txt"
+
+                    let! refsResult =
+                        workspace.Session.Core.ListRefs(context "core-reads-refs")
+                        |> Async.StartAsPromise
+
+                    let refs = expectOperationValue "list refs" refsResult
+                    Vitest.expect(refs |> Array.exists (fun reference -> reference.Name = parsed.TargetRef)).toBe true
+                    Vitest.expect(refs |> Array.exists (fun reference -> reference.Name = index.WorkspaceBranch)).toBe false
+
+                    do! workspace.WriteFile "base.txt" "local base edit\n"
+                    do! workspace.WriteFile "keep-local.txt" "keep this local edit\n"
+
+                    let! dirtyStatusResult =
+                        workspace.Session.Core.GetStatus(context "core-reads-dirty-status")
+                        |> Async.StartAsPromise
+
+                    let dirtyStatus = expectOperationValue "dirty status" dirtyStatusResult
+                    let! restoreResult =
+                        workspace.Session.Core.RestorePaths
+                            {
+                                Paths = [| repositoryPath "base.txt" |]
+                                ExpectedWorkspaceVersion = dirtyStatus.WorkspaceVersion
+                            }
+                            (context "core-reads-restore")
+                        |> Async.StartAsPromise
+
+                    expectOperationValue "restore selected path" restoreResult |> ignore
+
+                    let! restoredBase = workspace.ReadFile "base.txt"
+                    let! preservedLocal = workspace.ReadFile "keep-local.txt"
+                    Vitest.expect(restoredBase).toEqual (Some "base content\n")
+                    Vitest.expect(preservedLocal).toEqual (Some "keep this local edit\n")
+
+                    let! diffResult =
+                        workspace.Session.Core.GetDiffSummary(context "core-reads-diff")
+                        |> Async.StartAsPromise
+
+                    let diff = expectOperationValue "object diff" diffResult
+                    let diffPaths = diff.Entries |> Array.map (fun entry -> RepositoryPath.value entry.Path)
+                    Vitest.expect(diffPaths).toEqual ([| "keep-local.txt" |])
+
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+)
