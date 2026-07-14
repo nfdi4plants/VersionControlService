@@ -24,7 +24,7 @@ Vitest.describe (
     fun () ->
         Vitest.test (
             "lakeFS creates a unique owned server-visible workspace branch",
-            TestOptions(timeout = 120000),
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
             fun () -> promise {
                 if not (integrationEnabled ()) then
                     return failwith "lakeFS integration skipped: Docker not available"
@@ -95,7 +95,7 @@ Vitest.describe (
 
         Vitest.test (
             "lakeFS selected revision reports and recovers interrupted remote state",
-            TestOptions(timeout = 120000),
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
             fun () -> promise {
                 if not (integrationEnabled ()) then
                     return failwith "lakeFS integration skipped: Docker not available"

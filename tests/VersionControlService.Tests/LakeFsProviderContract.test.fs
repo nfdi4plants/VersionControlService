@@ -469,7 +469,7 @@ let createLakeFsHarness () : ProviderTestHarness =
 
 let private lakeFsHarness = createLakeFsHarness ()
 
-let private registrations = [|
+let private registerProfiles () = [|
     CoreProviderSuite.register lakeFsHarness
     SynchronizationProviderSuite.register lakeFsHarness
     ConflictProviderSuite.register lakeFsHarness
@@ -478,6 +478,19 @@ let private registrations = [|
     ExtensionProviderSuites.register lakeFsHarness
     SwateSelectableSuite.register lakeFsHarness
 |]
+
+let private registrations =
+    if integrationEnabled () then
+        registerProfiles ()
+    else
+        printfn "lakeFS integration skipped: Docker not available"
+
+        Vitest.Describe.Skip.skip (
+            "lakeFS integration skipped: Docker not available",
+            fun () -> registerProfiles () |> ignore
+        )
+
+        [||]
 
 let private expectOperationValue operation = function
     | Succeeded outcome -> outcome.Value
@@ -492,7 +505,7 @@ Vitest.describe (
     fun () ->
         Vitest.test (
             "lakeFS selected revision preserves unrelated local changes and verifies commit head",
-            TestOptions(timeout = 120000),
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
             fun () -> promise {
                 if not (integrationEnabled ()) then
                     return failwith "lakeFS integration skipped: Docker not available"
@@ -637,7 +650,7 @@ Vitest.describe (
     fun () ->
         Vitest.test (
             "lakeFS core reports status refs restore and paginated object diff",
-            TestOptions(timeout = 120000),
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
             fun () -> promise {
                 if not (integrationEnabled ()) then
                     return failwith "lakeFS integration skipped: Docker not available"
