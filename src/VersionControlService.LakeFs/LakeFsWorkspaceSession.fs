@@ -1500,7 +1500,11 @@ let private update (state: SessionState) (request: UpdateRequest) (context: Oper
                                 let! items = buildConflictItems state resolved overlapping head context
 
                                 state.ConflictGeneration <- state.ConflictGeneration + 1
-                                state.Conflict <- Some(LakeFsConflictSession.create head items)
+                                let workspaceRevision =
+                                    state.Index.WorkspaceRevision |> Option.defaultValue head
+
+                                state.Conflict <-
+                                    Some(LakeFsConflictSession.create head workspaceRevision items)
 
                                 return
                                     OperationResult.partiallySucceeded
@@ -1898,6 +1902,86 @@ let private handleRejection () =
 let private validateHandle (state: SessionState) (handle: ConflictSessionHandle) (expectedVersion: string) =
     LakeFsConflictSession.validate state.Conflict handle (workspaceVersion state) expectedVersion
 
+let private completeConflictFinalize
+    (state: SessionState)
+    (resolved: LakeFsConnection)
+    (targetRevision: string)
+    (resultingRevision: string)
+    (context: OperationContext)
+    =
+    async {
+        let! materialized =
+            materializeRef state resolved state.Index.WorkspaceBranch context
+
+        match materialized with
+        | Error failure -> return Failed { failure with StateChanged = true }
+        | Ok() ->
+            state.Index <- {
+                state.Index with
+                    BaseRevision = Some targetRevision
+                    WorkspaceRevision = Some resultingRevision
+            }
+
+            match saveIndex state with
+            | Error failure -> return Failed { failure with StateChanged = true }
+            | Ok() ->
+                state.Conflict <- None
+                return OperationResult.succeeded (Some(mkRevisionId resultingRevision))
+    }
+
+let private partialConflictFinalize
+    (state: SessionState)
+    (conflict: LakeFsConflictSession.State)
+    (expectedDestination: string)
+    (observedDestination: string)
+    (resultingRevision: string)
+    (observedTarget: string option)
+    (canConfirmOnRetry: bool)
+    =
+    if canConfirmOnRetry then
+        conflict.PendingFinalizeRevision <- Some resultingRevision
+        conflict.HandleVersion <- conflict.HandleVersion + 1
+
+    let revision = mkRevisionId resultingRevision
+    let outcome = {
+        OperationOutcome.performed (Some revision) with
+            ResultingRevision = Some revision
+            Publication = LocalOnly
+    }
+
+    OperationResult.partiallySucceeded
+        outcome
+        {
+            OperationFailure.create
+                Concurrency
+                "precondition_failed"
+                "The conflict-finalize destination advanced during verification." with
+                RevisionEvidence = [|
+                    "expected_destination", mkRevisionId expectedDestination
+                    "observed_destination", mkRevisionId observedDestination
+                    "observed_result", revision
+                    "expected_target", mkRevisionId conflict.TargetRevisionAtOpen
+                    yield!
+                        observedTarget
+                        |> Option.map (fun target -> "observed_target", mkRevisionId target)
+                        |> Option.toList
+                |]
+        }
+        {
+            Code =
+                if canConfirmOnRetry then
+                    ConflictRecovery.RefreshConflictSession
+                else
+                    "review_and_retry"
+            Instructions =
+                Some(
+                    if canConfirmOnRetry then
+                        "Refresh the rotated live session and deliberately confirm the verified resolution revision."
+                    else
+                        "Review the observed workspace branch and retry deliberately."
+                )
+        }
+
 let private createConflictService (state: SessionState) : ConflictResolutionService = {
     GetActiveSession = fun _ -> async { return OperationResult.succeeded (conflictSummary state) }
     Resolve =
@@ -1937,7 +2021,6 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                     match connection with
                     | Error failure -> return Failed failure
                     | Ok resolved ->
-                        // Pre-check the finalize destination (the target head).
                         let! targetHead = getTargetHead state context
 
                         match targetHead with
@@ -1947,117 +2030,220 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                 Failed {
                                     handleRejection () with
                                         RevisionEvidence = [|
-                                            "expected_destination", mkRevisionId conflict.TargetRevisionAtOpen
-                                            "observed_destination", mkRevisionId observedTarget
+                                            "expected_target", mkRevisionId conflict.TargetRevisionAtOpen
+                                            "observed_target", mkRevisionId observedTarget
                                         |]
                                 }
                         | Ok observedTarget ->
-                            do! barrier state "finalize-precheck-done" context
+                            match conflict.PendingFinalizeRevision with
+                            | Some pendingRevision ->
+                                let! pendingBranch =
+                                    LakeFsApi.getBranch
+                                        resolved
+                                        state.Index.Repository
+                                        state.Index.WorkspaceBranch
+                                        context
 
-                            // Act: merge the target into the workspace branch with the
-                            // destination-wins whole-merge strategy as the mechanical
-                            // step, then upload each per-path resolution on top. This
-                            // is custom orchestration, not native per-path merging.
-                            let! merged =
-                                LakeFsApi.mergeWithStrategy
-                                    resolved
-                                    state.Index.Repository
-                                    state.Index.TargetRef
-                                    state.Index.WorkspaceBranch
-                                    "merge: finalize conflict session"
-                                    (Some "dest-wins")
-                                    context
+                                match pendingBranch with
+                                | Error failure -> return Failed failure
+                                | Ok branch when branch.CommitId <> pendingRevision ->
+                                    return
+                                        Failed {
+                                            handleRejection () with
+                                                RevisionEvidence = [|
+                                                    "expected_destination", mkRevisionId pendingRevision
+                                                    "observed_destination", mkRevisionId branch.CommitId
+                                                |]
+                                        }
+                                | Ok _ ->
+                                    return!
+                                        completeConflictFinalize
+                                            state
+                                            resolved
+                                            observedTarget
+                                            pendingRevision
+                                            context
+                            | None ->
+                                let expectedDestination = conflict.WorkspaceRevisionAtOpen
+                                do! barrier state "finalize-precheck-done" context
 
-                            match merged with
-                            | Error failure -> return Failed failure
-                            | Ok _ ->
-                                let mutable uploadFailure: OperationFailure option = None
+                                let! destinationBeforeMerge =
+                                    LakeFsApi.getBranch
+                                        resolved
+                                        state.Index.Repository
+                                        state.Index.WorkspaceBranch
+                                        context
 
-                                for item in conflict.Items do
-                                    if uploadFailure.IsNone then
-                                        match item.ResolvedContent with
-                                        | Some(Some content) ->
-                                            let! upload =
-                                                LakeFsApi.uploadObject
-                                                    resolved
-                                                    state.Index.Repository
-                                                    state.Index.WorkspaceBranch
-                                                    (objectKey state item.ItemPath)
-                                                    content
-                                                    context
-
-                                            match upload with
-                                            | Error failure -> uploadFailure <- Some failure
-                                            | Ok() -> ()
-                                        | Some None ->
-                                            let! deletion =
-                                                LakeFsApi.deleteObject
-                                                    resolved
-                                                    state.Index.Repository
-                                                    state.Index.WorkspaceBranch
-                                                    (objectKey state item.ItemPath)
-                                                    context
-
-                                            match deletion with
-                                            | Error failure when failure.Category = NotFound -> ()
-                                            | Error failure -> uploadFailure <- Some failure
-                                            | Ok() -> ()
-                                        | None -> ()
-
-                                match uploadFailure with
-                                | Some failure -> return Failed { failure with StateChanged = true }
-                                | None ->
-                                    let! committed =
-                                        LakeFsApi.commit
+                                match destinationBeforeMerge with
+                                | Error failure -> return Failed failure
+                                | Ok observedDestination ->
+                                    // Use destination-wins only to establish the merge base;
+                                    // each selected resolution is applied explicitly below.
+                                    let! merged =
+                                        LakeFsApi.mergeWithStrategy
                                             resolved
                                             state.Index.Repository
+                                            state.Index.TargetRef
                                             state.Index.WorkspaceBranch
-                                            (request.Message |> Option.defaultValue "merge: finalize conflict session")
+                                            "merge: finalize conflict session"
+                                            (Some "dest-wins")
                                             context
 
-                                    match committed with
-                                    | Error failure -> return Failed { failure with StateChanged = true }
-                                    | Ok commit ->
-                                        // Verify the workspace branch head, then verify the
-                                        // pre-checked target one more time.
-                                        let! verifyTarget = getTargetHead state context
+                                    match merged with
+                                    | Error failure -> return Failed failure
+                                    | Ok mergeResult ->
+                                        let! mergeBranch =
+                                            LakeFsApi.getBranch
+                                                resolved
+                                                state.Index.Repository
+                                                state.Index.WorkspaceBranch
+                                                context
 
-                                        match verifyTarget with
-                                        | Ok verifiedTarget when verifiedTarget <> observedTarget ->
+                                        let! mergeCommit =
+                                            LakeFsApi.getCommit
+                                                resolved
+                                                state.Index.Repository
+                                                mergeResult.Reference
+                                                context
+
+                                        let mergeVerified =
+                                            match mergeBranch, mergeCommit with
+                                            | Ok branch, Ok commit ->
+                                                let sourceVerified =
+                                                    mergeResult.Reference = observedTarget
+                                                    || commit.Parents |> Array.contains observedTarget
+
+                                                let destinationVerified =
+                                                    mergeResult.Reference = observedDestination.CommitId
+                                                    || commit.Parents
+                                                       |> Array.contains observedDestination.CommitId
+
+                                                branch.CommitId = mergeResult.Reference
+                                                && sourceVerified
+                                                && destinationVerified
+                                            | _ -> false
+
+                                        if not mergeVerified then
                                             return
-                                                Failed {
-                                                    handleRejection () with
-                                                        RevisionEvidence = [|
-                                                            "expected_destination", mkRevisionId observedTarget
-                                                            "observed_destination", mkRevisionId verifiedTarget
-                                                        |]
-                                                }
-                                        | _ ->
-                                            // Materialize resolved content locally.
+                                                partialConflictFinalize
+                                                    state
+                                                    conflict
+                                                    expectedDestination
+                                                    observedDestination.CommitId
+                                                    mergeResult.Reference
+                                                    (Some observedTarget)
+                                                    false
+                                        else
+                                            let mutable resolutionFailure: OperationFailure option = None
+
                                             for item in conflict.Items do
-                                                match item.ResolvedContent with
-                                                | Some(Some content) -> writeLocal state item.ItemPath content
-                                                | Some None -> removeLocal state item.ItemPath
-                                                | None -> ()
+                                                if resolutionFailure.IsNone then
+                                                    match item.ResolvedContent with
+                                                    | Some(Some content) ->
+                                                        let! upload =
+                                                            LakeFsApi.uploadObject
+                                                                resolved
+                                                                state.Index.Repository
+                                                                state.Index.WorkspaceBranch
+                                                                (objectKey state item.ItemPath)
+                                                                content
+                                                                context
 
-                                            let! materialized =
-                                                materializeRef state resolved state.Index.WorkspaceBranch context
+                                                        match upload with
+                                                        | Error failure -> resolutionFailure <- Some failure
+                                                        | Ok() -> ()
+                                                    | Some None ->
+                                                        let! deletion =
+                                                            LakeFsApi.deleteObject
+                                                                resolved
+                                                                state.Index.Repository
+                                                                state.Index.WorkspaceBranch
+                                                                (objectKey state item.ItemPath)
+                                                                context
 
-                                            match materialized with
-                                            | Error failure -> return Failed { failure with StateChanged = true }
-                                            | Ok() ->
-                                                state.Index <- {
-                                                    state.Index with
-                                                        BaseRevision = Some observedTarget
-                                                        WorkspaceRevision = Some commit.Id
-                                                }
+                                                        match deletion with
+                                                        | Error failure when failure.Category = NotFound -> ()
+                                                        | Error failure -> resolutionFailure <- Some failure
+                                                        | Ok() -> ()
+                                                    | None -> ()
 
-                                                match saveIndex state with
+                                            match resolutionFailure with
+                                            | Some failure ->
+                                                return Failed { failure with StateChanged = true }
+                                            | None ->
+                                                let! committed =
+                                                    LakeFsApi.commit
+                                                        resolved
+                                                        state.Index.Repository
+                                                        state.Index.WorkspaceBranch
+                                                        (request.Message
+                                                         |> Option.defaultValue
+                                                             "merge: finalize conflict session")
+                                                        context
+
+                                                match committed with
                                                 | Error failure ->
                                                     return Failed { failure with StateChanged = true }
-                                                | Ok() ->
-                                                    state.Conflict <- None
-                                                    return OperationResult.succeeded (Some(mkRevisionId commit.Id))
+                                                | Ok commit ->
+                                                    let! branchAfter =
+                                                        LakeFsApi.getBranch
+                                                            resolved
+                                                            state.Index.Repository
+                                                            state.Index.WorkspaceBranch
+                                                            context
+
+                                                    let! commitAfter =
+                                                        LakeFsApi.getCommit
+                                                            resolved
+                                                            state.Index.Repository
+                                                            commit.Id
+                                                            context
+
+                                                    let! targetAfter = getTargetHead state context
+
+                                                    let resolutionVerified =
+                                                        match branchAfter, commitAfter with
+                                                        | Ok branch, Ok resultingCommit ->
+                                                            branch.CommitId = commit.Id
+                                                            && (commit.Id = mergeResult.Reference
+                                                                || resultingCommit.Parents
+                                                                   |> Array.contains mergeResult.Reference)
+                                                        | _ -> false
+
+                                                    let targetVerified =
+                                                        match targetAfter with
+                                                        | Ok target -> target = observedTarget
+                                                        | Error _ -> false
+
+                                                    let canConfirmOnRetry =
+                                                        resolutionVerified && targetVerified
+
+                                                    if
+                                                        expectedDestination = observedDestination.CommitId
+                                                        && canConfirmOnRetry
+                                                    then
+                                                        return!
+                                                            completeConflictFinalize
+                                                                state
+                                                                resolved
+                                                                observedTarget
+                                                                commit.Id
+                                                                context
+                                                    else
+                                                        let observedTargetAfter =
+                                                            match targetAfter with
+                                                            | Ok target -> Some target
+                                                            | Error _ -> None
+
+                                                        return
+                                                            partialConflictFinalize
+                                                                state
+                                                                conflict
+                                                                expectedDestination
+                                                                observedDestination.CommitId
+                                                                commit.Id
+                                                                observedTargetAfter
+                                                                canConfirmOnRetry
         }
     Cancel =
         fun request context -> async {

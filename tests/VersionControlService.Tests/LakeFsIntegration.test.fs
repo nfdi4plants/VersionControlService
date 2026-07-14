@@ -497,4 +497,238 @@ Vitest.describe (
                     return raise error
             }
         )
+
+        Vitest.test (
+            "lakeFS conflict finalize verifies destination head and parentage after a race",
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
+            fun () -> promise {
+                if not (integrationEnabled ()) then
+                    return failwith "lakeFS integration skipped: Docker not available"
+
+                let harness = createLakeFsHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+
+                    do!
+                        harness.AdvanceTarget workspace [|
+                            { Path = "base.txt"; Content = Some "target conflict content\n" }
+                        |]
+
+                    do! workspace.WriteFile "base.txt" "workspace conflict content\n"
+                    let! saveStatusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "finalize-race-save-status")
+                        |> Async.StartAsPromise
+
+                    let saveStatus = expectValue "finalize race save status" saveStatusResult
+                    let! saveResult =
+                        workspace.Session.Core.CreateRevision
+                            {
+                                Message = "workspace conflict before finalize race"
+                                Paths = [| repositoryPath "base.txt" |]
+                                ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+                            }
+                            (OperationContext.detached "finalize-race-save")
+                        |> Async.StartAsPromise
+
+                    expectValue "finalize race save" saveResult |> ignore
+
+                    let! updateStatusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "finalize-race-update-status")
+                        |> Async.StartAsPromise
+
+                    let updateStatus = expectValue "finalize race update status" updateStatusResult
+                    let synchronization =
+                        workspace.Session.Synchronization
+                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization services.")
+
+                    let! updateResult =
+                        synchronization.Update
+                            { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
+                            (OperationContext.detached "finalize-race-update")
+                        |> Async.StartAsPromise
+
+                    let updateFailure = expectFailure "finalize race conflicting update" updateResult
+                    Vitest.expect(updateFailure.Category).toEqual FailureCategory.Conflict
+
+                    let conflicts =
+                        workspace.Session.ConflictResolution
+                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS conflict-resolution services.")
+
+                    let! sessionResult =
+                        conflicts.GetActiveSession(OperationContext.detached "finalize-race-session")
+                        |> Async.StartAsPromise
+
+                    let summary =
+                        expectValue "finalize race session" sessionResult
+                        |> Option.defaultWith (fun () -> failwith "Expected an active conflict session.")
+
+                    let! resolutionStatusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "finalize-race-resolution-status")
+                        |> Async.StartAsPromise
+
+                    let resolutionStatus = expectValue "finalize race resolution status" resolutionStatusResult
+                    let! resolutionResult =
+                        conflicts.Resolve
+                            {
+                                Handle = summary.Handle
+                                ExpectedWorkspaceVersion = resolutionStatus.WorkspaceVersion
+                                Path = repositoryPath "base.txt"
+                                Resolution = PickCandidate "target"
+                            }
+                            (OperationContext.detached "finalize-race-resolution")
+                        |> Async.StartAsPromise
+
+                    let resolution = expectValue "finalize race resolution" resolutionResult
+                    let before =
+                        match LakeFsWorkspaceIndex.load workspace.Binding.WorkspaceRoot with
+                        | LakeFsWorkspaceIndex.Loaded index -> index
+                        | _ -> failwith "Expected an index before the finalize race."
+
+                    let parsed =
+                        LakeFsTypes.LakeFsLocation.tryParse workspace.Binding.Location.ProviderLocation
+                        |> Result.defaultWith failwith
+
+                    let! targetResult =
+                        LakeFsApi.getBranch
+                            (connection ())
+                            parsed.Repository
+                            parsed.TargetRef
+                            (OperationContext.detached "finalize-race-target")
+                        |> Async.StartAsPromise
+
+                    let target = targetResult |> Result.defaultWith (fun failure -> failwith failure.Message)
+                    let! finalizeStatusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "finalize-race-finalize-status")
+                        |> Async.StartAsPromise
+
+                    let finalizeStatus = expectValue "finalize race finalize status" finalizeStatusResult
+
+                    do!
+                        harness.ArmDestinationRace workspace [|
+                            { Path = "finalize-racer.txt"; Content = Some "finalize racer content\n" }
+                        |]
+
+                    let! finalizeResult =
+                        conflicts.Finalize
+                            {
+                                Handle = resolution.RefreshedHandle
+                                ExpectedWorkspaceVersion = finalizeStatus.WorkspaceVersion
+                                Message = Some "finalize during destination race"
+                            }
+                            (OperationContext.detached "finalize-race")
+                        |> Async.StartAsPromise
+
+                    let partialRevision, failure =
+                        match finalizeResult with
+                        | Succeeded _ -> failwith "A raced conflict finalize must not report clean success."
+                        | Failed failure -> None, failure
+                        | PartiallySucceeded(outcome, failure) -> outcome.Value, failure
+
+                    Vitest.expect(failure.Category).toEqual FailureCategory.Concurrency
+                    let evidence = failure.RevisionEvidence |> Map.ofArray
+                    Vitest.expect(evidence.ContainsKey "expected_destination").toBe true
+                    Vitest.expect(evidence.ContainsKey "observed_destination").toBe true
+                    Vitest.expect(evidence.ContainsKey "observed_result").toBe true
+
+                    let expectedWorkspace =
+                        before.WorkspaceRevision |> Option.defaultWith (fun () -> failwith "Expected a workspace revision.")
+
+                    Vitest.expect(evidence["expected_destination"] |> RevisionId.value).toBe expectedWorkspace
+                    let observedDestination = evidence["observed_destination"] |> RevisionId.value
+                    let observedResult = evidence["observed_result"] |> RevisionId.value
+                    Vitest.expect(partialRevision |> Option.map RevisionId.value).toEqual (Some observedResult)
+
+                    let! workspaceHeadResult =
+                        LakeFsApi.getBranch
+                            (connection ())
+                            parsed.Repository
+                            before.WorkspaceBranch
+                            (OperationContext.detached "finalize-race-workspace-head")
+                        |> Async.StartAsPromise
+
+                    let workspaceHead = workspaceHeadResult |> Result.defaultWith (fun failure -> failwith failure.Message)
+                    Vitest.expect(workspaceHead.CommitId).toBe observedResult
+
+                    let! resolutionCommitResult =
+                        LakeFsApi.getCommit
+                            (connection ())
+                            parsed.Repository
+                            observedResult
+                            (OperationContext.detached "finalize-race-resolution-commit")
+                        |> Async.StartAsPromise
+
+                    let resolutionCommit = resolutionCommitResult |> Result.defaultWith (fun failure -> failwith failure.Message)
+                    Vitest.expect(resolutionCommit.Parents.Length).toBe 1
+                    let mergeRevision = resolutionCommit.Parents[0]
+
+                    let! mergeCommitResult =
+                        LakeFsApi.getCommit
+                            (connection ())
+                            parsed.Repository
+                            mergeRevision
+                            (OperationContext.detached "finalize-race-merge-commit")
+                        |> Async.StartAsPromise
+
+                    let mergeCommit = mergeCommitResult |> Result.defaultWith (fun failure -> failwith failure.Message)
+                    Vitest.expect(mergeCommit.Parents).toContain target.CommitId
+                    Vitest.expect(mergeCommit.Parents).toContain observedDestination
+
+                    let afterPartial =
+                        match LakeFsWorkspaceIndex.load workspace.Binding.WorkspaceRoot with
+                        | LakeFsWorkspaceIndex.Loaded index -> index
+                        | _ -> failwith "Expected an index after the raced finalize."
+
+                    Vitest.expect(afterPartial.Generation).toBe before.Generation
+                    Vitest.expect(afterPartial.WorkspaceRevision).toEqual before.WorkspaceRevision
+
+                    let! liveSessionResult =
+                        conflicts.GetActiveSession(OperationContext.detached "finalize-race-live-session")
+                        |> Async.StartAsPromise
+
+                    let liveSession =
+                        expectValue "live session after raced finalize" liveSessionResult
+                        |> Option.defaultWith (fun () -> failwith "The raced finalize left no recoverable session.")
+
+                    Vitest.expect(liveSession.Handle.Version).not.toBe resolution.RefreshedHandle.Version
+                    let! retryStatusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "finalize-race-retry-status")
+                        |> Async.StartAsPromise
+
+                    let retryStatus = expectValue "finalize race retry status" retryStatusResult
+                    let! retryResult =
+                        conflicts.Finalize
+                            {
+                                Handle = liveSession.Handle
+                                ExpectedWorkspaceVersion = retryStatus.WorkspaceVersion
+                                Message = Some "confirm raced conflict finalize"
+                            }
+                            (OperationContext.detached "finalize-race-retry")
+                        |> Async.StartAsPromise
+
+                    let retryRevision = expectValue "finalize race retry" retryResult
+                    Vitest.expect(retryRevision |> Option.map RevisionId.value).toEqual (Some observedResult)
+
+                    let! closedSessionResult =
+                        conflicts.GetActiveSession(OperationContext.detached "finalize-race-closed-session")
+                        |> Async.StartAsPromise
+
+                    Vitest.expect(expectValue "closed raced session" closedSessionResult).toEqual None
+
+                    let! targetAfterResult =
+                        LakeFsApi.getBranch
+                            (connection ())
+                            parsed.Repository
+                            parsed.TargetRef
+                            (OperationContext.detached "finalize-race-target-after")
+                        |> Async.StartAsPromise
+
+                    let targetAfter = targetAfterResult |> Result.defaultWith (fun failure -> failwith failure.Message)
+                    Vitest.expect(targetAfter.CommitId).toBe target.CommitId
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
 )

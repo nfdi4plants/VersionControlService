@@ -20,16 +20,20 @@ type State = {
     mutable HandleVersion: int
     Items: ItemState list
     TargetRevisionAtOpen: string
+    WorkspaceRevisionAtOpen: string
+    mutable PendingFinalizeRevision: string option
 }
 
 let private revisionId value =
     RevisionId.tryCreate value |> Result.defaultWith failwith
 
-let create targetRevision items = {
+let create targetRevision workspaceRevision items = {
     SessionId = $"lakefs-conflict-{LakeFsIndex.createOwnershipToken ()}"
     HandleVersion = 1
     Items = items
     TargetRevisionAtOpen = targetRevision
+    WorkspaceRevisionAtOpen = workspaceRevision
+    PendingFinalizeRevision = None
 }
 
 let rejection () =
@@ -149,4 +153,3 @@ let resolve (conflict: State) (path: RepositoryPath) (resolution: ConflictResolu
 
 let hasUnresolvedItems (conflict: State) =
     conflict.Items |> List.exists (fun item -> item.ResolvedContent.IsNone)
-
