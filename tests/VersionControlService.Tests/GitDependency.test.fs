@@ -29,7 +29,7 @@ let private expectFailure (operationName: string) (result: OperationResult<'T>) 
     | Succeeded _
     | PartiallySucceeded _ -> failwith $"Expected {operationName} to fail."
 
-let private dependencyHooks (gitAvailable: bool) (lfsAvailable: bool) (repairConfiguration: bool) =
+let private dependencyHooks (gitAvailable: bool) (lfsVersion: string option) (repairConfiguration: bool) =
     let mutable configurationInstalled = false
     let commands = ResizeArray<string[]>()
 
@@ -43,14 +43,14 @@ let private dependencyHooks (gitAvailable: bool) (lfsAvailable: bool) (repairCon
                         match request.Arguments with
                         | [| "--version" |] when gitAvailable -> processOutput 0 "git version 2.45.1\n" ""
                         | [| "--version" |] -> processOutput 1 "" "git was not found"
-                        | [| "lfs"; "version" |] when lfsAvailable -> processOutput 0 "git-lfs/3.6.1 (GitHub; windows amd64; go 1.23.0)\n" ""
+                        | [| "lfs"; "version" |] when lfsVersion.IsSome -> processOutput 0 (lfsVersion |> Option.get) ""
                         | [| "lfs"; "version" |] -> processOutput 1 "" "git: 'lfs' is not a git command"
                         | [| "config"; "--global"; "--get"; "filter.lfs.process" |]
                             when gitAvailable && configurationInstalled ->
                             processOutput 0 "git-lfs filter-process\n" ""
                         | [| "config"; "--global"; "--get"; "filter.lfs.process" |] ->
                             processOutput 1 "" ""
-                        | [| "lfs"; "install"; "--skip-repo" |] when lfsAvailable ->
+                        | [| "lfs"; "install"; "--skip-repo" |] when lfsVersion.IsSome ->
                             if repairConfiguration then
                                 configurationInstalled <- true
 
@@ -72,7 +72,7 @@ Vitest.describe (
         Vitest.test (
             "Git dependency remediation is truthful",
             fun () -> promise {
-                let missingHooks, _ = dependencyHooks false false false
+                let missingHooks, _ = dependencyHooks false None false
                 let missingFactory = GitWorkspaceSession.createFactory missingHooks
                 let! missingResult = Async.StartAsPromise(missingFactory.CheckDependencies(context "missing-dependencies"))
                 let missing = expectValue "missing dependencies" missingResult
@@ -83,7 +83,44 @@ Vitest.describe (
                     Vitest.expect(status.Compatible).toBe (false)
                     Vitest.expect(status.Remediation.IsSome).toBe (true)
 
-                let noRepairHooks, _ = dependencyHooks true true false
+                let missingLfsHooks, missingLfsCommands = dependencyHooks true None false
+                let missingLfsFactory = GitWorkspaceSession.createFactory missingLfsHooks
+                let! missingLfsResult =
+                    Async.StartAsPromise(
+                        missingLfsFactory.InstallDependency "git-lfs-configuration" (context "missing-lfs-remediation")
+                    )
+
+                let missingLfsFailure = expectFailure "missing Git LFS configuration remediation" missingLfsResult
+                Vitest.expect(missingLfsFailure.Category).toEqual (Unsupported)
+                Vitest.expect(missingLfsFailure.Code).toBe ("manual_install_required")
+                Vitest.expect(missingLfsFailure.Message.Contains("Install Git LFS")).toBe (true)
+                Vitest.expect(
+                    missingLfsCommands
+                    |> Seq.exists (fun command -> command = [| "lfs"; "install"; "--skip-repo" |])
+                ).toBe (false)
+
+                let incompatibleLfsHooks, incompatibleLfsCommands =
+                    dependencyHooks true (Some "git-lfs/3.6.1 (GitHub; windows amd64; go 1.23.0)\n") false
+
+                let incompatibleLfsFactory = GitWorkspaceSession.createFactory incompatibleLfsHooks
+                let! incompatibleLfsResult =
+                    Async.StartAsPromise(
+                        incompatibleLfsFactory.InstallDependency "git-lfs-configuration" (context "incompatible-lfs-remediation")
+                    )
+
+                let incompatibleLfsFailure =
+                    expectFailure "incompatible Git LFS configuration remediation" incompatibleLfsResult
+
+                Vitest.expect(incompatibleLfsFailure.Category).toEqual (Unsupported)
+                Vitest.expect(incompatibleLfsFailure.Code).toBe ("manual_install_required")
+                Vitest.expect(incompatibleLfsFailure.Message.Contains("Install Git LFS")).toBe (true)
+                Vitest.expect(
+                    incompatibleLfsCommands
+                    |> Seq.exists (fun command -> command = [| "lfs"; "install"; "--skip-repo" |])
+                ).toBe (false)
+
+                let noRepairHooks, _ =
+                    dependencyHooks true (Some "git-lfs/3.7.0 (GitHub; windows amd64; go 1.23.0)\n") false
                 let noRepairFactory = GitWorkspaceSession.createFactory noRepairHooks
                 let! noRepairResult =
                     Async.StartAsPromise(noRepairFactory.InstallDependency "git-lfs-configuration" (context "repair-not-applied"))
@@ -113,7 +150,8 @@ Vitest.describe (
                 Vitest.expect(lfsInstallFailure.Category).toEqual (Unsupported)
                 Vitest.expect(lfsInstallFailure.Message.Contains("Install Git LFS")).toBe (true)
 
-                let repairedHooks, commands = dependencyHooks true true true
+                let repairedHooks, commands =
+                    dependencyHooks true (Some "git-lfs/3.7.0 (GitHub; windows amd64; go 1.23.0)\n") true
                 let repairedFactory = GitWorkspaceSession.createFactory repairedHooks
                 let! repairedResult =
                     Async.StartAsPromise(repairedFactory.InstallDependency "git-lfs-configuration" (context "repair-applied"))
@@ -132,15 +170,15 @@ Vitest.describe (
                     |> Seq.filter (fun command -> command = [| "config"; "--global"; "--get"; "filter.lfs.process" |])
                     |> Seq.length
                 ).toBeGreaterThanOrEqual (1)
-                let configurationCheckIndex =
-                    commands
-                    |> Seq.findIndex (fun command -> command = [| "config"; "--global"; "--get"; "filter.lfs.process" |])
-
                 let installationIndex =
                     commands
                     |> Seq.findIndex (fun command -> command = [| "lfs"; "install"; "--skip-repo" |])
 
-                Vitest.expect(configurationCheckIndex > installationIndex).toBe (true)
+                Vitest.expect(
+                    commands
+                    |> Seq.skip (installationIndex + 1)
+                    |> Seq.exists (fun command -> command = [| "config"; "--global"; "--get"; "filter.lfs.process" |])
+                ).toBe (true)
             }
         )
 )

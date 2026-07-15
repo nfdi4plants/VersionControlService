@@ -1863,7 +1863,11 @@ let createFactoryWithCredentials
                 match lfsVersion with
                 | Ok output when output.ExitCode = 0 ->
                     let versionText = output.StdOut.Trim()
-                    let compatible = GitLfsService.tryParseVersion versionText |> Option.isSome
+
+                    let compatible =
+                        match GitLfsService.tryParseVersion versionText with
+                        | Some(major, minor, _) -> major > 3 || (major = 3 && minor >= 7)
+                        | None -> false
 
                     {
                         Component = "git-lfs"
@@ -1907,6 +1911,12 @@ let createFactoryWithCredentials
 
             return OperationResult.succeeded [| gitStatus; lfsStatus; filterStatus |]
         }
+
+    let manualLfsInstallationRequired () =
+        OperationFailure.create
+            Unsupported
+            "manual_install_required"
+            "Install Git LFS 3.7 or newer manually, then rerun dependency checks."
 
     {
     Id = gitProviderId
@@ -2144,40 +2154,52 @@ let createFactoryWithCredentials
             async {
                 match dependencyComponent with
                 | "git-lfs-configuration" ->
-                    let! installResult =
-                        runGit hooks "." [| "lfs"; "install"; "--skip-repo" |] None context
+                    let! precheckResult = checkDependencies context
 
-                    match installResult with
-                    | Error failure -> return Failed failure
-                    | Ok output when output.ExitCode <> 0 ->
-                        return
-                            Failed(
-                                OperationFailure.createRedacted
-                                    DependencyMissing
-                                    "lfs_configuration_install_failed"
-                                    $"Git LFS configuration failed: {output.StdErr}"
-                            )
-                    | Ok _ ->
-                        let! dependenciesResult = checkDependencies context
+                    match precheckResult with
+                    | Failed failure -> return Failed failure
+                    | PartiallySucceeded(_, failure) -> return Failed failure
+                    | Succeeded precheck ->
+                        match
+                            precheck.Value
+                            |> Array.tryFind (fun status -> status.Component = "git-lfs")
+                        with
+                        | Some status when status.Installed && status.Compatible ->
+                            let! installResult =
+                                runGit hooks "." [| "lfs"; "install"; "--skip-repo" |] None context
 
-                        match dependenciesResult with
-                        | Failed failure -> return Failed failure
-                        | PartiallySucceeded(_, failure) -> return Failed failure
-                        | Succeeded outcome ->
-                            match
-                                outcome.Value
-                                |> Array.tryFind (fun status -> status.Component = "git-lfs-configuration")
-                            with
-                            | Some status when status.Installed && status.Compatible ->
-                                return OperationResult.succeeded status
-                            | _ ->
+                            match installResult with
+                            | Error failure -> return Failed failure
+                            | Ok output when output.ExitCode <> 0 ->
                                 return
                                     Failed(
-                                        OperationFailure.create
+                                        OperationFailure.createRedacted
                                             DependencyMissing
-                                            "lfs_configuration_unhealthy"
-                                            "Git LFS reported successful installation, but filter.lfs.process is still not configured."
+                                            "lfs_configuration_install_failed"
+                                            $"Git LFS configuration failed: {output.StdErr}"
                                     )
+                            | Ok _ ->
+                                let! dependenciesResult = checkDependencies context
+
+                                match dependenciesResult with
+                                | Failed failure -> return Failed failure
+                                | PartiallySucceeded(_, failure) -> return Failed failure
+                                | Succeeded outcome ->
+                                    match
+                                        outcome.Value
+                                        |> Array.tryFind (fun status -> status.Component = "git-lfs-configuration")
+                                    with
+                                    | Some status when status.Installed && status.Compatible ->
+                                        return OperationResult.succeeded status
+                                    | _ ->
+                                        return
+                                            Failed(
+                                                OperationFailure.create
+                                                    DependencyMissing
+                                                    "lfs_configuration_unhealthy"
+                                                    "Git LFS reported successful installation, but filter.lfs.process is still not configured."
+                                            )
+                        | _ -> return Failed(manualLfsInstallationRequired ())
                 | "git" ->
                     return
                         Failed(
@@ -2187,13 +2209,7 @@ let createFactoryWithCredentials
                                 "Install Git 2.38 or newer manually, then rerun dependency checks."
                         )
                 | "git-lfs" ->
-                    return
-                        Failed(
-                            OperationFailure.create
-                                Unsupported
-                                "manual_install_required"
-                                "Install Git LFS manually, then rerun dependency checks."
-                        )
+                    return Failed(manualLfsInstallationRequired ())
                 | _ ->
                     return
                         Failed(
