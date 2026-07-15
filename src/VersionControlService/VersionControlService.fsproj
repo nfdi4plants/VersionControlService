@@ -11,7 +11,6 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="VersionControlProviderRegistry.fs" />
-    <Compile Include="Resolution\ProviderResolver.fs" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\VersionControlService.Abstractions\VersionControlService.Abstractions.fsproj" />

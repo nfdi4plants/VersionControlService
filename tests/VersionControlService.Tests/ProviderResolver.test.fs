@@ -6,7 +6,7 @@ open VersionControlService.Abstractions
 open VersionControlService.Tests.NodePath
 open Vitest
 
-module ProviderResolver = VersionControlService.Resolution.ProviderResolver
+module ProviderResolver = VersionControlService.Abstractions.ProviderResolver
 
 let private fsPromisesDynamic: obj = importAll "fs/promises"
 let private osDynamic: obj = importAll "os"
@@ -160,6 +160,12 @@ let private binding (id: ProviderId) (root: string) (profile: string option) : W
     ConnectionProfileId = profile
 }
 
+let private request path sensitivity binding : ProviderResolver.ResolutionRequest = {
+    WorkspacePath = path
+    ExplicitBinding = binding
+    PathCaseSensitivity = sensitivity
+}
+
 let private resolveAsync catalog request =
     Async.StartAsPromise(ProviderResolver.resolve catalog request)
 
@@ -188,10 +194,7 @@ Vitest.describe (
                 let explicitBinding = binding gitFactory.Id "/workspace" (Some "profile-a")
 
                 let! report =
-                    resolveAsync catalog {
-                        WorkspacePath = "/workspace"
-                        ExplicitBinding = Some explicitBinding
-                    }
+                    resolveAsync catalog (request "/workspace" CaseSensitive (Some explicitBinding))
 
                 match report.Resolution with
                 | ProviderResolver.Bound(boundBinding, factory) ->
@@ -200,6 +203,29 @@ Vitest.describe (
                 | _ -> failwith "Expected the explicit binding to win."
 
                 Vitest.expect(probeConsulted).toBe (false)
+            }
+        )
+
+        Vitest.test (
+            "provider resolver honors explicit path case semantics",
+            fun () -> promise {
+                let catalog =
+                    createCatalog [ createProbeFactory "git" (detectUnder "/Repo") ]
+
+                let! sensitive =
+                    resolveAsync catalog (request "/repo/file" CaseSensitive None)
+
+                let! insensitive =
+                    resolveAsync catalog (request "/repo/file" CaseInsensitive None)
+
+                match sensitive.Resolution with
+                | ProviderResolver.UnmanagedWorkspace -> ()
+                | _ -> failwith "Expected case-sensitive resolution to leave the workspace unmanaged."
+
+                match insensitive.Resolution with
+                | ProviderResolver.ProbedWorkspace(factory, _) ->
+                    Vitest.expect(ProviderId.value factory.Id).toBe ("git")
+                | _ -> failwith "Expected case-insensitive resolution to select Git."
             }
         )
 
@@ -213,10 +239,7 @@ Vitest.describe (
                     ]
 
                 let! report =
-                    resolveAsync catalog {
-                        WorkspacePath = "/plain/directory"
-                        ExplicitBinding = None
-                    }
+                    resolveAsync catalog (request "/plain/directory" CaseSensitive None)
 
                 match report.Resolution with
                 | ProviderResolver.UnmanagedWorkspace -> Vitest.expect(report.Diagnostics.Length).toBe (0)
@@ -234,10 +257,7 @@ Vitest.describe (
                     ]
 
                 let! report =
-                    resolveAsync catalog {
-                        WorkspacePath = "/workspace/sub"
-                        ExplicitBinding = None
-                    }
+                    resolveAsync catalog (request "/workspace/sub" CaseSensitive None)
 
                 match report.Resolution with
                 | ProviderResolver.AmbiguousWorkspace candidates ->
@@ -261,10 +281,7 @@ Vitest.describe (
                     createCatalog [ throwingFactory; createProbeFactory "git" neverDetect ]
 
                 let! report =
-                    resolveAsync catalog {
-                        WorkspacePath = "/workspace"
-                        ExplicitBinding = None
-                    }
+                    resolveAsync catalog (request "/workspace" CaseSensitive None)
 
                 match report.Resolution with
                 | ProviderResolver.UnmanagedWorkspace ->
@@ -285,10 +302,7 @@ Vitest.describe (
                     ]
 
                 let! report =
-                    resolveAsync catalog {
-                        WorkspacePath = "/repo/inner/deep/file-parent"
-                        ExplicitBinding = None
-                    }
+                    resolveAsync catalog (request "/repo/inner/deep/file-parent" CaseSensitive None)
 
                 match report.Resolution with
                 | ProviderResolver.ProbedWorkspace(factory, candidate) ->
@@ -325,10 +339,7 @@ Vitest.describe (
                         ]
 
                     let! report =
-                        resolveAsync catalog {
-                            WorkspacePath = rootPath
-                            ExplicitBinding = None
-                        }
+                        resolveAsync catalog (request rootPath CaseSensitive None)
 
                     match report.Resolution with
                     | ProviderResolver.AmbiguousWorkspace candidates -> Vitest.expect(candidates.Length).toBe (2)
@@ -338,10 +349,7 @@ Vitest.describe (
                     let lakeId = providerId "lakefs"
 
                     let! boundReport =
-                        resolveAsync catalog {
-                            WorkspacePath = rootPath
-                            ExplicitBinding = Some(binding lakeId rootPath (Some "lake-profile"))
-                        }
+                        resolveAsync catalog (request rootPath CaseSensitive (Some(binding lakeId rootPath (Some "lake-profile"))))
 
                     match boundReport.Resolution with
                     | ProviderResolver.Bound(_, factory) -> Vitest.expect(ProviderId.value factory.Id).toBe ("lakefs")
@@ -362,10 +370,7 @@ Vitest.describe (
 
                 let openSession root profile = promise {
                     let! report =
-                        resolveAsync catalog {
-                            WorkspacePath = root
-                            ExplicitBinding = Some(binding gitFactory.Id root (Some profile))
-                        }
+                        resolveAsync catalog (request root CaseSensitive (Some(binding gitFactory.Id root (Some profile))))
 
                     match report.Resolution with
                     | ProviderResolver.Bound(boundBinding, factory) ->
@@ -397,10 +402,7 @@ Vitest.describe (
                     createCatalog [ createProbeFactory "git" neverDetect; externalFactory ]
 
                 let! report =
-                    resolveAsync catalog {
-                        WorkspacePath = "/external/project"
-                        ExplicitBinding = None
-                    }
+                    resolveAsync catalog (request "/external/project" CaseSensitive None)
 
                 match report.Resolution with
                 | ProviderResolver.ProbedWorkspace(factory, _) ->
