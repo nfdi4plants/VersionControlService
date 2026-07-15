@@ -44,6 +44,86 @@ module FakeProvider =
         SetSettings = fun _ _ -> async { return OperationResult.succeeded () }
     }
 
+    let private finalPath = repositoryPath "portable.txt"
+
+    let private finalTargetRef: LogicalRef = {
+        Name = "fake-target"
+        ProviderRef = providerRef "fake-target"
+        Kind = RemoteRef
+        IsCurrent = false
+    }
+
+    let private finalConflictItem: ConflictItem = {
+        Path = finalPath
+        Candidates = [||]
+        CombinedPreview = Some(TextPreview "combined preview")
+        SupportsResolvedContent = true
+    }
+
+    let private finalObjectState: ObjectState = {
+        Path = finalPath
+        IsMaterialized = true
+        IsLocallyAvailable = true
+        SizeBytes = None
+        ObjectId = None
+    }
+
+    let private unsupported (operation: string) : OperationResult<'T> =
+        OperationResult.failed (
+            OperationFailure.create Unsupported "operation_not_supported" $"{operation} is not supported by this provider."
+        )
+
+    let createFinalTextDiff () : TextDiffService = {
+        GetDiff = fun _ _ -> async { return OperationResult.succeeded (TextContent "diff") }
+        GetWordDiff = fun _ _ -> async { return OperationResult.succeeded (TextContent "word diff") }
+        GetBaseContent = fun _ _ -> async { return OperationResult.succeeded (TextContent "base content") }
+    }
+
+    let createFinalSynchronization () : SynchronizationService =
+        let state = {
+            BaseRevision = None
+            WorkspaceRevision = None
+            TargetRevision = None
+            TargetRef = Some finalTargetRef
+            LocalRevisionCount = None
+            TargetRevisionCount = None
+            RemoteChangedPaths = None
+            Relationship = UpToDate
+        }
+
+        {
+            Refresh = fun _ -> async { return OperationResult.succeeded state }
+            PreviewUpdate = fun _ -> async { return unsupported "Synchronization preview" }
+            Update = fun _ _ -> async { return unsupported "Synchronization update" }
+            Publish = fun _ _ -> async { return unsupported "Synchronization publish" }
+        }
+
+    let createFinalConflictResolution () : ConflictResolutionService = {
+        GetActiveSession =
+            fun _ ->
+                async {
+                    return
+                        OperationResult.succeeded (
+                            Some {
+                                Handle = {
+                                    SessionId = "fake-conflict-session"
+                                    Version = "1"
+                                }
+                                Items = [| finalConflictItem |]
+                            }
+                        )
+                }
+        Resolve = fun _ _ -> async { return unsupported "Conflict resolution" }
+        Finalize = fun _ _ -> async { return unsupported "Conflict finalization" }
+        Cancel = fun _ _ -> async { return unsupported "Conflict cancellation" }
+    }
+
+    let createFinalObjectMaterialization () : ObjectMaterializationService = {
+        ListObjects = fun _ -> async { return OperationResult.succeeded [| finalObjectState |] }
+        Materialize = fun _ _ -> async { return unsupported "Object materialization" }
+        Dematerialize = fun _ _ -> async { return unsupported "Object dematerialization" }
+    }
+
     let fakeLocation (id: ProviderId) : RepositoryLocation = {
         ProviderId = id
         DisplayName = None
@@ -266,6 +346,60 @@ let contractShapeTests =
                 Expect.isTrue outcome.Value.MaterializeLargeObjects "The fake returns its materialization setting."
             | PartiallySucceeded _
             | Failed _ -> failtest "Expected fake storage settings."
+
+        testCaseAsync "an opened session returns all final SPI additions through services and operation results"
+        <| async {
+            let id = FakeProvider.providerId "fake.final-surface"
+
+            let factory =
+                FakeProvider.createFactory id (fun descriptor -> {
+                    WorkspaceSession.createCoreOnly descriptor (FakeProvider.createCore ()) with
+                        TextDiff = Some(FakeProvider.createFinalTextDiff ())
+                        ConflictResolution = Some(FakeProvider.createFinalConflictResolution ())
+                        Synchronization = Some(FakeProvider.createFinalSynchronization ())
+                        ObjectMaterialization = Some(FakeProvider.createFinalObjectMaterialization ())
+                })
+
+            let! session = openSession factory
+            let context = OperationContext.detached "final-service-surface"
+
+            let textDiff =
+                match session.TextDiff with
+                | Some service -> service
+                | None -> failtest "Expected the text-diff service."
+
+            let! baseResult = textDiff.GetBaseContent (FakeProvider.repositoryPath "portable.txt") context
+            let baseContent = expectSucceeded "get base content" baseResult
+            Expect.equal baseContent (TextContent "base content") "Base content comes from the service result."
+
+            let conflicts =
+                match session.ConflictResolution with
+                | Some service -> service
+                | None -> failtest "Expected the conflict-resolution service."
+
+            let! summaryResult = conflicts.GetActiveSession context
+            let summary = expectSucceeded "get active conflict session" summaryResult
+            let conflict = summary |> Option.defaultWith (fun () -> failtest "Expected an active conflict session.")
+            Expect.equal conflict.Items[0].CombinedPreview (Some(TextPreview "combined preview")) "Combined preview comes from the session result."
+
+            let synchronization =
+                match session.Synchronization with
+                | Some service -> service
+                | None -> failtest "Expected the synchronization service."
+
+            let! stateResult = synchronization.Refresh context
+            let state = expectSucceeded "refresh synchronization" stateResult
+            Expect.equal (state.TargetRef |> Option.map _.Name) (Some "fake-target") "Target ref comes from the refresh result."
+
+            let objects =
+                match session.ObjectMaterialization with
+                | Some service -> service
+                | None -> failtest "Expected the object-materialization service."
+
+            let! objectsResult = objects.ListObjects context
+            let objectState = expectSucceeded "list objects" objectsResult |> Array.exactlyOne
+            Expect.isTrue objectState.IsLocallyAvailable "Local availability comes from the object-list result."
+        }
 
         testCaseAsync "a core-only provider implements no optional service"
         <| async {

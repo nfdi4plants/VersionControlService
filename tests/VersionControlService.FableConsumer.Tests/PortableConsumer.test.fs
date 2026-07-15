@@ -65,6 +65,44 @@ let private createFakeTextDiff () : TextDiffService = {
     GetBaseContent = fun _ _ -> async { return OperationResult.succeeded (TextContent "base content") }
 }
 
+let private unsupported (operation: string) : OperationResult<'T> =
+    OperationResult.failed (
+        OperationFailure.create Unsupported "operation_not_supported" $"{operation} is not supported by this provider."
+    )
+
+let private createFakeSynchronization () : SynchronizationService = {
+    Refresh = fun _ -> async { return OperationResult.succeeded fakeSynchronizationState }
+    PreviewUpdate = fun _ -> async { return unsupported "Synchronization preview" }
+    Update = fun _ _ -> async { return unsupported "Synchronization update" }
+    Publish = fun _ _ -> async { return unsupported "Synchronization publish" }
+}
+
+let private createFakeConflictResolution () : ConflictResolutionService = {
+    GetActiveSession =
+        fun _ ->
+            async {
+                return
+                    OperationResult.succeeded (
+                        Some {
+                            Handle = {
+                                SessionId = "fake-conflict-session"
+                                Version = "1"
+                            }
+                            Items = [| fakeConflictItem |]
+                        }
+                    )
+            }
+    Resolve = fun _ _ -> async { return unsupported "Conflict resolution" }
+    Finalize = fun _ _ -> async { return unsupported "Conflict finalization" }
+    Cancel = fun _ _ -> async { return unsupported "Conflict cancellation" }
+}
+
+let private createFakeObjectMaterialization () : ObjectMaterializationService = {
+    ListObjects = fun _ -> async { return OperationResult.succeeded [| fakeObjectState |] }
+    Materialize = fun _ _ -> async { return unsupported "Object materialization" }
+    Dematerialize = fun _ _ -> async { return unsupported "Object dematerialization" }
+}
+
 /// Core whose diff summary is a 50-step long operation reporting progress each step
 /// and observing cancellation between steps.
 let private createFakeCore () : CoreVersionControl =
@@ -164,6 +202,9 @@ let private createFakeFactory () : ProviderFactory =
                     OperationResult.succeeded {
                         WorkspaceSession.createCoreOnly descriptor (createFakeCore ()) with
                             TextDiff = Some(createFakeTextDiff ())
+                            ConflictResolution = Some(createFakeConflictResolution ())
+                            Synchronization = Some(createFakeSynchronization ())
+                            ObjectMaterialization = Some(createFakeObjectMaterialization ())
                     }
             }
         CheckDependencies = fun _ -> async { return OperationResult.succeeded [||] }
@@ -290,19 +331,50 @@ Vitest.describe (
                 let workflow = async {
                     let! session = openFakeSession factory context
 
-                    match session.TextDiff with
-                    | Some textDiff ->
-                        let! baseResult = textDiff.GetBaseContent fakePath context
-                        return expectSucceeded "get base content" baseResult
-                    | None -> return failwith "Expected the fake text-diff service."
+                    let textDiff =
+                        match session.TextDiff with
+                        | Some service -> service
+                        | None -> failwith "Expected the fake text-diff service."
+
+                    let! baseResult = textDiff.GetBaseContent fakePath context
+                    let baseContent = expectSucceeded "get base content" baseResult
+
+                    let conflicts =
+                        match session.ConflictResolution with
+                        | Some service -> service
+                        | None -> failwith "Expected the fake conflict-resolution service."
+
+                    let! summaryResult = conflicts.GetActiveSession context
+                    let summary = expectSucceeded "get active conflict session" summaryResult
+
+                    let conflict =
+                        summary |> Option.defaultWith (fun () -> failwith "Expected an active fake conflict session.")
+
+                    let synchronization =
+                        match session.Synchronization with
+                        | Some service -> service
+                        | None -> failwith "Expected the fake synchronization service."
+
+                    let! stateResult = synchronization.Refresh context
+                    let state = expectSucceeded "refresh synchronization" stateResult
+
+                    let objects =
+                        match session.ObjectMaterialization with
+                        | Some service -> service
+                        | None -> failwith "Expected the fake object-materialization service."
+
+                    let! objectsResult = objects.ListObjects context
+                    let objectState = expectSucceeded "list objects" objectsResult |> Array.exactlyOne
+
+                    return baseContent, conflict.Items[0].CombinedPreview, state.TargetRef, objectState.IsLocallyAvailable
                 }
 
-                let! baseContent = Async.StartAsPromise workflow
+                let! baseContent, combinedPreview, targetRef, isLocallyAvailable = Async.StartAsPromise workflow
 
                 Vitest.expect(baseContent).toEqual (TextContent "base content")
-                Vitest.expect(fakeConflictItem.CombinedPreview).toEqual (Some(TextPreview "<<<<<<< local\n=======\n>>>>>>> target\n"))
-                Vitest.expect(fakeSynchronizationState.TargetRef).toEqual (Some fakeTargetRef)
-                Vitest.expect(fakeObjectState.IsLocallyAvailable).toBe (true)
+                Vitest.expect(combinedPreview).toEqual (Some(TextPreview "<<<<<<< local\n=======\n>>>>>>> target\n"))
+                Vitest.expect(targetRef).toEqual (Some fakeTargetRef)
+                Vitest.expect(isLocallyAvailable).toBe (true)
             }
         )
 )
