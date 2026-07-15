@@ -7,6 +7,7 @@ open VersionControlService.Abstractions
 open VersionControlService.Tests.Contracts
 open VersionControlService.Tests.Contracts.ProviderHarness
 open VersionControlService.Tests.NodePath
+open Vitest
 
 module GitWorkspaceSession = VersionControlService.Git.GitWorkspaceSession
 module NodeProcess = VersionControlService.Runtime.Node.Process
@@ -47,6 +48,13 @@ let private tryReadUtf8FileAsync (path: string) : JS.Promise<string option> = pr
         return Some content
     with _ ->
         return None
+}
+
+/// Captures raw bytes as base64 so adoption tests can assert Git configuration
+/// is untouched, rather than merely textually equivalent.
+let private readFileBase64Async (path: string) : JS.Promise<string> = promise {
+    let! bytes = fsPromisesDynamic?readFile (path) |> unbox<JS.Promise<obj>>
+    return bytes?toString("base64") |> unbox<string>
 }
 
 let private removeFileAsync (path: string) : JS.Promise<unit> = promise {
@@ -441,3 +449,162 @@ let private registrations = [|
     ExtensionProviderSuites.register gitHarness
     SwateSelectableSuite.register gitHarness
 |]
+
+let private expectProviderValue (operationName: string) (result: OperationResult<'T>) : 'T =
+    match result with
+    | Succeeded outcome -> outcome.Value
+    | PartiallySucceeded(_, failure) ->
+        failwith $"{operationName} unexpectedly returned partial success ({failure.Code})."
+    | Failed failure ->
+        failwith $"{operationName} failed ({failure.Category}/{failure.Code}): {failure.Message}"
+
+let private expectProviderFailure (operationName: string) (result: OperationResult<'T>) : OperationFailure =
+    match result with
+    | Failed failure -> failure
+    | Succeeded _
+    | PartiallySucceeded _ -> failwith $"Expected {operationName} to fail."
+
+Vitest.describe (
+    "Git workspace adoption",
+    fun () ->
+        Vitest.test (
+            "Git adopts an existing repository",
+            fun () -> promise {
+                let! root = createTempDirectoryAsync ()
+
+                try
+                    let remotePath = join [| root; "origin.git" |]
+                    let repoPath = join [| root; "existing" |]
+                    let localOnlyPath = join [| root; "local-only" |]
+
+                    let! _ = runGitIn root [||] [| "init"; "--bare"; "-b"; "main"; remotePath |] None
+                    let! _ = runGitIn root [||] [| "init"; "-b"; "main"; repoPath |] None
+                    do! configureUser repoPath
+                    do! writeUtf8FileAsync (join [| repoPath; "base.txt" |]) "base\n"
+                    let! _ = runGitIn repoPath [||] [| "add"; "-A" |] None
+                    let! _ = runGitIn repoPath [||] [| "commit"; "-m"; "test: base" |] None
+                    let! _ = runGitIn repoPath [||] [| "remote"; "add"; "origin"; remotePath |] None
+                    let! expectedRemoteLocation =
+                        runGitIn repoPath [||] [| "config"; "--get"; "remote.origin.url" |] None
+
+                    let configPath = join [| repoPath; ".git"; "config" |]
+                    let! configBefore = readFileBase64Async configPath
+                    let factory = GitWorkspaceSession.createFactory GitWorkspaceSession.GitSessionHooks.none
+
+                    let! adoptionResult =
+                        Async.StartAsPromise(
+                            factory.Adopt
+                                {
+                                    WorkspaceRoot = repoPath
+                                    ConnectionProfileId = Some "account-a"
+                                }
+                                (OperationContext.detached "adopt-remote")
+                        )
+
+                    let binding = expectProviderValue "adopt existing Git repository" adoptionResult
+                    Vitest.expect(binding.WorkspaceRoot).toBe (repoPath.Replace("\\", "/"))
+                    Vitest.expect(binding.Location.ProviderLocation).toBe (expectedRemoteLocation.Trim())
+                    Vitest.expect(binding.ConnectionProfileId).toEqual (Some "account-a")
+                    Vitest.expect(binding.Location.ConnectionProfileId).toEqual (Some "account-a")
+
+                    let! configAfter = readFileBase64Async configPath
+                    Vitest.expect(configAfter).toBe (configBefore)
+
+                    let! _ = runGitIn root [||] [| "init"; "-b"; "main"; localOnlyPath |] None
+                    do! writeUtf8FileAsync (join [| localOnlyPath; "uncommitted.txt" |]) "local change\n"
+
+                    let! localAdoptionResult =
+                        Async.StartAsPromise(
+                            factory.Adopt
+                                {
+                                    WorkspaceRoot = localOnlyPath
+                                    ConnectionProfileId = None
+                                }
+                                (OperationContext.detached "adopt-local")
+                        )
+
+                    let localBinding = expectProviderValue "adopt remote-less Git repository" localAdoptionResult
+                    Vitest.expect(localBinding.WorkspaceRoot).toBe (localOnlyPath.Replace("\\", "/"))
+                    Vitest.expect(localBinding.Location.ProviderLocation).toBe (localOnlyPath.Replace("\\", "/"))
+
+                    let! opened =
+                        Async.StartAsPromise(factory.Open localBinding (OperationContext.detached "open-adopted-local"))
+
+                    let session = expectProviderValue "open adopted local repository" opened
+                    let! statusResult =
+                        Async.StartAsPromise(session.Core.GetStatus(OperationContext.detached "adopted-local-status"))
+
+                    let status = expectProviderValue "adopted local status" statusResult
+                    Vitest.expect(status.Changes |> Array.map (fun change -> RepositoryPath.value change.Path)).toEqual ([| "uncommitted.txt" |])
+
+                    match status.Synchronization with
+                    | Some synchronization -> Vitest.expect(synchronization.Relationship).toEqual (NoTarget)
+                    | None -> failwith "Expected synchronization information for the adopted local repository."
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "Git initialization preserves an existing non-Git directory and reports an already initialized repository",
+            fun () -> promise {
+                let! root = createTempDirectoryAsync ()
+
+                try
+                    let nonGitPath = join [| root; "non-git" |]
+                    let existingGitPath = join [| root; "already-git" |]
+                    let filePath = join [| nonGitPath; "uncommitted.txt" |]
+                    do! writeUtf8FileAsync filePath "uncommitted bytes\n"
+                    let! bytesBefore = readFileBase64Async filePath
+                    let factory = GitWorkspaceSession.createFactory GitWorkspaceSession.GitSessionHooks.none
+
+                    let! initializationResult =
+                        Async.StartAsPromise(
+                            factory.Initialize
+                                {
+                                    TargetPath = nonGitPath
+                                    Location = None
+                                }
+                                (OperationContext.detached "initialize-non-git")
+                        )
+
+                    let binding = expectProviderValue "initialize non-Git directory" initializationResult
+                    let! bytesAfter = readFileBase64Async filePath
+                    Vitest.expect(bytesAfter).toBe (bytesBefore)
+
+                    let! opened =
+                        Async.StartAsPromise(factory.Open binding (OperationContext.detached "open-initialized-non-git"))
+
+                    let session = expectProviderValue "open initialized non-Git directory" opened
+                    let! statusResult =
+                        Async.StartAsPromise(session.Core.GetStatus(OperationContext.detached "initialized-non-git-status"))
+
+                    let status = expectProviderValue "initialized non-Git status" statusResult
+                    Vitest.expect(status.Changes |> Array.map (fun change -> RepositoryPath.value change.Path)).toEqual ([| "uncommitted.txt" |])
+
+                    let! _ = runGitIn root [||] [| "init"; "-b"; "main"; existingGitPath |] None
+
+                    let! existingResult =
+                        Async.StartAsPromise(
+                            factory.Initialize
+                                {
+                                    TargetPath = existingGitPath
+                                    Location = None
+                                }
+                                (OperationContext.detached "initialize-existing-git")
+                        )
+
+                    let existingFailure = expectProviderFailure "initialize existing Git repository" existingResult
+                    Vitest.expect(existingFailure.Category).toEqual (Validation)
+                    Vitest.expect(existingFailure.Code).toBe ("already_initialized")
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+)

@@ -1821,6 +1821,93 @@ let createFactoryWithCredentials
     (hooks: GitSessionHooks)
     (credentials: GitCredentialStrategy.GitCredentialStrategy)
     : ProviderFactory =
+    let checkDependencies (context: OperationContext) : Async<OperationResult<DependencyStatus[]>> =
+        async {
+            let! gitVersion = runGit hooks "." [| "--version" |] None context
+            let! lfsVersion = runGit hooks "." [| "lfs"; "version" |] None context
+            let! lfsFilter =
+                runGit hooks "." [| "config"; "--global"; "--get"; "filter.lfs.process" |] None context
+
+            let gitStatus: DependencyStatus =
+                match gitVersion with
+                | Ok output when output.ExitCode = 0 ->
+                    let versionText = output.StdOut.Trim()
+
+                    let compatible =
+                        match GitService.tryParseVersion versionText with
+                        | Some(major, minor, _) -> major > 2 || (major = 2 && minor >= 38)
+                        | None -> false
+
+                    {
+                        Component = "git"
+                        Installed = true
+                        Version = Some versionText
+                        Compatible = compatible
+                        Remediation =
+                            if compatible then
+                                None
+                            else
+                                Some
+                                    "Install Git 2.38 or newer: synchronization preview requires `git merge-tree --write-tree`."
+                    }
+                | _ ->
+                    {
+                        Component = "git"
+                        Installed = false
+                        Version = None
+                        Compatible = false
+                        Remediation = Some "Install Git 2.38 or newer and ensure it is on PATH."
+                    }
+
+            let lfsStatus: DependencyStatus =
+                match lfsVersion with
+                | Ok output when output.ExitCode = 0 ->
+                    let versionText = output.StdOut.Trim()
+                    let compatible = GitLfsService.tryParseVersion versionText |> Option.isSome
+
+                    {
+                        Component = "git-lfs"
+                        Installed = true
+                        Version = Some versionText
+                        Compatible = compatible
+                        Remediation =
+                            if compatible then
+                                None
+                            else
+                                Some "Install a supported Git LFS release and ensure `git lfs version` succeeds."
+                    }
+                | _ ->
+                    {
+                        Component = "git-lfs"
+                        Installed = false
+                        Version = None
+                        Compatible = false
+                        Remediation = Some "Install Git LFS and ensure `git lfs version` succeeds."
+                    }
+
+            let filterInstalled =
+                match lfsFilter with
+                | Ok output when output.ExitCode = 0 -> not (String.IsNullOrWhiteSpace output.StdOut)
+                | _ -> false
+
+            let filterStatus: DependencyStatus =
+                {
+                    Component = "git-lfs-configuration"
+                    Installed = filterInstalled
+                    Version = None
+                    Compatible = filterInstalled && lfsStatus.Compatible
+                    Remediation =
+                        if filterInstalled && lfsStatus.Compatible then
+                            None
+                        elif not lfsStatus.Installed then
+                            Some "Install Git LFS before configuring its global filter process."
+                        else
+                            Some "Run `git lfs install --skip-repo` to configure Git LFS globally."
+                }
+
+            return OperationResult.succeeded [| gitStatus; lfsStatus; filterStatus |]
+        }
+
     {
     Id = gitProviderId
     Probe = probe
@@ -1878,6 +1965,14 @@ let createFactoryWithCredentials
             let! result = Async.AwaitPromise(GitProvisioningService.initRepository request.TargetPath)
 
             match result with
+            | Error failure when failure.Message.Contains("already a git repository", StringComparison.OrdinalIgnoreCase) ->
+                return
+                    Failed(
+                        OperationFailure.create
+                            Validation
+                            "already_initialized"
+                            "The target path is already initialized as a Git repository."
+                    )
             | Error failure -> return Failed(toOperationFailure failure)
             | Ok normalizedPath ->
                 let location =
@@ -1974,15 +2069,32 @@ let createFactoryWithCredentials
                                 }
         }
     Adopt =
-        fun _ _ ->
+        fun request context ->
             async {
-                return
-                    OperationResult.failed (
-                        OperationFailure.create
-                            Unsupported
-                            "operation_not_supported"
-                            "Adoption is not supported by this provider."
-                    )
+                let! rootResult =
+                    runGitChecked hooks request.WorkspaceRoot [| "rev-parse"; "--show-toplevel" |] None context
+
+                match rootResult with
+                | Error failure -> return Failed failure
+                | Ok rootOutput ->
+                    let workspaceRoot = rootOutput.StdOut.Trim()
+                    let! remoteResult =
+                        runGit hooks workspaceRoot [| "config"; "--get"; "remote.origin.url" |] None context
+
+                    let providerLocation =
+                        match remoteResult with
+                        | Ok output when output.ExitCode = 0 && not (String.IsNullOrWhiteSpace output.StdOut) ->
+                            output.StdOut.Trim()
+                        | _ -> workspaceRoot
+
+                    let location = {
+                        ProviderId = gitProviderId
+                        DisplayName = None
+                        ProviderLocation = providerLocation
+                        ConnectionProfileId = request.ConnectionProfileId
+                    }
+
+                    return OperationResult.succeeded (bindingFor workspaceRoot location)
             }
     Bind =
         fun request context -> async {
@@ -2026,62 +2138,70 @@ let createFactoryWithCredentials
         fun binding _ -> async {
             return OperationResult.succeeded (createSessionWithCredentials hooks credentials binding)
         }
-    CheckDependencies =
-        fun context -> async {
-            let! gitVersion = runGit hooks "." [| "--version" |] None context
-
-            match gitVersion with
-            | Ok output when output.ExitCode = 0 ->
-                let versionText = output.StdOut.Trim()
-
-                // Synchronization preview uses `merge-tree --write-tree`,
-                // documented from Git 2.38 — older versions are incompatible.
-                let versionMatch =
-                    System.Text.RegularExpressions.Regex.Match(versionText, @"(\d+)\.(\d+)")
-
-                let compatible =
-                    versionMatch.Success
-                    && (let major = int versionMatch.Groups[1].Value
-                        let minor = int versionMatch.Groups[2].Value
-                        major > 2 || (major = 2 && minor >= 38))
-
-                return
-                    OperationResult.succeeded [|
-                        {
-                            Component = "git"
-                            Installed = true
-                            Version = Some versionText
-                            Compatible = compatible
-                            Remediation =
-                                if compatible then
-                                    None
-                                else
-                                    Some
-                                        "Install Git 2.38 or newer: synchronization preview requires `git merge-tree --write-tree`."
-                        }
-                    |]
-            | _ ->
-                return
-                    OperationResult.succeeded [|
-                        {
-                            Component = "git"
-                            Installed = false
-                            Version = None
-                            Compatible = false
-                            Remediation = Some "Install Git 2.38 or newer and ensure it is on PATH."
-                        }
-                    |]
-        }
+    CheckDependencies = checkDependencies
     InstallDependency =
-        fun _ _ ->
+        fun dependencyComponent context ->
             async {
-                return
-                    OperationResult.failed (
-                        OperationFailure.create
-                            Unsupported
-                            "operation_not_supported"
-                            "Dependency installation is not supported by this provider."
-                    )
+                match dependencyComponent with
+                | "git-lfs-configuration" ->
+                    let! installResult =
+                        runGit hooks "." [| "lfs"; "install"; "--skip-repo" |] None context
+
+                    match installResult with
+                    | Error failure -> return Failed failure
+                    | Ok output when output.ExitCode <> 0 ->
+                        return
+                            Failed(
+                                OperationFailure.createRedacted
+                                    DependencyMissing
+                                    "lfs_configuration_install_failed"
+                                    $"Git LFS configuration failed: {output.StdErr}"
+                            )
+                    | Ok _ ->
+                        let! dependenciesResult = checkDependencies context
+
+                        match dependenciesResult with
+                        | Failed failure -> return Failed failure
+                        | PartiallySucceeded(_, failure) -> return Failed failure
+                        | Succeeded outcome ->
+                            match
+                                outcome.Value
+                                |> Array.tryFind (fun status -> status.Component = "git-lfs-configuration")
+                            with
+                            | Some status when status.Installed && status.Compatible ->
+                                return OperationResult.succeeded status
+                            | _ ->
+                                return
+                                    Failed(
+                                        OperationFailure.create
+                                            DependencyMissing
+                                            "lfs_configuration_unhealthy"
+                                            "Git LFS reported successful installation, but filter.lfs.process is still not configured."
+                                    )
+                | "git" ->
+                    return
+                        Failed(
+                            OperationFailure.create
+                                Unsupported
+                                "manual_install_required"
+                                "Install Git 2.38 or newer manually, then rerun dependency checks."
+                        )
+                | "git-lfs" ->
+                    return
+                        Failed(
+                            OperationFailure.create
+                                Unsupported
+                                "manual_install_required"
+                                "Install Git LFS manually, then rerun dependency checks."
+                        )
+                | _ ->
+                    return
+                        Failed(
+                            OperationFailure.create
+                                Unsupported
+                                "dependency_not_supported"
+                                "Unsupported dependency component. Supported remediation: git-lfs-configuration."
+                        )
             }
     }
 

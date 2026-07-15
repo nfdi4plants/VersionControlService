@@ -156,6 +156,24 @@ let classifyFailureKind (message: string) =
     else
         GitFailureKind.Unknown
 
+/// Parses the numeric portion of Git's human-readable version output. Keeping
+/// this tolerant makes dependency probing work for the platform-specific text
+/// emitted by Git distributions without treating an unparseable version as
+/// compatible.
+let tryParseVersion (versionText: string) : (int * int * int) option =
+    let matchResult = Regex.Match(versionText |> Option.ofObj |> Option.defaultValue String.Empty, @"(\d+)\.(\d+)(?:\.(\d+))?")
+
+    if matchResult.Success then
+        let patch =
+            if matchResult.Groups.[3].Success then
+                int matchResult.Groups.[3].Value
+            else
+                0
+
+        Some(int matchResult.Groups.[1].Value, int matchResult.Groups.[2].Value, patch)
+    else
+        None
+
 // GitService owns threshold formatting because the threshold is part of git workflow policy, not raw LFS command execution.
 let private formatThresholdMb (thresholdMb: int) = $"{thresholdMb} MB"
 

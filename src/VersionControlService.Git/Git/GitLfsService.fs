@@ -2,6 +2,7 @@ module VersionControlService.Git.GitLfsService
 
 open System
 open System.Collections.Generic
+open System.Text.RegularExpressions
 open Fable.Core
 open VersionControlService.Support
 open VersionControlService.Contracts.FileSystem
@@ -26,6 +27,23 @@ let mutable private cachedSystemInstalled = false
 
 [<Literal>]
 let private lfsLsFilesTimeoutMs = 15000
+
+/// Parses Git LFS's platform-specific version banner (`git-lfs/3.6.1`,
+/// `git lfs 3.6.1`, ...). A successful executable probe without a version is
+/// still installed, but is not considered compatible for dependent workflows.
+let tryParseVersion (versionText: string) : (int * int * int) option =
+    let matchResult = Regex.Match(versionText |> Option.ofObj |> Option.defaultValue String.Empty, @"(\d+)\.(\d+)(?:\.(\d+))?")
+
+    if matchResult.Success then
+        let patch =
+            if matchResult.Groups.[3].Success then
+                int matchResult.Groups.[3].Value
+            else
+                0
+
+        Some(int matchResult.Groups.[1].Value, int matchResult.Groups.[2].Value, patch)
+    else
+        None
 
 let parseLsFiles (stdoutText: string) : GitLfsLsFileInfo[] =
     try

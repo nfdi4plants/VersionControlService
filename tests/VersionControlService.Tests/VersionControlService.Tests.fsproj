@@ -16,6 +16,7 @@
     <Compile Include="Contracts\ExtensionProviderSuites.fs" />
     <Compile Include="Contracts\SwateSelectableSuite.fs" />
     <Compile Include="GitProviderContract.test.fs" />
+    <Compile Include="GitDependency.test.fs" />
     <Compile Include="GitProvider.test.fs" />
     <Compile Include="GitSynchronization.test.fs" />
     <Compile Include="GitCredentials.test.fs" />
