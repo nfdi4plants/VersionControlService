@@ -161,6 +161,132 @@ let private sessionStatus (session: WorkspaceSession) = promise {
     return expectValue "status" result
 }
 
+let private createUnmergedConflictFixture () = promise {
+    let! root, workPath, barePath, session = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+    do! advanceTarget root barePath [ "base.txt", "target version\n" ]
+    do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) "workspace version\n"
+
+    let! saveStatus = sessionStatus session
+
+    let! saveResult =
+        Async.StartAsPromise(
+            session.Core.CreateRevision
+                {
+                    Message = "local conflicting change"
+                    Paths = [| mkPath "base.txt" |]
+                    ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+                }
+                (ctx "preview-conflict-save")
+        )
+
+    expectValue "local conflict revision" saveResult |> ignore
+    let! updateStatus = sessionStatus session
+
+    let! updateResult =
+        Async.StartAsPromise(
+            (syncService session).Update
+                { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
+                (ctx "preview-conflict-update")
+        )
+
+    match updateResult with
+    | Failed failure
+    | PartiallySucceeded(_, failure) when failure.Code = "conflicts_detected" -> ()
+    | Failed failure
+    | PartiallySucceeded(_, failure) ->
+        failwith $"Expected conflicts_detected, received {failure.Category}/{failure.Code}."
+    | Succeeded _ -> failwith "Expected the update to create a real unmerged conflict."
+
+    let conflicts = conflictService session
+    let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession(ctx "preview-conflict-session"))
+
+    let summary =
+        match expectValue "preview conflict session" summaryResult with
+        | Some value -> value
+        | None -> failwith "Expected an active conflict session."
+
+    let! capturedStatus = sessionStatus session
+    return root, workPath, conflicts, summary, capturedStatus.WorkspaceVersion
+}
+
+Vitest.describe (
+    "Git conflict preview tracks out-of-band edits",
+    fun () ->
+        Vitest.test (
+            "returns the current edited marker text as the combined preview",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, conflicts, _, _ = createUnmergedConflictFixture ()
+
+                try
+                    let editedMarkerText =
+                        "<<<<<<< edited workspace\nmanually edited marker content\n=======\ntarget version\n>>>>>>> edited target\n"
+
+                    do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) editedMarkerText
+                    let! refreshedResult =
+                        Async.StartAsPromise(conflicts.GetActiveSession(ctx "edited-conflict-preview"))
+
+                    let refreshed =
+                        match expectValue "edited conflict preview" refreshedResult with
+                        | Some value -> value
+                        | None -> failwith "Expected the edited conflict session to remain active."
+
+                    Vitest.expect(refreshed.Items.Length).toBe (1)
+                    Vitest.expect(refreshed.Items[0].CombinedPreview).toEqual (Some(TextPreview editedMarkerText))
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "rejects the captured handle and workspace token after an unstaged marker edit",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, conflicts, capturedSummary, capturedWorkspaceVersion =
+                    createUnmergedConflictFixture ()
+
+                try
+                    do!
+                        writeUtf8FileAsync
+                            (join [| workPath; "base.txt" |])
+                            "<<<<<<< edited workspace\nout-of-band edit\n=======\ntarget version\n>>>>>>> edited target\n"
+
+                    let! staleResolve =
+                        Async.StartAsPromise(
+                            conflicts.Resolve
+                                {
+                                    Handle = capturedSummary.Handle
+                                    ExpectedWorkspaceVersion = capturedWorkspaceVersion
+                                    Path = mkPath "base.txt"
+                                    Resolution = PickCandidate "target"
+                                }
+                                (ctx "out-of-band-stale-resolve")
+                        )
+
+                    let failure =
+                        match staleResolve with
+                        | Failed failure -> failure
+                        | PartiallySucceeded(_, failure) -> failure
+                        | Succeeded _ -> failwith "Expected the out-of-band edit to stale the captured request."
+
+                    Vitest.expect(failure.Category).toEqual (Concurrency)
+                    Vitest.expect(failure.Code).toBe ("precondition_failed")
+
+                    Vitest
+                        .expect(failure.RecoveryAction |> Option.map _.Code)
+                        .toEqual (Some "refresh_conflict_session")
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+)
+
 Vitest.describe (
     "GitWorkspaceSession v2 synchronization",
     fun () ->

@@ -42,6 +42,16 @@ let private writeUtf8FileAsync (path: string) (content: string) : JS.Promise<uni
     return ()
 }
 
+[<Emit("Buffer.from($0)")>]
+let private bufferFromBytes (_bytes: int[]) : obj = jsNative
+
+let private writeBinaryFileAsync (path: string) (bytes: int[]) : JS.Promise<unit> = promise {
+    let parent = dirname path
+    do! ensureDirectoryAsync parent
+    let! _ = fsPromisesDynamic?writeFile (path, bufferFromBytes bytes) |> unbox<JS.Promise<obj>>
+    return ()
+}
+
 let private tryReadUtf8FileAsync (path: string) : JS.Promise<string option> = promise {
     try
         let! content = fsPromisesDynamic?readFile (path, "utf8") |> unbox<JS.Promise<string>>
@@ -487,6 +497,49 @@ let private adoptionHooks (originResult: OperationResult<NodeProcess.ProcessOutp
     Barrier = None
 }
 
+let private createBaseContentFixture () = promise {
+    let! root = createTempDirectoryAsync ()
+    let repoPath = join [| root; "work" |]
+    let! _ = runGitIn root [||] [| "init"; "-b"; "main"; repoPath |] None
+    do! configureUser repoPath
+    do! writeUtf8FileAsync (join [| repoPath; "base.txt" |]) "base content\n"
+    do! writeUtf8FileAsync (join [| repoPath; "rename-source.txt" |]) "committed rename source\n"
+    do! writeBinaryFileAsync (join [| repoPath; "binary.dat" |]) [| 0; 255; 1; 2; 3 |]
+    let! _ = runGitIn repoPath [||] [| "add"; "-A" |] None
+    let! _ = runGitIn repoPath [||] [| "commit"; "-m"; "test: base content" |] None
+
+    do! writeUtf8FileAsync (join [| repoPath; "base.txt" |]) "modified content\n"
+    let! _ = runGitIn repoPath [||] [| "mv"; "rename-source.txt"; "renamed.txt" |] None
+    do! writeUtf8FileAsync (join [| repoPath; "added.txt" |]) "new content\n"
+    do! writeBinaryFileAsync (join [| repoPath; "binary.dat" |]) [| 0; 254; 9; 8; 7 |]
+
+    let binding: WorkspaceBinding = {
+        SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
+        ProviderId = gitProviderId
+        WorkspaceRoot = repoPath
+        ProviderStateRef = None
+        Location = {
+            ProviderId = gitProviderId
+            DisplayName = None
+            ProviderLocation = repoPath
+            ConnectionProfileId = None
+        }
+        ConnectionProfileId = None
+    }
+
+    return root, GitWorkspaceSession.createSession GitWorkspaceSession.GitSessionHooks.none binding
+}
+
+let private textDiffService (session: WorkspaceSession) =
+    match session.TextDiff with
+    | Some service -> service
+    | None -> failwith "Expected the Git text-diff service."
+
+let private repositoryPath (value: string) =
+    match RepositoryPath.tryCreate value with
+    | Ok path -> path
+    | Error message -> failwith message
+
 Vitest.describe (
     "Git workspace adoption",
     fun () ->
@@ -691,6 +744,104 @@ Vitest.describe (
 
                 Vitest.expect(unexpectedOutputFailure.Category).toEqual (ProviderError)
                 Vitest.expect(unexpectedOutputFailure.Code).toBe ("origin_lookup_failed")
+            }
+        )
+)
+
+Vitest.describe (
+    "Git base content",
+    fun () ->
+        Vitest.test (
+            "returns the committed text for a modified path",
+            fun () -> promise {
+                let! root, session = createBaseContentFixture ()
+
+                try
+                    let! result =
+                        (textDiffService session).GetBaseContent
+                            (repositoryPath "base.txt")
+                            (OperationContext.detached "base-modified")
+                        |> Async.StartAsPromise
+
+                    match expectProviderValue "modified base content" result with
+                    | TextContent text -> Vitest.expect(text).toBe ("base content\n")
+                    | UnsupportedContent _ -> failwith "Expected text base content."
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "follows a rename to the committed old path",
+            fun () -> promise {
+                let! root, session = createBaseContentFixture ()
+
+                try
+                    let! result =
+                        (textDiffService session).GetBaseContent
+                            (repositoryPath "renamed.txt")
+                            (OperationContext.detached "base-renamed")
+                        |> Async.StartAsPromise
+
+                    match expectProviderValue "renamed base content" result with
+                    | TextContent text -> Vitest.expect(text).toBe ("committed rename source\n")
+                    | UnsupportedContent _ -> failwith "Expected text base content."
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "reports a path absent from the committed base as not found",
+            fun () -> promise {
+                let! root, session = createBaseContentFixture ()
+
+                try
+                    let! result =
+                        (textDiffService session).GetBaseContent
+                            (repositoryPath "added.txt")
+                            (OperationContext.detached "base-absent")
+                        |> Async.StartAsPromise
+
+                    let failure = expectProviderFailure "absent base content" result
+                    Vitest.expect(failure.Category).toEqual (NotFound)
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "returns unsupported content for committed binary bytes",
+            fun () -> promise {
+                let! root, session = createBaseContentFixture ()
+
+                try
+                    let! result =
+                        (textDiffService session).GetBaseContent
+                            (repositoryPath "binary.dat")
+                            (OperationContext.detached "base-binary")
+                        |> Async.StartAsPromise
+
+                    match expectProviderValue "binary base content" result with
+                    | UnsupportedContent reason ->
+                        Vitest
+                            .expect(reason |> Option.exists (fun value -> value.Contains "binary.dat"))
+                            .toBe (true)
+                    | TextContent text -> failwith $"Expected unsupported binary content, received text '{text}'."
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
             }
         )
 )

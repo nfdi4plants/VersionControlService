@@ -471,7 +471,7 @@ let private isExplicitlyUnsupportedPath (path: string) =
     not (String.IsNullOrWhiteSpace extension)
     && explicitlyUnsupportedExtensions.Contains(extension.ToLowerInvariant())
 
-let private isLikelyBinaryBuffer (buffer: obj) =
+let internal isLikelyBinaryBuffer (buffer: obj) =
     let sampleLength = min (bufferLength buffer) 8192
 
     if sampleLength = 0 then
@@ -626,23 +626,31 @@ let private readWorkingTreeTextIfPresent
                     return Ok(Some(bufferToUtf8String buffer))
     }
 
-let private readHeadTextIfAvailable (git: ISimpleGit) (requestedPath: string) : JS.Promise<GitResult<string option>> = promise {
-    match ensureValidPathspec requestedPath with
-    | Error validationError -> return errorResult validationError
-    | Ok safePath ->
-        if isExplicitlyUnsupportedPath safePath then
-            return unsupportedGitContentResult safePath
-        else
-            let! result =
-                GitInternals.runSimpleGit
-                    toFailure
-                    (fun currentGit -> currentGit.raw [| "show"; $"HEAD:{safePath}" |])
-                    git
+let private readHeadTextIfAvailable
+    (git: ISimpleGit)
+    (requestedPath: string)
+    (headPath: string)
+    : JS.Promise<GitResult<string option>> =
+    promise {
+        match ensureValidPathspec requestedPath, ensureValidPathspec headPath with
+        | Error validationError, _
+        | _, Error validationError -> return errorResult validationError
+        | Ok safeRequestedPath, Ok safeHeadPath ->
+            if isExplicitlyUnsupportedPath safeRequestedPath || isExplicitlyUnsupportedPath safeHeadPath then
+                return unsupportedGitContentResult safeRequestedPath
+            else
+                let! result =
+                    GitInternals.runSimpleGit
+                        toFailure
+                        (fun currentGit -> currentGit.showBuffer(U2.Case1 $"HEAD:{safeHeadPath}"))
+                        git
 
-            match result with
-            | Ok content -> return Ok(Some content)
-            | Error failure when isMissingHeadContentFailure failure -> return Ok None
-            | Error failure -> return Error failure
+                match result with
+                | Ok buffer when isLikelyBinaryBuffer buffer ->
+                    return unsupportedGitContentResult safeRequestedPath
+                | Ok buffer -> return Ok(Some(bufferToUtf8String buffer))
+                | Error failure when isMissingHeadContentFailure failure -> return Ok None
+                | Error failure -> return Error failure
 }
 
 let private quoteDiffPathToken (pathPrefix: string) (path: string option) =
@@ -1478,6 +1486,35 @@ let getWordDiff (arcPath: string) (pathSpecs: string[]) : JS.Promise<GitResult<s
                 })
 }
 
+/// Reads committed HEAD content for a literal workspace path, following the old
+/// path recorded by status when the worktree entry is a rename.
+let getBaseContent (arcPath: string) (requestedPath: string) : JS.Promise<GitResult<string option>> = promise {
+    match ensureValidPathspec requestedPath with
+    | Error validationError -> return errorResult validationError
+    | Ok safeRequestedPath ->
+        return!
+            withLocalGit
+                arcPath
+                (fun git -> promise {
+                    let! status = git.status ()
+                    let statusDto = toStatusDto arcPath status
+
+                    let headPath =
+                        statusDto.Files
+                        |> Array.tryFind (fun file ->
+                            String.Equals(file.Path, safeRequestedPath, StringComparison.Ordinal)
+                        )
+                        |> Option.bind _.OriginalPath
+                        |> Option.defaultValue safeRequestedPath
+
+                    let! contentResult = readHeadTextIfAvailable git safeRequestedPath headPath
+
+                    match contentResult with
+                    | Ok content -> return content
+                    | Error failure -> return abortGitPromise failure.Message
+                })
+}
+
 /// Loads previous/current text plus word-diff metadata for diff views.
 /// Binary or explicitly unsupported files return the unsupported-content sentinel.
 let getDiffViewData (arcPath: string) (requestedPath: string) : JS.Promise<GitResult<GitDiffViewDataDto>> = promise {
@@ -1505,7 +1542,8 @@ let getDiffViewData (arcPath: string) (requestedPath: string) : JS.Promise<GitRe
                             let previousPathCandidate =
                                 fileStatus.OriginalPath |> Option.defaultValue safeRequestedPath
 
-                            let! previousContentResult = readHeadTextIfAvailable git previousPathCandidate
+                            let! previousContentResult =
+                                readHeadTextIfAvailable git safeRequestedPath previousPathCandidate
 
                             let previousContent =
                                 match previousContentResult with

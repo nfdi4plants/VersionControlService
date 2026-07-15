@@ -8,6 +8,7 @@ open VersionControlService.Abstractions
 module NodeProcess = VersionControlService.Runtime.Node.Process
 
 type GitRunner = string[] -> string option -> Async<Result<NodeProcess.ProcessOutput, OperationFailure>>
+type CombinedPreviewReader = string -> Async<ConflictPreview option>
 
 /// Stale, foreign, or closed handles are rejected before provider state changes.
 let handleRejection () =
@@ -62,6 +63,7 @@ let readStageContent (runGit: GitRunner) (stage: int) (path: string) : Async<str
 /// Builds conflict items with workspace/target/base candidates and text previews.
 let buildConflictItems
     (runGit: GitRunner)
+    (readCombinedPreview: CombinedPreviewReader)
     (mergeHeadRevision: RevisionId option)
     (unmergedPaths: string[])
     : Async<ConflictItem[]> =
@@ -75,6 +77,7 @@ let buildConflictItems
                 let! baseContent = readStageContent runGit 1 pathValue
                 let! workspaceContent = readStageContent runGit 2 pathValue
                 let! targetContent = readStageContent runGit 3 pathValue
+                let! combinedPreview = readCombinedPreview pathValue
 
                 items.Add {
                     Path = path
@@ -104,7 +107,7 @@ let buildConflictItems
                                 |]
                             | None -> [||]
                     |]
-                    CombinedPreview = None
+                    CombinedPreview = combinedPreview
                     SupportsResolvedContent = true
                 }
 
