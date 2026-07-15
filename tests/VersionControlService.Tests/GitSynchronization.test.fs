@@ -25,7 +25,26 @@ let private removeDirectoryAsync (path: string) : JS.Promise<unit> = promise {
     return ()
 }
 
+let private ensureDirectoryAsync (path: string) : JS.Promise<unit> = promise {
+    let! _ = fsPromisesDynamic?mkdir (path, createObj [ "recursive" ==> true ]) |> unbox<JS.Promise<obj>>
+    return ()
+}
+
+let private removePathAsync (path: string) : JS.Promise<unit> = promise {
+    let! _ =
+        fsPromisesDynamic?rm (path, createObj [ "recursive" ==> true; "force" ==> true ])
+        |> unbox<JS.Promise<obj>>
+
+    return ()
+}
+
+let private createDirectoryLinkAsync (targetPath: string) (linkPath: string) : JS.Promise<unit> = promise {
+    let! _ = fsPromisesDynamic?symlink (targetPath, linkPath, "junction") |> unbox<JS.Promise<obj>>
+    return ()
+}
+
 let private writeUtf8FileAsync (path: string) (content: string) : JS.Promise<unit> = promise {
+    do! ensureDirectoryAsync (dirname path)
     let! _ = fsPromisesDynamic?writeFile (path, content, "utf8") |> unbox<JS.Promise<obj>>
     return ()
 }
@@ -161,8 +180,8 @@ let private sessionStatus (session: WorkspaceSession) = promise {
     return expectValue "status" result
 }
 
-let private createUnmergedConflictFixture () = promise {
-    let! root, workPath, barePath, session = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+let private createUnmergedConflictFixtureWithHooks (hooks: GitWorkspaceSession.GitSessionHooks) = promise {
+    let! root, workPath, barePath, session = createSyncFixture hooks
     do! advanceTarget root barePath [ "base.txt", "target version\n" ]
     do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) "workspace version\n"
 
@@ -206,7 +225,53 @@ let private createUnmergedConflictFixture () = promise {
         | None -> failwith "Expected an active conflict session."
 
     let! capturedStatus = sessionStatus session
-    return root, workPath, conflicts, summary, capturedStatus.WorkspaceVersion
+    return root, workPath, session, conflicts, summary, capturedStatus.WorkspaceVersion
+}
+
+let private createUnmergedConflictFixture () =
+    createUnmergedConflictFixtureWithHooks GitWorkspaceSession.GitSessionHooks.none
+
+let private createNestedUnmergedConflictFixture () = promise {
+    let! root, workPath, barePath, session = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+    let conflictPath = "nested/conflict.txt"
+    do! writeUtf8FileAsync (join [| workPath; conflictPath |]) "nested base content\n"
+    let! _ = runGitIn workPath [| "add"; "-A" |]
+    let! _ = runGitIn workPath [| "commit"; "-m"; "test: nested conflict base" |]
+    let! _ = runGitIn workPath [| "push"; "origin"; "HEAD" |]
+    do! advanceTarget root barePath [ conflictPath, "nested target version\n" ]
+    do! writeUtf8FileAsync (join [| workPath; conflictPath |]) "nested workspace version\n"
+    let! saveStatus = sessionStatus session
+
+    let! saveResult =
+        Async.StartAsPromise(
+            session.Core.CreateRevision
+                {
+                    Message = "local nested conflicting change"
+                    Paths = [| mkPath conflictPath |]
+                    ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+                }
+                (ctx "nested-conflict-save")
+        )
+
+    expectValue "local nested conflict revision" saveResult |> ignore
+    let! updateStatus = sessionStatus session
+
+    let! updateResult =
+        Async.StartAsPromise(
+            (syncService session).Update
+                { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
+                (ctx "nested-conflict-update")
+        )
+
+    match updateResult with
+    | Failed failure
+    | PartiallySucceeded(_, failure) when failure.Code = "conflicts_detected" -> ()
+    | Failed failure
+    | PartiallySucceeded(_, failure) ->
+        failwith $"Expected nested conflicts_detected, received {failure.Category}/{failure.Code}."
+    | Succeeded _ -> failwith "Expected the nested update to create a real unmerged conflict."
+
+    return root, workPath, session, conflictService session, conflictPath
 }
 
 Vitest.describe (
@@ -216,7 +281,7 @@ Vitest.describe (
             "returns the current edited marker text as the combined preview",
             TestOptions(timeout = 120000),
             fun () -> promise {
-                let! root, workPath, conflicts, _, _ = createUnmergedConflictFixture ()
+                let! root, workPath, _, conflicts, _, _ = createUnmergedConflictFixture ()
 
                 try
                     let editedMarkerText =
@@ -245,7 +310,7 @@ Vitest.describe (
             "rejects the captured handle and workspace token after an unstaged marker edit",
             TestOptions(timeout = 120000),
             fun () -> promise {
-                let! root, workPath, conflicts, capturedSummary, capturedWorkspaceVersion =
+                let! root, workPath, _, conflicts, capturedSummary, capturedWorkspaceVersion =
                     createUnmergedConflictFixture ()
 
                 try
@@ -279,6 +344,155 @@ Vitest.describe (
                         .expect(failure.RecoveryAction |> Option.map _.Code)
                         .toEqual (Some "refresh_conflict_session")
 
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+)
+
+Vitest.describe (
+    "Git conflict evidence hardening",
+    fun () ->
+        let expectFailure operationName result =
+            match result with
+            | Failed failure -> failure
+            | PartiallySucceeded(_, failure) -> failure
+            | Succeeded _ -> failwith $"Expected {operationName} to fail."
+
+        Vitest.test (
+            "propagates an unmerged-path process failure instead of minting a token",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable armFailure = false
+                let injectedFailure = OperationFailure.create Network "unmerged_probe_failed" "Injected unmerged probe failure."
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunProcess =
+                        Some(fun request context ->
+                            if
+                                armFailure
+                                && request.Arguments = [| "diff"; "--name-only"; "--diff-filter=U"; "-z" |]
+                            then
+                                async { return OperationResult.failed injectedFailure }
+                            else
+                                NodeProcess.run request context)
+                    Barrier = None
+                }
+
+                let! root, _, session, _, _, _ = createUnmergedConflictFixtureWithHooks hooks
+
+                try
+                    armFailure <- true
+                    let! result = Async.StartAsPromise(session.Core.GetStatus(ctx "failed-unmerged-probe"))
+                    let failure = expectFailure "status with failed unmerged probe" result
+                    Vitest.expect(failure.Category).toEqual (Network)
+                    Vitest.expect(failure.Code).toBe ("unmerged_probe_failed")
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "propagates an unreadable unmerged worktree path instead of minting a token",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, session, _, _, _ = createUnmergedConflictFixture ()
+
+                try
+                    let conflictFile = join [| workPath; "base.txt" |]
+                    do! removePathAsync conflictFile
+                    do! ensureDirectoryAsync conflictFile
+                    let! result = Async.StartAsPromise(session.Core.GetStatus(ctx "unreadable-unmerged-path"))
+                    let failure = expectFailure "status with unreadable unmerged path" result
+                    Vitest.expect(failure.Category).toEqual (ProviderError)
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "hashes a large unmerged file through Git instead of buffering it in the session",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable observedHashObject = false
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunProcess =
+                        Some(fun request context ->
+                            if request.Arguments |> Array.contains "hash-object" then
+                                observedHashObject <- true
+
+                            NodeProcess.run request context)
+                    Barrier = None
+                }
+
+                let! root, workPath, session, _, _, _ = createUnmergedConflictFixtureWithHooks hooks
+
+                try
+                    observedHashObject <- false
+                    let largeMarkerText = "x".PadRight(8 * 1024 * 1024, 'x')
+                    do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) largeMarkerText
+                    let! statusResult = Async.StartAsPromise(session.Core.GetStatus(ctx "large-unmerged-status"))
+                    expectValue "large unmerged status" statusResult |> ignore
+                    Vitest.expect(observedHashObject).toBe (true)
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "rejects a parent junction before conflict hashing can read outside the workspace",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, session, _, conflictPath = createNestedUnmergedConflictFixture ()
+
+                try
+                    let outsideDirectory = join [| root; "outside-status" |]
+                    let linkedDirectory = join [| workPath; "nested" |]
+                    let secretText = "outside status secret must not be read\n"
+                    do! writeUtf8FileAsync (join [| outsideDirectory; "conflict.txt" |]) secretText
+                    do! removePathAsync linkedDirectory
+                    do! createDirectoryLinkAsync outsideDirectory linkedDirectory
+                    let! result = Async.StartAsPromise(session.Core.GetStatus(ctx "linked-conflict-status"))
+                    let failure = expectFailure "status through a parent junction" result
+                    Vitest.expect(failure.Category).toEqual (Validation)
+                    Vitest.expect(failure.Code).toBe ("unsafe_workspace_path")
+                    Vitest.expect(failure.Message.Contains secretText).toBe (false)
+                    Vitest.expect(failure.AffectedPaths).toEqual ([| conflictPath |])
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "rejects a parent junction before combined preview can expose outside bytes",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, _, conflicts, conflictPath = createNestedUnmergedConflictFixture ()
+
+                try
+                    let outsideDirectory = join [| root; "outside-preview" |]
+                    let linkedDirectory = join [| workPath; "nested" |]
+                    let secretText = "outside preview secret must not be exposed\n"
+                    do! writeUtf8FileAsync (join [| outsideDirectory; "conflict.txt" |]) secretText
+                    do! removePathAsync linkedDirectory
+                    do! createDirectoryLinkAsync outsideDirectory linkedDirectory
+                    let! result = Async.StartAsPromise(conflicts.GetActiveSession(ctx "linked-conflict-preview"))
+                    let failure = expectFailure "preview through a parent junction" result
+                    Vitest.expect(failure.Category).toEqual (Validation)
+                    Vitest.expect(failure.Code).toBe ("unsafe_workspace_path")
+                    Vitest.expect(failure.Message.Contains secretText).toBe (false)
+                    Vitest.expect(failure.AffectedPaths).toEqual ([| conflictPath |])
                     do! removeDirectoryAsync root
                 with error ->
                     do! removeDirectoryAsync root

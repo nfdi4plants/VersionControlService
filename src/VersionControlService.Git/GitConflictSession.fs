@@ -8,7 +8,7 @@ open VersionControlService.Abstractions
 module NodeProcess = VersionControlService.Runtime.Node.Process
 
 type GitRunner = string[] -> string option -> Async<Result<NodeProcess.ProcessOutput, OperationFailure>>
-type CombinedPreviewReader = string -> Async<ConflictPreview option>
+type CombinedPreviewReader = string -> Async<Result<ConflictPreview option, OperationFailure>>
 
 /// Stale, foreign, or closed handles are rejected before provider state changes.
 let handleRejection () =
@@ -66,50 +66,57 @@ let buildConflictItems
     (readCombinedPreview: CombinedPreviewReader)
     (mergeHeadRevision: RevisionId option)
     (unmergedPaths: string[])
-    : Async<ConflictItem[]> =
+    : Async<Result<ConflictItem[], OperationFailure>> =
     async {
         let items = ResizeArray<ConflictItem>()
+        let mutable previewFailure = None
 
         for pathValue in unmergedPaths do
-            match RepositoryPath.tryCreate pathValue with
-            | Error _ -> ()
-            | Ok path ->
+            match previewFailure, RepositoryPath.tryCreate pathValue with
+            | Some _, _
+            | None, Error _ -> ()
+            | None, Ok path ->
                 let! baseContent = readStageContent runGit 1 pathValue
                 let! workspaceContent = readStageContent runGit 2 pathValue
                 let! targetContent = readStageContent runGit 3 pathValue
-                let! combinedPreview = readCombinedPreview pathValue
+                let! combinedPreviewResult = readCombinedPreview pathValue
 
-                items.Add {
-                    Path = path
-                    Candidates = [|
-                        {
-                            CandidateId = "workspace"
-                            Label = "Workspace version"
-                            Revision = None
-                            Preview = workspaceContent |> Option.map TextPreview
-                        }
-                        {
-                            CandidateId = "target"
-                            Label = "Target version"
-                            Revision = mergeHeadRevision
-                            Preview = targetContent |> Option.map TextPreview
-                        }
-                        yield!
-                            match baseContent with
-                            | Some content ->
-                                [|
-                                    {
-                                        CandidateId = "base"
-                                        Label = "Base version"
-                                        Revision = None
-                                        Preview = Some(TextPreview content)
-                                    }
-                                |]
-                            | None -> [||]
-                    |]
-                    CombinedPreview = combinedPreview
-                    SupportsResolvedContent = true
-                }
+                match combinedPreviewResult with
+                | Error failure -> previewFailure <- Some failure
+                | Ok combinedPreview ->
+                    items.Add {
+                        Path = path
+                        Candidates = [|
+                            {
+                                CandidateId = "workspace"
+                                Label = "Workspace version"
+                                Revision = None
+                                Preview = workspaceContent |> Option.map TextPreview
+                            }
+                            {
+                                CandidateId = "target"
+                                Label = "Target version"
+                                Revision = mergeHeadRevision
+                                Preview = targetContent |> Option.map TextPreview
+                            }
+                            yield!
+                                match baseContent with
+                                | Some content ->
+                                    [|
+                                        {
+                                            CandidateId = "base"
+                                            Label = "Base version"
+                                            Revision = None
+                                            Preview = Some(TextPreview content)
+                                        }
+                                    |]
+                                | None -> [||]
+                        |]
+                        CombinedPreview = combinedPreview
+                        SupportsResolvedContent = true
+                    }
 
-        return items.ToArray()
+        match previewFailure with
+        | Some failure -> return Error failure
+        | None -> return Ok(items.ToArray())
     }

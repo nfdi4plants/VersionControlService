@@ -213,105 +213,221 @@ let private stableHash (text: string) =
 
     hash
 
-let private stableBufferHash (buffer: obj) =
-    let mutable hash = 5381
+let private unsafeWorkspacePathFailure (path: string) =
+    {
+        OperationFailure.create
+            Validation
+            "unsafe_workspace_path"
+            $"The unmerged path '{path}' traverses a symbolic link or reparse point." with
+            AffectedPaths = [| path |]
+    }
 
-    for index in 0 .. NodeInterop.bufferLength buffer - 1 do
-        hash <- ((hash <<< 5) + hash + NodeInterop.bufferByteAt buffer index) &&& 0x7FFFFFFF
+let private workspaceEvidenceFailure (path: string) (message: string) =
+    {
+        OperationFailure.createRedacted ProviderError "workspace_evidence_unavailable" message with
+            AffectedPaths = [| path |]
+    }
 
-    hash
+let private validateContainedWorktreeFile (state: SessionState) (path: string) =
+    async {
+        let repositoryRoot = NodePath.resolve [| state.RepoPath |]
+        let absolutePath = NodePath.resolve [| repositoryRoot; path |]
+        let relativePath = NodePath.relative repositoryRoot absolutePath
+
+        if
+            String.IsNullOrEmpty relativePath
+            || relativePath = "."
+            || relativePath = ".."
+            || relativePath.StartsWith("../", StringComparison.Ordinal)
+            || relativePath.StartsWith("..\\", StringComparison.Ordinal)
+            || NodePath.isAbsolute relativePath
+        then
+            return Error(unsafeWorkspacePathFailure path)
+        else
+            let segments = path.Replace("\\", "/").Split('/')
+            let mutable currentPath = repositoryRoot
+            let mutable validationFailure = None
+            let mutable index = 0
+
+            while validationFailure.IsNone && index < segments.Length do
+                currentPath <- NodePath.join [| currentPath; segments[index] |]
+
+                try
+                    let! stats = NodeFileSystem.lstatAsync currentPath |> Async.AwaitPromise
+
+                    if stats.isSymbolicLink () then
+                        validationFailure <- Some(unsafeWorkspacePathFailure path)
+                    elif index < segments.Length - 1 && not (stats.isDirectory ()) then
+                        validationFailure <-
+                            Some(
+                                workspaceEvidenceFailure
+                                    path
+                                    $"A parent of the unmerged path '{path}' is not a directory."
+                            )
+                    elif index = segments.Length - 1 && not (stats.isFile ()) then
+                        validationFailure <-
+                            Some(
+                                workspaceEvidenceFailure path $"The unmerged path '{path}' is not a regular file."
+                            )
+                with error ->
+                    validationFailure <-
+                        Some(
+                            workspaceEvidenceFailure
+                                path
+                                $"The unmerged path '{path}' could not be inspected: {error.Message}"
+                        )
+
+                index <- index + 1
+
+            match validationFailure with
+            | Some failure -> return Error failure
+            | None -> return Ok absolutePath
+    }
+
+let private hashUnmergedWorktreePath
+    (state: SessionState)
+    (path: string)
+    (context: OperationContext)
+    : Async<Result<string, OperationFailure>> =
+    async {
+        let! containment = validateContainedWorktreeFile state path
+
+        match containment with
+        | Error failure -> return Error failure
+        | Ok _ ->
+            let! hashResult =
+                runGit
+                    state.Hooks
+                    state.RepoPath
+                    [| "hash-object"; "--no-filters"; "--"; path |]
+                    None
+                    context
+
+            match hashResult with
+            | Error failure -> return Error failure
+            | Ok output when output.ExitCode = 0 -> return Ok($"{path}:{output.StdOut.Trim()}")
+            | Ok output ->
+                return
+                    Error(
+                        workspaceEvidenceFailure
+                            path
+                            $"Hashing the unmerged path '{path}' failed: {output.StdErr}"
+                    )
+    }
+
+let private computeUnmergedContentPart (state: SessionState) (context: OperationContext) =
+    async {
+        let! unmergedResult =
+            runGit
+                state.Hooks
+                state.RepoPath
+                [| "diff"; "--name-only"; "--diff-filter=U"; "-z" |]
+                None
+                context
+
+        match unmergedResult with
+        | Error failure -> return Error failure
+        | Ok output when output.ExitCode <> 0 ->
+            return
+                Error(
+                    OperationFailure.createRedacted
+                        ProviderError
+                        "git_failure"
+                        $"Listing unmerged paths for workspace evidence failed: {output.StdErr}"
+                )
+        | Ok output ->
+            let paths =
+                output.StdOut.Split '\000'
+                |> Array.filter (fun path -> not (String.IsNullOrEmpty path))
+
+            let rec collect index evidence =
+                async {
+                    if index >= paths.Length then
+                        return Ok(stableHash (String.concat "\000" (List.rev evidence)))
+                    else
+                        let! hashed = hashUnmergedWorktreePath state paths[index] context
+
+                        match hashed with
+                        | Error failure -> return Error failure
+                        | Ok item -> return! collect (index + 1) (item :: evidence)
+                }
+
+            return! collect 0 []
+    }
 
 /// Stable opaque workspace-version token derived from HEAD, an identity over
 /// index/worktree state, and the active merge/conflict state. Pure reads over an
 /// unchanged workspace return the same token; the token guards in-process,
 /// per-session races only — external processes can invalidate it at any time,
 /// which is why mutations revalidate it under the session lock.
-let private computeWorkspaceVersion (state: SessionState) (context: OperationContext) : Async<string> =
+let private computeWorkspaceVersion
+    (state: SessionState)
+    (context: OperationContext)
+    : Async<Result<string, OperationFailure>> =
     async {
         let! headOutput =
             runGit state.Hooks state.RepoPath [| "rev-parse"; "--verify"; "--quiet"; "HEAD" |] None context
 
-        let headPart =
-            match headOutput with
-            | Ok output when output.ExitCode = 0 -> output.StdOut.Trim()
-            | _ -> "unborn"
+        match headOutput with
+        | Error failure -> return Error failure
+        | Ok headResult ->
+            let headPart =
+                if headResult.ExitCode = 0 then headResult.StdOut.Trim() else "unborn"
 
-        let! statusOutput =
-            runGit
-                state.Hooks
-                state.RepoPath
-                [|
-                    "status"
-                    "--porcelain=v2"
-                    "-z"
-                    "--untracked-files=all"
-                |]
-                None
-                context
+            let! statusOutput =
+                runGit
+                    state.Hooks
+                    state.RepoPath
+                    [| "status"; "--porcelain=v2"; "-z"; "--untracked-files=all" |]
+                    None
+                    context
 
-        let statusPart =
             match statusOutput with
-            | Ok output when output.ExitCode = 0 -> stableHash output.StdOut
-            | _ -> -1
+            | Error failure -> return Error failure
+            | Ok statusResult when statusResult.ExitCode <> 0 ->
+                return
+                    Error(
+                        OperationFailure.createRedacted
+                            ProviderError
+                            "git_failure"
+                            $"Reading workspace status evidence failed: {statusResult.StdErr}"
+                    )
+            | Ok statusResult ->
+                let statusPart = stableHash statusResult.StdOut
+                let! unmergedContentResult = computeUnmergedContentPart state context
 
-        let! unmergedContentPart =
-            async {
-                let! unmergedOutput =
-                    runGit
-                        state.Hooks
-                        state.RepoPath
-                        [| "diff"; "--name-only"; "--diff-filter=U"; "-z" |]
-                        None
-                        context
+                match unmergedContentResult with
+                | Error failure -> return Error failure
+                | Ok unmergedContentPart ->
+                    let! mergeHeadOutput =
+                        runGit
+                            state.Hooks
+                            state.RepoPath
+                            [| "rev-parse"; "--git-path"; "MERGE_HEAD" |]
+                            None
+                            context
 
-                match unmergedOutput with
-                | Ok output when output.ExitCode = 0 ->
-                    let paths =
-                        output.StdOut.Split '\000'
-                        |> Array.filter (fun path -> not (String.IsNullOrEmpty path))
+                    match mergeHeadOutput with
+                    | Error failure -> return Error failure
+                    | Ok mergeHeadResult ->
+                        let mergePart =
+                            if mergeHeadResult.ExitCode = 0 then
+                                let mergeHeadPath = mergeHeadResult.StdOut.Trim()
 
-                    let evidence = ResizeArray<string>()
+                                let resolvedPath =
+                                    if
+                                        mergeHeadPath.StartsWith "/"
+                                        || (mergeHeadPath.Length >= 2 && mergeHeadPath[1] = ':')
+                                    then
+                                        mergeHeadPath
+                                    else
+                                        NodePath.join [| state.RepoPath; mergeHeadPath |]
 
-                    for path in paths do
-                        let absolutePath = NodePath.join [| state.RepoPath; path |]
+                                if NodeFileSystem.existsSync resolvedPath then "merge" else "none"
+                            else
+                                "none"
 
-                        if NodeFileSystem.existsSync absolutePath then
-                            try
-                                let! buffer =
-                                    NodeFileSystem.readFileBufferAsync absolutePath
-                                    |> Async.AwaitPromise
-
-                                evidence.Add($"{path}:{stableBufferHash buffer}")
-                            with _ ->
-                                evidence.Add($"{path}:unreadable")
-                        else
-                            evidence.Add($"{path}:missing")
-
-                    return stableHash (String.concat "\000" evidence)
-                | _ -> return -1
-            }
-
-        let! mergeHeadOutput =
-            runGit state.Hooks state.RepoPath [| "rev-parse"; "--git-path"; "MERGE_HEAD" |] None context
-
-        let mergePart =
-            match mergeHeadOutput with
-            | Ok output when output.ExitCode = 0 ->
-                let mergeHeadPath = output.StdOut.Trim()
-
-                let resolvedPath =
-                    if
-                        mergeHeadPath.StartsWith "/"
-                        || (mergeHeadPath.Length >= 2 && mergeHeadPath[1] = ':')
-                    then
-                        mergeHeadPath
-                    else
-                        NodePath.join [| state.RepoPath; mergeHeadPath |]
-
-                if NodeFileSystem.existsSync resolvedPath then "merge" else "none"
-            | _ -> "none"
-
-        return $"git:{headPart}:{statusPart}:{unmergedContentPart}:{mergePart}"
+                        return Ok($"git:{headPart}:{statusPart}:{unmergedContentPart}:{mergePart}")
     }
 
 /// Serializes a mutation and revalidates the expected workspace version under the
@@ -326,24 +442,24 @@ let private withValidatedMutation
         do! state.Lock.Acquire()
 
         try
-            let! currentVersion = computeWorkspaceVersion state context
+            let! currentVersionResult = computeWorkspaceVersion state context
 
-            if currentVersion <> expectedVersion then
-                return
-                    Failed(
-                        OperationFailure.create
-                            Concurrency
-                            "precondition_failed"
-                            "The expected workspace version is stale; refresh status and retry."
-                    )
-            else
-                return! body ()
+            match currentVersionResult with
+            | Error failure -> return Failed failure
+            | Ok currentVersion ->
+                if currentVersion <> expectedVersion then
+                    return
+                        Failed(
+                            OperationFailure.create
+                                Concurrency
+                                "precondition_failed"
+                                "The expected workspace version is stale; refresh status and retry."
+                        )
+                else
+                    return! body ()
         finally
             state.Lock.Release()
     }
-
-let private workspaceVersion (state: SessionState) (_status: GitStatusDto) : Async<string> =
-    computeWorkspaceVersion state (OperationContext.detached "workspace-version")
 
 let private toWorkspaceStatus (state: SessionState) (status: GitStatusDto) (context: OperationContext) =
     async {
@@ -353,7 +469,12 @@ let private toWorkspaceStatus (state: SessionState) (status: GitStatusDto) (cont
             status.Files
             |> Array.choose (fun file -> toFileChange (conflictedSet.Contains file.Path) file)
 
-        let! version = workspaceVersion state status
+        let! versionResult = computeWorkspaceVersion state context
+
+        let versionFailure, version =
+            match versionResult with
+            | Error failure -> Some failure, String.Empty
+            | Ok value -> None, value
 
         // Synchronization revisions: HEAD and the current branch's origin counterpart.
         let! headRevision =
@@ -384,31 +505,34 @@ let private toWorkspaceStatus (state: SessionState) (status: GitStatusDto) (cont
             | _ when status.Ahead > 0 -> LocalAhead
             | _ -> UnknownRelationship
 
-        return {
-            CurrentRef =
-                status.Current
-                |> Option.map (fun current -> {
-                    Name = current
-                    ProviderRef = mkProviderRef $"git-local:{current}"
-                    Kind = LocalRef
-                    IsCurrent = true
-                })
-            WorkspaceVersion = version
-            Changes = changes
-            // Conflict sessions arrive with the Task 9 conflict-session cycle.
-            ActiveConflictSession = None
-            Synchronization =
-                Some {
-                    BaseRevision = None
-                    WorkspaceRevision = workspaceRevision
-                    TargetRevision = targetRevision
-                    TargetRef = None
-                    LocalRevisionCount = Some status.Ahead
-                    TargetRevisionCount = Some status.Behind
-                    RemoteChangedPaths = None
-                    Relationship = relationship
+        match versionFailure with
+        | Some failure -> return Error failure
+        | None ->
+            return
+                Ok {
+                    CurrentRef =
+                        status.Current
+                        |> Option.map (fun current -> {
+                            Name = current
+                            ProviderRef = mkProviderRef $"git-local:{current}"
+                            Kind = LocalRef
+                            IsCurrent = true
+                        })
+                    WorkspaceVersion = version
+                    Changes = changes
+                    ActiveConflictSession = None
+                    Synchronization =
+                        Some {
+                            BaseRevision = None
+                            WorkspaceRevision = workspaceRevision
+                            TargetRevision = targetRevision
+                            TargetRef = None
+                            LocalRevisionCount = Some status.Ahead
+                            TargetRevisionCount = Some status.Behind
+                            RemoteChangedPaths = None
+                            Relationship = relationship
+                        }
                 }
-        }
     }
 
 /// Resolves a repository state path (MERGE_HEAD, ...) through Git itself so
@@ -445,22 +569,30 @@ let private tryGetMergeHead (state: SessionState) (context: OperationContext) =
 let private conflictRunner (state: SessionState) (context: OperationContext) : GitConflictSession.GitRunner =
     fun arguments stdinData -> runGit state.Hooks state.RepoPath arguments stdinData context
 
-let private readConflictCombinedPreview (state: SessionState) (path: string) : Async<ConflictPreview option> =
+let private readConflictCombinedPreview
+    (state: SessionState)
+    (path: string)
+    : Async<Result<ConflictPreview option, OperationFailure>> =
     async {
-        let absolutePath = NodePath.join [| state.RepoPath; path |]
+        let! containment = validateContainedWorktreeFile state path
 
-        if not (NodeFileSystem.existsSync absolutePath) then
-            return None
-        else
+        match containment with
+        | Error failure -> return Error failure
+        | Ok absolutePath ->
             try
                 let! buffer = NodeFileSystem.readFileBufferAsync absolutePath |> Async.AwaitPromise
 
                 if GitService.isLikelyBinaryBuffer buffer then
-                    return Some(UnsupportedPreview(Some $"Unsupported git content for '{path}'."))
+                    return Ok(Some(UnsupportedPreview(Some $"Unsupported git content for '{path}'.")))
                 else
-                    return Some(TextPreview(NodeInterop.bufferToUtf8String buffer))
-            with _ ->
-                return Some(UnsupportedPreview(Some $"The combined conflict content for '{path}' could not be read."))
+                    return Ok(Some(TextPreview(NodeInterop.bufferToUtf8String buffer)))
+            with error ->
+                return
+                    Error(
+                        workspaceEvidenceFailure
+                            path
+                            $"The combined conflict content for '{path}' could not be read: {error.Message}"
+                    )
     }
 
 /// Active merge state as a provider-managed conflict session. Present whenever
@@ -474,7 +606,7 @@ let private getMergeConflictSummary (state: SessionState) (context: OperationCon
         match mergeHead with
         | None ->
             state.ConflictSession <- None
-            return None
+            return Ok None
         | Some mergeHeadValue ->
             let sessionId, version =
                 match state.ConflictSession with
@@ -489,26 +621,29 @@ let private getMergeConflictSummary (state: SessionState) (context: OperationCon
             let runner = conflictRunner state context
             let! unmergedResult = GitConflictSession.listUnmergedPaths runner
 
-            let unmergedPaths =
-                match unmergedResult with
-                | Ok paths -> paths
-                | Error _ -> [||]
+            match unmergedResult with
+            | Error failure -> return Error failure
+            | Ok unmergedPaths ->
+                let! itemsResult =
+                    GitConflictSession.buildConflictItems
+                        runner
+                        (readConflictCombinedPreview state)
+                        (Some(mkRevisionId mergeHeadValue))
+                        unmergedPaths
 
-            let! items =
-                GitConflictSession.buildConflictItems
-                    runner
-                    (readConflictCombinedPreview state)
-                    (Some(mkRevisionId mergeHeadValue))
-                    unmergedPaths
-
-            return
-                Some {
-                    Handle = {
-                        SessionId = sessionId
-                        Version = string version
-                    }
-                    Items = items
-                }
+                match itemsResult with
+                | Error failure -> return Error failure
+                | Ok items ->
+                    return
+                        Ok(
+                            Some {
+                                Handle = {
+                                    SessionId = sessionId
+                                    Version = string version
+                                }
+                                Items = items
+                            }
+                        )
     }
 
 let private getWorkspaceStatus (state: SessionState) (context: OperationContext) =
@@ -518,38 +653,45 @@ let private getWorkspaceStatus (state: SessionState) (context: OperationContext)
         match statusResult with
         | Error failure -> return Failed failure
         | Ok status ->
-            let! workspaceStatus = toWorkspaceStatus state status context
-            let! conflictSummary = getMergeConflictSummary state context
+            let! workspaceStatusResult = toWorkspaceStatus state status context
 
-            // Submodule-internal changes are never workspace changes: entries at or
-            // under a gitlink root are filtered from the reported change list.
-            let selectedRevisionRunner: GitSelectedRevision.GitRunner =
-                fun arguments stdinData environment ->
-                    runGitEnv state.Hooks state.RepoPath arguments stdinData environment context
+            match workspaceStatusResult with
+            | Error failure -> return Failed failure
+            | Ok workspaceStatus ->
+                let! conflictSummaryResult = getMergeConflictSummary state context
 
-            let! gitlinkRootsResult = GitSelectedRevision.listGitlinkRoots selectedRevisionRunner
+                match conflictSummaryResult with
+                | Error failure -> return Failed failure
+                | Ok conflictSummary ->
+                    // Submodule-internal changes are never workspace changes: entries at or
+                    // under a gitlink root are filtered from the reported change list.
+                    let selectedRevisionRunner: GitSelectedRevision.GitRunner =
+                        fun arguments stdinData environment ->
+                            runGitEnv state.Hooks state.RepoPath arguments stdinData environment context
 
-            let gitlinkRoots =
-                match gitlinkRootsResult with
-                | Ok roots -> roots
-                | Error _ -> [||]
+                    let! gitlinkRootsResult = GitSelectedRevision.listGitlinkRoots selectedRevisionRunner
 
-            let filteredChanges =
-                workspaceStatus.Changes
-                |> Array.filter (fun change ->
-                    let pathValue = RepositoryPath.value change.Path
+                    let gitlinkRoots =
+                        match gitlinkRootsResult with
+                        | Ok roots -> roots
+                        | Error _ -> [||]
 
-                    not (
-                        gitlinkRoots
-                        |> Array.exists (fun root -> pathValue = root || pathValue.StartsWith(root + "/"))
-                    ))
+                    let filteredChanges =
+                        workspaceStatus.Changes
+                        |> Array.filter (fun change ->
+                            let pathValue = RepositoryPath.value change.Path
 
-            return
-                OperationResult.succeeded {
-                    workspaceStatus with
-                        Changes = filteredChanges
-                        ActiveConflictSession = conflictSummary
-                }
+                            not (
+                                gitlinkRoots
+                                |> Array.exists (fun root -> pathValue = root || pathValue.StartsWith(root + "/"))
+                            ))
+
+                    return
+                        OperationResult.succeeded {
+                            workspaceStatus with
+                                Changes = filteredChanges
+                                ActiveConflictSession = conflictSummary
+                        }
     }
 
 // ---------------------------------------------------------------------------
@@ -1445,12 +1587,15 @@ let private validateConflictHandle
         | Some mergeHeadValue, Some(sessionId, version) when
             sessionId = handle.SessionId && string version = handle.Version
             ->
-            let! currentVersion = computeWorkspaceVersion state context
+            let! currentVersionResult = computeWorkspaceVersion state context
 
-            if currentVersion <> expectedWorkspaceVersion then
-                return Error(GitConflictSession.handleRejection ())
-            else
-                return Ok mergeHeadValue
+            match currentVersionResult with
+            | Error failure -> return Error failure
+            | Ok currentVersion ->
+                if currentVersion <> expectedWorkspaceVersion then
+                    return Error(GitConflictSession.handleRejection ())
+                else
+                    return Ok mergeHeadValue
         | _ -> return Error(GitConflictSession.handleRejection ())
     }
 
@@ -1494,8 +1639,11 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
     {
         GetActiveSession =
             fun context -> async {
-                let! summary = getMergeConflictSummary state context
-                return OperationResult.succeeded summary
+                let! summaryResult = getMergeConflictSummary state context
+
+                match summaryResult with
+                | Error failure -> return Failed failure
+                | Ok summary -> return OperationResult.succeeded summary
             }
         Resolve =
             fun request context -> async {
@@ -1566,16 +1714,19 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                 | Error failure -> return Failed failure
                                 | Ok() ->
                                     let refreshedHandle = rotateConflictHandle state
-                                    let! summary = getMergeConflictSummary state context
+                                    let! summaryResult = getMergeConflictSummary state context
 
-                                    return
-                                        OperationResult.succeeded {
-                                            RefreshedHandle = refreshedHandle
-                                            RemainingItems =
-                                                summary
-                                                |> Option.map _.Items
-                                                |> Option.defaultValue [||]
-                                        }
+                                    match summaryResult with
+                                    | Error failure -> return Failed failure
+                                    | Ok summary ->
+                                        return
+                                            OperationResult.succeeded {
+                                                RefreshedHandle = refreshedHandle
+                                                RemainingItems =
+                                                    summary
+                                                    |> Option.map _.Items
+                                                    |> Option.defaultValue [||]
+                                            }
             }
         Finalize =
             fun request context -> async {
@@ -1743,6 +1894,164 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
 // Optional extensions available from the shell
 // ---------------------------------------------------------------------------
 
+let private validateLiteralRepositoryPath (path: string) =
+    let hasDrivePrefix = path.Length >= 2 && Char.IsLetter path[0] && path[1] = ':'
+
+    if String.IsNullOrEmpty path then
+        Error(OperationFailure.create Validation "invalid_path" "The repository path must not be empty.")
+    elif path.StartsWith "/" || hasDrivePrefix then
+        Error(OperationFailure.create Validation "invalid_path" "Absolute repository paths are not allowed.")
+    elif path.Contains '\000' then
+        Error(OperationFailure.create Validation "invalid_path" "Repository paths must not contain null bytes.")
+    elif path.Split('/') |> Array.exists (fun segment -> segment = "." || segment = "..") then
+        Error(OperationFailure.create Validation "invalid_path" "Repository paths must not contain traversal segments.")
+    else
+        Ok path
+
+let private tryPorcelainV2RenamePath (record: string) =
+    let mutable separatorCount = 0
+    let mutable index = 0
+
+    while separatorCount < 9 && index < record.Length do
+        if record[index] = ' ' then
+            separatorCount <- separatorCount + 1
+
+        index <- index + 1
+
+    if separatorCount = 9 then Some(record.Substring index) else None
+
+let private findBasePathFromStatus (requestedPath: string) (statusText: string) =
+    let records = statusText.Split '\000'
+    let mutable index = 0
+    let mutable basePath = requestedPath
+    let mutable found = false
+
+    while not found && index < records.Length do
+        let record = records[index]
+
+        if record.StartsWith("2 ", StringComparison.Ordinal) then
+            match tryPorcelainV2RenamePath record with
+            | Some renamedPath when
+                index + 1 < records.Length
+                && String.Equals(renamedPath, requestedPath, StringComparison.Ordinal)
+                ->
+                basePath <- records[index + 1]
+                found <- true
+            | _ -> index <- index + 2
+        else
+            index <- index + 1
+
+    basePath
+
+let private getBaseContent
+    (state: SessionState)
+    (path: RepositoryPath)
+    (context: OperationContext)
+    : Async<OperationResult<ContentView>> =
+    async {
+        let requestedPath = RepositoryPath.value path
+
+        match validateLiteralRepositoryPath requestedPath with
+        | Error failure -> return Failed failure
+        | Ok literalPath ->
+            let! statusResult =
+                runGit
+                    state.Hooks
+                    state.RepoPath
+                    [| "status"; "--porcelain=v2"; "-z"; "--untracked-files=all" |]
+                    None
+                    context
+
+            match statusResult with
+            | Error failure -> return Failed failure
+            | Ok statusOutput when statusOutput.ExitCode <> 0 ->
+                return
+                    Failed(
+                        OperationFailure.createRedacted
+                            ProviderError
+                            "git_failure"
+                            $"Reading exact Git status for base content failed: {statusOutput.StdErr}"
+                    )
+            | Ok statusOutput ->
+                let basePath = findBasePathFromStatus literalPath statusOutput.StdOut
+
+                let comparedPaths = [|
+                    yield literalPath
+
+                    if not (String.Equals(basePath, literalPath, StringComparison.Ordinal)) then
+                        yield basePath
+                |]
+
+                let! binaryResult =
+                    runGit
+                        state.Hooks
+                        state.RepoPath
+                        [|
+                            "--literal-pathspecs"
+                            "diff"
+                            "--numstat"
+                            "--no-ext-diff"
+                            "--no-textconv"
+                            "--find-renames"
+                            "HEAD"
+                            "--"
+                            yield! comparedPaths
+                        |]
+                        None
+                        context
+
+                match binaryResult with
+                | Error failure -> return Failed failure
+                | Ok binaryOutput when binaryOutput.ExitCode <> 0 ->
+                    return
+                        Failed(
+                            OperationFailure.createRedacted
+                                ProviderError
+                                "git_failure"
+                                $"Classifying Git base content failed: {binaryOutput.StdErr}"
+                        )
+                | Ok binaryOutput when
+                    binaryOutput.StdOut.Split '\n'
+                    |> Array.exists (fun line -> line.StartsWith("-\t-\t", StringComparison.Ordinal))
+                    ->
+                    return
+                        OperationResult.succeeded (
+                            UnsupportedContent(Some $"Unsupported git content for '{literalPath}'.")
+                        )
+                | Ok _ ->
+                    let! showResult =
+                        runGit state.Hooks state.RepoPath [| "show"; $"HEAD:{basePath}" |] None context
+
+                    match showResult with
+                    | Error failure -> return Failed failure
+                    | Ok showOutput when showOutput.ExitCode = 0 ->
+                        return OperationResult.succeeded (TextContent showOutput.StdOut)
+                    | Ok showOutput ->
+                        let diagnostic = (showOutput.StdErr + showOutput.StdOut).ToLowerInvariant()
+
+                        if
+                            diagnostic.Contains("does not exist in 'head'")
+                            || diagnostic.Contains("exists on disk, but not in 'head'")
+                            || diagnostic.Contains("invalid object name 'head'")
+                            || diagnostic.Contains("bad revision 'head'")
+                        then
+                            return
+                                Failed(
+                                    OperationFailure.create
+                                        NotFound
+                                        "base_content_not_found"
+                                        $"The path '{literalPath}' is absent from the committed base."
+                                )
+                        else
+                            return
+                                Failed(
+                                    OperationFailure.createRedacted
+                                        ProviderError
+                                        "git_failure"
+                                        $"Reading Git base content failed: {showOutput.StdErr}"
+                                )
+    }
+
 let private createTextDiff (state: SessionState) : TextDiffService =
     let mapDiff (operation: JS.Promise<GitService.GitResult<string>>) =
         async {
@@ -1756,27 +2065,7 @@ let private createTextDiff (state: SessionState) : TextDiffService =
     {
         GetDiff = fun path _ -> mapDiff (GitService.getDiff state.RepoPath [| RepositoryPath.value path |])
         GetWordDiff = fun path _ -> mapDiff (GitService.getWordDiff state.RepoPath [| RepositoryPath.value path |])
-        GetBaseContent =
-            fun path _ -> async {
-                let requestedPath = RepositoryPath.value path
-                let! result = GitService.getBaseContent state.RepoPath requestedPath |> Async.AwaitPromise
-
-                match result with
-                | Ok(Some content) -> return OperationResult.succeeded (TextContent content)
-                | Ok None ->
-                    return
-                        Failed(
-                            OperationFailure.create
-                                NotFound
-                                "base_content_not_found"
-                                $"The path '{requestedPath}' is absent from the committed base."
-                        )
-                | Error failure ->
-                    match GitService.tryGetUnsupportedGitContent requestedPath failure with
-                    | Some unsupported ->
-                        return OperationResult.succeeded (UnsupportedContent unsupported.Reason)
-                    | None -> return Failed(toOperationFailure failure)
-                }
+        GetBaseContent = fun path context -> getBaseContent state path context
     }
 
 let private createBrowser (state: SessionState) : RepositoryBrowserService = {

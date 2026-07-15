@@ -497,7 +497,7 @@ let private adoptionHooks (originResult: OperationResult<NodeProcess.ProcessOutp
     Barrier = None
 }
 
-let private createBaseContentFixture () = promise {
+let private createBaseContentFixtureWithHooks (hooks: GitWorkspaceSession.GitSessionHooks) = promise {
     let! root = createTempDirectoryAsync ()
     let repoPath = join [| root; "work" |]
     let! _ = runGitIn root [||] [| "init"; "-b"; "main"; repoPath |] None
@@ -512,6 +512,69 @@ let private createBaseContentFixture () = promise {
     let! _ = runGitIn repoPath [||] [| "mv"; "rename-source.txt"; "renamed.txt" |] None
     do! writeUtf8FileAsync (join [| repoPath; "added.txt" |]) "new content\n"
     do! writeBinaryFileAsync (join [| repoPath; "binary.dat" |]) [| 0; 254; 9; 8; 7 |]
+
+    let binding: WorkspaceBinding = {
+        SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
+        ProviderId = gitProviderId
+        WorkspaceRoot = repoPath
+        ProviderStateRef = None
+        Location = {
+            ProviderId = gitProviderId
+            DisplayName = None
+            ProviderLocation = repoPath
+            ConnectionProfileId = None
+        }
+        ConnectionProfileId = None
+    }
+
+    return root, GitWorkspaceSession.createSession hooks binding
+}
+
+let private createBaseContentFixture () =
+    createBaseContentFixtureWithHooks GitWorkspaceSession.GitSessionHooks.none
+
+let private createWhitespaceBaseContentFixture () = promise {
+    let! root = createTempDirectoryAsync ()
+    let repoPath = join [| root; "work" |]
+    let! _ = runGitIn root [||] [| "init"; "-b"; "main"; repoPath |] None
+    do! configureUser repoPath
+    do! writeUtf8FileAsync (join [| repoPath; " leading.txt" |]) "leading base content\n"
+    let! _ = runGitIn repoPath [||] [| "add"; "-A" |] None
+    let! _ = runGitIn repoPath [||] [| "commit"; "-m"; "test: leading path" |] None
+
+    let trailingPath = "trailing.txt "
+    let renameSource = "rename-source.txt "
+    let renamedPath = "renamed.txt "
+    let! trailingBlob = runGitIn repoPath [||] [| "hash-object"; "-w"; "--stdin" |] (Some "trailing base content\n")
+    let! renameBlob = runGitIn repoPath [||] [| "hash-object"; "-w"; "--stdin" |] (Some "rename base content\n")
+
+    let! _ =
+        runGitIn
+            repoPath
+            [||]
+            [| "-c"; "core.protectNTFS=false"; "update-index"; "--add"; "--cacheinfo"; $"100644,{trailingBlob.Trim()},{trailingPath}" |]
+            None
+
+    let! _ =
+        runGitIn
+            repoPath
+            [||]
+            [| "-c"; "core.protectNTFS=false"; "update-index"; "--add"; "--cacheinfo"; $"100644,{renameBlob.Trim()},{renameSource}" |]
+            None
+
+    let! _ = runGitIn repoPath [||] [| "commit"; "-m"; "test: trailing paths" |] None
+    do! writeUtf8FileAsync (join [| repoPath; " leading.txt" |]) "modified leading content\n"
+
+    let zeroObjectId = "0000000000000000000000000000000000000000"
+    let renameIndexPayload =
+        $"0 {zeroObjectId}\t{renameSource}\000100644 {renameBlob.Trim()}\t{renamedPath}\000"
+
+    let! _ =
+        runGitIn
+            repoPath
+            [||]
+            [| "-c"; "core.protectNTFS=false"; "update-index"; "-z"; "--index-info" |]
+            (Some renameIndexPayload)
 
     let binding: WorkspaceBinding = {
         SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
@@ -838,6 +901,137 @@ Vitest.describe (
                             .toBe (true)
                     | TextContent text -> failwith $"Expected unsupported binary content, received text '{text}'."
 
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+)
+
+Vitest.describe (
+    "Git base content hardening",
+    fun () ->
+        let expectTextBase expected operationName result =
+            match expectProviderValue operationName result with
+            | TextContent text -> Vitest.expect(text).toBe (expected)
+            | UnsupportedContent _ -> failwith $"Expected text content for {operationName}."
+
+        Vitest.test (
+            "preserves a literal leading-space path",
+            fun () -> promise {
+                let! root, session = createWhitespaceBaseContentFixture ()
+
+                try
+                    let! result =
+                        (textDiffService session).GetBaseContent
+                            (repositoryPath " leading.txt")
+                            (OperationContext.detached "base-leading-space")
+                        |> Async.StartAsPromise
+
+                    expectTextBase "leading base content\n" "leading-space base content" result
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "preserves a literal trailing-space path",
+            fun () -> promise {
+                let! root, session = createWhitespaceBaseContentFixture ()
+
+                try
+                    let! result =
+                        (textDiffService session).GetBaseContent
+                            (repositoryPath "trailing.txt ")
+                            (OperationContext.detached "base-trailing-space")
+                        |> Async.StartAsPromise
+
+                    expectTextBase "trailing base content\n" "trailing-space base content" result
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "follows an exact trailing-space rename without trimming status tokens",
+            fun () -> promise {
+                let! root, session = createWhitespaceBaseContentFixture ()
+
+                try
+                    let! result =
+                        (textDiffService session).GetBaseContent
+                            (repositoryPath "renamed.txt ")
+                            (OperationContext.detached "base-whitespace-rename")
+                        |> Async.StartAsPromise
+
+                    expectTextBase "rename base content\n" "whitespace rename base content" result
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "preserves cancellation before the base-status subprocess",
+            fun () -> promise {
+                let! root, session = createBaseContentFixture ()
+                let source = OperationCancellation.Source()
+                source.Cancel()
+
+                try
+                    let context = OperationContext.create "base-canceled-status" source.Cancellation ignore
+
+                    let! result =
+                        (textDiffService session).GetBaseContent (repositoryPath "base.txt") context
+                        |> Async.StartAsPromise
+
+                    let failure = expectProviderFailure "canceled base status" result
+                    Vitest.expect(failure.Category).toEqual (Canceled)
+                    Vitest.expect(failure.Code).toBe ("operation_canceled")
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "preserves cancellation between base status and show",
+            fun () -> promise {
+                let source = OperationCancellation.Source()
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunProcess =
+                        Some(fun request context ->
+                            async {
+                                let! result = NodeProcess.run request context
+
+                                if request.Arguments |> Array.contains "--numstat" then
+                                    source.Cancel()
+
+                                return result
+                            })
+                    Barrier = None
+                }
+
+                let! root, session = createBaseContentFixtureWithHooks hooks
+
+                try
+                    let context = OperationContext.create "base-canceled-show" source.Cancellation ignore
+
+                    let! result =
+                        (textDiffService session).GetBaseContent (repositoryPath "base.txt") context
+                        |> Async.StartAsPromise
+
+                    let failure = expectProviderFailure "canceled base show" result
+                    Vitest.expect(failure.Category).toEqual (Canceled)
+                    Vitest.expect(failure.Code).toBe ("operation_canceled")
                     do! removeDirectoryAsync root
                 with error ->
                     do! removeDirectoryAsync root

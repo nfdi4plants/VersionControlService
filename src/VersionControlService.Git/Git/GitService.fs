@@ -1486,35 +1486,6 @@ let getWordDiff (arcPath: string) (pathSpecs: string[]) : JS.Promise<GitResult<s
                 })
 }
 
-/// Reads committed HEAD content for a literal workspace path, following the old
-/// path recorded by status when the worktree entry is a rename.
-let getBaseContent (arcPath: string) (requestedPath: string) : JS.Promise<GitResult<string option>> = promise {
-    match ensureValidPathspec requestedPath with
-    | Error validationError -> return errorResult validationError
-    | Ok safeRequestedPath ->
-        return!
-            withLocalGit
-                arcPath
-                (fun git -> promise {
-                    let! status = git.status ()
-                    let statusDto = toStatusDto arcPath status
-
-                    let headPath =
-                        statusDto.Files
-                        |> Array.tryFind (fun file ->
-                            String.Equals(file.Path, safeRequestedPath, StringComparison.Ordinal)
-                        )
-                        |> Option.bind _.OriginalPath
-                        |> Option.defaultValue safeRequestedPath
-
-                    let! contentResult = readHeadTextIfAvailable git safeRequestedPath headPath
-
-                    match contentResult with
-                    | Ok content -> return content
-                    | Error failure -> return abortGitPromise failure.Message
-                })
-}
-
 /// Loads previous/current text plus word-diff metadata for diff views.
 /// Binary or explicitly unsupported files return the unsupported-content sentinel.
 let getDiffViewData (arcPath: string) (requestedPath: string) : JS.Promise<GitResult<GitDiffViewDataDto>> = promise {
