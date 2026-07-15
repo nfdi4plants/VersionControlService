@@ -43,7 +43,13 @@ let private createLongOperationCore () : CoreVersionControl =
 
 let private createFakeFactory () : ProviderFactory =
     FakeProvider.createFactory fakeProviderId (fun descriptor ->
-        WorkspaceSession.createCoreOnly descriptor (createLongOperationCore ()))
+        {
+            WorkspaceSession.createCoreOnly descriptor (createLongOperationCore ()) with
+                TextDiff = Some(FakeProvider.createFinalTextDiff ())
+                ConflictResolution = Some(FakeProvider.createFinalConflictResolution ())
+                Synchronization = Some(FakeProvider.createFinalSynchronization ())
+                ObjectMaterialization = Some(FakeProvider.createFinalObjectMaterialization ())
+        })
 
 let private expectSucceeded (operationName: string) (result: OperationResult<'T>) : 'T =
     match result with
@@ -90,6 +96,55 @@ let portableConsumerTests =
             let status = expectSucceeded "get status" statusResult
 
             Expect.equal status.WorkspaceVersion "fake-v1" "The fake session returns its workspace version."
+        }
+
+        testCaseAsync "a portable opened session returns every final SPI value through optional service results"
+        <| async {
+            let factory = createFakeFactory ()
+            let context = OperationContext.detached "portable-final-spi"
+            let path =
+                match RepositoryPath.tryCreate "portable.txt" with
+                | Ok value -> value
+                | Error message -> failtest message
+
+            let! session = openFakeSession factory context
+
+            let textDiff =
+                match session.TextDiff with
+                | Some service -> service
+                | None -> failtest "Expected the portable text-diff service."
+
+            let! baseResult = textDiff.GetBaseContent path context
+            let baseContent = expectSucceeded "get base content" baseResult
+            Expect.equal baseContent (TextContent "base content") "Base content comes from the text-diff result."
+
+            let conflicts =
+                match session.ConflictResolution with
+                | Some service -> service
+                | None -> failtest "Expected the portable conflict-resolution service."
+
+            let! summaryResult = conflicts.GetActiveSession context
+            let summary = expectSucceeded "get active conflict session" summaryResult
+            let conflict = summary |> Option.defaultWith (fun () -> failtest "Expected an active portable conflict session.")
+            Expect.equal conflict.Items[0].CombinedPreview (Some(TextPreview "combined preview")) "Combined preview comes from the conflict result."
+
+            let synchronization =
+                match session.Synchronization with
+                | Some service -> service
+                | None -> failtest "Expected the portable synchronization service."
+
+            let! stateResult = synchronization.Refresh context
+            let state = expectSucceeded "refresh synchronization" stateResult
+            Expect.equal (state.TargetRef |> Option.map _.Name) (Some "fake-target") "Target ref comes from the refresh result."
+
+            let objects =
+                match session.ObjectMaterialization with
+                | Some service -> service
+                | None -> failtest "Expected the portable object-materialization service."
+
+            let! objectsResult = objects.ListObjects context
+            let objectState = expectSucceeded "list objects" objectsResult |> Array.exactlyOne
+            Expect.isTrue objectState.IsLocallyAvailable "Local availability comes from the object-list result."
         }
 
         testCaseAsync "cancellation reaches and stops a fake long operation in .NET"
