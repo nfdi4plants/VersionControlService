@@ -464,6 +464,29 @@ let private expectProviderFailure (operationName: string) (result: OperationResu
     | Succeeded _
     | PartiallySucceeded _ -> failwith $"Expected {operationName} to fail."
 
+let private processOutput exitCode stdout stderr : NodeProcess.ProcessOutput = {
+    ExitCode = exitCode
+    StdOut = stdout
+    StdErr = stderr
+}
+
+let private adoptionHooks (originResult: OperationResult<NodeProcess.ProcessOutput>) : GitWorkspaceSession.GitSessionHooks = {
+    RunProcess =
+        Some(fun request _ ->
+            async {
+                match request.Arguments with
+                | [| "rev-parse"; "--show-toplevel" |] ->
+                    return OperationResult.succeeded (processOutput 0 "C:/adoption-fixture\n" "")
+                | [| "config"; "--get"; "remote.origin.url" |] -> return originResult
+                | _ ->
+                    return
+                        OperationResult.failed(
+                            OperationFailure.create ProviderError "unexpected_command" "Unexpected Git command."
+                        )
+            })
+    Barrier = None
+}
+
 Vitest.describe (
     "Git workspace adoption",
     fun () ->
@@ -605,6 +628,69 @@ Vitest.describe (
                 with error ->
                     do! removeDirectoryAsync root
                     return raise error
+            }
+        )
+
+        Vitest.test (
+            "Git adoption preserves origin lookup failure semantics",
+            fun () -> promise {
+                let request = {
+                    WorkspaceRoot = "C:/adoption-fixture"
+                    ConnectionProfileId = None
+                }
+
+                let missingOriginFactory =
+                    GitWorkspaceSession.createFactory(
+                        adoptionHooks (OperationResult.succeeded (processOutput 1 "" ""))
+                    )
+
+                let! missingOriginResult =
+                    Async.StartAsPromise(missingOriginFactory.Adopt request (OperationContext.detached "origin-missing"))
+
+                let missingOrigin = expectProviderValue "adopt without origin" missingOriginResult
+                Vitest.expect(missingOrigin.Location.ProviderLocation).toBe ("C:/adoption-fixture")
+
+                let canceledFactory =
+                    GitWorkspaceSession.createFactory(
+                        adoptionHooks (OperationResult.canceled "The origin lookup was canceled.")
+                    )
+
+                let! canceledResult =
+                    Async.StartAsPromise(canceledFactory.Adopt request (OperationContext.detached "origin-canceled"))
+
+                let canceledFailure = expectProviderFailure "canceled origin lookup" canceledResult
+                Vitest.expect(canceledFailure.Category).toEqual (Canceled)
+                Vitest.expect(canceledFailure.Code).toBe ("operation_canceled")
+
+                let processFailureFactory =
+                    GitWorkspaceSession.createFactory(
+                        adoptionHooks (
+                            OperationResult.failed(
+                                OperationFailure.create Network "origin_process_failed" "The origin lookup process failed."
+                            )
+                        )
+                    )
+
+                let! processFailureResult =
+                    Async.StartAsPromise(processFailureFactory.Adopt request (OperationContext.detached "origin-process-failed"))
+
+                let processFailure = expectProviderFailure "failed origin lookup process" processFailureResult
+                Vitest.expect(processFailure.Category).toEqual (Network)
+                Vitest.expect(processFailure.Code).toBe ("origin_process_failed")
+
+                let unexpectedOutputFactory =
+                    GitWorkspaceSession.createFactory(
+                        adoptionHooks (OperationResult.succeeded (processOutput 2 "" "fatal: config is unreadable"))
+                    )
+
+                let! unexpectedOutputResult =
+                    Async.StartAsPromise(unexpectedOutputFactory.Adopt request (OperationContext.detached "origin-unexpected-output"))
+
+                let unexpectedOutputFailure =
+                    expectProviderFailure "unexpected origin lookup output" unexpectedOutputResult
+
+                Vitest.expect(unexpectedOutputFailure.Category).toEqual (ProviderError)
+                Vitest.expect(unexpectedOutputFailure.Code).toBe ("origin_lookup_failed")
             }
         )
 )

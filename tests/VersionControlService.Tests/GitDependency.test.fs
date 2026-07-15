@@ -29,8 +29,13 @@ let private expectFailure (operationName: string) (result: OperationResult<'T>) 
     | Succeeded _
     | PartiallySucceeded _ -> failwith $"Expected {operationName} to fail."
 
-let private dependencyHooks (gitAvailable: bool) (lfsVersion: string option) (repairConfiguration: bool) =
-    let mutable configurationInstalled = false
+let private dependencyHooks
+    (gitAvailable: bool)
+    (lfsVersion: string option)
+    (initialFilterProcess: string option)
+    (filterProcessAfterInstall: string option)
+    =
+    let mutable filterProcess = initialFilterProcess
     let commands = ResizeArray<string[]>()
 
     let hooks: GitWorkspaceSession.GitSessionHooks = {
@@ -46,13 +51,12 @@ let private dependencyHooks (gitAvailable: bool) (lfsVersion: string option) (re
                         | [| "lfs"; "version" |] when lfsVersion.IsSome -> processOutput 0 (lfsVersion |> Option.get) ""
                         | [| "lfs"; "version" |] -> processOutput 1 "" "git: 'lfs' is not a git command"
                         | [| "config"; "--global"; "--get"; "filter.lfs.process" |]
-                            when gitAvailable && configurationInstalled ->
-                            processOutput 0 "git-lfs filter-process\n" ""
+                            when gitAvailable && filterProcess.IsSome ->
+                            processOutput 0 (filterProcess |> Option.get) ""
                         | [| "config"; "--global"; "--get"; "filter.lfs.process" |] ->
                             processOutput 1 "" ""
                         | [| "lfs"; "install"; "--skip-repo" |] when lfsVersion.IsSome ->
-                            if repairConfiguration then
-                                configurationInstalled <- true
+                            filterProcess <- filterProcessAfterInstall
 
                             processOutput 0 "Git LFS initialized.\n" ""
                         | [| "lfs"; "install"; "--skip-repo" |] ->
@@ -72,7 +76,7 @@ Vitest.describe (
         Vitest.test (
             "Git dependency remediation is truthful",
             fun () -> promise {
-                let missingHooks, _ = dependencyHooks false None false
+                let missingHooks, _ = dependencyHooks false None None None
                 let missingFactory = GitWorkspaceSession.createFactory missingHooks
                 let! missingResult = Async.StartAsPromise(missingFactory.CheckDependencies(context "missing-dependencies"))
                 let missing = expectValue "missing dependencies" missingResult
@@ -83,7 +87,7 @@ Vitest.describe (
                     Vitest.expect(status.Compatible).toBe (false)
                     Vitest.expect(status.Remediation.IsSome).toBe (true)
 
-                let missingLfsHooks, missingLfsCommands = dependencyHooks true None false
+                let missingLfsHooks, missingLfsCommands = dependencyHooks true None None None
                 let missingLfsFactory = GitWorkspaceSession.createFactory missingLfsHooks
                 let! missingLfsResult =
                     Async.StartAsPromise(
@@ -100,7 +104,7 @@ Vitest.describe (
                 ).toBe (false)
 
                 let incompatibleLfsHooks, incompatibleLfsCommands =
-                    dependencyHooks true (Some "git-lfs/3.6.1 (GitHub; windows amd64; go 1.23.0)\n") false
+                    dependencyHooks true (Some "git-lfs/3.6.1 (GitHub; windows amd64; go 1.23.0)\n") None None
 
                 let incompatibleLfsFactory = GitWorkspaceSession.createFactory incompatibleLfsHooks
                 let! incompatibleLfsResult =
@@ -120,7 +124,7 @@ Vitest.describe (
                 ).toBe (false)
 
                 let noRepairHooks, _ =
-                    dependencyHooks true (Some "git-lfs/3.7.0 (GitHub; windows amd64; go 1.23.0)\n") false
+                    dependencyHooks true (Some "git-lfs/3.7.0 (GitHub; windows amd64; go 1.23.0)\n") None None
                 let noRepairFactory = GitWorkspaceSession.createFactory noRepairHooks
                 let! noRepairResult =
                     Async.StartAsPromise(noRepairFactory.InstallDependency "git-lfs-configuration" (context "repair-not-applied"))
@@ -151,7 +155,11 @@ Vitest.describe (
                 Vitest.expect(lfsInstallFailure.Message.Contains("Install Git LFS")).toBe (true)
 
                 let repairedHooks, commands =
-                    dependencyHooks true (Some "git-lfs/3.7.0 (GitHub; windows amd64; go 1.23.0)\n") true
+                    dependencyHooks
+                        true
+                        (Some "git-lfs/3.7.0 (GitHub; windows amd64; go 1.23.0)\n")
+                        None
+                        (Some "git-lfs filter-process\n")
                 let repairedFactory = GitWorkspaceSession.createFactory repairedHooks
                 let! repairedResult =
                     Async.StartAsPromise(repairedFactory.InstallDependency "git-lfs-configuration" (context "repair-applied"))
@@ -179,6 +187,56 @@ Vitest.describe (
                     |> Seq.skip (installationIndex + 1)
                     |> Seq.exists (fun command -> command = [| "config"; "--global"; "--get"; "filter.lfs.process" |])
                 ).toBe (true)
+
+                let staleFilter = Some "git-lfs filter-process --skip\n"
+                let staleHooks, _ =
+                    dependencyHooks
+                        true
+                        (Some "git-lfs/3.7.0 (GitHub; windows amd64; go 1.23.0)\n")
+                        staleFilter
+                        staleFilter
+
+                let staleFactory = GitWorkspaceSession.createFactory staleHooks
+                let! staleDependenciesResult = Async.StartAsPromise(staleFactory.CheckDependencies(context "stale-filter"))
+                let staleDependencies = expectValue "stale filter dependencies" staleDependenciesResult
+                let staleFilterStatus =
+                    staleDependencies |> Array.find (fun status -> status.Component = "git-lfs-configuration")
+
+                Vitest.expect(staleFilterStatus.Installed).toBe (false)
+                Vitest.expect(staleFilterStatus.Compatible).toBe (false)
+                Vitest.expect(staleFilterStatus.Remediation.IsSome).toBe (true)
+
+                let! staleInstallResult =
+                    Async.StartAsPromise(staleFactory.InstallDependency "git-lfs-configuration" (context "stale-filter-install"))
+
+                let staleInstallFailure = expectFailure "stale filter post-install recheck" staleInstallResult
+                Vitest.expect(staleInstallFailure.Category).toEqual (DependencyMissing)
+                Vitest.expect(staleInstallFailure.Code).toBe ("lfs_configuration_unhealthy")
+
+            }
+        )
+
+        Vitest.test (
+            "Git dependency cancellation is preserved",
+            fun () -> promise {
+                let cancellation = OperationCancellation.Source()
+                cancellation.Cancel()
+
+                let canceledContext =
+                    OperationContext.create "canceled-dependencies" cancellation.Cancellation ignore
+
+                let canceledFactory = GitWorkspaceSession.createFactory GitWorkspaceSession.GitSessionHooks.none
+                let! canceledCheckResult = Async.StartAsPromise(canceledFactory.CheckDependencies canceledContext)
+                let canceledCheckFailure = expectFailure "canceled dependency check" canceledCheckResult
+                Vitest.expect(canceledCheckFailure.Category).toEqual (Canceled)
+                Vitest.expect(canceledCheckFailure.Code).toBe ("operation_canceled")
+
+                let! canceledInstallResult =
+                    Async.StartAsPromise(canceledFactory.InstallDependency "git-lfs-configuration" canceledContext)
+
+                let canceledInstallFailure = expectFailure "canceled dependency installation" canceledInstallResult
+                Vitest.expect(canceledInstallFailure.Category).toEqual (Canceled)
+                Vitest.expect(canceledInstallFailure.Code).toBe ("operation_canceled")
             }
         )
 )
