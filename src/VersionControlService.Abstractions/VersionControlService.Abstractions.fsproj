@@ -7,6 +7,7 @@
     <Compile Include="Paths.fs" />
     <Compile Include="Operations.fs" />
     <Compile Include="Workspace.fs" />
+    <Compile Include="Refs.fs" />
     <Compile Include="Synchronization.fs" />
     <Compile Include="Conflicts.fs" />
     <Compile Include="Core.fs" />

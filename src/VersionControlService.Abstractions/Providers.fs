@@ -48,9 +48,13 @@ type ProviderFactory = {
     VerifyLocation: VerifyLocationRequest -> OperationContext -> Async<OperationResult<AccessReport>>
     Initialize: InitializeRequest -> OperationContext -> Async<OperationResult<WorkspaceBinding>>
     Clone: CloneRequest -> OperationContext -> Async<OperationResult<WorkspaceBinding>>
+    /// Registers an existing provider-owned workspace without cloning.
+    Adopt: AdoptRequest -> OperationContext -> Async<OperationResult<WorkspaceBinding>>
     /// Attaches or re-targets an existing local workspace without cloning.
     Bind: BindRequest -> OperationContext -> Async<OperationResult<WorkspaceBinding>>
     Open: WorkspaceBinding -> OperationContext -> Async<OperationResult<WorkspaceSession>>
     /// Reports installed/missing/incompatible dependency components with remediation.
     CheckDependencies: OperationContext -> Async<OperationResult<DependencyStatus[]>>
+    /// Attempts remediation for a component reported by CheckDependencies.
+    InstallDependency: string -> OperationContext -> Async<OperationResult<DependencyStatus>>
 }

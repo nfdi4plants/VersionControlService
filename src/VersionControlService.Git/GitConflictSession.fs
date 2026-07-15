@@ -104,6 +104,7 @@ let buildConflictItems
                                 |]
                             | None -> [||]
                     |]
+                    CombinedPreview = None
                     SupportsResolvedContent = true
                 }
 

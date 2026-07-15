@@ -26,8 +26,8 @@ let private createLongOperationCore () : CoreVersionControl =
                         context.ReportProgress {
                             PhaseCode = "fake-step"
                             Item = None
-                            Completed = Some step
-                            Total = Some 50
+                            Completed = Some(float step)
+                            Total = Some 50.0
                             DisplayMessage = None
                         }
 
@@ -96,7 +96,7 @@ let portableConsumerTests =
         <| async {
             let factory = createFakeFactory ()
             let source = OperationCancellation.Source()
-            let mutable lastCompleted = 0
+            let mutable lastCompleted = 0.0
 
             // Deterministic cancellation: cancel from the progress callback at step 3.
             let context =
@@ -105,7 +105,7 @@ let portableConsumerTests =
                     | Some completed ->
                         lastCompleted <- completed
 
-                        if completed = 3 then
+                        if completed = 3.0 then
                             source.Cancel()
                     | None -> ())
 

@@ -22,6 +22,8 @@ type ConflictCandidate = {
 type ConflictItem = {
     Path: RepositoryPath
     Candidates: ConflictCandidate[]
+    /// Provider-owned combined representation, e.g. Git conflict-marker text.
+    CombinedPreview: ConflictPreview option
     /// True when the provider accepts caller-supplied resolved content for this item.
     SupportsResolvedContent: bool
 }

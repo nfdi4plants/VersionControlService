@@ -316,6 +316,7 @@ let private synchronizationState (state: SessionState) (targetHead: string optio
         BaseRevision = baseRevision |> Option.map mkRevisionId
         WorkspaceRevision = workspaceRevision |> Option.map mkRevisionId
         TargetRevision = targetHead |> Option.map mkRevisionId
+        TargetRef = None
         LocalRevisionCount = None
         TargetRevisionCount = None
         RemoteChangedPaths = None
@@ -787,8 +788,8 @@ let private createRevision (state: SessionState) (request: CreateRevisionRequest
                                 context.ReportProgress {
                                     PhaseCode = "selected-upload-complete"
                                     Item = None
-                                    Completed = Some completedPaths.Length
-                                    Total = Some selectedTransfers.Length
+                                    Completed = Some(float completedPaths.Length)
+                                    Total = Some(float selectedTransfers.Length)
                                     DisplayMessage = Some "Selected lakeFS objects uploaded"
                                 }
 

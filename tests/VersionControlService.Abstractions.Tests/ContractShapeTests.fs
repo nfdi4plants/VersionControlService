@@ -17,6 +17,33 @@ module FakeProvider =
         | Ok reference -> reference
         | Error message -> failwith message
 
+    let repositoryPath (path: string) =
+        match RepositoryPath.tryCreate path with
+        | Ok value -> value
+        | Error message -> failwith message
+
+    let progress: OperationProgress = {
+        PhaseCode = "transfer"
+        Item = None
+        Completed = Some 3_000_000_000.0
+        Total = Some 4_000_000_000.0
+        DisplayMessage = None
+    }
+
+    let storagePolicy: StoragePolicyService = {
+        SetPathPolicy = fun (_path: RepositoryPath) _enabled _context -> async { return OperationResult.succeeded () }
+        GetSettings =
+            fun _ ->
+                async {
+                    return
+                        OperationResult.succeeded {
+                            AutoPolicyThresholdMb = Some 1
+                            MaterializeLargeObjects = true
+                        }
+                }
+        SetSettings = fun _ _ -> async { return OperationResult.succeeded () }
+    }
+
     let fakeLocation (id: ProviderId) : RepositoryLocation = {
         ProviderId = id
         DisplayName = None
@@ -88,6 +115,7 @@ module FakeProvider =
             BaseRevision = None
             WorkspaceRevision = None
             TargetRevision = None
+            TargetRef = None
             LocalRevisionCount = None
             TargetRevisionCount = None
             RemoteChangedPaths = None
@@ -144,6 +172,14 @@ module FakeProvider =
             fun request _ -> async {
                 return OperationResult.succeeded (createBinding id request.TargetPath request.Location)
             }
+        Adopt =
+            fun _ _ ->
+                async {
+                    return
+                        OperationResult.failed (
+                            OperationFailure.create Unsupported "operation_not_supported" "Adoption is not supported by this provider."
+                        )
+                }
         Bind =
             fun request _ -> async {
                 return OperationResult.succeeded (createBinding id request.WorkspaceRoot request.Location)
@@ -159,6 +195,17 @@ module FakeProvider =
                 return OperationResult.succeeded (buildSession descriptor)
             }
         CheckDependencies = fun _ -> async { return OperationResult.succeeded [||] }
+        InstallDependency =
+            fun _ _ ->
+                async {
+                    return
+                        OperationResult.failed (
+                            OperationFailure.create
+                                Unsupported
+                                "operation_not_supported"
+                                "Dependency installation is not supported by this provider."
+                        )
+                }
     }
 
 let private expectSucceeded (operationName: string) (result: OperationResult<'T>) : 'T =
@@ -206,6 +253,20 @@ let private openSession (factory: ProviderFactory) =
 [<Tests>]
 let contractShapeTests =
     testList "ContractShapes" [
+        testCase "typed provider fakes retain byte-scale progress and storage settings"
+        <| fun () ->
+            Expect.equal FakeProvider.progress.Completed (Some 3_000_000_000.0) "Completed progress is not limited to 32 bits."
+            Expect.equal FakeProvider.progress.Total (Some 4_000_000_000.0) "Total progress is not limited to 32 bits."
+
+            let context = OperationContext.detached "storage-policy-settings"
+
+            match FakeProvider.storagePolicy.GetSettings context |> Async.RunSynchronously with
+            | Succeeded outcome ->
+                Expect.equal outcome.Value.AutoPolicyThresholdMb (Some 1) "The fake returns typed storage settings."
+                Expect.isTrue outcome.Value.MaterializeLargeObjects "The fake returns its materialization setting."
+            | PartiallySucceeded _
+            | Failed _ -> failtest "Expected fake storage settings."
+
         testCaseAsync "a core-only provider implements no optional service"
         <| async {
             let id = FakeProvider.providerId "fake.coreonly"

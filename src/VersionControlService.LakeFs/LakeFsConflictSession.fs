@@ -110,6 +110,7 @@ let summary
                                     |]
                                 | None -> [||]
                         |]
+                        CombinedPreview = None
                         SupportsResolvedContent = true
                     })
             |> List.toArray

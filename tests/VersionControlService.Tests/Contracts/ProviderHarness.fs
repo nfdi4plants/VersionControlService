@@ -418,6 +418,7 @@ module FakeHarness =
                                 |]
                             | None -> [||]
                     |]
+                    CombinedPreview = None
                     SupportsResolvedContent = true
                 })
                 |> List.toArray
@@ -454,6 +455,7 @@ module FakeHarness =
             BaseRevision = Some(mkRevisionId workspace.BaseRevisionId)
             WorkspaceRevision = Some(mkRevisionId localHead)
             TargetRevision = targetRevision |> Option.map mkRevisionId
+            TargetRef = None
             LocalRevisionCount = None
             TargetRevisionCount = None
             RemoteChangedPaths = remoteChanged
@@ -475,8 +477,8 @@ module FakeHarness =
                     context.ReportProgress {
                         PhaseCode = "transfer"
                         Item = None
-                        Completed = Some step
-                        Total = Some 200
+                        Completed = Some(float step)
+                        Total = Some 200.0
                         DisplayMessage = Some "Transferring objects"
                     }
 
@@ -1196,6 +1198,14 @@ module FakeHarness =
         {
             GetDiff = fun path _ -> async { return OperationResult.succeeded (diffFor path) }
             GetWordDiff = fun path _ -> async { return OperationResult.succeeded (diffFor path) }
+            GetBaseContent =
+                fun _ _ ->
+                    async {
+                        return
+                            OperationResult.succeeded (
+                                UnsupportedContent(Some "Base content is not supported by the fake provider yet.")
+                            )
+                    }
         }
 
     let private createBrowser () : RepositoryBrowserService = {
@@ -1297,6 +1307,17 @@ module FakeHarness =
                     else
                         return OperationResult.succeeded (bindingFor request.TargetPath request.Location)
                 }
+            Adopt =
+                fun _ _ ->
+                    async {
+                        return
+                            OperationResult.failed (
+                                OperationFailure.create
+                                    Unsupported
+                                    "operation_not_supported"
+                                    "Adoption is not supported by this provider."
+                            )
+                    }
             Bind =
                 fun request _ -> async {
                     return OperationResult.succeeded (bindingFor request.WorkspaceRoot request.Location)
@@ -1354,6 +1375,17 @@ module FakeHarness =
                             }
                         |]
                 }
+            InstallDependency =
+                fun _ _ ->
+                    async {
+                        return
+                            OperationResult.failed (
+                                OperationFailure.create
+                                    Unsupported
+                                    "operation_not_supported"
+                                    "Dependency installation is not supported by this provider."
+                            )
+                    }
         }
 
         let getWorkspaceState (harnessWorkspace: HarnessWorkspace) =

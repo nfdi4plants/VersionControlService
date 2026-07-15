@@ -15,6 +15,8 @@ type SynchronizationState = {
     BaseRevision: RevisionId option
     WorkspaceRevision: RevisionId option
     TargetRevision: RevisionId option
+    /// Configured publication/update target, when the workspace has one.
+    TargetRef: LogicalRef option
     LocalRevisionCount: int option
     TargetRevisionCount: int option
     /// Advisory cache from the most recent Refresh/PreviewUpdate; may be None or

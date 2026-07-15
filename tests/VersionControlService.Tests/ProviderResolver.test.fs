@@ -63,6 +63,17 @@ let private createProbeFactory (idName: string) (probe: string -> Async<ProbeRes
         VerifyLocation = fun _ _ -> async { return notExercised "VerifyLocation" }
         Initialize = fun _ _ -> async { return notExercised "Initialize" }
         Clone = fun _ _ -> async { return notExercised "Clone" }
+        Adopt =
+            fun _ _ ->
+                async {
+                    return
+                        OperationResult.failed (
+                            OperationFailure.create
+                                Unsupported
+                                "operation_not_supported"
+                                "Adoption is not supported by this provider."
+                        )
+                }
         Bind = fun _ _ -> async { return notExercised "Bind" }
         Open =
             fun binding _ -> async {
@@ -99,6 +110,17 @@ let private createProbeFactory (idName: string) (probe: string -> Async<ProbeRes
                 return OperationResult.succeeded (WorkspaceSession.createCoreOnly descriptor core)
             }
         CheckDependencies = fun _ -> async { return OperationResult.succeeded [||] }
+        InstallDependency =
+            fun _ _ ->
+                async {
+                    return
+                        OperationResult.failed (
+                            OperationFailure.create
+                                Unsupported
+                                "operation_not_supported"
+                                "Dependency installation is not supported by this provider."
+                        )
+                }
     }
 
 let private neverDetect (_path: string) : Async<ProbeResult> = async { return NotDetected }

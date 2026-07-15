@@ -21,6 +21,14 @@ let lakeFsProviderId =
 let private connectionFailure (message: string) =
     OperationFailure.createRedacted Authentication "connection_profile_unresolved" message
 
+let private unsupported (operation: string) : OperationResult<'T> =
+    OperationResult.failed (
+        OperationFailure.create
+            Unsupported
+            "operation_not_supported"
+            $"{operation} is not supported by this provider."
+    )
+
 let private resolveLocation
     (credentials: LakeFsCredentials.LakeFsCredentialStrategy)
     (location: RepositoryLocation)
@@ -164,6 +172,7 @@ let createFactory (credentials: LakeFsCredentials.LakeFsCredentialStrategy) : Pr
 
                     return OperationResult.succeeded (bindingFor request.TargetPath request.Location)
         }
+    Adopt = fun _ _ -> async { return unsupported "Adoption" }
     Bind =
         fun request _ -> async {
             // Binding data comes exclusively from the request — provider markers
@@ -185,4 +194,5 @@ let createFactory (credentials: LakeFsCredentials.LakeFsCredentialStrategy) : Pr
             // The lakeFS provider needs no local tooling: the API client is built in.
             return OperationResult.succeeded [||]
         }
+    InstallDependency = fun _ _ -> async { return unsupported "Dependency installation" }
 }

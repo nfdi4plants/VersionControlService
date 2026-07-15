@@ -46,8 +46,8 @@ type OperationProgress = {
     PhaseCode: string
     /// Optional item or repository path the progress refers to.
     Item: string option
-    Completed: int option
-    Total: int option
+    Completed: float option
+    Total: float option
     /// Sanitized human-readable message.
     DisplayMessage: string option
 }

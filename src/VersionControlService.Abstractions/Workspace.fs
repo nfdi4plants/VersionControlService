@@ -65,6 +65,14 @@ type CloneRequest = {
     MaterializeAllObjects: bool
 }
 
+/// Registers an existing provider-owned workspace with the host without cloning
+/// or mutating the workspace. Provider discovery remains read-only; adoption is
+/// explicit and may be unsupported by a provider.
+type AdoptRequest = {
+    WorkspaceRoot: string
+    ConnectionProfileId: string option
+}
+
 /// Attaches or re-targets an existing local workspace to a repository location
 /// without cloning (the neutral replacement for "connect remote").
 type BindRequest = {

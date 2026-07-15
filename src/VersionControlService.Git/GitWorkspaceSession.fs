@@ -356,6 +356,7 @@ let private toWorkspaceStatus (state: SessionState) (status: GitStatusDto) (cont
                     BaseRevision = None
                     WorkspaceRevision = workspaceRevision
                     TargetRevision = targetRevision
+                    TargetRef = None
                     LocalRevisionCount = Some status.Ahead
                     TargetRevisionCount = Some status.Behind
                     RemoteChangedPaths = None
@@ -1091,6 +1092,7 @@ let private synchronizationState (state: SessionState) (context: OperationContex
                     BaseRevision = baseRevision |> Option.map mkRevisionId
                     WorkspaceRevision = workspaceRevision |> Option.map mkRevisionId
                     TargetRevision = targetRevision |> Option.map mkRevisionId
+                    TargetRef = None
                     LocalRevisionCount = None
                     TargetRevisionCount = None
                     RemoteChangedPaths = remoteChanged
@@ -1686,6 +1688,14 @@ let private createTextDiff (state: SessionState) : TextDiffService =
     {
         GetDiff = fun path _ -> mapDiff (GitService.getDiff state.RepoPath [| RepositoryPath.value path |])
         GetWordDiff = fun path _ -> mapDiff (GitService.getWordDiff state.RepoPath [| RepositoryPath.value path |])
+        GetBaseContent =
+            fun _ _ ->
+                async {
+                    return
+                        OperationResult.succeeded (
+                            UnsupportedContent(Some "Base content is not supported by this provider yet.")
+                        )
+                }
     }
 
 let private createBrowser (state: SessionState) : RepositoryBrowserService = {
@@ -1963,6 +1973,17 @@ let createFactoryWithCredentials
                                             "Retry downloading large objects once the object store is reachable."
                                 }
         }
+    Adopt =
+        fun _ _ ->
+            async {
+                return
+                    OperationResult.failed (
+                        OperationFailure.create
+                            Unsupported
+                            "operation_not_supported"
+                            "Adoption is not supported by this provider."
+                    )
+            }
     Bind =
         fun request context -> async {
             // Attach or re-target: set the origin remote of the existing workspace.
@@ -2051,6 +2072,17 @@ let createFactoryWithCredentials
                         }
                     |]
         }
+    InstallDependency =
+        fun _ _ ->
+            async {
+                return
+                    OperationResult.failed (
+                        OperationFailure.create
+                            Unsupported
+                            "operation_not_supported"
+                            "Dependency installation is not supported by this provider."
+                    )
+            }
     }
 
 /// Factory with the anonymous credential strategy.

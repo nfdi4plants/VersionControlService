@@ -16,6 +16,55 @@ let private fakeLocation: RepositoryLocation = {
     ConnectionProfileId = None
 }
 
+let private fakePath =
+    match RepositoryPath.tryCreate "portable.txt" with
+    | Ok path -> path
+    | Error message -> failwith message
+
+let private fakeProviderRef =
+    match ProviderRef.tryCreate "fake-portable-target" with
+    | Ok reference -> reference
+    | Error message -> failwith message
+
+let private fakeTargetRef: LogicalRef = {
+    Name = "portable-target"
+    ProviderRef = fakeProviderRef
+    Kind = RemoteRef
+    IsCurrent = false
+}
+
+let private fakeSynchronizationState: SynchronizationState = {
+    BaseRevision = None
+    WorkspaceRevision = None
+    TargetRevision = None
+    TargetRef = Some fakeTargetRef
+    LocalRevisionCount = None
+    TargetRevisionCount = None
+    RemoteChangedPaths = None
+    Relationship = UpToDate
+}
+
+let private fakeConflictItem: ConflictItem = {
+    Path = fakePath
+    Candidates = [||]
+    CombinedPreview = Some(TextPreview "<<<<<<< local\n=======\n>>>>>>> target\n")
+    SupportsResolvedContent = true
+}
+
+let private fakeObjectState: ObjectState = {
+    Path = fakePath
+    IsMaterialized = false
+    IsLocallyAvailable = true
+    SizeBytes = None
+    ObjectId = None
+}
+
+let private createFakeTextDiff () : TextDiffService = {
+    GetDiff = fun _ _ -> async { return OperationResult.succeeded (TextContent "diff") }
+    GetWordDiff = fun _ _ -> async { return OperationResult.succeeded (TextContent "word diff") }
+    GetBaseContent = fun _ _ -> async { return OperationResult.succeeded (TextContent "base content") }
+}
+
 /// Core whose diff summary is a 50-step long operation reporting progress each step
 /// and observing cancellation between steps.
 let private createFakeCore () : CoreVersionControl =
@@ -50,8 +99,8 @@ let private createFakeCore () : CoreVersionControl =
                     context.ReportProgress {
                         PhaseCode = "fake-step"
                         Item = None
-                        Completed = Some step
-                        Total = Some 50
+                        Completed = Some(float step)
+                        Total = Some 50.0
                         DisplayMessage = None
                     }
 
@@ -93,6 +142,14 @@ let private createFakeFactory () : ProviderFactory =
                 return OperationResult.succeeded (binding request.TargetPath location)
             }
         Clone = fun request _ -> async { return OperationResult.succeeded (binding request.TargetPath request.Location) }
+        Adopt =
+            fun _ _ ->
+                async {
+                    return
+                        OperationResult.failed (
+                            OperationFailure.create Unsupported "operation_not_supported" "Adoption is not supported by this provider."
+                        )
+                }
         Bind =
             fun request _ -> async { return OperationResult.succeeded (binding request.WorkspaceRoot request.Location) }
         Open =
@@ -103,9 +160,24 @@ let private createFakeFactory () : ProviderFactory =
                     Location = Some workspaceBinding.Location
                 }
 
-                return OperationResult.succeeded (WorkspaceSession.createCoreOnly descriptor (createFakeCore ()))
+                return
+                    OperationResult.succeeded {
+                        WorkspaceSession.createCoreOnly descriptor (createFakeCore ()) with
+                            TextDiff = Some(createFakeTextDiff ())
+                    }
             }
         CheckDependencies = fun _ -> async { return OperationResult.succeeded [||] }
+        InstallDependency =
+            fun _ _ ->
+                async {
+                    return
+                        OperationResult.failed (
+                            OperationFailure.create
+                                Unsupported
+                                "operation_not_supported"
+                                "Dependency installation is not supported by this provider."
+                        )
+                }
     }
 
 let private expectSucceeded (operationName: string) (result: OperationResult<'T>) : 'T =
@@ -154,7 +226,7 @@ Vitest.describe (
             fun () -> promise {
                 let factory = createFakeFactory ()
                 let source = OperationCancellation.Source()
-                let mutable lastCompleted = 0
+                let mutable lastCompleted = 0.0
 
                 // Deterministic cancellation: cancel from the progress callback at step 3.
                 let context =
@@ -163,7 +235,7 @@ Vitest.describe (
                         | Some completed ->
                             lastCompleted <- completed
 
-                            if completed = 3 then
+                            if completed = 3.0 then
                                 source.Cancel()
                         | None -> ())
 
@@ -206,6 +278,31 @@ Vitest.describe (
 
                 Vitest.expect(progressPhases.Count).toBe (50)
                 Vitest.expect(progressPhases |> Seq.forall (fun phase -> phase = "fake-step")).toBe (true)
+            }
+        )
+
+        Vitest.test (
+            "final SPI additions round-trip through the portable consumer",
+            fun () -> promise {
+                let factory = createFakeFactory ()
+                let context = OperationContext.detached "portable-final-spi"
+
+                let workflow = async {
+                    let! session = openFakeSession factory context
+
+                    match session.TextDiff with
+                    | Some textDiff ->
+                        let! baseResult = textDiff.GetBaseContent fakePath context
+                        return expectSucceeded "get base content" baseResult
+                    | None -> return failwith "Expected the fake text-diff service."
+                }
+
+                let! baseContent = Async.StartAsPromise workflow
+
+                Vitest.expect(baseContent).toEqual (TextContent "base content")
+                Vitest.expect(fakeConflictItem.CombinedPreview).toEqual (Some(TextPreview "<<<<<<< local\n=======\n>>>>>>> target\n"))
+                Vitest.expect(fakeSynchronizationState.TargetRef).toEqual (Some fakeTargetRef)
+                Vitest.expect(fakeObjectState.IsLocallyAvailable).toBe (true)
             }
         )
 )

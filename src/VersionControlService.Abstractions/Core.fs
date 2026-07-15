@@ -14,19 +14,6 @@ type FileChange = {
     Kind: FileChangeKind
 }
 
-type LogicalRefKind =
-    | LocalRef
-    | RemoteRef
-
-/// A logical branch/ref shown to consumers. ProviderRef is opaque and carried
-/// back to the provider unchanged.
-type LogicalRef = {
-    Name: string
-    ProviderRef: ProviderRef
-    Kind: LogicalRefKind
-    IsCurrent: bool
-}
-
 /// Truthful neutral status. WorkspaceVersion is the opaque optimistic-concurrency
 /// token: pure reads over an unchanged workspace return the same token.
 type WorkspaceStatus = {

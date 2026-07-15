@@ -60,6 +60,7 @@ let createObjectMaterialization (repoPath: string) : ObjectMaterializationServic
                             Some {
                                 Path = path
                                 IsMaterialized = file.downloaded
+                                IsLocallyAvailable = file.downloaded
                                 SizeBytes = Some file.size
                                 ObjectId = Some file.oid
                             }
@@ -74,14 +75,14 @@ let createObjectMaterialization (repoPath: string) : ObjectMaterializationServic
 
 let createStoragePolicy (repoPath: string) : StoragePolicyService = {
     SetPathPolicy =
-        fun pattern useLargeObjectStorage _ -> async {
+        fun path useLargeObjectStorage _ -> async {
             let command =
                 if useLargeObjectStorage then
                     GitLfsCommand.Track
                 else
                     GitLfsCommand.Untrack
 
-            let request = GitLfsService.createRequest repoPath command (Some pattern) None
+            let request = GitLfsService.createRequest repoPath command (Some(RepositoryPath.value path)) None
             let! result = Async.AwaitPromise(GitLfsService.runSilently request)
 
             match result with

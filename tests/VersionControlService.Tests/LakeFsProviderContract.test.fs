@@ -298,8 +298,8 @@ let createLakeFsHarness () : ProviderTestHarness =
                             operationContext.ReportProgress {
                                 PhaseCode = "transfer"
                                 Item = None
-                                Completed = Some step
-                                Total = Some 200
+                                Completed = Some(float step)
+                                Total = Some 200.0
                                 DisplayMessage = Some "Transferring lakeFS objects"
                             }
                 | false, _ -> ()

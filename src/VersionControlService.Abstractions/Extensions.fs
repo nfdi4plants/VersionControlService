@@ -9,12 +9,16 @@ type ContentView =
 type TextDiffService = {
     GetDiff: RepositoryPath -> OperationContext -> Async<OperationResult<ContentView>>
     GetWordDiff: RepositoryPath -> OperationContext -> Async<OperationResult<ContentView>>
+    /// Committed/base content of a path; providers own base revision lookup.
+    GetBaseContent: RepositoryPath -> OperationContext -> Async<OperationResult<ContentView>>
 }
 
 /// Materialization state of one lazily-hydrated object.
 type ObjectState = {
     Path: RepositoryPath
     IsMaterialized: bool
+    /// Whether the object bytes are available in provider-local storage.
+    IsLocallyAvailable: bool
     SizeBytes: float option
     ObjectId: string option
 }
@@ -33,11 +37,9 @@ type StoragePolicySettings = {
     MaterializeLargeObjects: bool
 }
 
-/// Optional large-object storage-policy extension. Patterns are provider policy
-/// patterns (e.g. Git attributes), not literal repository paths; any visible file
-/// the policy changes is reported in AffectedPaths.
+/// Optional large-object storage-policy extension over literal repository paths.
 type StoragePolicyService = {
-    SetPathPolicy: string -> bool -> OperationContext -> Async<OperationResult<unit>>
+    SetPathPolicy: RepositoryPath -> bool -> OperationContext -> Async<OperationResult<unit>>
     GetSettings: OperationContext -> Async<OperationResult<StoragePolicySettings>>
     SetSettings: StoragePolicySettings -> OperationContext -> Async<OperationResult<unit>>
 }
