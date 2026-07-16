@@ -102,7 +102,7 @@ let private canRunGitLfsVersionWithPath (baseEnvironment: obj) (pathValue: strin
     with _ ->
         false
 
-let mutable private cachedGitToolPath: string option = None
+let mutable private cachedGitToolPath: (string * string) option = None
 
 /// Applies a resolved PATH to an environment object only when the inherited environment cannot
 /// run `git lfs --version` on macOS/Linux.
@@ -111,12 +111,18 @@ let ensureGitToolPath (environment: obj) =
 
     let resolvedPath =
         match cachedGitToolPath with
-        | Some path -> path
+        | Some(cachedInput, path) when String.Equals(cachedInput, currentPath, StringComparison.Ordinal) -> path
         | None ->
             let path =
                 resolveGitToolPath (canRunGitLfsVersionWithPath environment) (getProcessPlatform ()) currentPath
 
-            cachedGitToolPath <- Some path
+            cachedGitToolPath <- Some(currentPath, path)
+            path
+        | Some _ ->
+            let path =
+                resolveGitToolPath (canRunGitLfsVersionWithPath environment) (getProcessPlatform ()) currentPath
+
+            cachedGitToolPath <- Some(currentPath, path)
             path
 
     if String.Equals(currentPath, resolvedPath, StringComparison.Ordinal) then

@@ -51,11 +51,17 @@ let existsSync (path: string) : bool = jsNative
 [<Import("statSync", "fs")>]
 let statSync (path: string) : Stats = jsNative
 
+[<Import("lstatSync", "fs")>]
+let lstatSync (path: string) : Stats = jsNative
+
 [<Import("readFileSync", "fs")>]
 let readFileSync (path: string) (encoding: TextEncoding) : string = jsNative
 
 [<Import("writeFileSync", "fs")>]
 let writeFileSync (path: string) (content: string) (encoding: TextEncoding) : unit = jsNative
+
+[<Import("copyFileSync", "fs")>]
+let copyFileSync (sourcePath: string) (destinationPath: string) : unit = jsNative
 
 [<Import("renameSync", "fs")>]
 let renameSync (oldPath: string) (newPath: string) : unit = jsNative
@@ -95,6 +101,37 @@ let private fileSystemPromisesDynamic: obj = importAll "node:fs/promises"
 
 [<Emit("$0 == null")>]
 let private isNullish (_value: obj) : bool = jsNative
+
+/// Reads UTF-8 through a descriptor opened with O_NOFOLLOW where supported and
+/// returns the identity of the opened object for a caller-side lstat comparison.
+let readUtf8FileNoFollowSync (path: string) : string * Stats =
+    let noFollow: obj = fileSystemDynamic?constants?O_NOFOLLOW
+    let readOnly: int = unbox fileSystemDynamic?constants?O_RDONLY
+    let flags = if isNullish noFollow then readOnly else readOnly ||| unbox<int> noFollow
+    let descriptor: int = fileSystemDynamic?openSync (path, flags) |> unbox
+
+    try
+        let stats: Stats = fileSystemDynamic?fstatSync (descriptor) |> unbox
+        let content: string = fileSystemDynamic?readFileSync (descriptor, "utf8") |> unbox
+        content, stats
+    finally
+        fileSystemDynamic?closeSync (descriptor) |> ignore
+
+/// Creates a new UTF-8 file exclusively, flushes its bytes, and closes it.
+/// O_EXCL prevents an existing link from being followed at the temporary path.
+let writeUtf8FileExclusiveAndFlushSync (path: string) (content: string) : unit =
+    let flags: int =
+        (unbox<int> fileSystemDynamic?constants?O_WRONLY)
+        ||| (unbox<int> fileSystemDynamic?constants?O_CREAT)
+        ||| (unbox<int> fileSystemDynamic?constants?O_EXCL)
+
+    let descriptor: int = fileSystemDynamic?openSync (path, flags, 384) |> unbox
+
+    try
+        fileSystemDynamic?writeFileSync (descriptor, content, "utf8") |> ignore
+        fileSystemDynamic?fsyncSync (descriptor) |> ignore
+    finally
+        fileSystemDynamic?closeSync (descriptor) |> ignore
 
 /// Opens a read handle without following a leaf symlink on platforms where
 /// Node exposes O_NOFOLLOW. Windows does not expose that flag, so callers must

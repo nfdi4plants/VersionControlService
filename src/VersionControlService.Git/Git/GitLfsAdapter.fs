@@ -10,6 +10,40 @@ open VersionControlService.Git.GitAuthAdapter
 [<Literal>]
 let private repoValidationTimeoutMs = 5000
 
+[<Literal>]
+let private terminationGraceMs = 250
+
+[<Literal>]
+let private terminationSettlementMs = 1000
+
+let private isWindows () = processPlatform () = "win32"
+
+let private signalProcessTree (proc: obj) (signal: string) =
+    let pid: int = proc?pid |> unbox
+
+    if isWindows () then
+        childProcessDynamic?spawn (
+            "taskkill",
+            [| "/pid"; string pid; "/T"; "/F" |],
+            createObj [ "windowsHide" ==> true; "stdio" ==> "ignore" ]
+        )
+        |> ignore
+    else
+        try
+            let signalName = signal.Replace("SIG", "")
+
+            childProcessDynamic?execFileSync (
+                "kill",
+                [| $"-{signalName}"; $"-{pid}" |],
+                createObj [ "stdio" ==> "ignore" ]
+            )
+            |> ignore
+        with _ ->
+            try
+                proc?kill (signal) |> ignore
+            with _ ->
+                ()
+
 /// Low-level spawned `git` request used when simple-git cannot stream or feed stdin in the shape needed by LFS planning.
 type GitSpawnRequest = {
     WorkingDirectory: string option
@@ -37,6 +71,7 @@ let private resolveGitEnvironment (environment: obj option) =
 let private runGitProcess
     (captureStdout: bool)
     (onStarted: unit -> unit)
+    (onOutput: string -> unit)
     (request: GitSpawnRequest)
     : Promise<GitSpawnResult> =
     promise {
@@ -47,6 +82,7 @@ let private runGitProcess
                     "shell" ==> false
                     "windowsHide" ==> true
                     "env" ==> resolveGitEnvironment request.Environment
+                    "detached" ==> not (isWindows ())
 
                     match request.WorkingDirectory with
                     | Some value -> "cwd" ==> value
@@ -60,33 +96,30 @@ let private runGitProcess
             let mutable timedOut = false
             let mutable cancelRequested = false
             let mutable timeoutId: int option = None
+            let mutable cancelInterval: int option = None
+            let mutable escalationId: int option = None
+            let mutable settlementId: int option = None
+
+            let clearTimer (timer: int option) = timer |> Option.iter Fable.Core.JS.clearTimeout
+
+            let clearTimers () =
+                clearTimer timeoutId
+                cancelInterval |> Option.iter Fable.Core.JS.clearInterval
+                clearTimer escalationId
+                clearTimer settlementId
+                timeoutId <- None
+                cancelInterval <- None
+                escalationId <- None
+                settlementId <- None
 
             let clearIdleTimer () =
-                timeoutId |> Option.iter Fable.Core.JS.clearTimeout
+                clearTimer timeoutId
                 timeoutId <- None
-
-            let resetIdleTimer () =
-                clearIdleTimer ()
-
-                match request.TimeoutMs with
-                | Some timeoutMs when timeoutMs > 0 ->
-                    timeoutId <-
-                        Some(
-                            Fable.Core.JS.setTimeout
-                                (fun () ->
-                                    if not finished then
-                                        timedOut <- true
-                                        stderrChunks.Add $"Git command timed out after no output for {timeoutMs} ms."
-                                        proc?kill ("SIGTERM") |> ignore
-                                )
-                                timeoutMs
-                        )
-                | _ -> ()
 
             let finish exitCode =
                 if not finished then
                     finished <- true
-                    clearIdleTimer ()
+                    clearTimers ()
                     let effectiveExitCode = if cancelRequested && exitCode = 0 then -1 else exitCode
 
                     let stdoutBuffer =
@@ -103,10 +136,43 @@ let private runGitProcess
                         TimedOut = timedOut
                     }
 
+            let resetIdleTimer () =
+                clearIdleTimer ()
+
+                match request.TimeoutMs with
+                | Some timeoutMs when timeoutMs > 0 ->
+                    timeoutId <-
+                        Some(
+                            Fable.Core.JS.setTimeout
+                                (fun () ->
+                                    if not finished then
+                                        timedOut <- true
+                                        stderrChunks.Add $"Git command timed out after no output for {timeoutMs} ms."
+                                        signalProcessTree proc "SIGTERM"
+
+                                        if not (isWindows ()) then
+                                            escalationId <-
+                                                Some(
+                                                    Fable.Core.JS.setTimeout
+                                                        (fun () ->
+                                                            if not finished then
+                                                                signalProcessTree proc "SIGKILL")
+                                                        terminationGraceMs
+                                                )
+
+                                        settlementId <-
+                                            Some(Fable.Core.JS.setTimeout (fun () -> finish -1) terminationSettlementMs)
+                                )
+                                timeoutMs
+                        )
+                | _ -> ()
+
             proc?stdout?on (
                 "data",
                 fun d ->
                     resetIdleTimer ()
+                    let text = d?toString ("utf8") |> unbox<string>
+                    onOutput text
 
                     if captureStdout then
                         stdoutChunks.Add d
@@ -117,7 +183,9 @@ let private runGitProcess
                 "data",
                 fun d ->
                     resetIdleTimer ()
-                    stderrChunks.Add(d?toString ("utf8") |> unbox<string>)
+                    let text = d?toString ("utf8") |> unbox<string>
+                    stderrChunks.Add text
+                    onOutput text
             )
             |> ignore
 
@@ -127,9 +195,22 @@ let private runGitProcess
                 if not finished && not cancelRequested then
                     cancelRequested <- true
                     stderrChunks.Add "Git command cancelled."
-                    proc?kill ("SIGTERM") |> ignore
+                    signalProcessTree proc "SIGTERM"
 
-            let cancelInterval =
+                    if not (isWindows ()) then
+                        escalationId <-
+                            Some(
+                                Fable.Core.JS.setTimeout
+                                    (fun () ->
+                                        if not finished then
+                                            signalProcessTree proc "SIGKILL")
+                                    terminationGraceMs
+                            )
+
+                    settlementId <-
+                        Some(Fable.Core.JS.setTimeout (fun () -> finish -1) terminationSettlementMs)
+
+            cancelInterval <-
                 request.CancelCheck
                 |> Option.map (fun cancelCheck ->
                     Fable.Core.JS.setInterval
@@ -143,7 +224,6 @@ let private runGitProcess
             proc?on (
                 "close",
                 fun code ->
-                    cancelInterval |> Option.iter Fable.Core.JS.clearInterval
                     finish (if isNull code then -1 else int (unbox<float> code))
             )
             |> ignore
@@ -151,8 +231,6 @@ let private runGitProcess
             proc?on (
                 "error",
                 fun error ->
-                    cancelInterval |> Option.iter Fable.Core.JS.clearInterval
-
                     stderrChunks.Add(
                         error
                         |> Option.ofObj
@@ -181,18 +259,27 @@ let private runGitProcess
 }
 
 /// Runs `git` without a shell and captures stdout/stderr for callers that need exact output or stdin support.
-let runGitCaptured (request: GitSpawnRequest) : Promise<GitSpawnResult> = runGitProcess true ignore request
+let runGitCaptured (request: GitSpawnRequest) : Promise<GitSpawnResult> = runGitProcess true ignore ignore request
 
 /// Runs `git` with a notification after the child process and its cancellation handlers are active.
 let runGitCapturedWithStarted
     (onStarted: unit -> unit)
     (request: GitSpawnRequest)
     : Promise<GitSpawnResult> =
-    runGitProcess true onStarted request
+    runGitProcess true onStarted ignore request
+
+/// Assembly-internal streaming variant used by maintenance operations so
+/// provider progress originates from the real child process.
+let internal runGitCapturedWithStartedAndOutput
+    (onStarted: unit -> unit)
+    (onOutput: string -> unit)
+    (request: GitSpawnRequest)
+    : Promise<GitSpawnResult> =
+    runGitProcess true onStarted onOutput request
 
 /// Runs `git` while draining and discarding stdout.
 /// This is used for commands such as `git lfs smudge`, whose stdout may contain a large file.
-let runGitDiscardingStdout (request: GitSpawnRequest) : Promise<GitSpawnResult> = runGitProcess false ignore request
+let runGitDiscardingStdout (request: GitSpawnRequest) : Promise<GitSpawnResult> = runGitProcess false ignore ignore request
 
 /// Runs a small git command and returns stdout text, or None on command failure.
 /// Used for feature probes where failure should not surface as a user-facing Git error.
@@ -297,122 +384,24 @@ type NodeGitLfsAdapter() =
 
                 try
                     let! result =
-                        Fable.Core.JS.Constructors.Promise.Create(fun resolve _ ->
-                            let spawnOptions =
-                                createObj [
-                                    "shell" ==> false
-                                    "env" ==> createNonInteractiveEnv ()
+                        runGitProcess
+                            true
+                            ignore
+                            onProgress
+                            {
+                                WorkingDirectory = workingDirectory
+                                Arguments = args |> List.toArray
+                                Environment = None
+                                StandardInput = None
+                                CancelCheck = Some cancelCheck
+                                TimeoutMs = timeoutMs
+                            }
 
-                                    match workingDirectory with
-                                    | Some value -> "cwd" ==> value
-                                    | None -> ()
-                                ]
-
-                            let proc: obj =
-                                childProcessDynamic?spawn ("git", (args |> List.toArray), spawnOptions)
-
-                            let mutable output = ""
-                            let mutable errorOut = ""
-                            let mutable finished = false
-                            let mutable timedOut = false
-                            let mutable cancelRequested = false
-                            let mutable timeoutId: int option = None
-
-                            let clearIdleTimer () =
-                                timeoutId |> Option.iter Fable.Core.JS.clearTimeout
-                                timeoutId <- None
-
-                            let resetIdleTimer () =
-                                clearIdleTimer ()
-
-                                match timeoutMs with
-                                | Some ms when ms > 0 ->
-                                    timeoutId <-
-                                        Some(
-                                            Fable.Core.JS.setTimeout
-                                                (fun () ->
-                                                    if not finished then
-                                                        timedOut <- true
-
-                                                        errorOut <-
-                                                            errorOut
-                                                            + $"Git LFS command timed out after no output for {ms} ms."
-
-                                                        proc?kill ("SIGTERM") |> ignore
-                                                )
-                                                ms
-                                        )
-                                | _ -> ()
-
-                            proc?stdout?on (
-                                "data",
-                                fun d ->
-                                    resetIdleTimer ()
-                                    let msg = string d
-                                    output <- output + msg
-                                    onProgress msg
-                            )
-                            |> ignore
-
-                            proc?stderr?on (
-                                "data",
-                                fun d ->
-                                    resetIdleTimer ()
-                                    let msg = string d
-                                    errorOut <- errorOut + msg
-                                    onProgress msg
-                            )
-                            |> ignore
-
-                            resetIdleTimer ()
-
-                            let cancelInterval =
-                                Fable.Core.JS.setInterval
-                                    (fun () ->
-                                        if not finished && not cancelRequested && cancelCheck () then
-                                            cancelRequested <- true
-                                            errorOut <- errorOut + "Git LFS command cancelled."
-                                            proc?kill ("SIGTERM") |> ignore
-                                    )
-                                    300
-
-                            proc?on (
-                                "close",
-                                fun code ->
-                                    finished <- true
-                                    clearIdleTimer ()
-                                    Fable.Core.JS.clearInterval cancelInterval
-
-                                    let success =
-                                        (not timedOut)
-                                        && (not cancelRequested)
-                                        && if isNull code then false else (unbox<float> code) = 0.
-
-                                    resolve {
-                                        Success = success
-                                        Output = output
-                                        Error = errorOut
-                                    }
-                            )
-                            |> ignore
-
-                            proc?on (
-                                "error",
-                                fun err ->
-                                    finished <- true
-                                    clearIdleTimer ()
-                                    Fable.Core.JS.clearInterval cancelInterval
-
-                                    resolve {
-                                        Success = false
-                                        Output = ""
-                                        Error = string err
-                                    }
-                            )
-                            |> ignore
-                        )
-
-                    return result
+                    return {
+                        Success = result.ExitCode = 0 && not result.TimedOut
+                        Output = result.StdoutText
+                        Error = result.StderrText
+                    }
                 finally
                     activeLockKeys.Remove lockKey |> ignore
         }

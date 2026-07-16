@@ -4,6 +4,7 @@ open System
 open System.Collections.Generic
 open System.Text.RegularExpressions
 open Fable.Core
+open VersionControlService.Abstractions
 open VersionControlService.Support
 open VersionControlService.Contracts.FileSystem
 open VersionControlService.Contracts.Git
@@ -206,41 +207,109 @@ let private literalAttributePattern (relativePath: string) =
 
     quoted.Append('"').ToString()
 
-let private literalTrackingRule relativePath =
+let literalTrackingRule relativePath =
     $"{literalAttributePattern relativePath} filter=lfs diff=lfs merge=lfs -text"
 
 let private removeExactAttributeRule (rule: string) (content: string) =
     let rulePattern = $"^{Regex.Escape(rule)}(?:\\r?\\n|$)"
     Regex(rulePattern, RegexOptions.Multiline).Replace(content, String.Empty)
 
+let private sameFileIdentity (left: NodeFileSystem.Stats) (right: NodeFileSystem.Stats) =
+    left.dev = right.dev && left.ino = right.ino
+
+let private ensurePathHasNoLinks (path: string) =
+    let rec check current =
+        let parent = NodePath.dirname current
+
+        if parent <> current then
+            check parent
+
+        if NodeFileSystem.existsSync current && (NodeFileSystem.lstatSync current).isSymbolicLink () then
+            invalidOp $"Refusing to update Git attributes through the symbolic-link path '{current}'."
+
+    check (NodePath.resolve [| path |])
+
+let readAttributesNoFollow (attributesPath: string) =
+    if NodeFileSystem.existsSync attributesPath then
+        ensurePathHasNoLinks attributesPath
+        let pathStats = NodeFileSystem.lstatSync attributesPath
+        let content, openedStats = NodeFileSystem.readUtf8FileNoFollowSync attributesPath
+        let afterStats = NodeFileSystem.lstatSync attributesPath
+
+        if not (sameFileIdentity pathStats openedStats && sameFileIdentity pathStats afterStats) then
+            invalidOp "The Git attributes file changed while its policy was being read."
+
+        content, Some pathStats
+    else
+        ensurePathHasNoLinks (NodePath.dirname attributesPath)
+        "", None
+
+let replaceAttributesAtomically
+    (attributesPath: string)
+    (originalIdentity: NodeFileSystem.Stats option)
+    (content: string)
+    =
+    let tempPath = attributesPath + $".vcs-{Guid.NewGuid():N}.tmp"
+
+    try
+        NodeFileSystem.writeUtf8FileExclusiveAndFlushSync tempPath content
+        ensurePathHasNoLinks (NodePath.dirname attributesPath)
+
+        match originalIdentity with
+        | Some expected ->
+            if not (NodeFileSystem.existsSync attributesPath) then
+                invalidOp "The Git attributes file disappeared before its policy could be replaced."
+
+            ensurePathHasNoLinks attributesPath
+
+            if not (sameFileIdentity expected (NodeFileSystem.lstatSync attributesPath)) then
+                invalidOp "The Git attributes file changed before its policy could be replaced."
+        | None when NodeFileSystem.existsSync attributesPath ->
+            invalidOp "The Git attributes file appeared before its policy could be created."
+        | None -> ()
+
+        NodeFileSystem.renameSync tempPath attributesPath
+    finally
+        if NodeFileSystem.existsSync tempPath then
+            NodeFileSystem.unlinkSync tempPath
+
+let addLiteralTrackingRules (content: string) (relativePaths: string[]) =
+    let lineEnding = if content.Contains("\r\n") then "\r\n" else "\n"
+    let mutable updated = content
+    let mutable added = false
+
+    for relativePath in relativePaths |> Array.distinct do
+        let rule = literalTrackingRule relativePath
+        let rulePattern = $"^{Regex.Escape(rule)}(?:\r?$)"
+
+        if not (Regex.IsMatch(updated, rulePattern, RegexOptions.Multiline)) then
+            updated <-
+                if String.IsNullOrEmpty updated then
+                    rule + lineEnding
+                elif updated.EndsWith("\n") then
+                    updated + rule + lineEnding
+                else
+                    updated + lineEnding + rule + lineEnding
+
+            added <- true
+
+    updated, added
+
 let private rewriteLiteralTrackingRule repoPath relativePath enabled =
     try
         let attributesPath = NodePath.resolve [| repoPath; ".gitattributes" |]
-        let content =
-            if NodeFileSystem.existsSync attributesPath then
-                NodeFileSystem.readFileSync attributesPath NodeFileSystem.TextEncoding.Utf8
-            else
-                ""
+        let content, originalIdentity = readAttributesNoFollow attributesPath
         let canonicalRule = literalTrackingRule relativePath
-
-        let withoutLiteralRule =
-            content
-            |> removeExactAttributeRule canonicalRule
 
         let updated =
             if enabled then
-                let lineEnding = if content.Contains("\r\n") then "\r\n" else "\n"
-
-                if String.IsNullOrEmpty withoutLiteralRule then
-                    canonicalRule + lineEnding
-                elif withoutLiteralRule.EndsWith("\n") then
-                    withoutLiteralRule + canonicalRule + lineEnding
-                else
-                    withoutLiteralRule + lineEnding + canonicalRule + lineEnding
+                addLiteralTrackingRules content [| relativePath |] |> fst
             else
-                withoutLiteralRule
+                removeExactAttributeRule canonicalRule content
 
-        NodeFileSystem.writeFileSync attributesPath updated NodeFileSystem.TextEncoding.Utf8
+        if updated <> content then
+            replaceAttributesAtomically attributesPath originalIdentity updated
+
         Ok()
     with error ->
         Error $"Could not update the literal Git LFS path policy: {error.Message}"
@@ -267,9 +336,7 @@ let track (repoPath: string) (relativePath: string) : JS.Promise<Result<unit, st
 /// Removes the exact literal-filename rule emitted by `track`.
 /// git-lfs has no corresponding literal-filename switch for `untrack`.
 let untrackLiteral (repoPath: string) (relativePath: string) : JS.Promise<Result<unit, string>> = promise {
-    // Track first to verify the dependency and canonicalize any pre-existing
-    // unanchored rule before removing only this exact path policy.
-    match! trackLiteral repoPath relativePath with
+    match! requireGitLfsForLiteralPolicy repoPath with
     | Error error -> return Error error
     | Ok() -> return rewriteLiteralTrackingRule repoPath relativePath false
 }
@@ -828,19 +895,76 @@ let runAuthenticatedTransferWith
                 Error(exn (extractSpawnFailureMessage result))
     }
 
-/// Runs a maintenance command with authentication and captures its diagnostic output.
+let private maintenanceProgressPattern =
+    Regex(@"(?<progress>\d+(?:\.\d+)?)%\s+\((?<processed>\d+(?:\.\d+)?)/(?<total>\d+(?:\.\d+)?)(?:\s+bytes)?\)")
+
+let private tryParseInvariantFloat (value: string) =
+    match Double.TryParse value with
+    | true, parsed -> Some parsed
+    | false, _ -> None
+
+let private createMaintenanceOutputObserver (progressCallback: (GitProgressDto -> unit) option) =
+    let pending = System.Text.StringBuilder()
+
+    let reportLine (line: string) =
+        progressCallback
+        |> Option.iter (fun report ->
+            if not (String.IsNullOrWhiteSpace line) then
+                let matched = maintenanceProgressPattern.Match line
+
+                let progress, processed, total =
+                    if matched.Success then
+                        tryParseInvariantFloat matched.Groups["progress"].Value,
+                        tryParseInvariantFloat matched.Groups["processed"].Value,
+                        tryParseInvariantFloat matched.Groups["total"].Value
+                    else
+                        None, None, None
+
+                report {
+                    Method = Some "lfs"
+                    Stage = Some "maintenance"
+                    Progress = progress
+                    Processed = processed
+                    Total = total
+                    Output = Some(Redaction.redact line)
+                })
+
+    let observe (chunk: string) =
+        pending.Append chunk |> ignore
+        let mutable text = pending.ToString()
+        let mutable newline = text.IndexOf '\n'
+
+        while newline >= 0 do
+            reportLine (text.Substring(0, newline).TrimEnd '\r')
+            text <- text.Substring(newline + 1)
+            newline <- text.IndexOf '\n'
+
+        pending.Clear() |> ignore
+        pending.Append text |> ignore
+
+    let flush () =
+        if pending.Length > 0 then
+            reportLine (pending.ToString().TrimEnd '\r')
+            pending.Clear() |> ignore
+
+    observe, flush
+
+/// Runs a maintenance command with authentication and streams its real process progress.
 /// `onStarted` fires only after the child process can observe cancellation.
-let runAuthenticatedMaintenance
+let internal runAuthenticatedMaintenance
     (commandAuth: GitCommandAuthentication)
     (repoPath: string)
     (arguments: string[])
+    (progressCallback: (GitProgressDto -> unit) option)
     (cancelCheck: unit -> bool)
     (onStarted: unit -> unit)
     : JS.Promise<Result<string, exn>> =
     promise {
+        let observeOutput, flushOutput = createMaintenanceOutputObserver progressCallback
         let! result =
-            runGitCapturedWithStarted
+            runGitCapturedWithStartedAndOutput
                 onStarted
+                observeOutput
                 {
                     WorkingDirectory = Some repoPath
                     Arguments = [|
@@ -852,6 +976,8 @@ let runAuthenticatedMaintenance
                     CancelCheck = Some cancelCheck
                     TimeoutMs = None
                 }
+
+        flushOutput ()
 
         return
             if result.ExitCode = 0 && not result.TimedOut then

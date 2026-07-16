@@ -647,30 +647,57 @@ let private withValidatedMutation
             state.Lock.Release()
     }
 
+type private ConfiguredUpstream = {
+    RevisionRef: string
+    LogicalRef: LogicalRef
+}
+
 let private tryConfiguredUpstream (state: SessionState) (context: OperationContext) =
     async {
         let! result =
             runGit
                 state.Hooks
                 state.RepoPath
-                [| "rev-parse"; "--abbrev-ref"; "--symbolic-full-name"; "@{upstream}" |]
+                [| "rev-parse"; "--symbolic-full-name"; "@{upstream}" |]
                 None
                 context
 
         match result with
         | Error failure -> return Error failure
         | Ok output when output.ExitCode = 0 ->
-            let upstream = output.StdOut.Trim()
-            return Ok(if upstream = "" then None else Some upstream)
+            let revisionRef = output.StdOut.Trim()
+
+            let configured =
+                if revisionRef.StartsWith("refs/remotes/", StringComparison.Ordinal) then
+                    let name = revisionRef.Substring("refs/remotes/".Length)
+
+                    Some {
+                        RevisionRef = revisionRef
+                        LogicalRef = {
+                            Name = name
+                            ProviderRef = mkProviderRef $"git-remote:{name}"
+                            Kind = RemoteRef
+                            IsCurrent = false
+                        }
+                    }
+                elif revisionRef.StartsWith("refs/heads/", StringComparison.Ordinal) then
+                    let name = revisionRef.Substring("refs/heads/".Length)
+
+                    Some {
+                        RevisionRef = revisionRef
+                        LogicalRef = {
+                            Name = name
+                            ProviderRef = mkProviderRef $"git-local:{name}"
+                            Kind = LocalRef
+                            IsCurrent = false
+                        }
+                    }
+                else
+                    None
+
+            return Ok configured
         | Ok _ -> return Ok None
     }
-
-let private logicalTargetRef (upstream: string) : LogicalRef = {
-    Name = upstream
-    ProviderRef = mkProviderRef $"git-remote:{upstream}"
-    Kind = RemoteRef
-    IsCurrent = false
-}
 
 let private previewIndeterminate (classification: string) (detail: string) =
     {
@@ -683,7 +710,7 @@ let private previewIndeterminate (classification: string) (detail: string) =
 
 let private configuredUpstreamRemote
     (state: SessionState)
-    (upstream: string)
+    (upstreamName: string)
     (context: OperationContext)
     =
     async {
@@ -694,7 +721,7 @@ let private configuredUpstreamRemote
         | Ok output ->
             let remote =
                 output.StdOut.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
-                |> Array.filter (fun candidate -> upstream.StartsWith(candidate + "/", StringComparison.Ordinal))
+                |> Array.filter (fun candidate -> upstreamName.StartsWith(candidate + "/", StringComparison.Ordinal))
                 |> Array.sortByDescending _.Length
                 |> Array.tryHead
 
@@ -735,7 +762,7 @@ let private toWorkspaceStatus (state: SessionState) (status: GitStatusDto) (cont
         let! targetRevisionOutput =
             match upstream with
             | Some target ->
-                runGit state.Hooks state.RepoPath [| "rev-parse"; $"refs/remotes/{target}" |] None context
+                runGit state.Hooks state.RepoPath [| "rev-parse"; target.RevisionRef |] None context
             | None -> async { return Ok { ExitCode = 1; StdOut = ""; StdErr = "" } }
 
         let targetRevision =
@@ -775,7 +802,7 @@ let private toWorkspaceStatus (state: SessionState) (status: GitStatusDto) (cont
                             BaseRevision = None
                             WorkspaceRevision = workspaceRevision
                             TargetRevision = targetRevision
-                            TargetRef = upstream |> Option.map logicalTargetRef
+                            TargetRef = upstream |> Option.map _.LogicalRef
                             LocalRevisionCount = upstream |> Option.map (fun _ -> status.Ahead)
                             TargetRevisionCount = upstream |> Option.map (fun _ -> status.Behind)
                             RemoteChangedPaths = None
@@ -1598,7 +1625,7 @@ let private synchronizationState (state: SessionState) (context: OperationContex
             let! workspaceRevision = revParse state "HEAD" context
             let! targetRevision =
                 match upstream with
-                | Some target -> revParse state $"refs/remotes/{target}" context
+                | Some target -> revParse state target.RevisionRef context
                 | None -> async { return None }
 
             let! baseRevision =
@@ -1683,7 +1710,7 @@ let private synchronizationState (state: SessionState) (context: OperationContex
                         BaseRevision = baseRevision |> Option.map mkRevisionId
                         WorkspaceRevision = workspaceRevision |> Option.map mkRevisionId
                         TargetRevision = targetRevision |> Option.map mkRevisionId
-                        TargetRef = upstream |> Option.map logicalTargetRef
+                        TargetRef = upstream |> Option.map _.LogicalRef
                         LocalRevisionCount = None
                         TargetRevisionCount = None
                         RemoteChangedPaths = remoteChanged
@@ -1697,8 +1724,18 @@ let private refresh (state: SessionState) (context: OperationContext) =
 
         match upstreamResult with
         | Error failure -> return Failed failure
+        | Ok(Some upstream) when upstream.LogicalRef.Kind = LocalRef ->
+            let! stateResult = synchronizationState state context
+
+            match stateResult with
+            | Error failure -> return Failed failure
+            | Ok syncState ->
+                return
+                    OperationResult.noOp
+                        (Some "The configured target is a local ref and does not require fetching.")
+                        syncState
         | Ok(Some upstream) ->
-            let! remoteResult = configuredUpstreamRemote state upstream context
+            let! remoteResult = configuredUpstreamRemote state upstream.LogicalRef.Name context
 
             match remoteResult with
             | Error failure -> return Failed failure

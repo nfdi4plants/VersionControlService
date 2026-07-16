@@ -289,8 +289,93 @@ let private utf8ByteLength (text: string) : int = jsNative
 [<Emit("Date.now()")>]
 let private nowMilliseconds () : float = jsNative
 
+[<Emit("process.execPath")>]
+let private nodeExecutablePath: string = jsNative
+
+[<Emit("process.platform === 'win32'")>]
+let private isWindowsProcess () : bool = jsNative
+
+[<Emit("({ ...process.env, PATH: $0 + require('node:path').delimiter + (process.env.PATH || '') })")>]
+let private environmentWithPathPrefix (_directory: string) : obj = jsNative
+
+[<Emit("(() => { try { process.kill($0, 0); return true; } catch (_) { return false; } })()")>]
+let private processIsAlive (_pid: int) : bool = jsNative
+
+[<Emit("(() => { try { process.kill($0, 'SIGKILL'); } catch (_) {} })()")>]
+let private forceKillProcess (_pid: int) : unit = jsNative
+
+[<Emit("require('node:fs').existsSync($0)")>]
+let private fileExistsSync (_path: string) : bool = jsNative
+
 [<Emit("console.log($0)")>]
 let private consoleLog (_message: string) : unit = jsNative
+
+Vitest.describe (
+    "Git LFS spawned process safety",
+    fun () ->
+        Vitest.test (
+            "cancellation kills descendants and settles within a bounded deadline",
+            TestOptions(timeout = 10000),
+            fun () -> promise {
+                let! root = createTempDirectoryAsync ()
+                let fakeGitPath = join [| root; if isWindowsProcess () then "git.exe" else "git" |]
+                let descendantPidPath = join [| root; "descendant.pid" |]
+                let mutable spawnedDescendant = None
+
+                try
+                    if isWindowsProcess () then
+                        let! _ = fsPromisesDynamic?copyFile (nodeExecutablePath, fakeGitPath) |> unbox<JS.Promise<obj>>
+                        ()
+                    else
+                        let wrapper =
+                            $"#!/bin/sh\nif [ \"$1\" = \"lfs\" ] && [ \"$2\" = \"--version\" ]; then echo git-lfs-test; exit 0; fi\nexec '{nodeExecutablePath}' \"$@\"\n"
+
+                        do! writeUtf8FileAsync fakeGitPath wrapper
+                        let! _ = fsPromisesDynamic?chmod (fakeGitPath, 493) |> unbox<JS.Promise<obj>>
+                        ()
+
+                    let descendantScript =
+                        "process.on('SIGTERM',()=>{});setTimeout(()=>process.exit(0),5000)"
+
+                    let parentScript =
+                        "const {spawn}=require('node:child_process');" +
+                        $"const child=spawn(process.execPath,['-e',{JS.JSON.stringify descendantScript}],{{stdio:'ignore',detached:process.platform==='win32'}});" +
+                        "child.unref();" +
+                        $"require('node:fs').writeFileSync({JS.JSON.stringify descendantPidPath},String(child.pid));" +
+                        "process.on('SIGTERM',()=>{});setTimeout(()=>process.exit(0),2000)"
+
+                    let started = nowMilliseconds ()
+                    let! result =
+                        GitLfsAdapter.runGitCaptured {
+                            WorkingDirectory = Some root
+                            Arguments = [| "-e"; parentScript |]
+                            Environment = Some(environmentWithPathPrefix root)
+                            StandardInput = None
+                            CancelCheck = Some(fun () -> fileExistsSync descendantPidPath)
+                            TimeoutMs = None
+                        }
+
+                    let elapsed = nowMilliseconds () - started
+                    let! descendantPidText = readUtf8FileAsync descendantPidPath
+                    let descendantPid = descendantPidText.Trim() |> int
+
+                    spawnedDescendant <- Some descendantPid
+
+                    Vitest.expect(result.ExitCode).not.toBe 0
+                    Vitest.expect(elapsed < 1500.0).toBe true
+                    Vitest.expect(processIsAlive descendantPid).toBe false
+                    do! removeDirectoryAsync root
+                with error ->
+                    spawnedDescendant
+                    |> Option.iter (fun pid ->
+                        if processIsAlive pid then
+                            forceKillProcess pid)
+
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+)
 
 let private runSimpleGitResult
     (operation: ISimpleGit -> JS.Promise<'T>)

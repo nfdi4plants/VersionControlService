@@ -2039,6 +2039,7 @@ let pruneLfsCacheWithProgressAndCancellation
                         session.CommandAuth
                         arcPath
                         GitLfsService.storagePruneArgs
+                        progressCallback
                         cancelCheck
                         onStarted
                 with
@@ -2074,6 +2075,7 @@ let dedupLfsStorageWithProgressAndCancellation
                         session.CommandAuth
                         arcPath
                         GitLfsService.storageDedupArgs
+                        progressCallback
                         cancelCheck
                         onStarted
                 with
