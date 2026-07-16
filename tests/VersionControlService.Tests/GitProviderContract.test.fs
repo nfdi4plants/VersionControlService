@@ -518,6 +518,58 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "refresh fetches the remote named by the configured upstream",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let! _ =
+                        runGitIn
+                            workspace.Binding.WorkspaceRoot
+                            [||]
+                            [| "remote"; "rename"; "origin"; "backup" |]
+                            None
+
+                    do!
+                        harness.AdvanceTarget workspace [|
+                            {
+                                Path = "backup-target.txt"
+                                Content = Some "advanced through backup\n"
+                            }
+                        |]
+
+                    let synchronization =
+                        workspace.Session.Synchronization
+                        |> Option.defaultWith (fun () -> failwith "Expected Git synchronization.")
+
+                    let! refreshResult =
+                        synchronization.Refresh(OperationContext.detached "refresh-configured-remote")
+                        |> Async.StartAsPromise
+
+                    let refreshed = expectProviderValue "refresh configured upstream remote" refreshResult
+                    let target =
+                        refreshed.TargetRef
+                        |> Option.defaultWith (fun () -> failwith "Expected configured backup target.")
+
+                    Vitest.expect(target.Name).toBe "backup/main"
+                    Vitest.expect(refreshed.TargetRevision.IsSome).toBe true
+
+                    let changedPaths =
+                        refreshed.RemoteChangedPaths
+                        |> Option.defaultWith (fun () -> failwith "Expected refreshed target changes.")
+                        |> Array.map RepositoryPath.value
+
+                    Vitest.expect(changedPaths |> Array.contains "backup-target.txt").toBe true
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
             "a branch without an upstream exposes no neutral synchronization target",
             TestOptions(timeout = 120000),
             fun () -> promise {
@@ -609,6 +661,8 @@ Vitest.describe (
                         "literal[meta].bin", "literalm.bin", "nested/literal[meta].bin"
                         "literal*.star", "literalX.star", "nested/literal*.star"
                         "literal?.question", "literalX.question", "nested/literal?.question"
+                        "tab\tname.bin", "tab name.bin", "nested/tab\tname.bin"
+                        "line\nname.bin", "lineXname.bin", "nested/line\nname.bin"
                     |]
 
                     let repositoryPath value =
@@ -634,21 +688,23 @@ Vitest.describe (
                             runGitIn
                                 workspace.Binding.WorkspaceRoot
                                 [||]
-                                [| "check-attr"; "filter"; "--"; literalPath; decoyPath; nestedDecoyPath |]
+                                [| "check-attr"; "-z"; "filter"; "--"; literalPath; decoyPath; nestedDecoyPath |]
                                 None
 
-                        Vitest.expect(attributes.Contains($"{literalPath}: filter: lfs")).toBe true
-                        Vitest.expect(attributes.Contains($"{decoyPath}: filter: unspecified")).toBe true
-                        Vitest.expect(attributes.Contains($"{nestedDecoyPath}: filter: unspecified")).toBe true
+                        Vitest.expect(attributes.Contains($"{literalPath}\000filter\000lfs\000")).toBe true
+                        Vitest.expect(attributes.Contains($"{decoyPath}\000filter\000unspecified\000")).toBe true
+                        Vitest.expect(attributes.Contains($"{nestedDecoyPath}\000filter\000unspecified\000")).toBe true
 
                     let! attributeFile =
                         tryReadUtf8FileAsync (join [| workspace.Binding.WorkspaceRoot; ".gitattributes" |])
 
                     let attributeFile = attributeFile |> Option.defaultValue ""
-                    Vitest.expect(attributeFile.Contains("/space[[:space:]]name.bin filter=lfs")).toBe true
-                    Vitest.expect(attributeFile.Contains("/literal\\[meta\\].bin filter=lfs")).toBe true
-                    Vitest.expect(attributeFile.Contains("/literal\\*.star filter=lfs")).toBe true
-                    Vitest.expect(attributeFile.Contains("/literal\\?.question filter=lfs")).toBe true
+                    Vitest.expect(attributeFile.Contains("\"/space name.bin\" filter=lfs")).toBe true
+                    Vitest.expect(attributeFile.Contains("\"/literal\\\\[meta\\\\].bin\" filter=lfs")).toBe true
+                    Vitest.expect(attributeFile.Contains("\"/literal\\\\*.star\" filter=lfs")).toBe true
+                    Vitest.expect(attributeFile.Contains("\"/literal\\\\?.question\" filter=lfs")).toBe true
+                    Vitest.expect(attributeFile.Contains("\"/tab\\tname.bin\" filter=lfs")).toBe true
+                    Vitest.expect(attributeFile.Contains("\"/line\\nname.bin\" filter=lfs")).toBe true
 
                     for literalPath, _, _ in literalPaths do
                         let! result =
@@ -665,11 +721,11 @@ Vitest.describe (
                             runGitIn
                                 workspace.Binding.WorkspaceRoot
                                 [||]
-                                [| "check-attr"; "filter"; "--"; literalPath; nestedDecoyPath |]
+                                [| "check-attr"; "-z"; "filter"; "--"; literalPath; nestedDecoyPath |]
                                 None
 
-                        Vitest.expect(attributes.Contains($"{literalPath}: filter: unspecified")).toBe true
-                        Vitest.expect(attributes.Contains($"{nestedDecoyPath}: filter: unspecified")).toBe true
+                        Vitest.expect(attributes.Contains($"{literalPath}\000filter\000unspecified\000")).toBe true
+                        Vitest.expect(attributes.Contains($"{nestedDecoyPath}\000filter\000unspecified\000")).toBe true
 
                     do! harness.Cleanup()
                 with error ->
@@ -891,6 +947,49 @@ Vitest.describe (
                     Vitest.expect(failure.Code).toBe "preview_indeterminate"
                     Vitest.expect(failure.Retryable).toBe true
                     Vitest.expect(failure.StateChanged).toBe false
+
+                    let changedPathHooks: GitWorkspaceSession.GitSessionHooks = {
+                        RunBytesProcess = None
+                        RunProcess =
+                            Some(fun request context ->
+                                if
+                                    request.Arguments |> Array.contains "diff"
+                                    && request.Arguments |> Array.contains "--name-only"
+                                then
+                                    async {
+                                        return
+                                            OperationResult.failed(
+                                                OperationFailure.create
+                                                    ProviderError
+                                                    "changed_path_transport_failed"
+                                                    "The changed-path provider call failed."
+                                            )
+                                    }
+                                else
+                                    NodeProcess.run request context)
+                        Barrier = None
+                    }
+
+                    let changedPathSession =
+                        GitWorkspaceSession.createSession changedPathHooks workspace.Binding
+
+                    let changedPathSynchronization =
+                        changedPathSession.Synchronization
+                        |> Option.defaultWith (fun () -> failwith "Expected Git synchronization.")
+
+                    let! changedPathPreview =
+                        changedPathSynchronization.PreviewUpdate(
+                            OperationContext.detached "preview-indeterminate-changed-paths"
+                        )
+                        |> Async.StartAsPromise
+
+                    let changedPathFailure =
+                        expectProviderFailure "indeterminate changed-path preview" changedPathPreview
+
+                    Vitest.expect(changedPathFailure.Category).toEqual ProviderError
+                    Vitest.expect(changedPathFailure.Code).toBe "preview_indeterminate"
+                    Vitest.expect(changedPathFailure.Retryable).toBe true
+                    Vitest.expect(changedPathFailure.StateChanged).toBe false
                     do! harness.Cleanup()
                 with error ->
                     do! harness.Cleanup()

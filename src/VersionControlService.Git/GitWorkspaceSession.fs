@@ -672,6 +672,35 @@ let private logicalTargetRef (upstream: string) : LogicalRef = {
     IsCurrent = false
 }
 
+let private previewIndeterminate (classification: string) (detail: string) =
+    {
+        OperationFailure.createRedacted
+            ProviderError
+            "preview_indeterminate"
+            $"The update preview could not classify {classification}: {detail}" with
+            Retryable = true
+    }
+
+let private configuredUpstreamRemote
+    (state: SessionState)
+    (upstream: string)
+    (context: OperationContext)
+    =
+    async {
+        let! remotes = runGitChecked state.Hooks state.RepoPath [| "remote" |] None context
+
+        match remotes with
+        | Error failure -> return Error failure
+        | Ok output ->
+            let remote =
+                output.StdOut.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
+                |> Array.filter (fun candidate -> upstream.StartsWith(candidate + "/", StringComparison.Ordinal))
+                |> Array.sortByDescending _.Length
+                |> Array.tryHead
+
+            return Ok remote
+    }
+
 let private toWorkspaceStatus (state: SessionState) (status: GitStatusDto) (context: OperationContext) =
     async {
         let conflictedSet = Set.ofArray status.Conflicted
@@ -1594,7 +1623,7 @@ let private synchronizationState (state: SessionState) (context: OperationContex
                 | Some _, Some _, Some _ -> Diverged
                 | _ -> UnknownRelationship
 
-            let! remoteChanged =
+            let! remoteChangedResult =
                 match baseRevision, targetRevision with
                 | Some mergeBase, Some target when mergeBase <> target ->
                     async {
@@ -1614,59 +1643,95 @@ let private synchronizationState (state: SessionState) (context: OperationContex
 
                         match diff with
                         | Ok output when output.ExitCode = 0 ->
-                            return
-                                Some(
-                                    output.StdOut.Split '\000'
-                                    |> Array.filter (fun entry -> entry <> "")
-                                    |> Array.choose (tryCreateRepositoryPath >> Result.toOption)
-                                )
-                        | _ -> return None
+                            let entries =
+                                output.StdOut.Split '\000'
+                                |> Array.filter (fun entry -> entry <> "")
+
+                            let mutable invalidPath = None
+
+                            let paths =
+                                entries
+                                |> Array.choose (fun entry ->
+                                    match tryCreateRepositoryPath entry with
+                                    | Ok path -> Some path
+                                    | Error message ->
+                                        invalidPath <- Some message
+                                        None)
+
+                            match invalidPath with
+                            | Some message ->
+                                return Error(previewIndeterminate "target changed paths" message)
+                            | None -> return Ok(Some paths)
+                        | Ok output ->
+                            let detail =
+                                if String.IsNullOrWhiteSpace output.StdErr then
+                                    output.StdOut
+                                else
+                                    output.StdErr
+
+                            return Error(previewIndeterminate "target changed paths" detail)
+                        | Error failure ->
+                            return Error(previewIndeterminate "target changed paths" failure.Message)
                     }
-                | _ -> async { return None }
+                | _ -> async { return Ok None }
 
-            return
-                Ok {
-                    BaseRevision = baseRevision |> Option.map mkRevisionId
-                    WorkspaceRevision = workspaceRevision |> Option.map mkRevisionId
-                    TargetRevision = targetRevision |> Option.map mkRevisionId
-                    TargetRef = upstream |> Option.map logicalTargetRef
-                    LocalRevisionCount = None
-                    TargetRevisionCount = None
-                    RemoteChangedPaths = remoteChanged
-                    Relationship = relationship
-                }
-    }
-
-let private hasOrigin (state: SessionState) (context: OperationContext) =
-    async {
-        let! result = runGit state.Hooks state.RepoPath [| "remote" |] None context
-
-        match result with
-        | Ok output -> return output.StdOut.Contains "origin"
-        | Error _ -> return false
+            match remoteChangedResult with
+            | Error failure -> return Error failure
+            | Ok remoteChanged ->
+                return
+                    Ok {
+                        BaseRevision = baseRevision |> Option.map mkRevisionId
+                        WorkspaceRevision = workspaceRevision |> Option.map mkRevisionId
+                        TargetRevision = targetRevision |> Option.map mkRevisionId
+                        TargetRef = upstream |> Option.map logicalTargetRef
+                        LocalRevisionCount = None
+                        TargetRevisionCount = None
+                        RemoteChangedPaths = remoteChanged
+                        Relationship = relationship
+                    }
     }
 
 let private refresh (state: SessionState) (context: OperationContext) =
     async {
-        let! originExists = hasOrigin state context
+        let! upstreamResult = tryConfiguredUpstream state context
 
-        if originExists then
-            do! barrier state.Hooks state.RepoPath "transfer-start" context
+        match upstreamResult with
+        | Error failure -> return Failed failure
+        | Ok(Some upstream) ->
+            let! remoteResult = configuredUpstreamRemote state upstream context
 
-            let! authArguments = credentialArguments state
+            match remoteResult with
+            | Error failure -> return Failed failure
+            | Ok None ->
+                return
+                    Failed(
+                        OperationFailure.create
+                            Validation
+                            "configured_target_invalid"
+                            "The configured Git upstream does not identify a remote."
+                    )
+            | Ok(Some remote) ->
+                do! barrier state.Hooks state.RepoPath "transfer-start" context
 
-            let! fetchResult =
-                runGitChecked state.Hooks state.RepoPath [| yield! authArguments; "fetch"; "origin" |] None context
+                let! authArguments = credentialArguments state
 
-            match fetchResult with
-            | Error failure -> return Failed { failure with Retryable = true }
-            | Ok _ ->
-                let! stateResult = synchronizationState state context
+                let! fetchResult =
+                    runGitChecked
+                        state.Hooks
+                        state.RepoPath
+                        [| yield! authArguments; "fetch"; remote |]
+                        None
+                        context
 
-                match stateResult with
-                | Error failure -> return Failed failure
-                | Ok syncState -> return OperationResult.succeeded syncState
-        else
+                match fetchResult with
+                | Error failure -> return Failed { failure with Retryable = true }
+                | Ok _ ->
+                    let! stateResult = synchronizationState state context
+
+                    match stateResult with
+                    | Error failure -> return Failed failure
+                    | Ok syncState -> return OperationResult.succeeded syncState
+        | Ok None ->
             let! stateResult = synchronizationState state context
 
             match stateResult with
@@ -1723,23 +1788,9 @@ let private previewUpdate (state: SessionState) (context: OperationContext) =
                                 let detail =
                                     if String.IsNullOrWhiteSpace output.StdErr then output.StdOut else output.StdErr
 
-                                return
-                                    Error {
-                                        OperationFailure.createRedacted
-                                            ProviderError
-                                            "preview_indeterminate"
-                                            $"The update preview could not classify committed conflicts: {detail}" with
-                                            Retryable = true
-                                    }
+                                return Error(previewIndeterminate "committed conflicts" detail)
                             | Error failure ->
-                                return
-                                    Error {
-                                        OperationFailure.createRedacted
-                                            ProviderError
-                                            "preview_indeterminate"
-                                            $"The update preview could not classify committed conflicts: {failure.Message}" with
-                                            Retryable = true
-                                    }
+                                return Error(previewIndeterminate "committed conflicts" failure.Message)
                         }
                     | _ -> async { return Ok false }
 

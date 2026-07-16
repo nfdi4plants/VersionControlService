@@ -547,6 +547,44 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "target diff failures surface through PreviewUpdate as indeterminate",
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
+            fun () -> promise {
+                if not (integrationEnabled ()) then
+                    return failwith "lakeFS integration skipped: Docker not available"
+
+                let harness = createLakeFsHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let parsed = parseLocation workspace.Binding.Location
+                    do! deleteRepository parsed.Repository
+
+                    let synchronization =
+                        workspace.Session.Synchronization
+                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization.")
+
+                    let! previewResult =
+                        synchronization.PreviewUpdate(context "preview-target-diff-failure")
+                        |> Async.StartAsPromise
+
+                    match previewResult with
+                    | Failed failure ->
+                        Vitest.expect(failure.Category).toEqual ProviderError
+                        Vitest.expect(failure.Code).toBe "preview_indeterminate"
+                        Vitest.expect(failure.Retryable).toBe true
+                        Vitest.expect(failure.StateChanged).toBe false
+                    | Succeeded _
+                    | PartiallySucceeded _ -> failwith "Expected target diff classification to fail."
+
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
             "configured target identity is exposed through the neutral synchronization state",
             TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
             fun () -> promise {

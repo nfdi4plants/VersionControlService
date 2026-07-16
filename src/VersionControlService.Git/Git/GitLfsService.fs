@@ -153,11 +153,11 @@ let run
 /// Runs Git LFS without progress or cancellation hooks.
 let runSilently (request: GitLfsRequest) : JS.Promise<Result<GitLfsResult, exn>> = run request ignore (fun () -> false)
 
-let private runLiteralTrackCommand (repoPath: string) (relativePath: string) : JS.Promise<Result<unit, string>> = promise {
+let private requireGitLfsForLiteralPolicy (repoPath: string) : JS.Promise<Result<unit, string>> = promise {
     let! result =
         runGitCaptured {
             WorkingDirectory = Some repoPath
-            Arguments = [| "lfs"; "track"; "--filename"; "--"; relativePath |]
+            Arguments = [| "lfs"; "version" |]
             Environment = None
             StandardInput = None
             CancelCheck = None
@@ -176,20 +176,35 @@ let private runLiteralTrackCommand (repoPath: string) (relativePath: string) : J
 }
 
 let private literalAttributePattern (relativePath: string) =
-    let escaped = System.Text.StringBuilder()
+    let globPattern = System.Text.StringBuilder("/")
 
     for character in relativePath do
         match character with
-        | ' ' -> escaped.Append("[[:space:]]") |> ignore
         | '['
         | ']'
         | '*'
-        | '?' -> escaped.Append('\\').Append(character) |> ignore
-        | '#'
-        | '!' when escaped.Length = 0 -> escaped.Append('\\').Append(character) |> ignore
-        | _ -> escaped.Append(character) |> ignore
+        | '?' -> globPattern.Append('\\').Append(character) |> ignore
+        | _ -> globPattern.Append(character) |> ignore
 
-    escaped.ToString()
+    let quoted = System.Text.StringBuilder("\"")
+
+    for character in globPattern.ToString() do
+        match character with
+        | '\\' -> quoted.Append("\\\\") |> ignore
+        | '"' -> quoted.Append("\\\"") |> ignore
+        | '\u0007' -> quoted.Append("\\a") |> ignore
+        | '\b' -> quoted.Append("\\b") |> ignore
+        | '\t' -> quoted.Append("\\t") |> ignore
+        | '\n' -> quoted.Append("\\n") |> ignore
+        | '\u000b' -> quoted.Append("\\v") |> ignore
+        | '\u000c' -> quoted.Append("\\f") |> ignore
+        | '\r' -> quoted.Append("\\r") |> ignore
+        | value when int value < 32 || int value = 127 ->
+            quoted.Append("\\").Append(Convert.ToString(int value, 8).PadLeft(3, '0'))
+            |> ignore
+        | _ -> quoted.Append(character) |> ignore
+
+    quoted.Append('"').ToString()
 
 let private literalTrackingRule relativePath =
     $"{literalAttributePattern relativePath} filter=lfs diff=lfs merge=lfs -text"
@@ -201,25 +216,27 @@ let private removeExactAttributeRule (rule: string) (content: string) =
 let private rewriteLiteralTrackingRule repoPath relativePath enabled =
     try
         let attributesPath = NodePath.resolve [| repoPath; ".gitattributes" |]
-        let content = NodeFileSystem.readFileSync attributesPath NodeFileSystem.TextEncoding.Utf8
+        let content =
+            if NodeFileSystem.existsSync attributesPath then
+                NodeFileSystem.readFileSync attributesPath NodeFileSystem.TextEncoding.Utf8
+            else
+                ""
         let canonicalRule = literalTrackingRule relativePath
-        let anchoredRule = $"/{canonicalRule}"
 
         let withoutLiteralRule =
             content
             |> removeExactAttributeRule canonicalRule
-            |> removeExactAttributeRule anchoredRule
 
         let updated =
             if enabled then
                 let lineEnding = if content.Contains("\r\n") then "\r\n" else "\n"
 
                 if String.IsNullOrEmpty withoutLiteralRule then
-                    anchoredRule + lineEnding
+                    canonicalRule + lineEnding
                 elif withoutLiteralRule.EndsWith("\n") then
-                    withoutLiteralRule + anchoredRule + lineEnding
+                    withoutLiteralRule + canonicalRule + lineEnding
                 else
-                    withoutLiteralRule + lineEnding + anchoredRule + lineEnding
+                    withoutLiteralRule + lineEnding + canonicalRule + lineEnding
             else
                 withoutLiteralRule
 
@@ -230,7 +247,7 @@ let private rewriteLiteralTrackingRule repoPath relativePath enabled =
 
 /// Tracks one exact repository-relative path and anchors the generated rule at the repository root.
 let trackLiteral (repoPath: string) (relativePath: string) : JS.Promise<Result<unit, string>> = promise {
-    match! runLiteralTrackCommand repoPath relativePath with
+    match! requireGitLfsForLiteralPolicy repoPath with
     | Error error -> return Error error
     | Ok() -> return rewriteLiteralTrackingRule repoPath relativePath true
 }

@@ -1383,7 +1383,13 @@ let private previewUpdate (state: SessionState) (context: OperationContext) =
         let! changed = targetChangedPaths state context
 
         match changed with
-        | Error failure -> return Failed failure
+        | Error failure ->
+            return
+                Failed(
+                    LakeFsSynchronization.previewIndeterminate
+                        "target changed paths"
+                        failure
+                )
         | Ok changedPaths ->
             let dirtyPaths = classifyWorkspace state |> List.map _.ChangePath |> Set.ofList
 
@@ -1391,7 +1397,13 @@ let private previewUpdate (state: SessionState) (context: OperationContext) =
             let! connection = connect state
 
             match connection with
-            | Error failure -> return Failed failure
+            | Error failure ->
+                return
+                    Failed(
+                        LakeFsSynchronization.previewIndeterminate
+                            "locally committed objects"
+                            failure
+                    )
             | Ok resolved ->
                 let! localCommitted =
                     match state.Index.BaseRevision, state.Index.WorkspaceRevision with
