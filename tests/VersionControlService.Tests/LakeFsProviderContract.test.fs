@@ -292,6 +292,14 @@ let createLakeFsHarness () : ProviderTestHarness =
                         control.SlowTransfer <- false
                         let mutable step = 0
 
+                        operationContext.ReportProgress {
+                            PhaseCode = "transfer-bytes"
+                            Item = Some "literal[object]*?.bin"
+                            Completed = Some(3.0 * 1024.0 * 1024.0 * 1024.0)
+                            Total = Some(4.0 * 1024.0 * 1024.0 * 1024.0)
+                            DisplayMessage = Some "Transferring large object"
+                        }
+
                         while step < 200 && not (operationContext.Cancellation.IsCancellationRequested()) do
                             do! Async.Sleep 2
                             step <- step + 1

@@ -12,6 +12,9 @@ open VersionControlService.Bindings.SimpleGit
 open VersionControlService.Git.GitLfsAdapter
 open VersionControlService.Git.GitAuthAdapter
 
+module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
+module NodePath = VersionControlService.Runtime.Node.Path
+
 /// Default timeout for interactive Git LFS commands launched by the service process.
 [<Literal>]
 let DefaultTimeoutMs = 30000
@@ -150,14 +153,108 @@ let run
 /// Runs Git LFS without progress or cancellation hooks.
 let runSilently (request: GitLfsRequest) : JS.Promise<Result<GitLfsResult, exn>> = run request ignore (fun () -> false)
 
-/// Tracks a repository-relative path in Git LFS. GitService uses this during automatic large-file staging.
-let track (repoPath: string) (relativePath: string) : JS.Promise<Result<unit, string>> = promise {
-    let! result = createRequest repoPath Track (Some relativePath) None |> runSilently
+let private runLiteralTrackCommand (repoPath: string) (relativePath: string) : JS.Promise<Result<unit, string>> = promise {
+    let! result =
+        runGitCaptured {
+            WorkingDirectory = Some repoPath
+            Arguments = [| "lfs"; "track"; "--filename"; "--"; relativePath |]
+            Environment = None
+            StandardInput = None
+            CancelCheck = None
+            TimeoutMs = Some DefaultTimeoutMs
+        }
 
     return
-        match result with
-        | Ok _ -> Ok()
-        | Error exn -> Error exn.Message
+        if result.ExitCode = 0 && not result.TimedOut then
+            Ok()
+        elif not (String.IsNullOrWhiteSpace result.StderrText) then
+            Error result.StderrText
+        elif not (String.IsNullOrWhiteSpace result.StdoutText) then
+            Error result.StdoutText
+        else
+            Error "Git LFS literal path tracking failed."
+}
+
+let private literalAttributePattern (relativePath: string) =
+    let escaped = System.Text.StringBuilder()
+
+    for character in relativePath do
+        match character with
+        | ' ' -> escaped.Append("[[:space:]]") |> ignore
+        | '['
+        | ']'
+        | '*'
+        | '?' -> escaped.Append('\\').Append(character) |> ignore
+        | '#'
+        | '!' when escaped.Length = 0 -> escaped.Append('\\').Append(character) |> ignore
+        | _ -> escaped.Append(character) |> ignore
+
+    escaped.ToString()
+
+let private literalTrackingRule relativePath =
+    $"{literalAttributePattern relativePath} filter=lfs diff=lfs merge=lfs -text"
+
+let private removeExactAttributeRule (rule: string) (content: string) =
+    let rulePattern = $"^{Regex.Escape(rule)}(?:\\r?\\n|$)"
+    Regex(rulePattern, RegexOptions.Multiline).Replace(content, String.Empty)
+
+let private rewriteLiteralTrackingRule repoPath relativePath enabled =
+    try
+        let attributesPath = NodePath.resolve [| repoPath; ".gitattributes" |]
+        let content = NodeFileSystem.readFileSync attributesPath NodeFileSystem.TextEncoding.Utf8
+        let canonicalRule = literalTrackingRule relativePath
+        let anchoredRule = $"/{canonicalRule}"
+
+        let withoutLiteralRule =
+            content
+            |> removeExactAttributeRule canonicalRule
+            |> removeExactAttributeRule anchoredRule
+
+        let updated =
+            if enabled then
+                let lineEnding = if content.Contains("\r\n") then "\r\n" else "\n"
+
+                if String.IsNullOrEmpty withoutLiteralRule then
+                    anchoredRule + lineEnding
+                elif withoutLiteralRule.EndsWith("\n") then
+                    withoutLiteralRule + anchoredRule + lineEnding
+                else
+                    withoutLiteralRule + lineEnding + anchoredRule + lineEnding
+            else
+                withoutLiteralRule
+
+        NodeFileSystem.writeFileSync attributesPath updated NodeFileSystem.TextEncoding.Utf8
+        Ok()
+    with error ->
+        Error $"Could not update the literal Git LFS path policy: {error.Message}"
+
+/// Tracks one exact repository-relative path and anchors the generated rule at the repository root.
+let trackLiteral (repoPath: string) (relativePath: string) : JS.Promise<Result<unit, string>> = promise {
+    match! runLiteralTrackCommand repoPath relativePath with
+    | Error error -> return Error error
+    | Ok() -> return rewriteLiteralTrackingRule repoPath relativePath true
+}
+
+/// Tracks a repository-relative path through git-lfs's literal filename mode.
+/// Provider storage-policy calls use trackLiteral to add repository-root anchoring.
+let track (repoPath: string) (relativePath: string) : JS.Promise<Result<unit, string>> =
+    promise {
+        let! result = createRequest repoPath Track (Some relativePath) None |> runSilently
+
+        return
+            match result with
+            | Ok _ -> Ok()
+            | Error exn -> Error exn.Message
+    }
+
+/// Removes the exact literal-filename rule emitted by `track`.
+/// git-lfs has no corresponding literal-filename switch for `untrack`.
+let untrackLiteral (repoPath: string) (relativePath: string) : JS.Promise<Result<unit, string>> = promise {
+    // Track first to verify the dependency and canonicalize any pre-existing
+    // unanchored rule before removing only this exact path policy.
+    match! trackLiteral repoPath relativePath with
+    | Error error -> return Error error
+    | Ok() -> return rewriteLiteralTrackingRule repoPath relativePath false
 }
 
 /// Runs `git lfs install` for a specific repository.
@@ -710,6 +807,38 @@ let runAuthenticatedTransferWith
         return
             if result.ExitCode = 0 && not result.TimedOut then
                 Ok()
+            else
+                Error(exn (extractSpawnFailureMessage result))
+    }
+
+/// Runs a maintenance command with authentication and captures its diagnostic output.
+/// `onStarted` fires only after the child process can observe cancellation.
+let runAuthenticatedMaintenance
+    (commandAuth: GitCommandAuthentication)
+    (repoPath: string)
+    (arguments: string[])
+    (cancelCheck: unit -> bool)
+    (onStarted: unit -> unit)
+    : JS.Promise<Result<string, exn>> =
+    promise {
+        let! result =
+            runGitCapturedWithStarted
+                onStarted
+                {
+                    WorkingDirectory = Some repoPath
+                    Arguments = [|
+                        yield! lfsTransferConfigArgs commandAuth.ConfigArgs
+                        yield! arguments
+                    |]
+                    Environment = Some commandAuth.Environment
+                    StandardInput = None
+                    CancelCheck = Some cancelCheck
+                    TimeoutMs = None
+                }
+
+        return
+            if result.ExitCode = 0 && not result.TimedOut then
+                Ok result.StdoutText
             else
                 Error(exn (extractSpawnFailureMessage result))
     }

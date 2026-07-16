@@ -2006,9 +2006,11 @@ let setLfsSettings (arcPath: string) (settings: GitLfsSettingsDto) : JS.Promise<
                 })
 }
 
-let pruneLfsCacheWithProgress
+let pruneLfsCacheWithProgressAndCancellation
     (arcPath: string)
     (progressCallback: GitProgressCallback option)
+    (cancelCheck: unit -> bool)
+    (onStarted: unit -> unit)
     : JS.Promise<GitResult<string>> =
     promise {
         let! localValidationResult =
@@ -2027,20 +2029,36 @@ let pruneLfsCacheWithProgress
         match localValidationResult with
         | Error failure -> return Error failure
         | Ok() ->
-            let! gitResult = createOriginLfsRemoteGit arcPath progressCallback
+            let! sessionResult = createOriginLfsRemoteSession arcPath progressCallback
 
-            match gitResult with
+            match sessionResult with
             | Error failure -> return Error failure
-            | Ok git ->
-                let! result = runSimpleGit (fun currentGit -> currentGit.raw GitLfsService.storagePruneArgs) git
-                return result
+            | Ok session ->
+                match!
+                    GitLfsService.runAuthenticatedMaintenance
+                        session.CommandAuth
+                        arcPath
+                        GitLfsService.storagePruneArgs
+                        cancelCheck
+                        onStarted
+                with
+                | Ok output -> return Ok output
+                | Error error -> return errorResult error
     }
+
+let pruneLfsCacheWithProgress
+    (arcPath: string)
+    (progressCallback: GitProgressCallback option)
+    : JS.Promise<GitResult<string>> =
+    pruneLfsCacheWithProgressAndCancellation arcPath progressCallback (fun () -> false) ignore
 
 let pruneLfsCache (arcPath: string) : JS.Promise<GitResult<string>> = pruneLfsCacheWithProgress arcPath None
 
-let dedupLfsStorageWithProgress
+let dedupLfsStorageWithProgressAndCancellation
     (arcPath: string)
     (progressCallback: GitProgressCallback option)
+    (cancelCheck: unit -> bool)
+    (onStarted: unit -> unit)
     : JS.Promise<GitResult<string>> =
     withLocalGitAndProgress
         arcPath
@@ -2049,9 +2067,25 @@ let dedupLfsStorageWithProgress
             match! requireCleanWorkingTreeForLfsStorageAction "Reducing Git LFS duplicate storage" git with
             | Error validationError -> return abortGitPromiseWith validationError
             | Ok() ->
-                let! output = git.raw GitLfsService.storageDedupArgs
-                return output
+                let session = createLocalGitSession arcPath progressCallback
+
+                match!
+                    GitLfsService.runAuthenticatedMaintenance
+                        session.CommandAuth
+                        arcPath
+                        GitLfsService.storageDedupArgs
+                        cancelCheck
+                        onStarted
+                with
+                | Ok output -> return output
+                | Error error -> return abortGitPromiseWith error
         })
+
+let dedupLfsStorageWithProgress
+    (arcPath: string)
+    (progressCallback: GitProgressCallback option)
+    : JS.Promise<GitResult<string>> =
+    dedupLfsStorageWithProgressAndCancellation arcPath progressCallback (fun () -> false) ignore
 
 let dedupLfsStorage (arcPath: string) : JS.Promise<GitResult<string>> =
     dedupLfsStorageWithProgress arcPath None

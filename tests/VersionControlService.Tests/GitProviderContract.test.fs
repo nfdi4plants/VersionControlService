@@ -4,12 +4,14 @@ open System
 open Fable.Core
 open Fable.Core.JsInterop
 open VersionControlService.Abstractions
+open VersionControlService.Contracts.Git
 open VersionControlService.Tests.Contracts
 open VersionControlService.Tests.Contracts.ProviderHarness
 open VersionControlService.Tests.NodePath
 open Vitest
 
 module GitWorkspaceSession = VersionControlService.Git.GitWorkspaceSession
+module GitLfsExtensions = VersionControlService.Git.GitLfsExtensions
 module NodeProcess = VersionControlService.Runtime.Node.Process
 
 let private fsPromisesDynamic: obj = importAll "fs/promises"
@@ -205,6 +207,14 @@ let createGitHarness () : ProviderTestHarness =
                         elif point = "transfer-start" && barriers.SlowTransfer then
                             barriers.SlowTransfer <- false
                             let mutable step = 0
+
+                            context.ReportProgress {
+                                PhaseCode = "transfer-bytes"
+                                Item = Some "literal[object]*?.bin"
+                                Completed = Some(3.0 * 1024.0 * 1024.0 * 1024.0)
+                                Total = Some(4.0 * 1024.0 * 1024.0 * 1024.0)
+                                DisplayMessage = Some "Transferring large object"
+                            }
 
                             while step < 200 && not (context.Cancellation.IsCancellationRequested()) do
                                 do! Async.Sleep 2
@@ -581,6 +591,182 @@ let private processOutput exitCode stdout stderr : NodeProcess.ProcessOutput = {
 Vitest.describe (
     "Git / extension suites",
     fun () ->
+        Vitest.test (
+            "storage policy treats repository paths with glob metacharacters literally",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+
+                    let storagePolicy =
+                        workspace.Session.StoragePolicy
+                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
+
+                    let literalPaths = [|
+                        "space name.bin", "spaceXname.bin", "nested/space name.bin"
+                        "literal[meta].bin", "literalm.bin", "nested/literal[meta].bin"
+                        "literal*.star", "literalX.star", "nested/literal*.star"
+                        "literal?.question", "literalX.question", "nested/literal?.question"
+                    |]
+
+                    let repositoryPath value =
+                        RepositoryPath.tryCreate value
+                        |> Result.defaultWith failwith
+
+                    // RepositoryPath normalizes provider paths to forward slashes;
+                    // a backslash therefore never reaches SetPathPolicy.
+                    Vitest.expect(RepositoryPath.tryCreate "literal\\path.bin" |> Result.isError).toBe true
+
+                    for literalPath, _, _ in literalPaths do
+                        let! result =
+                            storagePolicy.SetPathPolicy
+                                (repositoryPath literalPath)
+                                true
+                                (OperationContext.detached $"track-{literalPath}")
+                            |> Async.StartAsPromise
+
+                        expectProviderValue $"track literal path {literalPath}" result |> ignore
+
+                    for literalPath, decoyPath, nestedDecoyPath in literalPaths do
+                        let! attributes =
+                            runGitIn
+                                workspace.Binding.WorkspaceRoot
+                                [||]
+                                [| "check-attr"; "filter"; "--"; literalPath; decoyPath; nestedDecoyPath |]
+                                None
+
+                        Vitest.expect(attributes.Contains($"{literalPath}: filter: lfs")).toBe true
+                        Vitest.expect(attributes.Contains($"{decoyPath}: filter: unspecified")).toBe true
+                        Vitest.expect(attributes.Contains($"{nestedDecoyPath}: filter: unspecified")).toBe true
+
+                    let! attributeFile =
+                        tryReadUtf8FileAsync (join [| workspace.Binding.WorkspaceRoot; ".gitattributes" |])
+
+                    let attributeFile = attributeFile |> Option.defaultValue ""
+                    Vitest.expect(attributeFile.Contains("/space[[:space:]]name.bin filter=lfs")).toBe true
+                    Vitest.expect(attributeFile.Contains("/literal\\[meta\\].bin filter=lfs")).toBe true
+                    Vitest.expect(attributeFile.Contains("/literal\\*.star filter=lfs")).toBe true
+                    Vitest.expect(attributeFile.Contains("/literal\\?.question filter=lfs")).toBe true
+
+                    for literalPath, _, _ in literalPaths do
+                        let! result =
+                            storagePolicy.SetPathPolicy
+                                (repositoryPath literalPath)
+                                false
+                                (OperationContext.detached $"untrack-{literalPath}")
+                            |> Async.StartAsPromise
+
+                        expectProviderValue $"untrack literal path {literalPath}" result |> ignore
+
+                    for literalPath, _, nestedDecoyPath in literalPaths do
+                        let! attributes =
+                            runGitIn
+                                workspace.Binding.WorkspaceRoot
+                                [||]
+                                [| "check-attr"; "filter"; "--"; literalPath; nestedDecoyPath |]
+                                None
+
+                        Vitest.expect(attributes.Contains($"{literalPath}: filter: unspecified")).toBe true
+                        Vitest.expect(attributes.Contains($"{nestedDecoyPath}: filter: unspecified")).toBe true
+
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "maintenance honors cancellation requested by its first progress report",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+
+                    let maintenance =
+                        workspace.Session.Maintenance
+                        |> Option.defaultWith (fun () -> failwith "Expected Git maintenance.")
+
+                    let cancellation = OperationCancellation.Source()
+                    let mutable progressObserved = false
+
+                    let context =
+                        OperationContext.create
+                            "cancel-running-maintenance"
+                            cancellation.Cancellation
+                            (fun progress ->
+                                if not progressObserved then
+                                    progressObserved <- true
+                                    cancellation.Cancel())
+
+                    let! result = maintenance.Deduplicate context |> Async.StartAsPromise
+
+                    Vitest.expect(progressObserved).toBe true
+                    let failure = expectProviderFailure "canceled running maintenance" result
+                    Vitest.expect(failure.Category).toEqual Canceled
+                    Vitest.expect(failure.Code).toBe "operation_canceled"
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "maintenance preserves provider progress totals above two GiB",
+            fun () -> promise {
+                let completedBytes = 3.0 * 1024.0 * 1024.0 * 1024.0
+                let totalBytes = 4.0 * 1024.0 * 1024.0 * 1024.0
+
+                let successfulOperation
+                    (progress: (GitProgressDto -> unit) option)
+                    (_: unit -> bool)
+                    (onStarted: unit -> unit)
+                    =
+                    promise {
+                        onStarted ()
+
+                        progress
+                        |> Option.iter (fun report ->
+                            report {
+                                Method = Some "deduplicate"
+                                Stage = Some "objects"
+                                Progress = Some 75.0
+                                Processed = Some completedBytes
+                                Total = Some totalBytes
+                                Output = Some "Deduplicating large objects"
+                            })
+
+                        return Ok "deduplicated"
+                    }
+
+                let maintenance =
+                    GitLfsExtensions.createMaintenanceWithOperations {
+                        Prune = successfulOperation
+                        Deduplicate = successfulOperation
+                    }
+
+                let reports = ResizeArray<OperationProgress>()
+                let context =
+                    OperationContext.create "large-maintenance-progress" OperationCancellation.none reports.Add
+
+                let! result = maintenance.Deduplicate context |> Async.StartAsPromise
+                expectProviderValue "large maintenance progress" result |> ignore
+
+                let largeReport =
+                    reports
+                    |> Seq.find (fun report -> report.Completed.IsSome)
+
+                Vitest.expect(largeReport.PhaseCode).toBe "maintenance-deduplicate"
+                Vitest.expect(largeReport.Completed).toEqual (Some completedBytes)
+                Vitest.expect(largeReport.Total).toEqual (Some totalBytes)
+            }
+        )
+
         Vitest.test (
             "cached LFS object availability is independent from literal-path materialization",
             TestOptions(timeout = 120000),

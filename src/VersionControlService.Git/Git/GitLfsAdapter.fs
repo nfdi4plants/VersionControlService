@@ -34,7 +34,12 @@ let private resolveGitEnvironment (environment: obj option) =
     |> Option.defaultWith createNonInteractiveEnv
     |> GitCommandResolver.ensureGitToolPath
 
-let private runGitProcess (captureStdout: bool) (request: GitSpawnRequest) : Promise<GitSpawnResult> = promise {
+let private runGitProcess
+    (captureStdout: bool)
+    (onStarted: unit -> unit)
+    (request: GitSpawnRequest)
+    : Promise<GitSpawnResult> =
+    promise {
     let! result =
         Fable.Core.JS.Constructors.Promise.Create(fun resolve _ ->
             let spawnOptions =
@@ -118,15 +123,19 @@ let private runGitProcess (captureStdout: bool) (request: GitSpawnRequest) : Pro
 
             resetIdleTimer ()
 
+            let requestCancellation () =
+                if not finished && not cancelRequested then
+                    cancelRequested <- true
+                    stderrChunks.Add "Git command cancelled."
+                    proc?kill ("SIGTERM") |> ignore
+
             let cancelInterval =
                 request.CancelCheck
                 |> Option.map (fun cancelCheck ->
                     Fable.Core.JS.setInterval
                         (fun () ->
-                            if not finished && not cancelRequested && cancelCheck () then
-                                cancelRequested <- true
-                                stderrChunks.Add "Git command cancelled."
-                                proc?kill ("SIGTERM") |> ignore
+                            if cancelCheck () then
+                                requestCancellation ()
                         )
                         300
                 )
@@ -155,6 +164,12 @@ let private runGitProcess (captureStdout: bool) (request: GitSpawnRequest) : Pro
             )
             |> ignore
 
+            onStarted ()
+
+            match request.CancelCheck with
+            | Some cancelCheck when cancelCheck () -> requestCancellation ()
+            | _ -> ()
+
             match request.StandardInput with
             | Some input ->
                 proc?stdin?setDefaultEncoding ("utf8") |> ignore
@@ -166,11 +181,18 @@ let private runGitProcess (captureStdout: bool) (request: GitSpawnRequest) : Pro
 }
 
 /// Runs `git` without a shell and captures stdout/stderr for callers that need exact output or stdin support.
-let runGitCaptured (request: GitSpawnRequest) : Promise<GitSpawnResult> = runGitProcess true request
+let runGitCaptured (request: GitSpawnRequest) : Promise<GitSpawnResult> = runGitProcess true ignore request
+
+/// Runs `git` with a notification after the child process and its cancellation handlers are active.
+let runGitCapturedWithStarted
+    (onStarted: unit -> unit)
+    (request: GitSpawnRequest)
+    : Promise<GitSpawnResult> =
+    runGitProcess true onStarted request
 
 /// Runs `git` while draining and discarding stdout.
 /// This is used for commands such as `git lfs smudge`, whose stdout may contain a large file.
-let runGitDiscardingStdout (request: GitSpawnRequest) : Promise<GitSpawnResult> = runGitProcess false request
+let runGitDiscardingStdout (request: GitSpawnRequest) : Promise<GitSpawnResult> = runGitProcess false ignore request
 
 /// Runs a small git command and returns stdout text, or None on command failure.
 /// Used for feature probes where failure should not surface as a user-facing Git error.

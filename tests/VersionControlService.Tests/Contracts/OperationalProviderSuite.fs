@@ -54,6 +54,18 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
             profileTest "progress preserves byte totals above two GiB"
             <| fun () -> promise {
+                let! workspace = harness.CreateWorkspace()
+                do! harness.ArmSlowTransfer workspace
+
+                do!
+                    harness.AdvanceTarget workspace [|
+                        {
+                            Path = "large-progress.txt"
+                            Content = Some "large progress content\n"
+                        }
+                    |]
+
+                let! status = getStatus workspace
                 let reports = ResizeArray<OperationProgress>()
                 let context =
                     OperationContext.create "large-byte-progress" OperationCancellation.none reports.Add
@@ -61,16 +73,20 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 let completedBytes = 3.0 * 1024.0 * 1024.0 * 1024.0
                 let totalBytes = 4.0 * 1024.0 * 1024.0 * 1024.0
 
-                context.ReportProgress {
-                    PhaseCode = "transfer-bytes"
-                    Item = Some "literal[object]*?.bin"
-                    Completed = Some completedBytes
-                    Total = Some totalBytes
-                    DisplayMessage = None
-                }
+                let! updateResult =
+                    run ((syncService workspace.Session).Update { ExpectedWorkspaceVersion = status.WorkspaceVersion } context)
 
-                Vitest.expect(reports[0].Completed).toEqual (Some completedBytes)
-                Vitest.expect(reports[0].Total).toEqual (Some totalBytes)
+                expectOutcome "update with large-byte progress" updateResult |> ignore
+
+                let largeReport =
+                    reports
+                    |> Seq.tryFind (fun report ->
+                        report.Completed = Some completedBytes
+                        && report.Total = Some totalBytes)
+
+                Vitest.expect(largeReport.IsSome).toBe true
+                Vitest.expect(largeReport.Value.Completed).toEqual (Some completedBytes)
+                Vitest.expect(largeReport.Value.Total).toEqual (Some totalBytes)
             }
 
             profileTest "transfer operations can be canceled with structured results"
