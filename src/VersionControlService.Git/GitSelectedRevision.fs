@@ -63,74 +63,315 @@ let private validateSubmoduleBoundary
     else
         Ok()
 
-/// Metadata checks before the transaction commits: batched file sizes via stat,
-/// then ONE `git check-attr --stdin -z filter` call carrying every oversized
-/// selected path over NUL stdin — never per-path processes or argv path lists.
+type private SelectedLfsPlan = {
+    OversizedPaths: string[]
+    GeneratedAttributesContent: string option
+    AttributesOriginalIdentity: NodeFileSystem.Stats option
+}
+
+let private invalidThresholdFailure () =
+    OperationFailure.create
+        Validation
+        "invalid_lfs_threshold"
+        "The automatic LFS threshold must be a positive whole MiB value."
+
+let private dependencyMissingFailure (detail: string) =
+    OperationFailure.createRedacted
+        DependencyMissing
+        "git_lfs_missing"
+        $"Git LFS is required before an oversized selected file can be committed: {detail}"
+
+/// Computes every automatic-LFS decision before the selected-revision index or
+/// ref is mutated. The plan owns exact literal rules and rejects unrelated
+/// dirty attributes instead of merging consumer state implicitly.
 let private checkSelectedMetadata
     (runGit: GitRunner)
     (repoPath: string)
     (paths: RepositoryPath[])
-    : Async<Result<OperationWarning[], OperationFailure>> =
+    : Async<Result<SelectedLfsPlan, OperationFailure>> =
     async {
-        // Threshold config mirrors the extracted service's large-object policy key.
         let! thresholdOutput =
-            runGit [| "config"; "--get"; "swate.lfs.autotrackthresholdmb" |] None [||]
+            runGit [| "config"; "--get"; GitService.AutoTrackThresholdKey |] None [||]
 
-        let thresholdMb =
+        let thresholdResult =
             match thresholdOutput with
             | Ok output when output.ExitCode = 0 ->
                 match Int32.TryParse(output.StdOut.Trim()) with
-                | true, value when value > 0 -> value
-                | _ -> 1
-            | _ -> 1
+                | true, value when value > 0 -> Ok value
+                | _ -> Error(invalidThresholdFailure ())
+            | Ok output when output.ExitCode = 1 -> Ok GitService.DefaultAutoTrackThresholdMb
+            | Ok output -> Error(failedRun "git config --get automatic LFS threshold" output)
+            | Error failure -> Error failure
 
-        let thresholdBytes = float thresholdMb * 1024.0 * 1024.0
+        match thresholdResult with
+        | Error failure -> return Error failure
+        | Ok thresholdMb ->
+            let thresholdBytes = float thresholdMb * 1024.0 * 1024.0
 
-        let oversizedPaths =
-            paths
-            |> Array.map RepositoryPath.value
-            |> Array.filter (fun pathValue ->
-                let absolutePath = NodePath.join [| repoPath; pathValue |]
+            let oversizedPaths =
+                paths
+                |> Array.map RepositoryPath.value
+                |> Array.filter (fun pathValue ->
+                    let absolutePath = NodePath.join [| repoPath; pathValue |]
 
-                try
-                    NodeFileSystem.existsSync absolutePath
-                    && (NodeFileSystem.statSync absolutePath).size > thresholdBytes
-                with _ ->
-                    false)
+                    try
+                        NodeFileSystem.existsSync absolutePath
+                        && (NodeFileSystem.lstatSync absolutePath).isFile ()
+                        && (NodeFileSystem.statSync absolutePath).size >= thresholdBytes
+                    with _ ->
+                        false)
 
-        if oversizedPaths.Length = 0 then
-            return Ok [||]
+            if oversizedPaths.Length = 0 then
+                return
+                    Ok {
+                        OversizedPaths = [||]
+                        GeneratedAttributesContent = None
+                        AttributesOriginalIdentity = None
+                    }
+            else
+                let! lfsVersion = runGit [| "lfs"; "version" |] None [||]
+
+                match lfsVersion with
+                | Error failure -> return Error(dependencyMissingFailure failure.Message)
+                | Ok output when output.ExitCode <> 0 ->
+                    let detail =
+                        if String.IsNullOrWhiteSpace output.StdErr then output.StdOut else output.StdErr
+
+                    return Error(dependencyMissingFailure detail)
+                | Ok _ ->
+                    let attributesSelected =
+                        paths
+                        |> Array.exists (fun path -> RepositoryPath.value path = ".gitattributes")
+
+                    let! attributesStatus =
+                        runGit [| "status"; "--porcelain=v1"; "-z"; "--"; ".gitattributes" |] None [||]
+
+                    match attributesStatus with
+                    | Error failure -> return Error failure
+                    | Ok output when output.ExitCode <> 0 ->
+                        return Error(failedRun "git status -- .gitattributes" output)
+                    | Ok output when output.StdOut <> "" && not attributesSelected ->
+                        return
+                            Error {
+                                OperationFailure.create
+                                    Validation
+                                    "precondition_failed"
+                                    "Automatic LFS tracking cannot modify an unrelated dirty .gitattributes file." with
+                                    AffectedPaths = [| ".gitattributes" |]
+                            }
+                    | Ok _ ->
+                        let attributesPath = NodePath.join [| repoPath; ".gitattributes" |]
+
+                        let attributesContent, originalIdentity =
+                            GitLfsService.readAttributesNoFollow attributesPath
+
+                        let updatedAttributes, generated =
+                            GitLfsService.addLiteralTrackingRules attributesContent oversizedPaths
+
+                        return
+                            Ok {
+                                OversizedPaths = oversizedPaths
+                                GeneratedAttributesContent = if generated then Some updatedAttributes else None
+                                AttributesOriginalIdentity = originalIdentity
+                            }
+    }
+
+let private tryPointerOid (pointerText: string) =
+    pointerText.Replace("\r\n", "\n").Split '\n'
+    |> Array.tryPick (fun line ->
+        let prefix = "oid sha256:"
+
+        if line.StartsWith(prefix, StringComparison.Ordinal) then
+            let oid = line.Substring(prefix.Length).Trim()
+            if oid.Length = 64 then Some oid else None
         else
-            let stdinPayload = String.concat "\000" oversizedPaths
+            None)
 
-            let! attrOutput =
-                runGit [| "check-attr"; "--stdin"; "-z"; "filter" |] (Some stdinPayload) [||]
+let private prepareLfsPointerBlob
+    (runGit: GitRunner)
+    (repoPath: string)
+    (commonGitDir: string)
+    (relativePath: string)
+    : Async<Result<string, OperationFailure>> =
+    async {
+        let sourcePath = NodePath.join [| repoPath; relativePath |]
+        let snapshotPath = NodePath.join [| commonGitDir; $"vcs-lfs-snapshot-{DateTime.Now.Ticks}" |]
 
-            match attrOutput with
-            | Error attrFailure -> return Error attrFailure
-            | Ok output when output.ExitCode <> 0 -> return Error(failedRun "git check-attr" output)
-            | Ok output ->
-                // -z output is NUL-delimited (path, attribute, value) triples.
-                let fields = output.StdOut.Split '\000'
+        let cleanupSnapshot () =
+            try
+                if NodeFileSystem.existsSync snapshotPath then
+                    NodeFileSystem.unlinkSync snapshotPath
+            with _ ->
+                ()
 
-                let lfsTrackedPaths =
-                    [|
-                        for index in 0 .. 3 .. fields.Length - 3 do
-                            if fields[index + 1] = "filter" && fields[index + 2] = "lfs" then
-                                fields[index]
-                    |]
-                    |> Set.ofArray
+        try
+            return!
+                async {
+                    try
+                        NodeFileSystem.copyFileSync sourcePath snapshotPath
 
-                let warnings =
-                    oversizedPaths
-                    |> Array.filter (fun pathValue -> not (lfsTrackedPaths.Contains pathValue))
-                    |> Array.map (fun pathValue -> {
-                        Code = "oversized_object_not_tracked"
-                        Message =
-                            $"'{pathValue}' exceeds {thresholdMb} MB and is not tracked by large-object storage."
-                    })
+                        let! pointerResult =
+                            runGit [| "lfs"; "pointer"; $"--file={snapshotPath}" |] None [||]
 
-                return Ok warnings
+                        match pointerResult with
+                        | Error failure -> return Error(dependencyMissingFailure failure.Message)
+                        | Ok output when output.ExitCode <> 0 ->
+                            let detail =
+                                if String.IsNullOrWhiteSpace output.StdErr then output.StdOut else output.StdErr
+
+                            return Error(dependencyMissingFailure detail)
+                        | Ok output ->
+                            match tryPointerOid output.StdOut with
+                            | None ->
+                                return
+                                    Error(
+                                        OperationFailure.create
+                                            ProviderError
+                                            "lfs_pointer_invalid"
+                                            "Git LFS did not return a canonical pointer for an oversized selected file."
+                                    )
+                            | Some oid ->
+                                let objectDirectory =
+                                    NodePath.join
+                                        [|
+                                            commonGitDir
+                                            "lfs"
+                                            "objects"
+                                            oid.Substring(0, 2)
+                                            oid.Substring(2, 2)
+                                        |]
+
+                                let objectPath = NodePath.join [| objectDirectory; oid |]
+                                NodeFileSystem.mkdirSync objectDirectory (NodeFileSystem.MkdirOptions(recursive = true))
+
+                                if NodeFileSystem.existsSync objectPath then
+                                    cleanupSnapshot ()
+                                else
+                                    NodeFileSystem.renameSync snapshotPath objectPath
+
+                                let! pointerBlob =
+                                    runGit [| "hash-object"; "-w"; "--stdin" |] (Some output.StdOut) [||]
+
+                                match pointerBlob with
+                                | Error failure -> return Error failure
+                                | Ok hashOutput when hashOutput.ExitCode <> 0 ->
+                                    return Error(failedRun "git hash-object (LFS pointer)" hashOutput)
+                                | Ok hashOutput -> return Ok(hashOutput.StdOut.Trim())
+                    with error ->
+                        return
+                            Error(
+                                OperationFailure.createRedacted
+                                    ProviderError
+                                    "lfs_object_prepare_failed"
+                                    error.Message
+                            )
+                }
+        finally
+            cleanupSnapshot ()
+    }
+
+let private hashTextBlob (runGit: GitRunner) (content: string) =
+    async {
+        let! result = runGit [| "hash-object"; "-w"; "--stdin" |] (Some content) [||]
+
+        match result with
+        | Error failure -> return Error failure
+        | Ok output when output.ExitCode <> 0 -> return Error(failedRun "git hash-object" output)
+        | Ok output -> return Ok(output.StdOut.Trim())
+    }
+
+let private updateTemporaryIndexEntry
+    (runGit: GitRunner)
+    (environment: (string * string)[])
+    (mode: string)
+    (blobId: string)
+    (path: string)
+    =
+    async {
+        let indexInfo = $"{mode} {blobId}\t{path}\000"
+        let! result = runGit [| "update-index"; "-z"; "--index-info" |] (Some indexInfo) environment
+
+        match result with
+        | Error failure -> return Error failure
+        | Ok output when output.ExitCode <> 0 -> return Error(failedRun "git update-index" output)
+        | Ok _ -> return Ok()
+    }
+
+let private temporaryIndexMode
+    (runGit: GitRunner)
+    (environment: (string * string)[])
+    (path: string)
+    =
+    async {
+        let! result =
+            runGit
+                [| "--literal-pathspecs"; "ls-files"; "--stage"; "-z"; "--"; path |]
+                None
+                environment
+
+        match result with
+        | Error failure -> return Error failure
+        | Ok output when output.ExitCode <> 0 -> return Error(failedRun "git ls-files --stage" output)
+        | Ok output ->
+            let entry = output.StdOut.Split '\000' |> Array.tryFind (String.IsNullOrEmpty >> not)
+
+            match entry |> Option.bind (fun value -> value.Split ' ' |> Array.tryHead) with
+            | Some mode when mode <> "" -> return Ok mode
+            | _ ->
+                return
+                    Error(
+                        OperationFailure.create
+                            ProviderError
+                            "temporary_index_entry_missing"
+                            "The oversized selected file was not present in the temporary index."
+                    )
+    }
+
+let private applyLfsPlanToTemporaryIndex
+    (runGit: GitRunner)
+    (repoPath: string)
+    (commonGitDir: string)
+    (environment: (string * string)[])
+    (plan: SelectedLfsPlan)
+    =
+    async {
+        let mutable failure = None
+
+        for relativePath in plan.OversizedPaths do
+            match failure with
+            | Some _ -> ()
+            | None ->
+                match! prepareLfsPointerBlob runGit repoPath commonGitDir relativePath with
+                | Error currentFailure -> failure <- Some currentFailure
+                | Ok pointerBlob ->
+                    match! temporaryIndexMode runGit environment relativePath with
+                    | Error currentFailure -> failure <- Some currentFailure
+                    | Ok mode ->
+                        match!
+                            updateTemporaryIndexEntry
+                                runGit
+                                environment
+                                mode
+                                pointerBlob
+                                relativePath
+                        with
+                        | Error currentFailure -> failure <- Some currentFailure
+                        | Ok() -> ()
+
+        match failure, plan.GeneratedAttributesContent with
+        | Some currentFailure, _ -> return Error currentFailure
+        | None, None -> return Ok()
+        | None, Some attributesContent ->
+            match! hashTextBlob runGit attributesContent with
+            | Error currentFailure -> return Error currentFailure
+            | Ok attributesBlob ->
+                return!
+                    updateTemporaryIndexEntry
+                        runGit
+                        environment
+                        "100644"
+                        attributesBlob
+                        ".gitattributes"
     }
 
 /// Creates a revision from exact selected paths without touching the real index
@@ -222,7 +463,7 @@ let createRevision
 
                     match metadataResult with
                     | Error failure -> return Failed failure
-                    | Ok warnings ->
+                    | Ok lfsPlan ->
                         // Isolated temporary index inside the resolved git dir.
                         let! gitDirOutput = runGit [| "rev-parse"; "--absolute-git-dir" |] None [||]
 
@@ -232,6 +473,18 @@ let createRevision
                             return Failed(failedRun "git rev-parse --absolute-git-dir" gitDirResult)
                         | Ok gitDirResult ->
                             let gitDir = gitDirResult.StdOut.Trim()
+
+                            let! commonGitDirOutput =
+                                runGit
+                                    [| "rev-parse"; "--path-format=absolute"; "--git-common-dir" |]
+                                    None
+                                    [||]
+
+                            let commonGitDir =
+                                match commonGitDirOutput with
+                                | Ok output when output.ExitCode = 0 && not (String.IsNullOrWhiteSpace output.StdOut) ->
+                                    output.StdOut.Trim()
+                                | _ -> gitDir
 
                             let temporaryIndex =
                                 NodePath.join [| gitDir; $"vcs-selected-index-{DateTime.Now.Ticks}" |]
@@ -288,17 +541,32 @@ let createRevision
                                         else
                                             return Failed(failedRun "git add (temporary index)" addOutput)
                                     | Ok _ ->
-                                        let! treeResult = runGit [| "write-tree" |] None environment
+                                        let! preparedTree =
+                                            async {
+                                                match!
+                                                    applyLfsPlanToTemporaryIndex
+                                                        runGit
+                                                        repoPath
+                                                        commonGitDir
+                                                        environment
+                                                        lfsPlan
+                                                with
+                                                | Error failure -> return Error failure
+                                                | Ok() ->
+                                                    let! treeResult = runGit [| "write-tree" |] None environment
 
-                                        match treeResult with
+                                                    match treeResult with
+                                                    | Error failure -> return Error failure
+                                                    | Ok treeOutput when treeOutput.ExitCode <> 0 ->
+                                                        return Error(failedRun "git write-tree" treeOutput)
+                                                    | Ok treeOutput -> return Ok(treeOutput.StdOut.Trim())
+                                            }
+
+                                        match preparedTree with
                                         | Error failure ->
                                             cleanupTemporaryIndex ()
                                             return Failed failure
-                                        | Ok treeOutput when treeOutput.ExitCode <> 0 ->
-                                            cleanupTemporaryIndex ()
-                                            return Failed(failedRun "git write-tree" treeOutput)
-                                        | Ok treeOutput ->
-                                            let newTree = treeOutput.StdOut.Trim()
+                                        | Ok newTree ->
 
                                             let! headTree =
                                                 match expectedHead with
@@ -393,57 +661,105 @@ let createRevision
                                                         cleanupTemporaryIndex ()
                                                         do! barrier "selected-revision-post-update-ref"
 
-                                                        // Reconcile only the committed paths in the
-                                                        // real index (unrelated staged state untouched).
-                                                        let! reconcileResult =
-                                                            runGit
-                                                                [|
-                                                                    "reset"
-                                                                    yield!
-                                                                        GitPathTransport.pathspecFromStdinArguments
-                                                                |]
-                                                                (Some stdinPayload)
-                                                                [||]
+                                                        let attributesPath =
+                                                            RepositoryPath.tryCreate ".gitattributes"
+                                                            |> Result.defaultWith failwith
+
+                                                        let reconciliationPaths =
+                                                            match lfsPlan.GeneratedAttributesContent with
+                                                            | Some _ when not (paths |> Array.contains attributesPath) ->
+                                                                Array.append paths [| attributesPath |]
+                                                            | _ -> paths
+
+                                                        let affectedPaths =
+                                                            reconciliationPaths |> Array.map RepositoryPath.value
 
                                                         let revisionId =
                                                             match RevisionId.tryCreate newCommit with
                                                             | Ok value -> value
                                                             | Error errorMessage -> failwith errorMessage
 
-                                                        match reconcileResult with
-                                                        | Ok reconcileOutput when reconcileOutput.ExitCode = 0 ->
-                                                            return
-                                                                Succeeded {
-                                                                    OperationOutcome.performed revisionId with
-                                                                        AffectedPaths =
-                                                                            paths |> Array.map RepositoryPath.value
-                                                                        ResultingRevision = Some revisionId
-                                                                        Warnings = warnings
-                                                                        Publication = LocalOnly
+                                                        let outcome = {
+                                                            OperationOutcome.performed revisionId with
+                                                                AffectedPaths = affectedPaths
+                                                                ResultingRevision = Some revisionId
+                                                                Publication = LocalOnly
+                                                        }
+
+                                                        let partialReconciliation failure =
+                                                            OperationResult.partiallySucceeded
+                                                                outcome
+                                                                {
+                                                                    failure with
+                                                                        AffectedPaths = affectedPaths
                                                                 }
-                                                        | _ ->
-                                                            // The revision exists; only reconciliation failed.
-                                                            return
-                                                                OperationResult.partiallySucceeded
-                                                                    {
-                                                                        OperationOutcome.performed revisionId with
-                                                                            AffectedPaths =
-                                                                                paths
-                                                                                |> Array.map RepositoryPath.value
-                                                                            ResultingRevision = Some revisionId
-                                                                            Warnings = warnings
-                                                                            Publication = LocalOnly
-                                                                    }
-                                                                    (OperationFailure.create
-                                                                        ProviderError
-                                                                        "index_reconciliation_failed"
-                                                                        "The revision was created but the real index could not be reconciled.")
-                                                                    {
-                                                                        Code = "reconcile_index"
-                                                                        Instructions =
-                                                                            Some
-                                                                                "Run git reset on the committed paths to refresh their index entries."
-                                                                    }
+                                                                {
+                                                                    Code = "reconcile_index"
+                                                                    Instructions =
+                                                                        Some
+                                                                            "Restore the generated .gitattributes content and run git reset on the committed paths."
+                                                                }
+
+                                                        let attributesWriteResult =
+                                                            match lfsPlan.GeneratedAttributesContent with
+                                                            | None -> Ok()
+                                                            | Some attributesContent ->
+                                                                try
+                                                                    let attributesFile =
+                                                                        NodePath.join [| repoPath; ".gitattributes" |]
+
+                                                                    GitLfsService.replaceAttributesAtomically
+                                                                        attributesFile
+                                                                        lfsPlan.AttributesOriginalIdentity
+                                                                        attributesContent
+
+                                                                    Ok()
+                                                                with error ->
+                                                                    Error(
+                                                                        OperationFailure.createRedacted
+                                                                            ProviderError
+                                                                            "attributes_reconciliation_failed"
+                                                                            error.Message
+                                                                    )
+
+                                                        // Reconcile only the committed paths in the
+                                                        // real index (unrelated staged state untouched).
+                                                        match attributesWriteResult with
+                                                        | Error failure -> return partialReconciliation failure
+                                                        | Ok() ->
+                                                            let reconciliationPayload =
+                                                                GitPathTransport.nulDelimitedLiteralPathspecs reconciliationPaths
+
+                                                            let! reconcileResult =
+                                                                runGit
+                                                                    [|
+                                                                        "reset"
+                                                                        yield!
+                                                                            GitPathTransport.pathspecFromStdinArguments
+                                                                    |]
+                                                                    (Some reconciliationPayload)
+                                                                    [||]
+
+                                                            match reconcileResult with
+                                                            | Ok reconcileOutput when reconcileOutput.ExitCode = 0 ->
+                                                                return Succeeded outcome
+                                                            | Error failure ->
+                                                                return
+                                                                    partialReconciliation (
+                                                                        OperationFailure.createRedacted
+                                                                            ProviderError
+                                                                            "index_reconciliation_failed"
+                                                                            failure.Message
+                                                                    )
+                                                            | Ok reconcileOutput ->
+                                                                // The revision exists; only reconciliation failed.
+                                                                return
+                                                                    partialReconciliation (
+                                                                        OperationFailure.createRedacted
+                                                                            ProviderError
+                                                                            "index_reconciliation_failed"
+                                                                            reconcileOutput.StdErr
+                                                                    )
                             finally
                                 cleanupTemporaryIndex ()
     }

@@ -46,10 +46,15 @@ let private protocolOverridePattern =
 
 let private remoteNamePattern = Regex("^[A-Za-z0-9._/-]+$")
 let private invalidBranchCharactersPattern = Regex(@"[~^:?*\[\\\s]")
-let private gitLfsThresholdConfigKey = "swate.lfs.autotrackthresholdmb"
-let private gitLfsDownloadLargeFilesConfigKey = "swate.lfs.downloadlargefiles"
-let private gitLfsDefaultThresholdMb = 1
-let private gitLfsMaximumThresholdMb = 100
+[<Literal>]
+let AutoTrackThresholdKey = "versioncontrolservice.lfs.autotrackthresholdmb"
+
+[<Literal>]
+let MaterializeLargeObjectsKey = "versioncontrolservice.lfs.materializelargeobjects"
+
+[<Literal>]
+let DefaultAutoTrackThresholdMb = 1
+
 let private gitLfsDefaultDownloadLargeFiles = false
 
 let private pushCancellationRequests =
@@ -222,13 +227,11 @@ let private tryGetNodeErrorCode (error: exn) : string option =
 let private valueOrEmptyArray (items: 'T[]) = if isNull items then [||] else items
 
 // GitService validates the threshold because it owns the policy that decides when normal git actions must switch into LFS handling.
-let private validateLfsThresholdMb (thresholdMb: int) =
-    if thresholdMb < 1 then
-        Error(exn "Git LFS auto-track threshold must be at least 1 MB.")
-    elif thresholdMb > gitLfsMaximumThresholdMb then
-        Error(exn $"Git LFS auto-track threshold must not exceed {gitLfsMaximumThresholdMb} MB.")
-    else
+let validateLfsThresholdMb (thresholdMb: int) =
+    if thresholdMb > 0 then
         Ok thresholdMb
+    else
+        Error(exn "The automatic LFS threshold must be a positive whole MiB value.")
 
 // GitService parses the stored threshold because the setting is interpreted by git workflow code here.
 let private tryParseConfiguredThresholdMb (value: string option) =
@@ -237,7 +240,7 @@ let private tryParseConfiguredThresholdMb (value: string option) =
     | Some text ->
         let success, parsed = Int32.TryParse(text.Trim())
 
-        if success && parsed >= 1 && parsed <= gitLfsMaximumThresholdMb then
+        if success && parsed > 0 then
             Some parsed
         else
             None
@@ -803,20 +806,20 @@ let private runGitCapturedWithOutput progressCallback request = promise {
 // GitService reads the threshold because stage/commit need the value while deciding whether to enforce LFS automatically.
 let private getConfiguredLfsThresholdMb (git: ISimpleGit) : JS.Promise<int> = promise {
     try
-        let! configResult = git.getConfig (gitLfsThresholdConfigKey, "local")
+        let! configResult = git.getConfig (AutoTrackThresholdKey, "local")
 
         return
             configResult.value
             |> tryParseConfiguredThresholdMb
-            |> Option.defaultValue gitLfsDefaultThresholdMb
+            |> Option.defaultValue DefaultAutoTrackThresholdMb
     with _ ->
-        return gitLfsDefaultThresholdMb
+        return DefaultAutoTrackThresholdMb
 }
 
 // GitService reads the download preference because pull/sync need it while deciding whether to hydrate LFS content or keep pointers.
 let private getConfiguredLfsDownloadLargeFiles (git: ISimpleGit) : JS.Promise<bool> = promise {
     try
-        let! configResult = git.getConfig (gitLfsDownloadLargeFilesConfigKey, "local")
+        let! configResult = git.getConfig (MaterializeLargeObjectsKey, "local")
 
         return
             configResult.value
@@ -839,7 +842,7 @@ let private runGitLfsTrackCommand
     (thresholdMb: int)
     : JS.Promise<GitResult<unit>> =
     promise {
-        let! result = track arcPath relativePath
+        let! result = trackLiteral arcPath relativePath
 
         return
             match result with
@@ -867,7 +870,7 @@ let private getOversizedWorkingTreePaths
                 | Ok(_, absolutePath) ->
                     let! fileSizeOption = tryGetFileSizeInBytes absolutePath
 
-                    if fileSizeOption |> Option.exists (fun fileSize -> fileSize > thresholdBytes) then
+                    if fileSizeOption |> Option.exists (fun fileSize -> fileSize >= thresholdBytes) then
                         oversizedPaths.Add selectedPath
 
         match failure with
@@ -1990,7 +1993,7 @@ let setLfsSettings (arcPath: string) (settings: GitLfsSettingsDto) : JS.Promise<
                         git.raw [|
                             "config"
                             "--local"
-                            gitLfsThresholdConfigKey
+                            AutoTrackThresholdKey
                             formatThresholdConfigValue thresholdMb
                         |]
 
@@ -1998,7 +2001,7 @@ let setLfsSettings (arcPath: string) (settings: GitLfsSettingsDto) : JS.Promise<
                         git.raw [|
                             "config"
                             "--local"
-                            gitLfsDownloadLargeFilesConfigKey
+                            MaterializeLargeObjectsKey
                             formatDownloadLargeFilesConfigValue settings.DownloadLargeFiles
                         |]
 

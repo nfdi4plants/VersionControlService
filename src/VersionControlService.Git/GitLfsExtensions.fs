@@ -106,19 +106,28 @@ let createStoragePolicy (repoPath: string) : StoragePolicyService = {
         }
     SetSettings =
         fun settings _ -> async {
-            let! currentResult = Async.AwaitPromise(GitService.getLfsSettings repoPath)
+            if settings.AutoPolicyThresholdMb |> Option.exists (fun value -> value <= 0) then
+                return
+                    Failed(
+                        OperationFailure.create
+                            Validation
+                            "invalid_lfs_threshold"
+                            "The automatic LFS threshold must be a positive whole MiB value."
+                    )
+            else
+                let! currentResult = Async.AwaitPromise(GitService.getLfsSettings repoPath)
 
-            match currentResult with
-            | Error failure -> return Failed(toOperationFailure failure)
-            | Ok current ->
-                let next: GitLfsSettingsDto = {
-                    AutoTrackThresholdMb =
-                        settings.AutoPolicyThresholdMb
-                        |> Option.defaultValue current.AutoTrackThresholdMb
-                    DownloadLargeFiles = settings.MaterializeLargeObjects
-                }
+                match currentResult with
+                | Error failure -> return Failed(toOperationFailure failure)
+                | Ok current ->
+                    let next: GitLfsSettingsDto = {
+                        AutoTrackThresholdMb =
+                            settings.AutoPolicyThresholdMb
+                            |> Option.defaultValue current.AutoTrackThresholdMb
+                        DownloadLargeFiles = settings.MaterializeLargeObjects
+                    }
 
-                return! wrapUnit (GitService.setLfsSettings repoPath next)
+                    return! wrapUnit (GitService.setLfsSettings repoPath next)
         }
 }
 

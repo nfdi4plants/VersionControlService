@@ -11,8 +11,6 @@ open VersionControlService.Git.GitAuthAdapter
 open VersionControlService.Git.GitInternals
 open VersionControlService.Git.GitTokenProvider
 
-let private gitLfsDownloadLargeFilesConfigKey = "swate.lfs.downloadlargefiles"
-
 type ExistingPathKind =
     | Directory
     | File
@@ -248,7 +246,7 @@ let private persistCloneDownloadPreference
                 currentGit.raw [|
                     "config"
                     "--local"
-                    gitLfsDownloadLargeFilesConfigKey
+                    GitService.MaterializeLargeObjectsKey
                     formatDownloadLargeFilesConfigValue downloadLargeFiles
                 |]
 

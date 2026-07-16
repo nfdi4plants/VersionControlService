@@ -12,6 +12,7 @@ open Vitest
 
 module GitWorkspaceSession = VersionControlService.Git.GitWorkspaceSession
 module GitLfsExtensions = VersionControlService.Git.GitLfsExtensions
+module GitLfsService = VersionControlService.Git.GitLfsService
 module NodeProcess = VersionControlService.Runtime.Node.Process
 
 let private fsPromisesDynamic: obj = importAll "fs/promises"
@@ -81,6 +82,29 @@ let private renameAsync (fromPath: string) (toPath: string) : JS.Promise<unit> =
     let! _ = fsPromisesDynamic?rename (fromPath, toPath) |> unbox<JS.Promise<obj>>
     return ()
 }
+
+let private createDirectoryJunctionAsync (targetPath: string) (linkPath: string) : JS.Promise<unit> = promise {
+    let! _ = fsPromisesDynamic?symlink (targetPath, linkPath, "junction") |> unbox<JS.Promise<obj>>
+    return ()
+}
+
+[<Emit("(() => { const fs = require('node:fs'); const moduleApi = require('node:module'); const original = fs.renameSync; fs.renameSync = () => { throw new Error('injected atomic rename failure'); }; moduleApi.syncBuiltinESMExports(); return () => { fs.renameSync = original; moduleApi.syncBuiltinESMExports(); }; })()")>]
+let private injectRenameSyncFailure () : (unit -> unit) = jsNative
+
+[<Emit("process.execPath")>]
+let private nodeExecutablePath: string = jsNative
+
+[<Emit("process.platform === 'win32'")>]
+let private isWindowsProcess () : bool = jsNative
+
+[<Emit("process.env.PATH || ''")>]
+let private currentProcessPath () : string = jsNative
+
+[<Emit("process.env.PATH = $0")>]
+let private setCurrentProcessPath (_value: string) : unit = jsNative
+
+[<Emit("require('node:path').delimiter")>]
+let private pathDelimiter: string = jsNative
 
 /// Direct git invocation for harness fixture work (never through the session).
 let private runGitIn
@@ -570,6 +594,67 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "a local upstream remains a local target and refresh does not require a remote",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let! _ =
+                        harness.SeedRevisionOnNewRef
+                            workspace
+                            "integration"
+                            [| "local-target.txt", "advanced through a local upstream\n" |]
+
+                    let! _ =
+                        runGitIn
+                            workspace.Binding.WorkspaceRoot
+                            [||]
+                            [| "branch"; "--set-upstream-to=integration"; "main" |]
+                            None
+
+                    let! expectedTargetRevision =
+                        runGitIn workspace.Binding.WorkspaceRoot [||] [| "rev-parse"; "refs/heads/integration" |] None
+
+                    let! statusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "local-upstream-status")
+                        |> Async.StartAsPromise
+
+                    let status = expectProviderValue "local upstream status" statusResult
+                    let synchronization =
+                        status.Synchronization
+                        |> Option.defaultWith (fun () -> failwith "Expected local-upstream synchronization state.")
+
+                    let target =
+                        synchronization.TargetRef
+                        |> Option.defaultWith (fun () -> failwith "Expected configured local upstream target.")
+
+                    Vitest.expect(target.Name).toBe "integration"
+                    Vitest.expect(ProviderRef.value target.ProviderRef).toBe "git-local:integration"
+                    Vitest.expect(target.Kind).toEqual LocalRef
+                    Vitest.expect(synchronization.TargetRevision |> Option.map RevisionId.value).toEqual (Some(expectedTargetRevision.Trim()))
+                    Vitest.expect(synchronization.Relationship).toEqual TargetAhead
+
+                    let refresh =
+                        workspace.Session.Synchronization
+                        |> Option.defaultWith (fun () -> failwith "Expected Git synchronization.")
+
+                    let! refreshResult =
+                        refresh.Refresh(OperationContext.detached "refresh-local-upstream")
+                        |> Async.StartAsPromise
+
+                    let refreshed = expectProviderValue "refresh local upstream" refreshResult
+                    Vitest.expect(refreshed.TargetRef).toEqual (Some target)
+                    Vitest.expect(refreshed.TargetRevision |> Option.map RevisionId.value).toEqual (Some(expectedTargetRevision.Trim()))
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
             "a branch without an upstream exposes no neutral synchronization target",
             TestOptions(timeout = 120000),
             fun () -> promise {
@@ -663,6 +748,8 @@ Vitest.describe (
                         "literal?.question", "literalX.question", "nested/literal?.question"
                         "tab\tname.bin", "tab name.bin", "nested/tab\tname.bin"
                         "line\nname.bin", "lineXname.bin", "nested/line\nname.bin"
+                        "quote\"name.bin", "quoteXname.bin", "nested/quote\"name.bin"
+                        "bell\u0007name.bin", "bellXname.bin", "nested/bell\u0007name.bin"
                     |]
 
                     let repositoryPath value =
@@ -705,6 +792,8 @@ Vitest.describe (
                     Vitest.expect(attributeFile.Contains("\"/literal\\\\?.question\" filter=lfs")).toBe true
                     Vitest.expect(attributeFile.Contains("\"/tab\\tname.bin\" filter=lfs")).toBe true
                     Vitest.expect(attributeFile.Contains("\"/line\\nname.bin\" filter=lfs")).toBe true
+                    Vitest.expect(attributeFile.Contains("\"/quote\\\"name.bin\" filter=lfs")).toBe true
+                    Vitest.expect(attributeFile.Contains("\"/bell\\aname.bin\" filter=lfs")).toBe true
 
                     for literalPath, _, _ in literalPaths do
                         let! result =
@@ -727,6 +816,127 @@ Vitest.describe (
                         Vitest.expect(attributes.Contains($"{literalPath}\000filter\000unspecified\000")).toBe true
                         Vitest.expect(attributes.Contains($"{nestedDecoyPath}\000filter\000unspecified\000")).toBe true
 
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "storage policy rejects an attributes parent junction without mutating its outside target",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let attributesPath = join [| workspace.Binding.WorkspaceRoot; ".gitattributes" |]
+                    let outsideContent = "outside.bin filter=lfs diff=lfs merge=lfs -text\n"
+                    do! writeUtf8FileAsync attributesPath outsideContent
+                    let! outsideBefore = readFileBase64Async attributesPath
+                    let linkedRepo = workspace.Binding.WorkspaceRoot + "-junction"
+                    do! createDirectoryJunctionAsync workspace.Binding.WorkspaceRoot linkedRepo
+
+                    let! result = GitLfsService.trackLiteral linkedRepo "selected.bin"
+                    Vitest.expect(Result.isError result).toBe true
+                    let! outsideAfter = readFileBase64Async attributesPath
+                    Vitest.expect(outsideAfter).toBe outsideBefore
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "storage policy leaves previous attributes byte-identical when the atomic replacement fails",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let attributesPath = join [| workspace.Binding.WorkspaceRoot; ".gitattributes" |]
+                    let original = "# preserved bytes\r\nlegacy.bin filter=lfs diff=lfs merge=lfs -text\r\n"
+                    do! writeUtf8FileAsync attributesPath original
+                    let before = readFileBase64Async attributesPath
+                    let restoreRename = injectRenameSyncFailure ()
+
+                    let storagePolicy =
+                        workspace.Session.StoragePolicy
+                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
+
+                    let selectedPath = RepositoryPath.tryCreate "selected.bin" |> Result.defaultWith failwith
+
+                    let! result =
+                        promise {
+                            try
+                                return!
+                                    storagePolicy.SetPathPolicy
+                                        selectedPath
+                                        true
+                                        (OperationContext.detached "atomic-attributes-failure")
+                                    |> Async.StartAsPromise
+                            finally
+                                restoreRename ()
+                        }
+
+                    let failure = expectProviderFailure "atomic attributes replacement" result
+                    Vitest.expect(failure.StateChanged).toBe false
+                    let! before = before
+                    let! after = readFileBase64Async attributesPath
+                    Vitest.expect(after).toBe before
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "untracking an exact path preserves legacy unanchored and glob rules byte-for-byte",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let attributesPath = join [| workspace.Binding.WorkspaceRoot; ".gitattributes" |]
+                    let legacyRules =
+                        "file.bin filter=lfs diff=lfs merge=lfs -text\r\n*.dat filter=lfs diff=lfs merge=lfs -text\r\n"
+
+                    do! writeUtf8FileAsync attributesPath legacyRules
+                    let before = readFileBase64Async attributesPath
+
+                    let storagePolicy =
+                        workspace.Session.StoragePolicy
+                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
+
+                    for value in [| "nested/file.bin"; "nested/report.dat" |] do
+                        let path = RepositoryPath.tryCreate value |> Result.defaultWith failwith
+                        let! result =
+                            storagePolicy.SetPathPolicy
+                                path
+                                false
+                                (OperationContext.detached $"preserve-legacy-{value}")
+                            |> Async.StartAsPromise
+
+                        expectProviderValue $"untrack {value}" result |> ignore
+
+                    let! before = before
+                    let! after = readFileBase64Async attributesPath
+                    Vitest.expect(after).toBe before
+
+                    let! attributeOutput =
+                        runGitIn
+                            workspace.Binding.WorkspaceRoot
+                            [||]
+                            [| "check-attr"; "-z"; "filter"; "--"; "nested/file.bin"; "nested/report.dat" |]
+                            None
+
+                    Vitest.expect(attributeOutput.Contains("nested/file.bin\000filter\000lfs\000")).toBe true
+                    Vitest.expect(attributeOutput.Contains("nested/report.dat\000filter\000lfs\000")).toBe true
                     do! harness.Cleanup()
                 with error ->
                     do! harness.Cleanup()
@@ -773,53 +983,90 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "maintenance preserves provider progress totals above two GiB",
+            "maintenance streams real process progress totals above two GiB",
+            TestOptions(timeout = 120000),
             fun () -> promise {
+                let harness = createGitHarness ()
+                let! fakeRoot = createTempDirectoryAsync ()
                 let completedBytes = 3.0 * 1024.0 * 1024.0 * 1024.0
                 let totalBytes = 4.0 * 1024.0 * 1024.0 * 1024.0
+                let completedBytesText = string (int64 completedBytes)
+                let totalBytesText = string (int64 totalBytes)
 
-                let successfulOperation
-                    (progress: (GitProgressDto -> unit) option)
-                    (_: unit -> bool)
-                    (onStarted: unit -> unit)
-                    =
-                    promise {
-                        onStarted ()
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let fakeGitPath = join [| fakeRoot; if isWindowsProcess () then "git.exe" else "git" |]
 
-                        progress
-                        |> Option.iter (fun report ->
-                            report {
-                                Method = Some "deduplicate"
-                                Stage = Some "objects"
-                                Progress = Some 75.0
-                                Processed = Some completedBytes
-                                Total = Some totalBytes
-                                Output = Some "Deduplicating large objects"
-                            })
+                    if isWindowsProcess () then
+                        let! _ = fsPromisesDynamic?copyFile (nodeExecutablePath, fakeGitPath) |> unbox<JS.Promise<obj>>
+                        do!
+                            writeUtf8FileAsync
+                                (join [| workspace.Binding.WorkspaceRoot; "rev-parse" |])
+                                "console.log('true');\n"
 
-                        return Ok "deduplicated"
-                    }
+                        do! writeUtf8FileAsync (join [| workspace.Binding.WorkspaceRoot; "status" |]) ""
 
-                let maintenance =
-                    GitLfsExtensions.createMaintenanceWithOperations {
-                        Prune = successfulOperation
-                        Deduplicate = successfulOperation
-                    }
+                        do!
+                            writeUtf8FileAsync
+                                (join [| workspace.Binding.WorkspaceRoot; "lfs" |])
+                                ("console.log('deduplicate: 75% ("
+                                 + completedBytesText
+                                 + "/"
+                                 + totalBytesText
+                                 + " bytes)');\n")
+                    else
+                        let dispatcher = join [| fakeRoot; "fake-git.js" |]
 
-                let reports = ResizeArray<OperationProgress>()
-                let context =
-                    OperationContext.create "large-maintenance-progress" OperationCancellation.none reports.Add
+                        do!
+                            writeUtf8FileAsync
+                                dispatcher
+                                ("if (process.argv.includes('dedup')) console.log('deduplicate: 75% ("
+                                 + completedBytesText
+                                 + "/"
+                                 + totalBytesText
+                                 + " bytes)');\n")
 
-                let! result = maintenance.Deduplicate context |> Async.StartAsPromise
-                expectProviderValue "large maintenance progress" result |> ignore
+                        do!
+                            writeUtf8FileAsync
+                                fakeGitPath
+                                $"#!/bin/sh\nexec '{nodeExecutablePath}' '{dispatcher}' \"$@\"\n"
 
-                let largeReport =
-                    reports
-                    |> Seq.find (fun report -> report.Completed.IsSome)
+                        let! _ = fsPromisesDynamic?chmod (fakeGitPath, 493) |> unbox<JS.Promise<obj>>
+                        ()
 
-                Vitest.expect(largeReport.PhaseCode).toBe "maintenance-deduplicate"
-                Vitest.expect(largeReport.Completed).toEqual (Some completedBytes)
-                Vitest.expect(largeReport.Total).toEqual (Some totalBytes)
+                    let reports = ResizeArray<OperationProgress>()
+                    let context =
+                        OperationContext.create "large-maintenance-progress" OperationCancellation.none reports.Add
+
+                    let maintenance =
+                        workspace.Session.Maintenance
+                        |> Option.defaultWith (fun () -> failwith "Expected Git maintenance.")
+
+                    let originalPath = currentProcessPath ()
+                    let! result =
+                        promise {
+                            try
+                                setCurrentProcessPath (fakeRoot + pathDelimiter + originalPath)
+                                return! maintenance.Deduplicate context |> Async.StartAsPromise
+                            finally
+                                setCurrentProcessPath originalPath
+                        }
+
+                    expectProviderValue "large maintenance progress" result |> ignore
+
+                    let largeReport =
+                        reports
+                        |> Seq.find (fun report -> report.Completed.IsSome)
+
+                    Vitest.expect(largeReport.PhaseCode).toBe "maintenance-deduplicate"
+                    Vitest.expect(largeReport.Completed).toEqual (Some completedBytes)
+                    Vitest.expect(largeReport.Total).toEqual (Some totalBytes)
+                    do! harness.Cleanup()
+                    do! removeDirectoryAsync fakeRoot
+                with error ->
+                    do! harness.Cleanup()
+                    do! removeDirectoryAsync fakeRoot
+                    return raise error
             }
         )
 
@@ -990,6 +1237,220 @@ Vitest.describe (
                     Vitest.expect(changedPathFailure.Code).toBe "preview_indeterminate"
                     Vitest.expect(changedPathFailure.Retryable).toBe true
                     Vitest.expect(changedPathFailure.StateChanged).toBe false
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+)
+
+Vitest.describe (
+    "Git / automatic Git LFS policy",
+    fun () ->
+        Vitest.test (
+            "tracks selected files at or above the default one MiB threshold",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let oneMiB = 1024 * 1024
+                    do! workspace.WriteFile "below.bin" (String.replicate (oneMiB - 1) "b")
+                    do! workspace.WriteFile "exact.bin" (String.replicate oneMiB "e")
+                    do! workspace.WriteFile "above.bin" (String.replicate (oneMiB + 1) "a")
+
+                    let! statusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "automatic-lfs-status")
+                        |> Async.StartAsPromise
+
+                    let status = expectProviderValue "automatic LFS status" statusResult
+
+                    let paths =
+                        [| "below.bin"; "exact.bin"; "above.bin" |]
+                        |> Array.map (RepositoryPath.tryCreate >> Result.defaultWith failwith)
+
+                    let! revisionResult =
+                        workspace.Session.Core.CreateRevision
+                            {
+                                Message = "test: automatic LFS threshold"
+                                Paths = paths
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (OperationContext.detached "automatic-lfs-revision")
+                        |> Async.StartAsPromise
+
+                    expectProviderValue "automatic LFS revision" revisionResult |> ignore
+
+                    let! below = runGitIn workspace.Binding.WorkspaceRoot [||] [| "show"; "HEAD:below.bin" |] None
+                    let! exact = runGitIn workspace.Binding.WorkspaceRoot [||] [| "show"; "HEAD:exact.bin" |] None
+                    let! above = runGitIn workspace.Binding.WorkspaceRoot [||] [| "show"; "HEAD:above.bin" |] None
+
+                    Vitest.expect(below.Contains "git-lfs").toBe false
+                    Vitest.expect(exact.Contains "git-lfs").toBe true
+                    Vitest.expect(above.Contains "git-lfs").toBe true
+
+                    let! attributes = workspace.ReadFile ".gitattributes"
+                    let attributes = attributes |> Option.defaultValue ""
+                    Vitest.expect(attributes.Contains "\"/exact.bin\" filter=lfs").toBe true
+                    Vitest.expect(attributes.Contains "\"/above.bin\" filter=lfs").toBe true
+                    Vitest.expect(attributes.Contains "\"/below.bin\" filter=lfs").toBe false
+
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "validates and persists only library-owned automatic LFS settings",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let storagePolicy =
+                        workspace.Session.StoragePolicy
+                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
+
+                    let! setResult =
+                        storagePolicy.SetSettings
+                            {
+                                AutoPolicyThresholdMb = Some 4
+                                MaterializeLargeObjects = true
+                            }
+                            (OperationContext.detached "set-library-lfs-settings")
+                        |> Async.StartAsPromise
+
+                    expectProviderValue "set library LFS settings" setResult |> ignore
+
+                    let! threshold =
+                        runGitIn
+                            workspace.Binding.WorkspaceRoot
+                            [||]
+                            [| "config"; "--local"; "--get"; "versioncontrolservice.lfs.autotrackthresholdmb" |]
+                            None
+
+                    let! materialize =
+                        runGitIn
+                            workspace.Binding.WorkspaceRoot
+                            [||]
+                            [| "config"; "--local"; "--get"; "versioncontrolservice.lfs.materializelargeobjects" |]
+                            None
+
+                    let! localConfig =
+                        runGitIn workspace.Binding.WorkspaceRoot [||] [| "config"; "--local"; "--list" |] None
+
+                    Vitest.expect(threshold.Trim()).toBe "4"
+                    Vitest.expect(materialize.Trim()).toBe "true"
+                    Vitest.expect(localConfig.Contains "swate.lfs.").toBe false
+
+                    let fourMiB = 4 * 1024 * 1024
+                    do! workspace.WriteFile "configured-below.bin" (String.replicate (fourMiB - 1) "b")
+                    do! workspace.WriteFile "configured exact [file].bin" (String.replicate fourMiB "e")
+
+                    let! configuredStatusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "configured-lfs-status")
+                        |> Async.StartAsPromise
+
+                    let configuredStatus = expectProviderValue "configured LFS status" configuredStatusResult
+
+                    let configuredPaths =
+                        [| "configured-below.bin"; "configured exact [file].bin" |]
+                        |> Array.map (RepositoryPath.tryCreate >> Result.defaultWith failwith)
+
+                    let! configuredRevisionResult =
+                        workspace.Session.Core.CreateRevision
+                            {
+                                Message = "test: configured automatic LFS threshold"
+                                Paths = configuredPaths
+                                ExpectedWorkspaceVersion = configuredStatus.WorkspaceVersion
+                            }
+                            (OperationContext.detached "configured-lfs-revision")
+                        |> Async.StartAsPromise
+
+                    expectProviderValue "configured automatic LFS revision" configuredRevisionResult |> ignore
+
+                    let! configuredBelow =
+                        runGitIn workspace.Binding.WorkspaceRoot [||] [| "show"; "HEAD:configured-below.bin" |] None
+
+                    let! configuredExact =
+                        runGitIn
+                            workspace.Binding.WorkspaceRoot
+                            [||]
+                            [| "show"; "HEAD:configured exact [file].bin" |]
+                            None
+
+                    Vitest.expect(configuredBelow.Contains "git-lfs").toBe false
+                    Vitest.expect(configuredExact.Contains "git-lfs").toBe true
+
+                    let! configuredAttributes = workspace.ReadFile ".gitattributes"
+                    let configuredAttributes = configuredAttributes |> Option.defaultValue ""
+                    Vitest.expect(configuredAttributes.Contains "\"/configured exact \\\\[file\\\\].bin\" filter=lfs").toBe true
+
+                    Vitest.expect(
+                        GitLfsService.literalTrackingRule "literal[auto]* name.bin"
+                    ).toBe "\"/literal\\\\[auto\\\\]\\\\* name.bin\" filter=lfs diff=lfs merge=lfs -text"
+
+                    Vitest.expect(
+                        GitLfsService.literalTrackingRule "literal\\path.bin"
+                    ).toBe "\"/literal\\\\path.bin\" filter=lfs diff=lfs merge=lfs -text"
+
+                    Vitest.expect(RepositoryPath.tryCreate "literal\\path.bin" |> Result.isError).toBe true
+
+                    for invalidThreshold in [| 0; -1 |] do
+                        let! invalidResult =
+                            storagePolicy.SetSettings
+                                {
+                                    AutoPolicyThresholdMb = Some invalidThreshold
+                                    MaterializeLargeObjects = false
+                                }
+                                (OperationContext.detached $"invalid-lfs-threshold-{invalidThreshold}")
+                            |> Async.StartAsPromise
+
+                        let failure = expectProviderFailure "invalid LFS threshold" invalidResult
+                        Vitest.expect(failure.Category).toEqual Validation
+                        Vitest.expect(failure.StateChanged).toBe false
+
+                    let! _ =
+                        runGitIn
+                            workspace.Binding.WorkspaceRoot
+                            [||]
+                            [|
+                                "config"
+                                "--local"
+                                "versioncontrolservice.lfs.autotrackthresholdmb"
+                                "1.5"
+                            |]
+                            None
+
+                    do! workspace.WriteFile "fractional.bin" (String.replicate (1024 * 1024) "f")
+
+                    let! statusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "fractional-threshold-status")
+                        |> Async.StartAsPromise
+
+                    let status = expectProviderValue "fractional threshold status" statusResult
+                    let fractionalPath =
+                        RepositoryPath.tryCreate "fractional.bin"
+                        |> Result.defaultWith failwith
+
+                    let! revisionResult =
+                        workspace.Session.Core.CreateRevision
+                            {
+                                Message = "test: reject fractional threshold"
+                                Paths = [| fractionalPath |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (OperationContext.detached "fractional-threshold-revision")
+                        |> Async.StartAsPromise
+
+                    let fractionalFailure = expectProviderFailure "fractional LFS threshold" revisionResult
+                    Vitest.expect(fractionalFailure.Category).toEqual Validation
+                    Vitest.expect(fractionalFailure.StateChanged).toBe false
                     do! harness.Cleanup()
                 with error ->
                     do! harness.Cleanup()
