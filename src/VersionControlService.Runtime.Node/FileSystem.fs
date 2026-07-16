@@ -1,6 +1,7 @@
 module VersionControlService.Runtime.Node.FileSystem
 
 open Fable.Core
+open Fable.Core.JsInterop
 
 [<JS.PojoAttribute>]
 type MkdirOptions(?recursive: bool) =
@@ -23,6 +24,17 @@ type Stats =
     abstract member isFile: unit -> bool
     abstract member isSymbolicLink: unit -> bool
     abstract member size: float
+    abstract member dev: float
+    abstract member ino: float
+
+type FileReadResult =
+    abstract member bytesRead: int
+    abstract member buffer: obj
+
+type FileHandle =
+    abstract member read: buffer: obj * offset: int * length: int * position: float -> JS.Promise<FileReadResult>
+    abstract member stat: unit -> JS.Promise<Stats>
+    abstract member close: unit -> JS.Promise<unit>
 
 type Dirent =
     abstract member name: string
@@ -77,6 +89,27 @@ let statAsync (path: string) : JS.Promise<Stats> = jsNative
 
 [<Import("lstat", "fs/promises")>]
 let lstatAsync (path: string) : JS.Promise<Stats> = jsNative
+
+let private fileSystemDynamic: obj = importAll "node:fs"
+let private fileSystemPromisesDynamic: obj = importAll "node:fs/promises"
+
+[<Emit("$0 == null")>]
+let private isNullish (_value: obj) : bool = jsNative
+
+/// Opens a read handle without following a leaf symlink on platforms where
+/// Node exposes O_NOFOLLOW. Windows does not expose that flag, so callers must
+/// additionally compare handle/path identity after validating parent components.
+let openReadNoFollowAsync (path: string) : JS.Promise<FileHandle> =
+    let noFollow: obj = fileSystemDynamic?constants?O_NOFOLLOW
+
+    let flags: obj =
+        if isNullish noFollow then
+            box "r"
+        else
+            let readOnly: int = unbox fileSystemDynamic?constants?O_RDONLY
+            box (readOnly ||| unbox<int> noFollow)
+
+    fileSystemPromisesDynamic?``open`` (path, flags) |> unbox<JS.Promise<FileHandle>>
 
 [<Import("readdir", "fs/promises")>]
 let readdirAsync (path: string) : JS.Promise<string[]> = jsNative

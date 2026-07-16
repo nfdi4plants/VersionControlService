@@ -465,7 +465,7 @@ let private explicitlyUnsupportedExtensions =
         ".jar"
     ]
 
-let private isExplicitlyUnsupportedPath (path: string) =
+let internal isExplicitlyUnsupportedPath (path: string) =
     let extension = extname path
 
     not (String.IsNullOrWhiteSpace extension)
@@ -474,7 +474,9 @@ let private isExplicitlyUnsupportedPath (path: string) =
 let internal isLikelyBinaryBuffer (buffer: obj) =
     let sampleLength = min (bufferLength buffer) 8192
 
-    if sampleLength = 0 then
+    if not (bufferIsValidUtf8 buffer) then
+        true
+    elif sampleLength = 0 then
         false
     else
         let mutable nullByteDetected = false

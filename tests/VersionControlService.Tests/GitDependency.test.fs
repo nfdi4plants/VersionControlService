@@ -39,6 +39,7 @@ let private dependencyHooks
     let commands = ResizeArray<string[]>()
 
     let hooks: GitWorkspaceSession.GitSessionHooks = {
+        RunBytesProcess = None
         RunProcess =
             Some(fun request _ ->
                 async {

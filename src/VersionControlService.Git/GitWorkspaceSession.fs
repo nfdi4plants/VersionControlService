@@ -23,6 +23,7 @@ module NodeInterop = VersionControlService.Runtime.Node.Interop
 /// Test seams. `RunProcess` lets tests spy on or replace child-process execution;
 /// `Barrier` lets tests pause/act at named transaction points (root, point, context).
 type GitSessionHooks = {
+    RunBytesProcess: (NodeProcess.ProcessRequest -> OperationContext -> Async<OperationResult<NodeProcess.ByteProcessOutput>>) option
     RunProcess: (NodeProcess.ProcessRequest -> OperationContext -> Async<OperationResult<NodeProcess.ProcessOutput>>) option
     Barrier: (string -> string -> OperationContext -> Async<unit>) option
 }
@@ -30,6 +31,7 @@ type GitSessionHooks = {
 module GitSessionHooks =
 
     let none: GitSessionHooks = {
+        RunBytesProcess = None
         RunProcess = None
         Barrier = None
     }
@@ -115,6 +117,21 @@ let private runGitEnv
 
 let private runGit hooks repoPath arguments stdinData context =
     runGitEnv hooks repoPath arguments stdinData [||] context
+
+let private runHookedBytesProcess
+    (hooks: GitSessionHooks)
+    (request: NodeProcess.ProcessRequest)
+    (context: OperationContext)
+    =
+    async {
+        let runner = hooks.RunBytesProcess |> Option.defaultValue NodeProcess.runBytes
+        let! result = runner request context
+
+        match result with
+        | Succeeded outcome -> return Ok outcome.Value
+        | PartiallySucceeded(_, failure)
+        | Failed failure -> return Error failure
+    }
 
 /// runGit that fails when git exits nonzero.
 let private runGitChecked hooks repoPath arguments stdinData context =
@@ -205,14 +222,6 @@ let private credentialArguments (state: SessionState) : Async<string[]> =
 // Status and workspace version
 // ---------------------------------------------------------------------------
 
-let private stableHash (text: string) =
-    let mutable hash = 5381
-
-    for character in text do
-        hash <- ((hash <<< 5) + hash + int character) &&& 0x7FFFFFFF
-
-    hash
-
 let private unsafeWorkspacePathFailure (path: string) =
     {
         OperationFailure.create
@@ -227,6 +236,17 @@ let private workspaceEvidenceFailure (path: string) (message: string) =
         OperationFailure.createRedacted ProviderError "workspace_evidence_unavailable" message with
             AffectedPaths = [| path |]
     }
+
+let private comparisonReadCanceledFailure (path: string) =
+    {
+        OperationFailure.create Canceled "operation_canceled" "The Git comparison read was canceled." with
+            AffectedPaths = [| path |]
+    }
+
+type private ContainedWorktreeFile = {
+    AbsolutePath: string
+    Stats: NodeFileSystem.Stats
+}
 
 let private validateContainedWorktreeFile (state: SessionState) (path: string) =
     async {
@@ -247,6 +267,7 @@ let private validateContainedWorktreeFile (state: SessionState) (path: string) =
             let segments = path.Replace("\\", "/").Split('/')
             let mutable currentPath = repositoryRoot
             let mutable validationFailure = None
+            let mutable leafStats = None
             let mutable index = 0
 
             while validationFailure.IsNone && index < segments.Length do
@@ -269,6 +290,8 @@ let private validateContainedWorktreeFile (state: SessionState) (path: string) =
                             Some(
                                 workspaceEvidenceFailure path $"The unmerged path '{path}' is not a regular file."
                             )
+                    elif index = segments.Length - 1 then
+                        leafStats <- Some stats
                 with error ->
                     validationFailure <-
                         Some(
@@ -281,7 +304,194 @@ let private validateContainedWorktreeFile (state: SessionState) (path: string) =
 
             match validationFailure with
             | Some failure -> return Error failure
-            | None -> return Ok absolutePath
+            | None ->
+                match leafStats with
+                | Some stats ->
+                    return
+                        Ok {
+                            AbsolutePath = absolutePath
+                            Stats = stats
+                        }
+                | None ->
+                    return
+                        Error(
+                            workspaceEvidenceFailure path $"The unmerged path '{path}' could not be identified."
+                        )
+    }
+
+let private sameFileIdentity (left: NodeFileSystem.Stats) (right: NodeFileSystem.Stats) =
+    left.dev = right.dev && left.ino = right.ino
+
+let private withValidatedWorktreeHandle
+    (state: SessionState)
+    (path: string)
+    (context: OperationContext)
+    (consume: NodeFileSystem.FileHandle -> Async<Result<'T, OperationFailure>>)
+    : Async<Result<'T, OperationFailure>> =
+    async {
+        let! beforeOpen = validateContainedWorktreeFile state path
+
+        match beforeOpen with
+        | Error failure -> return Error failure
+        | Ok beforeFile ->
+            if context.Cancellation.IsCancellationRequested() then
+                return Error(comparisonReadCanceledFailure path)
+            else
+                do! barrier state.Hooks state.RepoPath "conflict-content-validated" context
+
+                if context.Cancellation.IsCancellationRequested() then
+                    return Error(comparisonReadCanceledFailure path)
+                else
+                    let! openResult =
+                        async {
+                            try
+                                let! handle =
+                                    NodeFileSystem.openReadNoFollowAsync beforeFile.AbsolutePath
+                                    |> Async.AwaitPromise
+
+                                return Ok handle
+                            with error ->
+                                return
+                                    Error(
+                                        workspaceEvidenceFailure
+                                            path
+                                            $"The unmerged path '{path}' could not be opened safely: {error.Message}"
+                                    )
+                        }
+
+                    match openResult with
+                    | Error failure -> return Error failure
+                    | Ok handle ->
+                        let! consumeResult =
+                            async {
+                                try
+                                    let! afterOpen = validateContainedWorktreeFile state path
+
+                                    match afterOpen with
+                                    | Error failure -> return Error failure
+                                    | Ok afterFile ->
+                                        let! handleStats = handle.stat () |> Async.AwaitPromise
+
+                                        if
+                                            not (sameFileIdentity beforeFile.Stats afterFile.Stats)
+                                            || not (sameFileIdentity afterFile.Stats handleStats)
+                                        then
+                                            return Error(unsafeWorkspacePathFailure path)
+                                        elif context.Cancellation.IsCancellationRequested() then
+                                            return Error(comparisonReadCanceledFailure path)
+                                        else
+                                            return! consume handle
+                                with error ->
+                                    return
+                                        Error(
+                                            workspaceEvidenceFailure
+                                                path
+                                                $"The unmerged path '{path}' could not be read safely: {error.Message}"
+                                        )
+                            }
+
+                        let! closeResult =
+                            async {
+                                try
+                                    do! handle.close () |> Async.AwaitPromise
+                                    return Ok()
+                                with error ->
+                                    return
+                                        Error(
+                                            workspaceEvidenceFailure
+                                                path
+                                                $"The unmerged path handle for '{path}' could not be closed: {error.Message}"
+                                        )
+                            }
+
+                        match consumeResult, closeResult with
+                        | Error failure, _ -> return Error failure
+                        | Ok _, Error failure -> return Error failure
+                        | Ok value, Ok() -> return Ok value
+    }
+
+let private hashHandleContent
+    (state: SessionState)
+    (path: string)
+    (context: OperationContext)
+    (handle: NodeFileSystem.FileHandle)
+    =
+    async {
+        let chunkSize = 64 * 1024
+        let buffer = NodeInterop.bufferAlloc chunkSize
+        let mutable position = 0.0
+        let hash = NodeInterop.createSha256Hash ()
+        let mutable finished = false
+        let mutable failure = None
+
+        while not finished && failure.IsNone do
+            if context.Cancellation.IsCancellationRequested() then
+                failure <- Some(comparisonReadCanceledFailure path)
+            else
+                let! readResult = handle.read(buffer, 0, chunkSize, position) |> Async.AwaitPromise
+
+                if readResult.bytesRead = 0 then
+                    finished <- true
+                else
+                    NodeInterop.updateHash
+                        hash
+                        (NodeInterop.bufferSubarray readResult.buffer 0 readResult.bytesRead)
+                    position <- position + float readResult.bytesRead
+                    do! barrier state.Hooks state.RepoPath "conflict-content-chunk" context
+
+                    if context.Cancellation.IsCancellationRequested() then
+                        failure <- Some(comparisonReadCanceledFailure path)
+
+        match failure with
+        | Some readFailure -> return Error readFailure
+        | None -> return Ok($"{path}\000{NodeInterop.digestHashHex hash}")
+    }
+
+type private BoundedContentRead =
+    | CompleteContent of obj
+    | ContentTooLarge
+
+let private readHandleContentBuffer
+    (state: SessionState)
+    (path: string)
+    (context: OperationContext)
+    (handle: NodeFileSystem.FileHandle)
+    =
+    async {
+        let chunkSize = 64 * 1024
+        let maximumPreviewBytes = 1024 * 1024
+        let chunks = ResizeArray<obj>()
+        let mutable position = 0.0
+        let mutable finished = false
+        let mutable tooLarge = false
+        let mutable failure = None
+
+        while not finished && failure.IsNone do
+            if context.Cancellation.IsCancellationRequested() then
+                failure <- Some(comparisonReadCanceledFailure path)
+            else
+                let buffer = NodeInterop.bufferAlloc chunkSize
+                let! readResult = handle.read(buffer, 0, chunkSize, position) |> Async.AwaitPromise
+
+                if readResult.bytesRead = 0 then
+                    finished <- true
+                elif position + float readResult.bytesRead > float maximumPreviewBytes then
+                    finished <- true
+                    tooLarge <- true
+                else
+                    chunks.Add(NodeInterop.bufferSubarray readResult.buffer 0 readResult.bytesRead)
+                    position <- position + float readResult.bytesRead
+
+                if readResult.bytesRead > 0 then
+                    do! barrier state.Hooks state.RepoPath "conflict-content-chunk" context
+
+                    if context.Cancellation.IsCancellationRequested() then
+                        failure <- Some(comparisonReadCanceledFailure path)
+
+        match failure with
+        | Some readFailure -> return Error readFailure
+        | None when tooLarge -> return Ok ContentTooLarge
+        | None -> return Ok(CompleteContent(NodeInterop.bufferConcat (chunks.ToArray())))
     }
 
 let private hashUnmergedWorktreePath
@@ -289,31 +499,7 @@ let private hashUnmergedWorktreePath
     (path: string)
     (context: OperationContext)
     : Async<Result<string, OperationFailure>> =
-    async {
-        let! containment = validateContainedWorktreeFile state path
-
-        match containment with
-        | Error failure -> return Error failure
-        | Ok _ ->
-            let! hashResult =
-                runGit
-                    state.Hooks
-                    state.RepoPath
-                    [| "hash-object"; "--no-filters"; "--"; path |]
-                    None
-                    context
-
-            match hashResult with
-            | Error failure -> return Error failure
-            | Ok output when output.ExitCode = 0 -> return Ok($"{path}:{output.StdOut.Trim()}")
-            | Ok output ->
-                return
-                    Error(
-                        workspaceEvidenceFailure
-                            path
-                            $"Hashing the unmerged path '{path}' failed: {output.StdErr}"
-                    )
-    }
+    withValidatedWorktreeHandle state path context (hashHandleContent state path context)
 
 let private computeUnmergedContentPart (state: SessionState) (context: OperationContext) =
     async {
@@ -343,7 +529,7 @@ let private computeUnmergedContentPart (state: SessionState) (context: Operation
             let rec collect index evidence =
                 async {
                     if index >= paths.Length then
-                        return Ok(stableHash (String.concat "\000" (List.rev evidence)))
+                        return Ok(NodeInterop.sha256Utf8 (String.concat "\000" (List.rev evidence)))
                     else
                         let! hashed = hashUnmergedWorktreePath state paths[index] context
 
@@ -393,7 +579,7 @@ let private computeWorkspaceVersion
                             $"Reading workspace status evidence failed: {statusResult.StdErr}"
                     )
             | Ok statusResult ->
-                let statusPart = stableHash statusResult.StdOut
+                let statusPart = NodeInterop.sha256Utf8 statusResult.StdOut
                 let! unmergedContentResult = computeUnmergedContentPart state context
 
                 match unmergedContentResult with
@@ -569,30 +755,134 @@ let private tryGetMergeHead (state: SessionState) (context: OperationContext) =
 let private conflictRunner (state: SessionState) (context: OperationContext) : GitConflictSession.GitRunner =
     fun arguments stdinData -> runGit state.Hooks state.RepoPath arguments stdinData context
 
+let private unsupportedConflictPreview (path: string) =
+    UnsupportedPreview(Some $"Unsupported git content for '{path}'.")
+
+let private maximumConflictPreviewBytes = int64 (1024 * 1024)
+
+let private readConflictStagePreview
+    (state: SessionState)
+    (stage: int)
+    (path: string)
+    (context: OperationContext)
+    : Async<Result<ConflictPreview option, OperationFailure>> =
+    async {
+        let stageExpression = $":{stage}:{path}"
+        let! objectIdResult =
+            runGit
+                state.Hooks
+                state.RepoPath
+                [| "rev-parse"; "--verify"; "--quiet"; stageExpression |]
+                None
+                context
+
+        match objectIdResult with
+        | Error failure -> return Error failure
+        | Ok output when output.ExitCode <> 0 -> return Ok None
+        | Ok output ->
+            let objectId = output.StdOut.Trim()
+
+            if String.IsNullOrWhiteSpace objectId then
+                return
+                    Error(
+                        OperationFailure.createRedacted
+                            ProviderError
+                            "invalid_git_output"
+                            $"Git returned an empty object ID for conflict stage {stage} at '{path}'."
+                    )
+            else
+                let! typeResult =
+                    runGit state.Hooks state.RepoPath [| "cat-file"; "-t"; objectId |] None context
+
+                match typeResult with
+                | Error failure -> return Error failure
+                | Ok typeOutput when typeOutput.ExitCode <> 0 ->
+                    return
+                        Error(
+                            OperationFailure.createRedacted
+                                ProviderError
+                                "git_failure"
+                                $"Git could not inspect conflict stage {stage} at '{path}'."
+                        )
+                | Ok typeOutput when
+                    typeOutput.StdOut.Trim() <> "blob"
+                    || GitService.isExplicitlyUnsupportedPath path
+                    ->
+                    return Ok(Some(unsupportedConflictPreview path))
+                | Ok _ ->
+                    let! sizeResult =
+                        runGit state.Hooks state.RepoPath [| "cat-file"; "-s"; objectId |] None context
+
+                    match sizeResult with
+                    | Error failure -> return Error failure
+                    | Ok sizeOutput when sizeOutput.ExitCode <> 0 ->
+                        return
+                            Error(
+                                OperationFailure.createRedacted
+                                    ProviderError
+                                    "git_failure"
+                                    $"Git could not size conflict stage {stage} at '{path}'."
+                            )
+                    | Ok sizeOutput ->
+                        match Int64.TryParse(sizeOutput.StdOut.Trim()) with
+                        | false, _ ->
+                            return
+                                Error(
+                                    OperationFailure.createRedacted
+                                        ProviderError
+                                        "invalid_git_output"
+                                        $"Git returned an invalid size for conflict stage {stage} at '{path}'."
+                                )
+                        | true, size when size > maximumConflictPreviewBytes ->
+                            return Ok(Some(unsupportedConflictPreview path))
+                        | true, _ ->
+                            let request = {
+                                NodeProcess.ProcessRequest.create "git" [| "cat-file"; "blob"; objectId |] with
+                                    WorkingDirectory = Some state.RepoPath
+                                    ProgressPhase = "git"
+                            }
+
+                            let! processResult = runHookedBytesProcess state.Hooks request context
+
+                            match processResult with
+                            | Error failure -> return Error failure
+                            | Ok processOutput when processOutput.ExitCode <> 0 ->
+                                return
+                                    Error(
+                                        OperationFailure.createRedacted
+                                            ProviderError
+                                            "git_failure"
+                                            $"Git could not read conflict stage {stage} at '{path}'."
+                                    )
+                            | Ok processOutput when GitService.isLikelyBinaryBuffer processOutput.StdOut ->
+                                return Ok(Some(unsupportedConflictPreview path))
+                            | Ok processOutput ->
+                                return Ok(Some(TextPreview(NodeInterop.bufferToUtf8String processOutput.StdOut)))
+    }
+
 let private readConflictCombinedPreview
     (state: SessionState)
     (path: string)
+    (context: OperationContext)
     : Async<Result<ConflictPreview option, OperationFailure>> =
     async {
-        let! containment = validateContainedWorktreeFile state path
+        if GitService.isExplicitlyUnsupportedPath path then
+            return Ok(Some(unsupportedConflictPreview path))
+        else
+            let! bufferResult =
+                withValidatedWorktreeHandle state path context (readHandleContentBuffer state path context)
 
-        match containment with
-        | Error failure -> return Error failure
-        | Ok absolutePath ->
-            try
-                let! buffer = NodeFileSystem.readFileBufferAsync absolutePath |> Async.AwaitPromise
-
+            match bufferResult with
+            | Error failure -> return Error failure
+            | Ok ContentTooLarge ->
+                return Ok(Some(UnsupportedPreview(Some $"Conflict preview for '{path}' exceeds the text preview limit.")))
+            | Ok(CompleteContent buffer) ->
                 if GitService.isLikelyBinaryBuffer buffer then
-                    return Ok(Some(UnsupportedPreview(Some $"Unsupported git content for '{path}'.")))
+                    return Ok(Some(unsupportedConflictPreview path))
+                elif not (NodeInterop.bufferIsValidUtf8 buffer) then
+                    return Ok(Some(unsupportedConflictPreview path))
                 else
                     return Ok(Some(TextPreview(NodeInterop.bufferToUtf8String buffer)))
-            with error ->
-                return
-                    Error(
-                        workspaceEvidenceFailure
-                            path
-                            $"The combined conflict content for '{path}' could not be read: {error.Message}"
-                    )
     }
 
 /// Active merge state as a provider-managed conflict session. Present whenever
@@ -626,8 +916,8 @@ let private getMergeConflictSummary (state: SessionState) (context: OperationCon
             | Ok unmergedPaths ->
                 let! itemsResult =
                     GitConflictSession.buildConflictItems
-                        runner
-                        (readConflictCombinedPreview state)
+                        (fun stage path -> readConflictStagePreview state stage path context)
+                        (fun path -> readConflictCombinedPreview state path context)
                         (Some(mkRevisionId mergeHeadValue))
                         unmergedPaths
 
@@ -1610,6 +1900,45 @@ let private rotateConflictHandle (state: SessionState) : ConflictSessionHandle =
         }
     | None -> failwith "No conflict session is active."
 
+let private manualConflictResolutionFailure (path: RepositoryPath) =
+    {
+        OperationFailure.create
+            Unsupported
+            "manual_resolution_required"
+            $"The conflict at '{RepositoryPath.value path}' contains binary or non-text content and must be resolved manually." with
+            AffectedPaths = [| RepositoryPath.value path |]
+    }
+
+let private ensureConflictSupportsTextResolution
+    (state: SessionState)
+    (path: RepositoryPath)
+    (context: OperationContext)
+    =
+    async {
+        let! summaryResult = getMergeConflictSummary state context
+
+        match summaryResult with
+        | Error failure -> return Error failure
+        | Ok None ->
+            return
+                Error(
+                    OperationFailure.create NotFound "conflict_item_not_found" "No active conflict session exists."
+                )
+        | Ok(Some summary) ->
+            match summary.Items |> Array.tryFind (fun item -> item.Path = path) with
+            | None ->
+                return
+                    Error(
+                        OperationFailure.create
+                            NotFound
+                            "conflict_item_not_found"
+                            "No unresolved conflict exists for the selected path."
+                    )
+            | Some item when not item.SupportsResolvedContent ->
+                return Error(manualConflictResolutionFailure path)
+            | Some _ -> return Ok()
+    }
+
 let private createConflictService (state: SessionState) : ConflictResolutionService =
     let stagePath (path: RepositoryPath) (context: OperationContext) =
         async {
@@ -1669,64 +1998,77 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                         $"No unresolved conflict exists for the selected path."
                                 )
                         else
-                            let resolveContent () =
-                                async {
-                                    match request.Resolution with
-                                    | SupplyResolvedContent content -> return Ok(Some content)
-                                    | PickCandidate "workspace" ->
-                                        let! content = GitConflictSession.readStageContent runner 2 pathValue
-                                        return Ok content
-                                    | PickCandidate "target" ->
-                                        let! content = GitConflictSession.readStageContent runner 3 pathValue
-                                        return Ok content
-                                    | PickCandidate "base" ->
-                                        let! content = GitConflictSession.readStageContent runner 1 pathValue
-                                        return Ok content
-                                    | PickCandidate _ ->
-                                        return
-                                            Error(
-                                                OperationFailure.create
-                                                    Validation
-                                                    "unknown_candidate"
-                                                    "The candidate ID is not part of this conflict item."
-                                            )
-                                }
+                            let! supportResult =
+                                ensureConflictSupportsTextResolution state request.Path context
 
-                            let! contentResult = resolveContent ()
-
-                            match contentResult with
+                            match supportResult with
                             | Error failure -> return Failed failure
-                            | Ok None ->
-                                return
-                                    Failed(
-                                        OperationFailure.create
-                                            Validation
-                                            "candidate_content_unavailable"
-                                            "The selected candidate has no content for this path."
-                                    )
-                            | Ok(Some content) ->
-                                let absolutePath = NodePath.join [| state.RepoPath; pathValue |]
-                                NodeFileSystem.writeFileSync absolutePath content NodeFileSystem.TextEncoding.Utf8
+                            | Ok() ->
+                                let readCandidate stage =
+                                    async {
+                                        let! previewResult =
+                                            readConflictStagePreview state stage pathValue context
 
-                                let! staged = stagePath request.Path context
+                                        match previewResult with
+                                        | Error failure -> return Error failure
+                                        | Ok None -> return Ok None
+                                        | Ok(Some(TextPreview content)) -> return Ok(Some content)
+                                        | Ok(Some(UnsupportedPreview _)) ->
+                                            return Error(manualConflictResolutionFailure request.Path)
+                                    }
 
-                                match staged with
+                                let resolveContent () =
+                                    async {
+                                        match request.Resolution with
+                                        | SupplyResolvedContent content -> return Ok(Some content)
+                                        | PickCandidate "workspace" -> return! readCandidate 2
+                                        | PickCandidate "target" -> return! readCandidate 3
+                                        | PickCandidate "base" -> return! readCandidate 1
+                                        | PickCandidate _ ->
+                                            return
+                                                Error(
+                                                    OperationFailure.create
+                                                        Validation
+                                                        "unknown_candidate"
+                                                        "The candidate ID is not part of this conflict item."
+                                                )
+                                    }
+
+                                let! contentResult = resolveContent ()
+
+                                match contentResult with
                                 | Error failure -> return Failed failure
-                                | Ok() ->
-                                    let refreshedHandle = rotateConflictHandle state
-                                    let! summaryResult = getMergeConflictSummary state context
+                                | Ok None ->
+                                    return
+                                        Failed(
+                                            OperationFailure.create
+                                                Validation
+                                                "candidate_content_unavailable"
+                                                "The selected candidate has no content for this path."
+                                        )
+                                | Ok(Some content) ->
+                                    let absolutePath = NodePath.join [| state.RepoPath; pathValue |]
+                                    NodeFileSystem.writeFileSync absolutePath content NodeFileSystem.TextEncoding.Utf8
 
-                                    match summaryResult with
+                                    let! staged = stagePath request.Path context
+
+                                    match staged with
                                     | Error failure -> return Failed failure
-                                    | Ok summary ->
-                                        return
-                                            OperationResult.succeeded {
-                                                RefreshedHandle = refreshedHandle
-                                                RemainingItems =
-                                                    summary
-                                                    |> Option.map _.Items
-                                                    |> Option.defaultValue [||]
-                                            }
+                                    | Ok() ->
+                                        let refreshedHandle = rotateConflictHandle state
+                                        let! summaryResult = getMergeConflictSummary state context
+
+                                        match summaryResult with
+                                        | Error failure -> return Failed failure
+                                        | Ok summary ->
+                                            return
+                                                OperationResult.succeeded {
+                                                    RefreshedHandle = refreshedHandle
+                                                    RemainingItems =
+                                                        summary
+                                                        |> Option.map _.Items
+                                                        |> Option.defaultValue [||]
+                                                }
             }
         Finalize =
             fun request context -> async {
@@ -1943,6 +2285,134 @@ let private findBasePathFromStatus (requestedPath: string) (statusText: string) 
 
     basePath
 
+let private baseContentNotFoundFailure (literalPath: string) =
+    OperationFailure.create
+        NotFound
+        "base_content_not_found"
+        $"The path '{literalPath}' is absent from the committed base."
+
+type private BaseBlobProbe = {
+    ObjectId: string
+    IsBlob: bool
+}
+
+let private probeBaseHead
+    (state: SessionState)
+    (literalPath: string)
+    (context: OperationContext)
+    : Async<Result<string, OperationFailure>> =
+    async {
+        let! headProbe =
+            runGit
+                state.Hooks
+                state.RepoPath
+                [| "rev-parse"; "--verify"; "--quiet"; "HEAD" |]
+                None
+                context
+
+        match headProbe with
+        | Error failure -> return Error failure
+        | Ok output when output.ExitCode <> 0 ->
+            return Error(baseContentNotFoundFailure literalPath)
+        | Ok headOutput ->
+            let headObjectId = headOutput.StdOut.Trim()
+
+            if String.IsNullOrWhiteSpace headObjectId then
+                return
+                    Error(
+                        OperationFailure.createRedacted
+                            ProviderError
+                            "invalid_git_output"
+                            "Git returned an empty HEAD object ID while reading base content."
+                    )
+            else
+                return Ok headObjectId
+    }
+
+let private probeBaseBlob
+    (state: SessionState)
+    (literalPath: string)
+    (basePath: string)
+    (headObjectId: string)
+    (context: OperationContext)
+    : Async<Result<BaseBlobProbe, OperationFailure>> =
+    async {
+        let objectExpression = $"{headObjectId}:{basePath}"
+        let! objectProbe =
+            runGit
+                state.Hooks
+                state.RepoPath
+                [| "rev-parse"; "--verify"; "--quiet"; objectExpression |]
+                None
+                context
+
+        match objectProbe with
+        | Error failure -> return Error failure
+        | Ok output when output.ExitCode <> 0 ->
+            return Error(baseContentNotFoundFailure literalPath)
+        | Ok objectOutput ->
+            let objectId = objectOutput.StdOut.Trim()
+
+            if String.IsNullOrWhiteSpace objectId then
+                return
+                    Error(
+                        OperationFailure.createRedacted
+                            ProviderError
+                            "invalid_git_output"
+                            $"Git returned an empty object ID for base path '{literalPath}'."
+                    )
+            else
+                let! typeProbe =
+                    runGit state.Hooks state.RepoPath [| "cat-file"; "-t"; objectId |] None context
+
+                match typeProbe with
+                | Error failure -> return Error failure
+                | Ok output when output.ExitCode <> 0 ->
+                    return
+                        Error(
+                            OperationFailure.createRedacted
+                                ProviderError
+                                "git_failure"
+                                $"Git could not inspect base content for '{literalPath}'."
+                        )
+                | Ok output ->
+                    return
+                        Ok {
+                            ObjectId = objectId
+                            IsBlob = output.StdOut.Trim() = "blob"
+                        }
+    }
+
+let private readBaseBlob
+    (state: SessionState)
+    (literalPath: string)
+    (objectName: string)
+    (context: OperationContext)
+    : Async<Result<obj, OperationFailure>> =
+    async {
+        let request = {
+            NodeProcess.ProcessRequest.create "git" [| "cat-file"; "blob"; objectName |] with
+                WorkingDirectory = Some state.RepoPath
+                ProgressPhase = "git"
+        }
+
+        let! processResult = runHookedBytesProcess state.Hooks request context
+
+        match processResult with
+        | Error failure -> return Error failure
+        | Ok processOutput when processOutput.ExitCode <> 0 ->
+            return
+                Error(
+                    OperationFailure.createRedacted
+                        ProviderError
+                        "git_failure"
+                        $"Reading Git base content failed: {processOutput.StdErr}"
+                )
+        | Ok _ when context.Cancellation.IsCancellationRequested() ->
+            return Error(comparisonReadCanceledFailure literalPath)
+        | Ok processOutput -> return Ok processOutput.StdOut
+    }
+
 let private getBaseContent
     (state: SessionState)
     (path: RepositoryPath)
@@ -1954,102 +2424,105 @@ let private getBaseContent
         match validateLiteralRepositoryPath requestedPath with
         | Error failure -> return Failed failure
         | Ok literalPath ->
-            let! statusResult =
-                runGit
-                    state.Hooks
-                    state.RepoPath
-                    [| "status"; "--porcelain=v2"; "-z"; "--untracked-files=all" |]
-                    None
-                    context
+            let rec readStableBase remainingRetries =
+                async {
+                    let! headResult = probeBaseHead state literalPath context
 
-            match statusResult with
-            | Error failure -> return Failed failure
-            | Ok statusOutput when statusOutput.ExitCode <> 0 ->
-                return
-                    Failed(
-                        OperationFailure.createRedacted
-                            ProviderError
-                            "git_failure"
-                            $"Reading exact Git status for base content failed: {statusOutput.StdErr}"
-                    )
-            | Ok statusOutput ->
-                let basePath = findBasePathFromStatus literalPath statusOutput.StdOut
-
-                let comparedPaths = [|
-                    yield literalPath
-
-                    if not (String.Equals(basePath, literalPath, StringComparison.Ordinal)) then
-                        yield basePath
-                |]
-
-                let! binaryResult =
-                    runGit
-                        state.Hooks
-                        state.RepoPath
-                        [|
-                            "--literal-pathspecs"
-                            "diff"
-                            "--numstat"
-                            "--no-ext-diff"
-                            "--no-textconv"
-                            "--find-renames"
-                            "HEAD"
-                            "--"
-                            yield! comparedPaths
-                        |]
-                        None
-                        context
-
-                match binaryResult with
-                | Error failure -> return Failed failure
-                | Ok binaryOutput when binaryOutput.ExitCode <> 0 ->
-                    return
-                        Failed(
-                            OperationFailure.createRedacted
-                                ProviderError
-                                "git_failure"
-                                $"Classifying Git base content failed: {binaryOutput.StdErr}"
-                        )
-                | Ok binaryOutput when
-                    binaryOutput.StdOut.Split '\n'
-                    |> Array.exists (fun line -> line.StartsWith("-\t-\t", StringComparison.Ordinal))
-                    ->
-                    return
-                        OperationResult.succeeded (
-                            UnsupportedContent(Some $"Unsupported git content for '{literalPath}'.")
-                        )
-                | Ok _ ->
-                    let! showResult =
-                        runGit state.Hooks state.RepoPath [| "show"; $"HEAD:{basePath}" |] None context
-
-                    match showResult with
+                    match headResult with
                     | Error failure -> return Failed failure
-                    | Ok showOutput when showOutput.ExitCode = 0 ->
-                        return OperationResult.succeeded (TextContent showOutput.StdOut)
-                    | Ok showOutput ->
-                        let diagnostic = (showOutput.StdErr + showOutput.StdOut).ToLowerInvariant()
+                    | Ok headObjectId ->
+                        let! statusResult =
+                            runGit
+                                state.Hooks
+                                state.RepoPath
+                                [|
+                                    "-c"
+                                    "status.renames=true"
+                                    "status"
+                                    "--find-renames"
+                                    "--porcelain=v2"
+                                    "-z"
+                                    "--untracked-files=all"
+                                |]
+                                None
+                                context
 
-                        if
-                            diagnostic.Contains("does not exist in 'head'")
-                            || diagnostic.Contains("exists on disk, but not in 'head'")
-                            || diagnostic.Contains("invalid object name 'head'")
-                            || diagnostic.Contains("bad revision 'head'")
-                        then
-                            return
-                                Failed(
-                                    OperationFailure.create
-                                        NotFound
-                                        "base_content_not_found"
-                                        $"The path '{literalPath}' is absent from the committed base."
-                                )
-                        else
+                        match statusResult with
+                        | Error failure -> return Failed failure
+                        | Ok statusOutput when statusOutput.ExitCode <> 0 ->
                             return
                                 Failed(
                                     OperationFailure.createRedacted
                                         ProviderError
                                         "git_failure"
-                                        $"Reading Git base content failed: {showOutput.StdErr}"
+                                        $"Reading exact Git status for base content failed: {statusOutput.StdErr}"
                                 )
+                        | Ok statusOutput ->
+                            let! observedHeadResult = probeBaseHead state literalPath context
+
+                            match observedHeadResult with
+                            | Ok observedHead when
+                                not (String.Equals(headObjectId, observedHead, StringComparison.Ordinal))
+                                && remainingRetries > 0
+                                ->
+                                return! readStableBase (remainingRetries - 1)
+                            | Ok observedHead when
+                                not (String.Equals(headObjectId, observedHead, StringComparison.Ordinal))
+                                ->
+                                return
+                                    Failed {
+                                        OperationFailure.create
+                                            Concurrency
+                                            "precondition_failed"
+                                            "HEAD changed repeatedly while reading base content." with
+                                            Retryable = true
+                                            RevisionEvidence = [|
+                                                "expected_head", mkRevisionId headObjectId
+                                                "observed_head", mkRevisionId observedHead
+                                            |]
+                                    }
+                            | Error failure when
+                                failure.Category = NotFound
+                                && remainingRetries > 0
+                                ->
+                                return! readStableBase (remainingRetries - 1)
+                            | Error failure -> return Failed failure
+                            | Ok _ ->
+                                let basePath = findBasePathFromStatus literalPath statusOutput.StdOut
+
+                                let! objectProbeResult =
+                                    probeBaseBlob state literalPath basePath headObjectId context
+
+                                match objectProbeResult with
+                                | Error failure -> return Failed failure
+                                | Ok probe when
+                                    not probe.IsBlob
+                                    ||
+                                    GitService.isExplicitlyUnsupportedPath literalPath
+                                    || GitService.isExplicitlyUnsupportedPath basePath
+                                    ->
+                                    return
+                                        OperationResult.succeeded (
+                                            UnsupportedContent(Some $"Unsupported git content for '{literalPath}'.")
+                                        )
+                                | Ok probe ->
+                                    let! baseBlob = readBaseBlob state literalPath probe.ObjectId context
+
+                                    match baseBlob with
+                                    | Error failure -> return Failed failure
+                                    | Ok buffer when GitService.isLikelyBinaryBuffer buffer ->
+                                        return
+                                            OperationResult.succeeded (
+                                                UnsupportedContent(Some $"Unsupported git content for '{literalPath}'.")
+                                            )
+                                    | Ok buffer ->
+                                        return
+                                            OperationResult.succeeded (
+                                                TextContent(NodeInterop.bufferToUtf8String buffer)
+                                            )
+                }
+
+            return! readStableBase 2
     }
 
 let private createTextDiff (state: SessionState) : TextDiffService =

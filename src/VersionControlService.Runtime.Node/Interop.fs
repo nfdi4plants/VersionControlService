@@ -20,5 +20,32 @@ let bufferConcat (buffers: obj[]) : obj = jsNative
 [<Emit("$0.subarray($1, $2)")>]
 let bufferSubarray (buffer: obj) (startIndex: int) (endIndex: int) : obj = jsNative
 
+[<Emit("Buffer.alloc($0)")>]
+let bufferAlloc (length: int) : obj = jsNative
+
 [<Emit("$0.toString('utf8')")>]
 let bufferToUtf8String (buffer: obj) : string = jsNative
+
+[<Emit("(() => { try { new TextDecoder('utf-8', { fatal: true }).decode($0); return true; } catch (_) { return false; } })()")>]
+let bufferIsValidUtf8 (buffer: obj) : bool = jsNative
+
+[<Emit("require('node:crypto').createHash('sha256')")>]
+let createSha256Hash () : obj = jsNative
+
+[<Emit("$0.update($1)")>]
+let updateHash (hash: obj) (buffer: obj) : unit = jsNative
+
+[<Emit("$0.digest('hex')")>]
+let digestHashHex (hash: obj) : string = jsNative
+
+[<Emit("require('node:crypto').createHash('sha256').update($0, 'utf8').digest('hex')")>]
+let sha256Utf8 (content: string) : string = jsNative
+
+[<Emit("new (require('node:string_decoder').StringDecoder)('utf8')")>]
+let createUtf8StringDecoder () : obj = jsNative
+
+[<Emit("$0.write($1)")>]
+let decodeUtf8Chunk (decoder: obj) (buffer: obj) : string = jsNative
+
+[<Emit("$0.end()")>]
+let finishUtf8Decoding (decoder: obj) : string = jsNative

@@ -181,6 +181,7 @@ let createGitHarness () : ProviderTestHarness =
     }
 
     let hooks: GitWorkspaceSession.GitSessionHooks = {
+        RunBytesProcess = None
         RunProcess = None
         Barrier =
             Some(fun root point context ->
@@ -481,6 +482,7 @@ let private processOutput exitCode stdout stderr : NodeProcess.ProcessOutput = {
 }
 
 let private adoptionHooks (originResult: OperationResult<NodeProcess.ProcessOutput>) : GitWorkspaceSession.GitSessionHooks = {
+    RunBytesProcess = None
     RunProcess =
         Some(fun request _ ->
             async {
@@ -504,7 +506,12 @@ let private createBaseContentFixtureWithHooks (hooks: GitWorkspaceSession.GitSes
     do! configureUser repoPath
     do! writeUtf8FileAsync (join [| repoPath; "base.txt" |]) "base content\n"
     do! writeUtf8FileAsync (join [| repoPath; "rename-source.txt" |]) "committed rename source\n"
+    do! writeUtf8FileAsync (join [| repoPath; "split-utf8.txt" |]) "prefix € suffix\n"
+    do! writeUtf8FileAsync (join [| repoPath; "folder"; "content.txt" |]) "nested base content\n"
+    do! writeUtf8FileAsync (join [| repoPath; "document.pdf" |]) "%PDF-1.4\nASCII fixture\n"
     do! writeBinaryFileAsync (join [| repoPath; "binary.dat" |]) [| 0; 255; 1; 2; 3 |]
+    do! writeBinaryFileAsync (join [| repoPath; "unchanged-binary.dat" |]) [| 0; 253; 4; 5; 6 |]
+    do! writeBinaryFileAsync (join [| repoPath; "invalid-utf8.dat" |]) [| 255; 254; 253 |]
     let! _ = runGitIn repoPath [||] [| "add"; "-A" |] None
     let! _ = runGitIn repoPath [||] [| "commit"; "-m"; "test: base content" |] None
 
@@ -907,6 +914,117 @@ Vitest.describe (
                     return raise error
             }
         )
+
+        Vitest.test (
+            "returns unsupported content for a known non-text extension with ASCII bytes",
+            fun () -> promise {
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess =
+                        Some(fun _ _ ->
+                            async {
+                                return
+                                    OperationResult.failed(
+                                        OperationFailure.create
+                                            ProviderError
+                                            "unexpected_unsupported_blob_read"
+                                            "Known unsupported extensions must not be buffered."
+                                    )
+                            })
+                    RunProcess = None
+                    Barrier = None
+                }
+
+                let! root, session = createBaseContentFixtureWithHooks hooks
+
+                try
+                    let! result =
+                        (textDiffService session).GetBaseContent
+                            (repositoryPath "document.pdf")
+                            (OperationContext.detached "base-explicitly-unsupported")
+                        |> Async.StartAsPromise
+
+                    match expectProviderValue "explicitly unsupported base content" result with
+                    | UnsupportedContent reason ->
+                        Vitest
+                            .expect(reason |> Option.exists (fun value -> value.Contains "document.pdf"))
+                            .toBe (true)
+                    | TextContent text -> failwith $"Expected unsupported PDF content, received '{text}'."
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "returns the committed text when the worktree version became binary",
+            fun () -> promise {
+                let! root, session = createBaseContentFixture ()
+
+                try
+                    let repoPath = join [| root; "work" |]
+                    do! writeBinaryFileAsync (join [| repoPath; "base.txt" |]) [| 0; 255; 7; 8 |]
+
+                    let! result =
+                        (textDiffService session).GetBaseContent
+                            (repositoryPath "base.txt")
+                            (OperationContext.detached "base-text-worktree-binary")
+                        |> Async.StartAsPromise
+
+                    match expectProviderValue "text base with binary worktree" result with
+                    | TextContent text -> Vitest.expect(text).toBe ("base content\n")
+                    | UnsupportedContent _ -> failwith "Expected the committed text blob."
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "reports an added path in an unborn repository as absent from the base",
+            fun () -> promise {
+                let! root = createTempDirectoryAsync ()
+                let repoPath = join [| root; "unborn" |]
+
+                try
+                    let! _ = runGitIn root [||] [| "init"; "-b"; "main"; repoPath |] None
+                    do! writeUtf8FileAsync (join [| repoPath; "added.txt" |]) "new content\n"
+
+                    let binding: WorkspaceBinding = {
+                        SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
+                        ProviderId = gitProviderId
+                        WorkspaceRoot = repoPath
+                        ProviderStateRef = None
+                        Location = {
+                            ProviderId = gitProviderId
+                            DisplayName = None
+                            ProviderLocation = repoPath
+                            ConnectionProfileId = None
+                        }
+                        ConnectionProfileId = None
+                    }
+
+                    let session =
+                        GitWorkspaceSession.createSession GitWorkspaceSession.GitSessionHooks.none binding
+
+                    let! result =
+                        (textDiffService session).GetBaseContent
+                            (repositoryPath "added.txt")
+                            (OperationContext.detached "base-unborn-absent")
+                        |> Async.StartAsPromise
+
+                    let failure = expectProviderFailure "unborn absent base content" result
+                    Vitest.expect(failure.Category).toEqual (NotFound)
+                    Vitest.expect(failure.Code).toBe ("base_content_not_found")
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
 )
 
 Vitest.describe (
@@ -978,6 +1096,325 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "classifies an unchanged committed binary blob from its materialized bytes",
+            fun () -> promise {
+                let! root, session = createBaseContentFixture ()
+
+                try
+                    let! result =
+                        (textDiffService session).GetBaseContent
+                            (repositoryPath "unchanged-binary.dat")
+                            (OperationContext.detached "base-unchanged-binary")
+                        |> Async.StartAsPromise
+
+                    match expectProviderValue "unchanged binary base content" result with
+                    | UnsupportedContent reason ->
+                        Vitest
+                            .expect(reason |> Option.exists (fun value -> value.Contains "unchanged-binary.dat"))
+                            .toBe (true)
+                    | TextContent text -> failwith $"Expected unsupported binary content, received text '{text}'."
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "rejects committed invalid UTF-8 without replacement decoding",
+            fun () -> promise {
+                let! root, session = createBaseContentFixture ()
+
+                try
+                    let! result =
+                        (textDiffService session).GetBaseContent
+                            (repositoryPath "invalid-utf8.dat")
+                            (OperationContext.detached "base-invalid-utf8")
+                        |> Async.StartAsPromise
+
+                    match expectProviderValue "invalid UTF-8 base content" result with
+                    | UnsupportedContent reason ->
+                        Vitest
+                            .expect(reason |> Option.exists (fun value -> value.Contains "invalid-utf8.dat"))
+                            .toBe (true)
+                    | TextContent text -> failwith $"Expected unsupported invalid UTF-8, received text '{text}'."
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "follows renames even when repository status rename detection is disabled",
+            fun () -> promise {
+                let! root, session = createBaseContentFixture ()
+
+                try
+                    let repoPath = join [| root; "work" |]
+                    let! _ = runGitIn repoPath [||] [| "config"; "status.renames"; "false" |] None
+
+                    let! result =
+                        (textDiffService session).GetBaseContent
+                            (repositoryPath "renamed.txt")
+                            (OperationContext.detached "base-rename-config-independent")
+                        |> Async.StartAsPromise
+
+                    expectTextBase
+                        "committed rename source\n"
+                        "config-independent renamed base content"
+                        result
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "reports an absent known non-text extension as not found before classification",
+            fun () -> promise {
+                let! root, session = createBaseContentFixture ()
+
+                try
+                    let! result =
+                        (textDiffService session).GetBaseContent
+                            (repositoryPath "missing.pdf")
+                            (OperationContext.detached "base-missing-unsupported-extension")
+                        |> Async.StartAsPromise
+
+                    let failure = expectProviderFailure "missing unsupported-extension base content" result
+                    Vitest.expect(failure.Category).toEqual (NotFound)
+                    Vitest.expect(failure.Code).toBe ("base_content_not_found")
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "returns unsupported content for a present non-blob base object",
+            fun () -> promise {
+                let! root, session = createBaseContentFixture ()
+
+                try
+                    let! result =
+                        (textDiffService session).GetBaseContent
+                            (repositoryPath "folder")
+                            (OperationContext.detached "base-present-tree")
+                        |> Async.StartAsPromise
+
+                    match expectProviderValue "present base tree" result with
+                    | UnsupportedContent _ -> ()
+                    | TextContent text -> failwith $"Expected unsupported tree content, received '{text}'."
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "reads base bytes through a frozen object id",
+            fun () -> promise {
+                let mutable rawObjectName = ""
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess =
+                        Some(fun request context ->
+                            if
+                                request.Arguments.Length = 3
+                                && request.Arguments[0] = "cat-file"
+                                && request.Arguments[1] = "blob"
+                            then
+                                rawObjectName <- request.Arguments[2]
+
+                            NodeProcess.runBytes request context)
+                    RunProcess = None
+                    Barrier = None
+                }
+
+                let! root, session = createBaseContentFixtureWithHooks hooks
+
+                try
+                    let! result =
+                        (textDiffService session).GetBaseContent
+                            (repositoryPath "base.txt")
+                            (OperationContext.detached "base-frozen-object")
+                        |> Async.StartAsPromise
+
+                    expectTextBase "base content\n" "frozen base object content" result
+                    Vitest.expect(rawObjectName.Contains ":").toBe (false)
+                    Vitest.expect(rawObjectName.Length).toBeGreaterThanOrEqual (40)
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "freezes HEAD before rename discovery",
+            fun () -> promise {
+                let mutable repoPath = ""
+                let mutable advancedHead = false
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = Some NodeProcess.runBytes
+                    RunProcess =
+                        Some(fun request context ->
+                            async {
+                                let! result = NodeProcess.run request context
+
+                                if
+                                    not advancedHead
+                                    && (request.Arguments |> Array.contains "status")
+                                then
+                                    advancedHead <- true
+
+                                    do!
+                                        Async.AwaitPromise(
+                                            writeUtf8FileAsync
+                                                (join [| repoPath; "renamed.txt" |])
+                                                "advanced committed rename content\n"
+                                        )
+
+                                    let! _ =
+                                        Async.AwaitPromise(runGitIn repoPath [||] [| "add"; "-A" |] None)
+
+                                    let! _ =
+                                        Async.AwaitPromise(
+                                            runGitIn
+                                                repoPath
+                                                [||]
+                                                [| "commit"; "-m"; "test: advance head during base read" |]
+                                                None
+                                        )
+
+                                    ()
+
+                                return result
+                            })
+                    Barrier = None
+                }
+
+                let! root, session = createBaseContentFixtureWithHooks hooks
+                repoPath <- join [| root; "work" |]
+
+                try
+                    let! result =
+                        (textDiffService session).GetBaseContent
+                            (repositoryPath "renamed.txt")
+                            (OperationContext.detached "base-head-race")
+                        |> Async.StartAsPromise
+
+                    expectTextBase "advanced committed rename content\n" "base content across a HEAD race" result
+                    Vitest.expect(advancedHead).toBe (true)
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "decodes committed UTF-8 only after all split process chunks are materialized",
+            fun () -> promise {
+                let splitUtf8Script =
+                    "const bytes=Buffer.from('prefix € suffix\\n','utf8');" +
+                    "process.stdout.write(bytes.subarray(0,8));" +
+                    "setTimeout(()=>process.stdout.write(bytes.subarray(8)),25);"
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess =
+                        Some(fun request context ->
+                            if
+                                request.Arguments.Length = 3
+                                && request.Arguments[0] = "cat-file"
+                                && request.Arguments[1] = "blob"
+                            then
+                                NodeProcess.runBytes
+                                    {
+                                        request with
+                                            Command = Fable.Core.JsInterop.emitJsExpr () "process.execPath"
+                                            Arguments = [| "-e"; splitUtf8Script |]
+                                            WorkingDirectory = None
+                                            StdinData = None
+                                    }
+                                    context
+                            else
+                                NodeProcess.runBytes request context)
+                    RunProcess =
+                        Some(fun request context ->
+                            NodeProcess.run request context)
+                    Barrier = None
+                }
+
+                let! root, session = createBaseContentFixtureWithHooks hooks
+
+                try
+                    let! result =
+                        (textDiffService session).GetBaseContent
+                            (repositoryPath "split-utf8.txt")
+                            (OperationContext.detached "base-split-utf8")
+                        |> Async.StartAsPromise
+
+                    expectTextBase "prefix € suffix\n" "split UTF-8 base content" result
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "reads committed bytes without a standalone node process or temporary materialization",
+            fun () -> promise {
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = Some NodeProcess.runBytes
+                    RunProcess =
+                        Some(fun request context ->
+                            if
+                                request.Command = "node"
+                                || (request.Arguments |> Array.contains "--git-path")
+                            then
+                                async {
+                                    return
+                                        OperationResult.failed(
+                                            OperationFailure.create
+                                                ProviderError
+                                                "unexpected_comparison_materialization"
+                                                "Base content must not require a standalone Node process or temporary Git storage."
+                                        )
+                                }
+                            else
+                                NodeProcess.run request context)
+                    Barrier = None
+                }
+
+                let! root, session = createBaseContentFixtureWithHooks hooks
+
+                try
+                    let! result =
+                        (textDiffService session).GetBaseContent
+                            (repositoryPath "base.txt")
+                            (OperationContext.detached "base-no-materialization")
+                        |> Async.StartAsPromise
+
+                    expectTextBase "base content\n" "base content without materialization" result
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
             "preserves cancellation before the base-status subprocess",
             fun () -> promise {
                 let! root, session = createBaseContentFixture ()
@@ -1007,16 +1444,14 @@ Vitest.describe (
                 let source = OperationCancellation.Source()
 
                 let hooks: GitWorkspaceSession.GitSessionHooks = {
-                    RunProcess =
+                    RunBytesProcess =
                         Some(fun request context ->
                             async {
-                                let! result = NodeProcess.run request context
-
-                                if request.Arguments |> Array.contains "--numstat" then
-                                    source.Cancel()
-
-                                return result
+                                source.Cancel()
+                                return! NodeProcess.runBytes request context
                             })
+                    RunProcess =
+                        Some(fun request context -> NodeProcess.run request context)
                     Barrier = None
                 }
 

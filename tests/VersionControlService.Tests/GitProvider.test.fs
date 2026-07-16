@@ -1278,6 +1278,7 @@ Vitest.describe (
                     let preSource = OperationCancellation.Source()
 
                     let preHooks: GitWorkspaceSession.GitSessionHooks = {
+                        RunBytesProcess = None
                         RunProcess = None
                         Barrier =
                             Some(fun _root point _context ->
@@ -1363,6 +1364,7 @@ Vitest.describe (
                     let postSource = OperationCancellation.Source()
 
                     let postHooks: GitWorkspaceSession.GitSessionHooks = {
+                        RunBytesProcess = None
                         RunProcess = None
                         Barrier =
                             Some(fun _root point _context ->

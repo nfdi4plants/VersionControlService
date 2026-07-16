@@ -5,6 +5,7 @@ open VersionControlService.Abstractions
 open Vitest
 
 module NodeProcess = VersionControlService.Runtime.Node.Process
+module NodeInterop = VersionControlService.Runtime.Node.Interop
 
 let private run (operation: Async<'T>) : JS.Promise<'T> = Async.StartAsPromise operation
 
@@ -49,6 +50,48 @@ Vitest.describe (
                 | Succeeded outcome -> Vitest.expect(outcome.Value.StdOut.Contains "got:a\000b\000c").toBe (true)
                 | PartiallySucceeded _
                 | Failed _ -> failwith "Expected the stdin process to succeed."
+            }
+        )
+
+        Vitest.test (
+            "captures stdout bytes before decoding split UTF-8 chunks",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let script =
+                    "const b=Buffer.from('prefix € suffix\\n','utf8');" +
+                    "process.stdout.write(b.subarray(0,8));" +
+                    "setTimeout(()=>process.stdout.write(b.subarray(8)),25);"
+
+                let request = NodeProcess.ProcessRequest.create nodeExecutable [| "-e"; script |]
+
+                let! result =
+                    run (NodeProcess.runBytes request (OperationContext.detached "runtime-byte-output"))
+
+                match result with
+                | Succeeded outcome ->
+                    Vitest.expect(outcome.Value.ExitCode).toBe (0)
+                    Vitest.expect(NodeInterop.bufferToUtf8String outcome.Value.StdOut).toBe ("prefix € suffix\n")
+                | PartiallySucceeded _
+                | Failed _ -> failwith "Expected byte-oriented process output."
+            }
+        )
+
+        Vitest.test (
+            "decodes split UTF-8 stdout chunks without replacement characters",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let script =
+                    "const b=Buffer.from('prefix € suffix\\n','utf8');" +
+                    "process.stdout.write(b.subarray(0,8));" +
+                    "setTimeout(()=>process.stdout.write(b.subarray(8)),25);"
+
+                let request = NodeProcess.ProcessRequest.create nodeExecutable [| "-e"; script |]
+                let! result = run (NodeProcess.run request (OperationContext.detached "runtime-text-output"))
+
+                match result with
+                | Succeeded outcome -> Vitest.expect(outcome.Value.StdOut).toBe ("prefix € suffix\n")
+                | PartiallySucceeded _
+                | Failed _ -> failwith "Expected text process output."
             }
         )
 

@@ -49,6 +49,15 @@ let private writeUtf8FileAsync (path: string) (content: string) : JS.Promise<uni
     return ()
 }
 
+[<Emit("Buffer.from($0)")>]
+let private bufferFromBytes (_bytes: int[]) : obj = jsNative
+
+let private writeBinaryFileAsync (path: string) (bytes: int[]) : JS.Promise<unit> = promise {
+    do! ensureDirectoryAsync (dirname path)
+    let! _ = fsPromisesDynamic?writeFile (path, bufferFromBytes bytes) |> unbox<JS.Promise<obj>>
+    return ()
+}
+
 let private tryReadUtf8FileAsync (path: string) : JS.Promise<string option> = promise {
     try
         let! content = fsPromisesDynamic?readFile (path, "utf8") |> unbox<JS.Promise<string>>
@@ -154,6 +163,7 @@ let private syncService (session: WorkspaceSession) =
 
 /// A process runner that fakes `git --version` and delegates everything else.
 let private versionFakingRunner (fakeVersion: string) : GitWorkspaceSession.GitSessionHooks = {
+    RunBytesProcess = None
     RunProcess =
         Some(fun request processContext ->
             async {
@@ -231,9 +241,11 @@ let private createUnmergedConflictFixtureWithHooks (hooks: GitWorkspaceSession.G
 let private createUnmergedConflictFixture () =
     createUnmergedConflictFixtureWithHooks GitWorkspaceSession.GitSessionHooks.none
 
-let private createNestedUnmergedConflictFixture () = promise {
-    let! root, workPath, barePath, session = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
-    let conflictPath = "nested/conflict.txt"
+let private createPathUnmergedConflictFixtureWithHooks
+    (hooks: GitWorkspaceSession.GitSessionHooks)
+    (conflictPath: string)
+    = promise {
+    let! root, workPath, barePath, session = createSyncFixture hooks
     do! writeUtf8FileAsync (join [| workPath; conflictPath |]) "nested base content\n"
     let! _ = runGitIn workPath [| "add"; "-A" |]
     let! _ = runGitIn workPath [| "commit"; "-m"; "test: nested conflict base" |]
@@ -273,6 +285,12 @@ let private createNestedUnmergedConflictFixture () = promise {
 
     return root, workPath, session, conflictService session, conflictPath
 }
+
+let private createNestedUnmergedConflictFixture () =
+    createPathUnmergedConflictFixtureWithHooks GitWorkspaceSession.GitSessionHooks.none "nested/conflict.txt"
+
+let private createNestedUnmergedConflictFixtureWithHooks hooks =
+    createPathUnmergedConflictFixtureWithHooks hooks "nested/conflict.txt"
 
 Vitest.describe (
     "Git conflict preview tracks out-of-band edits",
@@ -362,6 +380,396 @@ Vitest.describe (
             | Succeeded _ -> failwith $"Expected {operationName} to fail."
 
         Vitest.test (
+            "rotates the workspace token for byte sequences that collide under DJB2",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, session, _, _, _ = createUnmergedConflictFixture ()
+
+                try
+                    let conflictFile = join [| workPath; "base.txt" |]
+                    do! writeUtf8FileAsync conflictFile "AB"
+                    let! firstStatus = Async.StartAsPromise(session.Core.GetStatus(ctx "collision-evidence-first"))
+                    let firstVersion = (expectValue "first collision evidence" firstStatus).WorkspaceVersion
+
+                    do! writeUtf8FileAsync conflictFile "B!"
+                    let! secondStatus = Async.StartAsPromise(session.Core.GetStatus(ctx "collision-evidence-second"))
+                    let secondVersion = (expectValue "second collision evidence" secondStatus).WorkspaceVersion
+
+                    Vitest.expect(secondVersion).not.toBe (firstVersion)
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "returns manual-resolution previews for invalid UTF-8 conflict content",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, _, conflicts, _, _ = createUnmergedConflictFixture ()
+
+                try
+                    do! writeBinaryFileAsync (join [| workPath; "base.txt" |]) [| 255; 254; 253 |]
+                    let! result = Async.StartAsPromise(conflicts.GetActiveSession(ctx "binary-conflict-preview"))
+
+                    let summary =
+                        match expectValue "binary conflict preview" result with
+                        | Some value -> value
+                        | None -> failwith "Expected an active binary conflict session."
+
+                    Vitest.expect(summary.Items[0].CombinedPreview).toEqual (
+                        Some(UnsupportedPreview(Some "Unsupported git content for 'base.txt'."))
+                    )
+                    Vitest.expect(summary.Items[0].SupportsResolvedContent).toBe (false)
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "keeps invalid UTF-8 stage candidates byte-oriented and rejects automatic resolution",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable injectBinaryStages = false
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess =
+                        Some(fun request context ->
+                            if
+                                injectBinaryStages
+                                && request.Arguments.Length = 3
+                                && request.Arguments[0] = "cat-file"
+                                && request.Arguments[1] = "blob"
+                            then
+                                async {
+                                    let output: NodeProcess.ByteProcessOutput = {
+                                        ExitCode = 0
+                                        StdOut = bufferFromBytes [| 255; 254; 253 |]
+                                        StdErr = ""
+                                    }
+
+                                    return OperationResult.succeeded output
+                                }
+                            else
+                                NodeProcess.runBytes request context)
+                    RunProcess = None
+                    Barrier = None
+                }
+
+                let! root, workPath, session, conflicts, _, _ = createUnmergedConflictFixtureWithHooks hooks
+
+                try
+                    injectBinaryStages <- true
+                    let! summaryResult =
+                        Async.StartAsPromise(conflicts.GetActiveSession(ctx "binary-stage-conflict-preview"))
+
+                    let summary =
+                        match expectValue "binary stage conflict preview" summaryResult with
+                        | Some value -> value
+                        | None -> failwith "Expected an active binary stage conflict session."
+
+                    let previews = summary.Items[0].Candidates |> Array.choose _.Preview
+                    Vitest.expect(previews |> Array.forall (function UnsupportedPreview _ -> true | _ -> false)).toBe (true)
+                    Vitest.expect(summary.Items[0].SupportsResolvedContent).toBe (false)
+
+                    let! statusResult = Async.StartAsPromise(session.Core.GetStatus(ctx "binary-stage-status"))
+                    let workspaceVersion = (expectValue "binary stage status" statusResult).WorkspaceVersion
+                    let! resolveResult =
+                        Async.StartAsPromise(
+                            conflicts.Resolve
+                                {
+                                    Handle = summary.Handle
+                                    ExpectedWorkspaceVersion = workspaceVersion
+                                    Path = mkPath "base.txt"
+                                    Resolution = PickCandidate "workspace"
+                                }
+                                (ctx "binary-stage-resolve")
+                        )
+
+                    let failure = expectFailure "binary stage automatic resolution" resolveResult
+                    Vitest.expect(failure.Category).toEqual (Unsupported)
+                    Vitest.expect(failure.Code).toBe ("manual_resolution_required")
+                    let! markerContent = tryReadUtf8FileAsync (join [| workPath; "base.txt" |])
+                    Vitest.expect(markerContent |> Option.exists (fun content -> content.Contains "<<<<<<<")).toBe (true)
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "does not buffer conflict content for known unsupported extensions",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable inspectReads = false
+                let mutable stageBlobReads = 0
+                let mutable combinedPreviewChunks = 0
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess =
+                        Some(fun request context ->
+                            if
+                                inspectReads
+                                && request.Arguments.Length = 3
+                                && request.Arguments[0] = "cat-file"
+                                && request.Arguments[1] = "blob"
+                            then
+                                stageBlobReads <- stageBlobReads + 1
+
+                            NodeProcess.runBytes request context)
+                    RunProcess = None
+                    Barrier =
+                        Some(fun _ point _ ->
+                            async {
+                                if inspectReads && point = "conflict-content-chunk" then
+                                    combinedPreviewChunks <- combinedPreviewChunks + 1
+                            })
+                }
+
+                let! root, _, _, conflicts, _ =
+                    createPathUnmergedConflictFixtureWithHooks hooks "document.pdf"
+
+                try
+                    inspectReads <- true
+                    let! result =
+                        Async.StartAsPromise(conflicts.GetActiveSession(ctx "unsupported-extension-conflict"))
+                    inspectReads <- false
+
+                    let summary =
+                        match expectValue "unsupported extension conflict preview" result with
+                        | Some value -> value
+                        | None -> failwith "Expected an active unsupported-extension conflict session."
+
+                    Vitest.expect(stageBlobReads).toBe (0)
+                    Vitest.expect(combinedPreviewChunks).toBe (0)
+                    Vitest.expect(summary.Items[0].SupportsResolvedContent).toBe (false)
+                    do! removeDirectoryAsync root
+                with error ->
+                    inspectReads <- false
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "does not buffer oversized conflict stage blobs for supported extensions",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable inspectReads = false
+                let mutable stageBlobReads = 0
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess =
+                        Some(fun request context ->
+                            if
+                                inspectReads
+                                && request.Arguments.Length = 3
+                                && request.Arguments[0] = "cat-file"
+                                && request.Arguments[1] = "blob"
+                            then
+                                stageBlobReads <- stageBlobReads + 1
+
+                            NodeProcess.runBytes request context)
+                    RunProcess =
+                        Some(fun request context ->
+                            if
+                                inspectReads
+                                && request.Arguments.Length = 3
+                                && request.Arguments[0] = "cat-file"
+                                && request.Arguments[1] = "-s"
+                            then
+                                async {
+                                    return
+                                        OperationResult.succeeded {
+                                            NodeProcess.ExitCode = 0
+                                            StdOut = string (1024 * 1024 + 1)
+                                            StdErr = ""
+                                        }
+                                }
+                            else
+                                NodeProcess.run request context)
+                    Barrier = None
+                }
+
+                let! root, _, _, conflicts, _, _ = createUnmergedConflictFixtureWithHooks hooks
+
+                try
+                    inspectReads <- true
+                    let! result =
+                        Async.StartAsPromise(conflicts.GetActiveSession(ctx "oversized-stage-conflict"))
+                    inspectReads <- false
+
+                    let summary =
+                        match expectValue "oversized stage conflict preview" result with
+                        | Some value -> value
+                        | None -> failwith "Expected an active oversized-stage conflict session."
+
+                    Vitest.expect(stageBlobReads).toBe (0)
+                    Vitest.expect(summary.Items[0].SupportsResolvedContent).toBe (false)
+                    Vitest
+                        .expect(summary.Items[0].Candidates |> Array.forall (fun candidate ->
+                            match candidate.Preview with
+                            | Some(UnsupportedPreview _) -> true
+                            | _ -> false))
+                        .toBe (true)
+                    do! removeDirectoryAsync root
+                with error ->
+                    inspectReads <- false
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "reads conflict stages through frozen object ids",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable inspectReads = false
+                let mutable symbolicStageReads = 0
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess =
+                        Some(fun request context ->
+                            if
+                                inspectReads
+                                && request.Arguments.Length = 3
+                                && request.Arguments[0] = "cat-file"
+                                && request.Arguments[1] = "blob"
+                                && request.Arguments[2].StartsWith(":", StringComparison.Ordinal)
+                            then
+                                symbolicStageReads <- symbolicStageReads + 1
+
+                            NodeProcess.runBytes request context)
+                    RunProcess = None
+                    Barrier = None
+                }
+
+                let! root, _, _, conflicts, _, _ = createUnmergedConflictFixtureWithHooks hooks
+
+                try
+                    inspectReads <- true
+                    let! result =
+                        Async.StartAsPromise(conflicts.GetActiveSession(ctx "frozen-stage-conflict"))
+                    inspectReads <- false
+
+                    match expectValue "frozen stage conflict preview" result with
+                    | Some summary -> Vitest.expect(summary.Items.Length).toBe (1)
+                    | None -> failwith "Expected an active frozen-stage conflict session."
+
+                    Vitest.expect(symbolicStageReads).toBe (0)
+                    do! removeDirectoryAsync root
+                with error ->
+                    inspectReads <- false
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "resolves each conflict stage to one immutable blob before size and content reads",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable inspectReads = false
+                let sizeObjects = ResizeArray<string>()
+                let contentObjects = ResizeArray<string>()
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess =
+                        Some(fun request context ->
+                            if
+                                inspectReads
+                                && request.Arguments.Length = 3
+                                && request.Arguments[0] = "cat-file"
+                                && request.Arguments[1] = "blob"
+                            then
+                                contentObjects.Add request.Arguments[2]
+
+                            NodeProcess.runBytes request context)
+                    RunProcess =
+                        Some(fun request context ->
+                            if
+                                inspectReads
+                                && request.Arguments.Length = 3
+                                && request.Arguments[0] = "cat-file"
+                                && request.Arguments[1] = "-s"
+                            then
+                                sizeObjects.Add request.Arguments[2]
+
+                            NodeProcess.run request context)
+                    Barrier = None
+                }
+
+                let! root, _, _, conflicts, _, _ = createUnmergedConflictFixtureWithHooks hooks
+
+                try
+                    inspectReads <- true
+                    let! result =
+                        Async.StartAsPromise(conflicts.GetActiveSession(ctx "immutable-stage-preview"))
+                    inspectReads <- false
+                    expectValue "immutable stage preview" result |> ignore
+
+                    Vitest.expect(sizeObjects.Count).toBeGreaterThan (0)
+                    Vitest.expect(sizeObjects.ToArray()).toEqual (contentObjects.ToArray())
+                    Vitest
+                        .expect(sizeObjects |> Seq.forall (fun objectName -> not (objectName.StartsWith ":")))
+                        .toBe (true)
+                    do! removeDirectoryAsync root
+                with error ->
+                    inspectReads <- false
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "bounds combined-preview reads for oversized conflict files",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable countPreviewChunks = false
+                let mutable previewChunks = 0
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess = None
+                    Barrier =
+                        Some(fun _ point _ ->
+                            async {
+                                if countPreviewChunks && point = "conflict-content-chunk" then
+                                    previewChunks <- previewChunks + 1
+                            })
+                }
+
+                let! root, workPath, _, conflicts, _, _ = createUnmergedConflictFixtureWithHooks hooks
+
+                try
+                    let largeMarkerText = "z".PadRight(8 * 1024 * 1024, 'z')
+                    do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) largeMarkerText
+                    countPreviewChunks <- true
+                    let! result = Async.StartAsPromise(conflicts.GetActiveSession(ctx "bounded-conflict-preview"))
+                    countPreviewChunks <- false
+
+                    let summary =
+                        match expectValue "bounded conflict preview" result with
+                        | Some value -> value
+                        | None -> failwith "Expected an active oversized conflict session."
+
+                    match summary.Items[0].CombinedPreview with
+                    | Some(UnsupportedPreview _) -> ()
+                    | preview -> failwith $"Expected an unsupported oversized preview, received {preview}."
+
+                    Vitest.expect(previewChunks).toBeLessThanOrEqual (18)
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
             "propagates an unmerged-path process failure instead of minting a token",
             TestOptions(timeout = 120000),
             fun () -> promise {
@@ -369,6 +777,7 @@ Vitest.describe (
                 let injectedFailure = OperationFailure.create Network "unmerged_probe_failed" "Injected unmerged probe failure."
 
                 let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
                     RunProcess =
                         Some(fun request context ->
                             if
@@ -417,30 +826,185 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "hashes a large unmerged file through Git instead of buffering it in the session",
+            "hashes a large unmerged file from multiple bounded handle chunks",
             TestOptions(timeout = 120000),
             fun () -> promise {
-                let mutable observedHashObject = false
+                let mutable observedChunks = 0
 
                 let hooks: GitWorkspaceSession.GitSessionHooks = {
-                    RunProcess =
-                        Some(fun request context ->
-                            if request.Arguments |> Array.contains "hash-object" then
-                                observedHashObject <- true
-
-                            NodeProcess.run request context)
-                    Barrier = None
+                    RunBytesProcess = None
+                    RunProcess = None
+                    Barrier =
+                        Some(fun _ point _ ->
+                            async {
+                                if point = "conflict-content-chunk" then
+                                    observedChunks <- observedChunks + 1
+                            })
                 }
 
                 let! root, workPath, session, _, _, _ = createUnmergedConflictFixtureWithHooks hooks
 
                 try
-                    observedHashObject <- false
+                    observedChunks <- 0
                     let largeMarkerText = "x".PadRight(8 * 1024 * 1024, 'x')
                     do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) largeMarkerText
                     let! statusResult = Async.StartAsPromise(session.Core.GetStatus(ctx "large-unmerged-status"))
                     expectValue "large unmerged status" statusResult |> ignore
-                    Vitest.expect(observedHashObject).toBe (true)
+                    Vitest.expect(observedChunks).toBeGreaterThan (1)
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "cancels conflict hashing between bounded handle chunks",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let source = OperationCancellation.Source()
+                let mutable armed = false
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess = None
+                    Barrier =
+                        Some(fun _ point _ ->
+                            async {
+                                if armed && point = "conflict-content-chunk" then
+                                    armed <- false
+                                    source.Cancel()
+                            })
+                }
+
+                let! root, workPath, session, _, _, _ = createUnmergedConflictFixtureWithHooks hooks
+
+                try
+                    let largeMarkerText = "y".PadRight(2 * 1024 * 1024, 'y')
+                    do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) largeMarkerText
+                    armed <- true
+                    let context = OperationContext.create "cancel-conflict-chunks" source.Cancellation ignore
+                    let! result = Async.StartAsPromise(session.Core.GetStatus context)
+                    let failure = expectFailure "canceled conflict handle read" result
+                    Vitest.expect(failure.Category).toEqual (Canceled)
+                    Vitest.expect(failure.Code).toBe ("operation_canceled")
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "rejects a parent junction swapped in after validation before conflict hashing",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable armRace = false
+                let mutable linkedDirectory = ""
+                let mutable backupDirectory = ""
+                let mutable outsideDirectory = ""
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request context ->
+                            async {
+                                if armRace && request.Arguments |> Array.contains "hash-object" then
+                                    armRace <- false
+                                    let! _ =
+                                        fsPromisesDynamic?rename (linkedDirectory, backupDirectory)
+                                        |> unbox<JS.Promise<obj>>
+                                        |> Async.AwaitPromise
+
+                                    do! createDirectoryLinkAsync outsideDirectory linkedDirectory |> Async.AwaitPromise
+                                    let! result = NodeProcess.run request context
+                                    do! removePathAsync linkedDirectory |> Async.AwaitPromise
+                                    let! _ =
+                                        fsPromisesDynamic?rename (backupDirectory, linkedDirectory)
+                                        |> unbox<JS.Promise<obj>>
+                                        |> Async.AwaitPromise
+
+                                    return result
+                                else
+                                    return! NodeProcess.run request context
+                            })
+                    Barrier =
+                        Some(fun _ point _ ->
+                            async {
+                                if armRace && point = "conflict-content-validated" then
+                                    armRace <- false
+                                    let! _ =
+                                        fsPromisesDynamic?rename (linkedDirectory, backupDirectory)
+                                        |> unbox<JS.Promise<obj>>
+                                        |> Async.AwaitPromise
+
+                                    do! createDirectoryLinkAsync outsideDirectory linkedDirectory |> Async.AwaitPromise
+                            })
+                }
+
+                let! root, workPath, session, _, conflictPath = createNestedUnmergedConflictFixtureWithHooks hooks
+
+                try
+                    linkedDirectory <- join [| workPath; "nested" |]
+                    backupDirectory <- join [| workPath; "nested-safe" |]
+                    outsideDirectory <- join [| root; "outside-hash-race" |]
+                    let secretText = "outside hash race secret must not influence a token\n"
+                    do! writeUtf8FileAsync (join [| outsideDirectory; "conflict.txt" |]) secretText
+                    armRace <- true
+                    let! result = Async.StartAsPromise(session.Core.GetStatus(ctx "junction-hash-race"))
+                    let failure = expectFailure "status during a junction hash race" result
+                    Vitest.expect(failure.Category).toEqual (Validation)
+                    Vitest.expect(failure.Code).toBe ("unsafe_workspace_path")
+                    Vitest.expect(failure.Message.Contains secretText).toBe (false)
+                    Vitest.expect(failure.AffectedPaths).toEqual ([| conflictPath |])
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "rejects a parent junction swapped in after validation before combined preview read",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable armRace = false
+                let mutable linkedDirectory = ""
+                let mutable backupDirectory = ""
+                let mutable outsideDirectory = ""
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess = None
+                    Barrier =
+                        Some(fun _ point _ ->
+                            async {
+                                if armRace && point = "conflict-content-validated" then
+                                    armRace <- false
+                                    let! _ =
+                                        fsPromisesDynamic?rename (linkedDirectory, backupDirectory)
+                                        |> unbox<JS.Promise<obj>>
+                                        |> Async.AwaitPromise
+
+                                    do! createDirectoryLinkAsync outsideDirectory linkedDirectory |> Async.AwaitPromise
+                            })
+                }
+
+                let! root, workPath, _, conflicts, conflictPath = createNestedUnmergedConflictFixtureWithHooks hooks
+
+                try
+                    linkedDirectory <- join [| workPath; "nested" |]
+                    backupDirectory <- join [| workPath; "nested-safe" |]
+                    outsideDirectory <- join [| root; "outside-preview-race" |]
+                    let secretText = "outside preview race secret must not be exposed\n"
+                    do! writeUtf8FileAsync (join [| outsideDirectory; "conflict.txt" |]) secretText
+                    armRace <- true
+                    let! result = Async.StartAsPromise(conflicts.GetActiveSession(ctx "junction-preview-race"))
+                    let failure = expectFailure "preview during a junction race" result
+                    Vitest.expect(failure.Category).toEqual (Validation)
+                    Vitest.expect(failure.Code).toBe ("unsafe_workspace_path")
+                    Vitest.expect(failure.Message.Contains secretText).toBe (false)
+                    Vitest.expect(failure.AffectedPaths).toEqual ([| conflictPath |])
                     do! removeDirectoryAsync root
                 with error ->
                     do! removeDirectoryAsync root
@@ -513,6 +1077,7 @@ Vitest.describe (
                 let mutable armFinalizeRace = false
 
                 let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
                     RunProcess = None
                     Barrier =
                         Some(fun root point _context ->
@@ -765,6 +1330,7 @@ Vitest.describe (
                 let mutable armCancel: OperationCancellation.Source option = None
 
                 let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
                     RunProcess = None
                     Barrier =
                         Some(fun _root point _context ->

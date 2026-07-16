@@ -37,6 +37,14 @@ type ProcessOutput = {
     StdErr: string
 }
 
+/// Child-process output whose stdout remains byte-exact. Providers use this for
+/// object content that must not be decoded independently per stream chunk.
+type ByteProcessOutput = {
+    ExitCode: int
+    StdOut: obj
+    StdErr: string
+}
+
 let private childProcessModule: obj = importAll "child_process"
 let private processGlobal: obj = emitJsExpr () "process"
 
@@ -112,6 +120,8 @@ let run (request: ProcessRequest) (context: OperationContext) : Async<OperationR
             if not finished then
                 let stdout = System.Text.StringBuilder()
                 let stderr = System.Text.StringBuilder()
+                let stdoutDecoder = Interop.createUtf8StringDecoder ()
+                let stderrDecoder = Interop.createUtf8StringDecoder ()
                 let mutable canceled = false
 
                 let reportLine (line: string) =
@@ -124,16 +134,16 @@ let run (request: ProcessRequest) (context: OperationContext) : Async<OperationR
                             DisplayMessage = Some(Redaction.redact line)
                         }
 
-                let observeStream (stream: obj) (buffer: System.Text.StringBuilder) =
+                let observeStream (stream: obj) (decoder: obj) (buffer: System.Text.StringBuilder) =
                     if not (isNull stream) then
                         stream?on ("data", fun (data: obj) ->
-                            let text: string = unbox (data?toString "utf8")
+                            let text = Interop.decodeUtf8Chunk decoder data
                             buffer.Append text |> ignore
                             text.Split '\n' |> Array.iter reportLine)
                         |> ignore
 
-                observeStream child?stdout stdout
-                observeStream child?stderr stderr
+                observeStream child?stdout stdoutDecoder stdout
+                observeStream child?stderr stderrDecoder stderr
 
                 child?on ("error", fun (error: obj) ->
                     if not finished then
@@ -158,11 +168,132 @@ let run (request: ProcessRequest) (context: OperationContext) : Async<OperationR
                                 OperationResult.canceled "The operation was canceled and its process tree terminated."
                             )
                         else
+                            let finishStream (decoder: obj) (buffer: System.Text.StringBuilder) =
+                                let tail = Interop.finishUtf8Decoding decoder
+
+                                if not (String.IsNullOrEmpty tail) then
+                                    buffer.Append tail |> ignore
+                                    tail.Split '\n' |> Array.iter reportLine
+
+                            finishStream stdoutDecoder stdout
+                            finishStream stderrDecoder stderr
+
                             resolve (
                                 OperationResult.succeeded {
                                     ExitCode = (if isNull code then -1 else unbox<int> code)
                                     StdOut = stdout.ToString()
                                     StdErr = stderr.ToString()
+                                }
+                            ))
+                |> ignore
+
+                context.Cancellation.Register(fun () ->
+                    if not finished then
+                        canceled <- true
+                        killProcessTree (unbox<int> child?pid))
+
+                match request.StdinData with
+                | Some data ->
+                    child?stdin?write (data) |> ignore
+                    child?stdin?``end`` () |> ignore
+                | None -> child?stdin?``end`` () |> ignore)
+
+/// Runs a child process while preserving stdout as raw bytes. Stderr is decoded
+/// only after every chunk has arrived so diagnostics remain byte-boundary safe.
+let runBytes
+    (request: ProcessRequest)
+    (context: OperationContext)
+    : Async<OperationResult<ByteProcessOutput>> =
+    Async.FromContinuations(fun (resolve, _, _) ->
+        if context.Cancellation.IsCancellationRequested() then
+            resolve (OperationResult.canceled "The operation was canceled before the process started.")
+        else
+            let options =
+                createObj [
+                    "env" ==> mergeEnvironment (createObj [ for key, value in request.Environment -> key ==> value ])
+                    "windowsHide" ==> true
+                    "detached" ==> not (isWindows ())
+                ]
+
+            match request.WorkingDirectory with
+            | Some workingDirectory -> options?cwd <- workingDirectory
+            | None -> ()
+
+            let mutable finished = false
+
+            let child: obj =
+                try
+                    childProcessModule?spawn (request.Command, request.Arguments, options)
+                with error ->
+                    finished <- true
+
+                    resolve (
+                        OperationResult.failed (
+                            OperationFailure.createRedacted
+                                DependencyMissing
+                                "spawn_failed"
+                                $"Could not start '{request.Command}': {error.Message}"
+                        )
+                    )
+
+                    null
+
+            if not finished then
+                let stdout = ResizeArray<obj>()
+                let stderr = ResizeArray<obj>()
+                let mutable canceled = false
+
+                let observeBytes (stream: obj) (chunks: ResizeArray<obj>) =
+                    if not (isNull stream) then
+                        stream?on ("data", fun (data: obj) -> chunks.Add data) |> ignore
+
+                observeBytes child?stdout stdout
+                observeBytes child?stderr stderr
+
+                child?on ("error", fun (error: obj) ->
+                    if not finished then
+                        finished <- true
+
+                        resolve (
+                            OperationResult.failed (
+                                OperationFailure.createRedacted
+                                    DependencyMissing
+                                    "spawn_failed"
+                                    $"Could not run '{request.Command}': {unbox<string> error?message}"
+                            )
+                        ))
+                |> ignore
+
+                child?on ("close", fun (code: obj) ->
+                    if not finished then
+                        finished <- true
+
+                        if canceled then
+                            resolve (
+                                OperationResult.canceled "The operation was canceled and its process tree terminated."
+                            )
+                        else
+                            let stderrText =
+                                stderr.ToArray()
+                                |> Interop.bufferConcat
+                                |> Interop.bufferToUtf8String
+
+                            stderrText.Split '\n'
+                            |> Array.filter (String.IsNullOrWhiteSpace >> not)
+                            |> Array.iter (fun line ->
+                                context.ReportProgress {
+                                    PhaseCode = request.ProgressPhase
+                                    Item = None
+                                    Completed = None
+                                    Total = None
+                                    DisplayMessage = Some(Redaction.redact line)
+                                })
+
+                            resolve (
+                                OperationResult.succeeded {
+                                    ExitCode = (if isNull code then -1 else unbox<int> code)
+                                    StdOut = stdout.ToArray() |> Interop.bufferConcat
+                                    StdErr = stderrText
                                 }
                             ))
                 |> ignore

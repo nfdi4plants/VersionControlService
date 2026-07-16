@@ -8,6 +8,7 @@ open VersionControlService.Abstractions
 module NodeProcess = VersionControlService.Runtime.Node.Process
 
 type GitRunner = string[] -> string option -> Async<Result<NodeProcess.ProcessOutput, OperationFailure>>
+type StagePreviewReader = int -> string -> Async<Result<ConflictPreview option, OperationFailure>>
 type CombinedPreviewReader = string -> Async<Result<ConflictPreview option, OperationFailure>>
 
 /// Stale, foreign, or closed handles are rejected before provider state changes.
@@ -50,19 +51,9 @@ let listUnmergedPaths (runGit: GitRunner) : Async<Result<string[], OperationFail
         | Error failure -> return Error failure
     }
 
-/// Content of one index stage (1 = base, 2 = workspace, 3 = target) for a path.
-let readStageContent (runGit: GitRunner) (stage: int) (path: string) : Async<string option> =
-    async {
-        let! output = runGit [| "show"; $":{stage}:{path}" |] None
-
-        match output with
-        | Ok result when result.ExitCode = 0 -> return Some result.StdOut
-        | _ -> return None
-    }
-
-/// Builds conflict items with workspace/target/base candidates and text previews.
+/// Builds conflict items with provider-classified stage and combined previews.
 let buildConflictItems
-    (runGit: GitRunner)
+    (readStagePreview: StagePreviewReader)
     (readCombinedPreview: CombinedPreviewReader)
     (mergeHeadRevision: RevisionId option)
     (unmergedPaths: string[])
@@ -76,14 +67,27 @@ let buildConflictItems
             | Some _, _
             | None, Error _ -> ()
             | None, Ok path ->
-                let! baseContent = readStageContent runGit 1 pathValue
-                let! workspaceContent = readStageContent runGit 2 pathValue
-                let! targetContent = readStageContent runGit 3 pathValue
+                let! basePreviewResult = readStagePreview 1 pathValue
+                let! workspacePreviewResult = readStagePreview 2 pathValue
+                let! targetPreviewResult = readStagePreview 3 pathValue
                 let! combinedPreviewResult = readCombinedPreview pathValue
 
-                match combinedPreviewResult with
-                | Error failure -> previewFailure <- Some failure
-                | Ok combinedPreview ->
+                match basePreviewResult, workspacePreviewResult, targetPreviewResult, combinedPreviewResult with
+                | Error failure, _, _, _
+                | _, Error failure, _, _
+                | _, _, Error failure, _
+                | _, _, _, Error failure -> previewFailure <- Some failure
+                | Ok basePreview, Ok workspacePreview, Ok targetPreview, Ok combinedPreview ->
+                    let isUnsupported = function
+                        | Some(UnsupportedPreview _) -> true
+                        | _ -> false
+
+                    let requiresManualResolution =
+                        isUnsupported basePreview
+                        || isUnsupported workspacePreview
+                        || isUnsupported targetPreview
+                        || isUnsupported combinedPreview
+
                     items.Add {
                         Path = path
                         Candidates = [|
@@ -91,29 +95,29 @@ let buildConflictItems
                                 CandidateId = "workspace"
                                 Label = "Workspace version"
                                 Revision = None
-                                Preview = workspaceContent |> Option.map TextPreview
+                                Preview = workspacePreview
                             }
                             {
                                 CandidateId = "target"
                                 Label = "Target version"
                                 Revision = mergeHeadRevision
-                                Preview = targetContent |> Option.map TextPreview
+                                Preview = targetPreview
                             }
                             yield!
-                                match baseContent with
-                                | Some content ->
+                                match basePreview with
+                                | Some preview ->
                                     [|
                                         {
                                             CandidateId = "base"
                                             Label = "Base version"
                                             Revision = None
-                                            Preview = Some(TextPreview content)
+                                            Preview = Some preview
                                         }
                                     |]
                                 | None -> [||]
                         |]
                         CombinedPreview = combinedPreview
-                        SupportsResolvedContent = true
+                        SupportsResolvedContent = not requiresManualResolution
                     }
 
         match previewFailure with
