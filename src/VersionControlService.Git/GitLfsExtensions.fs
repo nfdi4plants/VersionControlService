@@ -59,7 +59,7 @@ let createObjectMaterialization (repoPath: string) : ObjectMaterializationServic
                         | Ok path ->
                             Some {
                                 Path = path
-                                IsMaterialized = file.downloaded
+                                IsMaterialized = file.checkout
                                 IsLocallyAvailable = file.downloaded
                                 SizeBytes = Some file.size
                                 ObjectId = Some file.oid
@@ -122,21 +122,49 @@ let createStoragePolicy (repoPath: string) : StoragePolicyService = {
         }
 }
 
+let private reportMaintenanceProgress (phaseCode: string) (context: OperationContext) (progress: GitProgressDto) =
+    context.ReportProgress {
+        PhaseCode = phaseCode
+        Item = None
+        Completed = progress.Processed
+        Total = progress.Total
+        DisplayMessage = progress.Output |> Option.map Redaction.redact
+    }
+
+let private beginMaintenance (phaseCode: string) (context: OperationContext) =
+    context.ReportProgress {
+        PhaseCode = phaseCode
+        Item = None
+        Completed = None
+        Total = None
+        DisplayMessage = None
+    }
+
 let createMaintenance (repoPath: string) : StorageMaintenanceService = {
     Prune =
-        fun _ -> async {
-            let! result = Async.AwaitPromise(GitService.pruneLfsCache repoPath)
+        fun context -> async {
+            if context.Cancellation.IsCancellationRequested() then
+                return OperationResult.canceled "Git LFS cache pruning was canceled."
+            else
+                beginMaintenance "maintenance-prune" context
+                let progress = reportMaintenanceProgress "maintenance-prune" context
+                let! result = Async.AwaitPromise(GitService.pruneLfsCacheWithProgress repoPath (Some progress))
 
-            match result with
-            | Ok output -> return OperationResult.succeeded output
-            | Error failure -> return Failed(toOperationFailure failure)
+                match result with
+                | Ok output -> return OperationResult.succeeded output
+                | Error failure -> return Failed(toOperationFailure failure)
         }
     Deduplicate =
-        fun _ -> async {
-            let! result = Async.AwaitPromise(GitService.dedupLfsStorage repoPath)
+        fun context -> async {
+            if context.Cancellation.IsCancellationRequested() then
+                return OperationResult.canceled "Git LFS storage deduplication was canceled."
+            else
+                beginMaintenance "maintenance-deduplicate" context
+                let progress = reportMaintenanceProgress "maintenance-deduplicate" context
+                let! result = Async.AwaitPromise(GitService.dedupLfsStorageWithProgress repoPath (Some progress))
 
-            match result with
-            | Ok output -> return OperationResult.succeeded output
-            | Error failure -> return Failed(toOperationFailure failure)
+                match result with
+                | Ok output -> return OperationResult.succeeded output
+                | Error failure -> return Failed(toOperationFailure failure)
         }
 }

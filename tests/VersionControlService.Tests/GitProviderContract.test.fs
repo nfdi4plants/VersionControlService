@@ -475,11 +475,243 @@ let private expectProviderFailure (operationName: string) (result: OperationResu
     | Succeeded _
     | PartiallySucceeded _ -> failwith $"Expected {operationName} to fail."
 
+Vitest.describe (
+    "Git / Swate-selectable profile",
+    fun () ->
+        Vitest.test (
+            "configured upstream target identity is exposed through the neutral synchronization state",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let! statusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "configured-target-ref")
+                        |> Async.StartAsPromise
+
+                    let status = expectProviderValue "configured target status" statusResult
+
+                    let target =
+                        status.Synchronization
+                        |> Option.bind _.TargetRef
+                        |> Option.defaultWith (fun () -> failwith "Expected the configured Git upstream target.")
+
+                    Vitest.expect(target.Name).toBe "origin/main"
+                    Vitest.expect(ProviderRef.value target.ProviderRef).toBe "git-remote:origin/main"
+                    Vitest.expect(target.Kind).toEqual RemoteRef
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "a branch without an upstream exposes no neutral synchronization target",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let! _ = runGitIn workspace.Binding.WorkspaceRoot [||] [| "branch"; "--unset-upstream" |] None
+
+                    let! statusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "missing-target-ref")
+                        |> Async.StartAsPromise
+
+                    let status = expectProviderValue "missing target status" statusResult
+                    let synchronization =
+                        status.Synchronization
+                        |> Option.defaultWith (fun () -> failwith "Expected Git synchronization state.")
+
+                    Vitest.expect(synchronization.TargetRef).toEqual None
+                    Vitest.expect(synchronization.TargetRevision).toEqual None
+                    Vitest.expect(synchronization.LocalRevisionCount).toEqual None
+                    Vitest.expect(synchronization.TargetRevisionCount).toEqual None
+                    Vitest.expect(synchronization.Relationship).toEqual NoTarget
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "a detached workspace exposes no neutral synchronization target",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let! _ = runGitIn workspace.Binding.WorkspaceRoot [||] [| "checkout"; "--detach" |] None
+
+                    let! statusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "detached-target-ref")
+                        |> Async.StartAsPromise
+
+                    let status = expectProviderValue "detached target status" statusResult
+                    let synchronization =
+                        status.Synchronization
+                        |> Option.defaultWith (fun () -> failwith "Expected Git synchronization state.")
+
+                    Vitest.expect(status.CurrentRef).toEqual None
+                    Vitest.expect(synchronization.WorkspaceRevision.IsSome).toBe true
+                    Vitest.expect(synchronization.TargetRef).toEqual None
+                    Vitest.expect(synchronization.TargetRevision).toEqual None
+                    Vitest.expect(synchronization.LocalRevisionCount).toEqual None
+                    Vitest.expect(synchronization.TargetRevisionCount).toEqual None
+                    Vitest.expect(synchronization.Relationship).toEqual NoTarget
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+)
+
 let private processOutput exitCode stdout stderr : NodeProcess.ProcessOutput = {
     ExitCode = exitCode
     StdOut = stdout
     StdErr = stderr
 }
+
+Vitest.describe (
+    "Git / extension suites",
+    fun () ->
+        Vitest.test (
+            "cached LFS object availability is independent from literal-path materialization",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let literalPath = "literal[meta].bin"
+                    let attributes = "/literal[[]meta].bin filter=lfs diff=lfs merge=lfs -text\n"
+                    do! workspace.WriteFile ".gitattributes" attributes
+                    do! workspace.WriteFile literalPath "cached object content\n"
+
+                    let! _ =
+                        runGitIn
+                            workspace.Binding.WorkspaceRoot
+                            [||]
+                            [| "--literal-pathspecs"; "add"; "--"; ".gitattributes"; literalPath |]
+                            None
+
+                    let! _ =
+                        runGitIn workspace.Binding.WorkspaceRoot [||] [| "commit"; "-m"; "test: cached lfs object" |] None
+
+                    let! _ = runGitIn workspace.Binding.WorkspaceRoot [||] [| "push"; "origin"; "main" |] None
+
+                    let! pointer =
+                        runGitIn workspace.Binding.WorkspaceRoot [||] [| "show"; $"HEAD:{literalPath}" |] None
+
+                    do! workspace.WriteFile literalPath pointer
+
+                    let materialization =
+                        workspace.Session.ObjectMaterialization
+                        |> Option.defaultWith (fun () -> failwith "Expected Git object materialization.")
+
+                    let! listResult =
+                        materialization.ListObjects(OperationContext.detached "cached-literal-list")
+                        |> Async.StartAsPromise
+
+                    let objectState =
+                        expectProviderValue "list cached literal LFS object" listResult
+                        |> Array.find (fun item -> RepositoryPath.value item.Path = literalPath)
+
+                    Vitest.expect(RepositoryPath.value objectState.Path).toBe literalPath
+                    Vitest.expect(objectState.IsMaterialized).toBe false
+                    Vitest.expect(objectState.IsLocallyAvailable).toBe true
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "preview classification failures are retryable indeterminate results",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    do! workspace.WriteFile "local.txt" "local revision\n"
+
+                    let! beforeRevisionResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "preview-local-status")
+                        |> Async.StartAsPromise
+
+                    let beforeRevision = expectProviderValue "preview local status" beforeRevisionResult
+                    let localPath =
+                        RepositoryPath.tryCreate "local.txt"
+                        |> Result.defaultWith failwith
+
+                    let! localRevisionResult =
+                        workspace.Session.Core.CreateRevision
+                            {
+                                Message = "local preview revision"
+                                Paths = [| localPath |]
+                                ExpectedWorkspaceVersion = beforeRevision.WorkspaceVersion
+                            }
+                            (OperationContext.detached "preview-local-revision")
+                        |> Async.StartAsPromise
+
+                    expectProviderValue "create local preview revision" localRevisionResult |> ignore
+
+                    do!
+                        harness.AdvanceTarget workspace [|
+                            {
+                                Path = "target.txt"
+                                Content = Some "target revision\n"
+                            }
+                        |]
+
+                    let hooks: GitWorkspaceSession.GitSessionHooks = {
+                        RunBytesProcess = None
+                        RunProcess =
+                            Some(fun request context ->
+                                if request.Arguments |> Array.contains "merge-tree" then
+                                    async {
+                                        return
+                                            OperationResult.failed(
+                                                OperationFailure.create
+                                                    ProviderError
+                                                    "merge_tree_transport_failed"
+                                                    "The merge-tree provider call failed."
+                                            )
+                                    }
+                                else
+                                    NodeProcess.run request context)
+                        Barrier = None
+                    }
+
+                    let session = GitWorkspaceSession.createSession hooks workspace.Binding
+                    let synchronization =
+                        session.Synchronization
+                        |> Option.defaultWith (fun () -> failwith "Expected Git synchronization.")
+
+                    let! previewResult =
+                        synchronization.PreviewUpdate(OperationContext.detached "preview-indeterminate")
+                        |> Async.StartAsPromise
+
+                    let failure = expectProviderFailure "indeterminate update preview" previewResult
+                    Vitest.expect(failure.Category).toEqual ProviderError
+                    Vitest.expect(failure.Code).toBe "preview_indeterminate"
+                    Vitest.expect(failure.Retryable).toBe true
+                    Vitest.expect(failure.StateChanged).toBe false
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+)
 
 let private adoptionHooks (originResult: OperationResult<NodeProcess.ProcessOutput>) : GitWorkspaceSession.GitSessionHooks = {
     RunBytesProcess = None

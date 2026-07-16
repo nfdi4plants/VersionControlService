@@ -647,6 +647,31 @@ let private withValidatedMutation
             state.Lock.Release()
     }
 
+let private tryConfiguredUpstream (state: SessionState) (context: OperationContext) =
+    async {
+        let! result =
+            runGit
+                state.Hooks
+                state.RepoPath
+                [| "rev-parse"; "--abbrev-ref"; "--symbolic-full-name"; "@{upstream}" |]
+                None
+                context
+
+        match result with
+        | Error failure -> return Error failure
+        | Ok output when output.ExitCode = 0 ->
+            let upstream = output.StdOut.Trim()
+            return Ok(if upstream = "" then None else Some upstream)
+        | Ok _ -> return Ok None
+    }
+
+let private logicalTargetRef (upstream: string) : LogicalRef = {
+    Name = upstream
+    ProviderRef = mkProviderRef $"git-remote:{upstream}"
+    Kind = RemoteRef
+    IsCurrent = false
+}
+
 let private toWorkspaceStatus (state: SessionState) (status: GitStatusDto) (context: OperationContext) =
     async {
         let conflictedSet = Set.ofArray status.Conflicted
@@ -662,7 +687,7 @@ let private toWorkspaceStatus (state: SessionState) (status: GitStatusDto) (cont
             | Error failure -> Some failure, String.Empty
             | Ok value -> None, value
 
-        // Synchronization revisions: HEAD and the current branch's origin counterpart.
+        // Synchronization revisions: HEAD and the configured upstream, if any.
         let! headRevision =
             runGit state.Hooks state.RepoPath [| "rev-parse"; "HEAD" |] None context
 
@@ -671,10 +696,17 @@ let private toWorkspaceStatus (state: SessionState) (status: GitStatusDto) (cont
             | Ok output when output.ExitCode = 0 -> Some(mkRevisionId (output.StdOut.Trim()))
             | _ -> None
 
+        let! upstreamResult = tryConfiguredUpstream state context
+
+        let upstreamFailure, upstream =
+            match upstreamResult with
+            | Error failure -> Some failure, None
+            | Ok value -> None, value
+
         let! targetRevisionOutput =
-            match status.Current with
-            | Some current ->
-                runGit state.Hooks state.RepoPath [| "rev-parse"; $"refs/remotes/origin/{current}" |] None context
+            match upstream with
+            | Some target ->
+                runGit state.Hooks state.RepoPath [| "rev-parse"; $"refs/remotes/{target}" |] None context
             | None -> async { return Ok { ExitCode = 1; StdOut = ""; StdErr = "" } }
 
         let targetRevision =
@@ -691,13 +723,15 @@ let private toWorkspaceStatus (state: SessionState) (status: GitStatusDto) (cont
             | _ when status.Ahead > 0 -> LocalAhead
             | _ -> UnknownRelationship
 
-        match versionFailure with
-        | Some failure -> return Error failure
-        | None ->
+        match versionFailure, upstreamFailure with
+        | Some failure, _ -> return Error failure
+        | None, Some failure -> return Error failure
+        | None, None ->
             return
                 Ok {
                     CurrentRef =
                         status.Current
+                        |> Option.filter (fun current -> current <> "HEAD")
                         |> Option.map (fun current -> {
                             Name = current
                             ProviderRef = mkProviderRef $"git-local:{current}"
@@ -712,9 +746,9 @@ let private toWorkspaceStatus (state: SessionState) (status: GitStatusDto) (cont
                             BaseRevision = None
                             WorkspaceRevision = workspaceRevision
                             TargetRevision = targetRevision
-                            TargetRef = None
-                            LocalRevisionCount = Some status.Ahead
-                            TargetRevisionCount = Some status.Behind
+                            TargetRef = upstream |> Option.map logicalTargetRef
+                            LocalRevisionCount = upstream |> Option.map (fun _ -> status.Ahead)
+                            TargetRevisionCount = upstream |> Option.map (fun _ -> status.Behind)
                             RemoteChangedPaths = None
                             Relationship = relationship
                         }
@@ -1527,13 +1561,16 @@ let private revParse (state: SessionState) (reference: string) (context: Operati
 
 let private synchronizationState (state: SessionState) (context: OperationContext) =
     async {
-        let! branchResult = currentBranchName state context
+        let! upstreamResult = tryConfiguredUpstream state context
 
-        match branchResult with
+        match upstreamResult with
         | Error failure -> return Error failure
-        | Ok branch ->
+        | Ok upstream ->
             let! workspaceRevision = revParse state "HEAD" context
-            let! targetRevision = revParse state $"refs/remotes/origin/{branch}" context
+            let! targetRevision =
+                match upstream with
+                | Some target -> revParse state $"refs/remotes/{target}" context
+                | None -> async { return None }
 
             let! baseRevision =
                 match targetRevision with
@@ -1592,7 +1629,7 @@ let private synchronizationState (state: SessionState) (context: OperationContex
                     BaseRevision = baseRevision |> Option.map mkRevisionId
                     WorkspaceRevision = workspaceRevision |> Option.map mkRevisionId
                     TargetRevision = targetRevision |> Option.map mkRevisionId
-                    TargetRef = None
+                    TargetRef = upstream |> Option.map logicalTargetRef
                     LocalRevisionCount = None
                     TargetRevisionCount = None
                     RemoteChangedPaths = remoteChanged
@@ -1680,18 +1717,42 @@ let private previewUpdate (state: SessionState) (context: OperationContext) =
                                     context
 
                             match mergeTree with
-                            | Ok output -> return output.ExitCode <> 0
-                            | Error _ -> return false
-                        }
-                    | _ -> async { return false }
+                            | Ok output when output.ExitCode = 0 -> return Ok false
+                            | Ok output when output.ExitCode = 1 -> return Ok true
+                            | Ok output ->
+                                let detail =
+                                    if String.IsNullOrWhiteSpace output.StdErr then output.StdOut else output.StdErr
 
-                return
-                    OperationResult.succeeded {
-                        ChangedPaths = changed
-                        OverlappingPaths = overlapping
-                        HasDataLossRisk = overlapping.Length > 0
-                        WouldCreateConflictSession = overlapping.Length > 0 || committedConflicts
-                    }
+                                return
+                                    Error {
+                                        OperationFailure.createRedacted
+                                            ProviderError
+                                            "preview_indeterminate"
+                                            $"The update preview could not classify committed conflicts: {detail}" with
+                                            Retryable = true
+                                    }
+                            | Error failure ->
+                                return
+                                    Error {
+                                        OperationFailure.createRedacted
+                                            ProviderError
+                                            "preview_indeterminate"
+                                            $"The update preview could not classify committed conflicts: {failure.Message}" with
+                                            Retryable = true
+                                    }
+                        }
+                    | _ -> async { return Ok false }
+
+                match committedConflicts with
+                | Error failure -> return Failed failure
+                | Ok hasCommittedConflicts ->
+                    return
+                        OperationResult.succeeded {
+                            ChangedPaths = changed
+                            OverlappingPaths = overlapping
+                            HasDataLossRisk = overlapping.Length > 0
+                            WouldCreateConflictSession = overlapping.Length > 0 || hasCommittedConflicts
+                        }
     }
 
 let private update (state: SessionState) (request: UpdateRequest) (context: OperationContext) =

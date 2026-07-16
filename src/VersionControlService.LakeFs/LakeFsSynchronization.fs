@@ -7,6 +7,17 @@ let private repositoryPaths (paths: string list) =
     |> List.choose (RepositoryPath.tryCreate >> Result.toOption)
     |> List.toArray
 
+/// Classifies a provider failure that prevents a safe update preview. The
+/// preview is read-only, so consumers may retry after the provider recovers.
+let previewIndeterminate (classification: string) (failure: OperationFailure) =
+    {
+        OperationFailure.createRedacted
+            ProviderError
+            "preview_indeterminate"
+            $"The update preview could not classify {classification}: {failure.Message}" with
+            Retryable = true
+    }
+
 /// Adds a provider-neutral, object-level remote diff to a live synchronization
 /// snapshot. Revision counts remain absent because lakeFS does not expose Git
 /// ahead/behind semantics.

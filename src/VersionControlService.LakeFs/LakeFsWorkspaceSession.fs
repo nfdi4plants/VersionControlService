@@ -316,7 +316,14 @@ let private synchronizationState (state: SessionState) (targetHead: string optio
         BaseRevision = baseRevision |> Option.map mkRevisionId
         WorkspaceRevision = workspaceRevision |> Option.map mkRevisionId
         TargetRevision = targetHead |> Option.map mkRevisionId
-        TargetRef = None
+        TargetRef =
+            targetHead
+            |> Option.map (fun _ -> {
+                Name = state.Index.TargetRef
+                ProviderRef = mkProviderRef $"lakefs:{state.Index.TargetRef}"
+                Kind = LocalRef
+                IsCurrent = false
+            })
         LocalRevisionCount = None
         TargetRevisionCount = None
         RemoteChangedPaths = None
@@ -1396,17 +1403,23 @@ let private previewUpdate (state: SessionState) (context: OperationContext) =
                             match diff with
                             | Ok entries ->
                                 return
-                                    entries
-                                    |> Array.toList
-                                    |> List.choose (fun entry -> relativePathOfKey state entry.Path)
-                                    |> Set.ofList
-                            | Error _ -> return Set.empty
+                                    Ok(
+                                        entries
+                                        |> Array.toList
+                                        |> List.choose (fun entry -> relativePathOfKey state entry.Path)
+                                        |> Set.ofList
+                                    )
+                            | Error failure ->
+                                return Error(LakeFsSynchronization.previewIndeterminate "locally committed objects" failure)
                         }
-                    | _ -> async { return Set.empty }
+                    | _ -> async { return Ok Set.empty }
 
-                return
-                    LakeFsSynchronization.createPreview changedPaths dirtyPaths localCommitted
-                    |> OperationResult.succeeded
+                match localCommitted with
+                | Error failure -> return Failed failure
+                | Ok localCommittedPaths ->
+                    return
+                        LakeFsSynchronization.createPreview changedPaths dirtyPaths localCommittedPaths
+                        |> OperationResult.succeeded
     }
 
 /// Builds the conflict item contents for overlapping paths from base, workspace

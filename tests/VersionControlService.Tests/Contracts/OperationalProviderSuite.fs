@@ -52,6 +52,27 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     | None -> ()
             }
 
+            profileTest "progress preserves byte totals above two GiB"
+            <| fun () -> promise {
+                let reports = ResizeArray<OperationProgress>()
+                let context =
+                    OperationContext.create "large-byte-progress" OperationCancellation.none reports.Add
+
+                let completedBytes = 3.0 * 1024.0 * 1024.0 * 1024.0
+                let totalBytes = 4.0 * 1024.0 * 1024.0 * 1024.0
+
+                context.ReportProgress {
+                    PhaseCode = "transfer-bytes"
+                    Item = Some "literal[object]*?.bin"
+                    Completed = Some completedBytes
+                    Total = Some totalBytes
+                    DisplayMessage = None
+                }
+
+                Vitest.expect(reports[0].Completed).toEqual (Some completedBytes)
+                Vitest.expect(reports[0].Total).toEqual (Some totalBytes)
+            }
+
             profileTest "transfer operations can be canceled with structured results"
             <| fun () -> promise {
                 let! workspace = harness.CreateWorkspace()

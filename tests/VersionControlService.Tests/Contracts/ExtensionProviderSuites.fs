@@ -91,6 +91,38 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     | Failed failure -> Vitest.expect(failure.Code.Length > 0).toBe (true)
                 }
 
+                profileTest "maintenance reports progress and honors cancellation"
+                <| fun () -> promise {
+                    let! workspace = harness.CreateWorkspace()
+
+                    let maintenance =
+                        match workspace.Session.Maintenance with
+                        | Some service -> service
+                        | None -> failwith "The harness advertises maintenance but the session lacks it."
+
+                    let progressReports = ResizeArray<OperationProgress>()
+
+                    let progressContext =
+                        OperationContext.create
+                            "maintenance-progress"
+                            OperationCancellation.none
+                            progressReports.Add
+
+                    let! _ = run (maintenance.Deduplicate progressContext)
+                    Vitest.expect(progressReports.Count > 0).toBe (true)
+
+                    let cancellation = OperationCancellation.Source()
+                    cancellation.Cancel()
+
+                    let canceledContext =
+                        OperationContext.create "maintenance-canceled" cancellation.Cancellation ignore
+
+                    let! canceledResult = run (maintenance.Prune canceledContext)
+                    let failure = expectFailure "canceled maintenance" canceledResult
+                    Vitest.expect(failure.Category).toEqual (Canceled)
+                    Vitest.expect(failure.StateChanged).toBe (false)
+                }
+
             if harness.ExpectedServices |> List.contains "browser" then
                 profileTest "repository browser URLs are data, never exceptions"
                 <| fun () -> promise {

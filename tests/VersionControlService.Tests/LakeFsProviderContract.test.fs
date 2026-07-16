@@ -12,6 +12,7 @@ open Vitest
 
 module LakeFsApi = VersionControlService.LakeFs.LakeFsApi
 module LakeFsCredentials = VersionControlService.LakeFs.LakeFsCredentials
+module LakeFsSynchronization = VersionControlService.LakeFs.LakeFsSynchronization
 module LakeFsWorkspaceIndex = VersionControlService.LakeFs.LakeFsWorkspaceIndex
 module LakeFsWorkspaceSession = VersionControlService.LakeFs.LakeFsWorkspaceSession
 
@@ -515,6 +516,60 @@ let private expectOperationValue operation = function
 
 let private repositoryPath value =
     RepositoryPath.tryCreate value |> Result.defaultWith failwith
+
+Vitest.describe (
+    "lakeFS / extension suites",
+    fun () ->
+        Vitest.test (
+            "unclassifiable previews use a retryable provider-neutral failure",
+            fun () -> promise {
+                let source =
+                    OperationFailure.create Network "diff_transport_failed" "The object diff could not be read."
+
+                let failure =
+                    LakeFsSynchronization.previewIndeterminate
+                        "locally committed objects"
+                        source
+
+                Vitest.expect(failure.Category).toEqual ProviderError
+                Vitest.expect(failure.Code).toBe "preview_indeterminate"
+                Vitest.expect(failure.Retryable).toBe true
+                Vitest.expect(failure.StateChanged).toBe false
+            }
+        )
+
+        Vitest.test (
+            "configured target identity is exposed through the neutral synchronization state",
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
+            fun () -> promise {
+                if not (integrationEnabled ()) then
+                    return failwith "lakeFS integration skipped: Docker not available"
+
+                let harness = createLakeFsHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let! statusResult =
+                        workspace.Session.Core.GetStatus(context "configured-target-ref")
+                        |> Async.StartAsPromise
+
+                    let status = expectOperationValue "configured target status" statusResult
+
+                    let target =
+                        status.Synchronization
+                        |> Option.bind _.TargetRef
+                        |> Option.defaultWith (fun () -> failwith "Expected the configured lakeFS target branch.")
+
+                    Vitest.expect(target.Name).toBe "main"
+                    Vitest.expect(ProviderRef.value target.ProviderRef).toBe "lakefs:main"
+                    Vitest.expect(target.Kind).toEqual LocalRef
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+)
 
 Vitest.describe (
     "lakeFS selected revision cycles",
