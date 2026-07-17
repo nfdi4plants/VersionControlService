@@ -23,6 +23,18 @@ let bufferSubarray (buffer: obj) (startIndex: int) (endIndex: int) : obj = jsNat
 [<Emit("Buffer.alloc($0)")>]
 let bufferAlloc (length: int) : obj = jsNative
 
+[<Emit("new Error($0)")>]
+let createError (_message: string) : obj = jsNative
+
+[<Emit("$0?.message ?? String($0)")>]
+let errorMessage (_error: obj) : string = jsNative
+
+[<Emit("require('node:crypto').randomUUID()")>]
+let randomUuid () : string = jsNative
+
+[<Emit("$0.then($1, $2)")>]
+let observePromise (_promise: JS.Promise<'T>) (_onSucceeded: 'T -> unit) (_onFailed: obj -> unit) : unit = jsNative
+
 [<Emit("$0.toString('utf8')")>]
 let bufferToUtf8String (buffer: obj) : string = jsNative
 

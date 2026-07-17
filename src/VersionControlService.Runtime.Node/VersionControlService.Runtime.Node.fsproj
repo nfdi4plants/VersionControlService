@@ -8,6 +8,7 @@
     <Compile Include="FileSystem.fs" />
     <Compile Include="Path.fs" />
     <Compile Include="Interop.fs" />
+    <Compile Include="BinaryIO.fs" />
     <Compile Include="SimpleGit.fs" />
     <Compile Include="Cancellation.fs" />
     <Compile Include="Process.fs" />

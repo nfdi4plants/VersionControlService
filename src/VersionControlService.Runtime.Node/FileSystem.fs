@@ -33,6 +33,8 @@ type FileReadResult =
 
 type FileHandle =
     abstract member read: buffer: obj * offset: int * length: int * position: float -> JS.Promise<FileReadResult>
+    abstract member writeFile: buffer: obj -> JS.Promise<unit>
+    abstract member sync: unit -> JS.Promise<unit>
     abstract member stat: unit -> JS.Promise<Stats>
     abstract member close: unit -> JS.Promise<unit>
 
@@ -83,6 +85,9 @@ let readFileBufferAsync (path: string) : JS.Promise<obj> = jsNative
 
 [<Import("writeFile", "fs/promises")>]
 let writeFileAsync (path: string) (content: string) (encoding: TextEncoding) : JS.Promise<unit> = jsNative
+
+[<Import("writeFile", "fs/promises")>]
+let writeFileBufferAsync (path: string) (buffer: obj) : JS.Promise<unit> = jsNative
 
 [<Import("rename", "fs/promises")>]
 let renameAsync (oldPath: string) (newPath: string) : JS.Promise<unit> = jsNative
@@ -147,6 +152,23 @@ let openReadNoFollowAsync (path: string) : JS.Promise<FileHandle> =
             box (readOnly ||| unbox<int> noFollow)
 
     fileSystemPromisesDynamic?``open`` (path, flags) |> unbox<JS.Promise<FileHandle>>
+
+/// Opens a new file exclusively so an existing path or link cannot be followed.
+let openWriteExclusiveAsync (path: string) : JS.Promise<FileHandle> =
+    fileSystemPromisesDynamic?``open`` (path, "wx", 384) |> unbox<JS.Promise<FileHandle>>
+
+/// Creates a readable byte stream. The raw Node object remains internal to the runtime package.
+let internal createReadStream (path: string) : obj = fileSystemDynamic?createReadStream (path)
+
+/// Creates an exclusive writable byte stream. The raw Node object remains internal to the runtime package.
+let internal createWriteStreamExclusive (path: string) : obj =
+    fileSystemDynamic?createWriteStream (path, createObj [ "flags" ==> "wx" ])
+
+let internal removeFileIfExistsSync (path: string) =
+    try
+        fileSystemDynamic?rmSync (path, createObj [ "force" ==> true ]) |> ignore
+    with _ ->
+        ()
 
 [<Import("readdir", "fs/promises")>]
 let readdirAsync (path: string) : JS.Promise<string[]> = jsNative
