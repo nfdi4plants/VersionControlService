@@ -9,6 +9,8 @@ open VersionControlService.LakeFs.LakeFsTypes
 
 module LakeFsApi = VersionControlService.LakeFs.LakeFsApi
 module LakeFsCredentials = VersionControlService.LakeFs.LakeFsCredentials
+module LakeFsProviderOptions = VersionControlService.LakeFs.LakeFsProviderOptions
+module LakeFsStateStore = VersionControlService.LakeFs.LakeFsStateStore
 module LakeFsWorkspaceIndex = VersionControlService.LakeFs.LakeFsWorkspaceIndex
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodePath = VersionControlService.Runtime.Node.Path
@@ -44,14 +46,20 @@ let private resolveLocation
             | Ok resolved -> return Ok(resolved, parsed)
     }
 
-let private bindingFor (workspaceRoot: string) (location: RepositoryLocation) : WorkspaceBinding = {
-    SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
-    ProviderId = lakeFsProviderId
-    WorkspaceRoot = workspaceRoot
-    ProviderStateRef = None
-    Location = location
-    ConnectionProfileId = location.ConnectionProfileId
-}
+let private bindingFor
+    (options: LakeFsProviderOptions.LakeFsProviderOptions)
+    (workspaceRoot: string)
+    (location: RepositoryLocation)
+    : Result<WorkspaceBinding, OperationFailure> =
+    LakeFsStateStore.create options workspaceRoot
+    |> Result.map (fun state -> {
+        SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
+        ProviderId = lakeFsProviderId
+        WorkspaceRoot = workspaceRoot
+        ProviderStateRef = Some state.StateId
+        Location = location
+        ConnectionProfileId = location.ConnectionProfileId
+    })
 
 /// Verifies requested intents against the server: reads through repository
 /// lookup, writes through a transient probe branch (created and deleted).
@@ -119,7 +127,10 @@ let probe (workspacePath: string) : Async<ProbeResult> =
             return ProbeFailed(OperationFailure.createRedacted ProviderError "probe_exception" error.Message)
     }
 
-let createFactory (credentials: LakeFsCredentials.LakeFsCredentialStrategy) : ProviderFactory = {
+let createFactory
+    (options: LakeFsProviderOptions.LakeFsProviderOptions)
+    (credentials: LakeFsCredentials.LakeFsCredentialStrategy)
+    : ProviderFactory = {
     Id = lakeFsProviderId
     Probe = probe
     VerifyLocation = fun request context -> verifyAccess credentials request context
@@ -143,7 +154,10 @@ let createFactory (credentials: LakeFsCredentials.LakeFsCredentialStrategy) : Pr
                     if not (NodeFileSystem.existsSync request.TargetPath) then
                         NodeFileSystem.mkdirSync request.TargetPath (NodeFileSystem.MkdirOptions(recursive = true))
 
-                    return OperationResult.succeeded (bindingFor request.TargetPath location)
+                    return
+                        match bindingFor options request.TargetPath location with
+                        | Ok binding -> OperationResult.succeeded binding
+                        | Error failure -> Failed failure
         }
     Clone =
         fun request context -> async {
@@ -170,14 +184,20 @@ let createFactory (credentials: LakeFsCredentials.LakeFsCredentialStrategy) : Pr
                     if not targetExists then
                         NodeFileSystem.mkdirSync request.TargetPath (NodeFileSystem.MkdirOptions(recursive = true))
 
-                    return OperationResult.succeeded (bindingFor request.TargetPath request.Location)
+                    return
+                        match bindingFor options request.TargetPath request.Location with
+                        | Ok binding -> OperationResult.succeeded binding
+                        | Error failure -> Failed failure
         }
     Adopt = fun _ _ -> async { return unsupported "Adoption" }
     Bind =
         fun request _ -> async {
             // Binding data comes exclusively from the request — provider markers
             // on disk are never read here.
-            return OperationResult.succeeded (bindingFor request.WorkspaceRoot request.Location)
+            return
+                match bindingFor options request.WorkspaceRoot request.Location with
+                | Ok binding -> OperationResult.succeeded binding
+                | Error failure -> Failed failure
         }
     Open =
         fun _ _ -> async {

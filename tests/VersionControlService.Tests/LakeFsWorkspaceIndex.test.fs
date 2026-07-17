@@ -2,10 +2,14 @@ module VersionControlService.Tests.LakeFsWorkspaceIndexTests
 
 open Fable.Core
 open Fable.Core.JsInterop
+open VersionControlService.Abstractions
 open VersionControlService.Tests.NodePath
 open Vitest
 
 module LakeFsWorkspaceIndex = VersionControlService.LakeFs.LakeFsWorkspaceIndex
+module LakeFsProviderOptions = VersionControlService.LakeFs.LakeFsProviderOptions
+module LakeFsStateStore = VersionControlService.LakeFs.LakeFsStateStore
+module RuntimeNodePath = VersionControlService.Runtime.Node.Path
 
 let private fsPromisesDynamic: obj = importAll "fs/promises"
 let private osDynamic: obj = importAll "os"
@@ -123,6 +127,86 @@ Vitest.describe (
                     let added = LakeFsWorkspaceIndex.classifyLocalObject None (Some "new content\n")
                     let addedClassified = added = LakeFsWorkspaceIndex.AddedObject
                     Vitest.expect(addedClassified).toBe (true)
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+)
+
+Vitest.describe (
+    "lakeFS external state",
+    fun () ->
+        Vitest.test (
+            "allocates and resolves opaque provider state outside the workspace",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root = createTempDirectoryAsync ()
+                let workspaceRoot = join [| root; "workspace" |]
+                let stateRoot = join [| root; "provider-state" |]
+                let! _ = fsPromisesDynamic?mkdir (workspaceRoot) |> unbox<JS.Promise<obj>>
+
+                try
+                    let options: LakeFsProviderOptions.LakeFsProviderOptions = { StateRoot = stateRoot }
+
+                    let allocated =
+                        match LakeFsStateStore.create options workspaceRoot with
+                        | Ok value -> value
+                        | Error failure -> failwith $"State allocation failed: {failure.Code}"
+
+                    Vitest.expect(RuntimeNodePath.isAbsolute allocated.StateId).toBe false
+                    Vitest.expect(allocated.StateDirectory.StartsWith(stateRoot)).toBe true
+
+                    for child in [| "transactions"; "recovery"; "temporary" |] do
+                        let childPath = join [| allocated.StateDirectory; child |]
+                        let! stats = fsPromisesDynamic?stat (childPath) |> unbox<JS.Promise<obj>>
+                        Vitest.expect(stats?isDirectory () |> unbox<bool>).toBe true
+
+                    let workspaceFiles = fsPromisesDynamic?readdir (workspaceRoot) |> unbox<JS.Promise<string[]>>
+                    let! workspaceFiles = workspaceFiles
+                    Vitest.expect(workspaceFiles).toEqual [||]
+
+                    let saved =
+                        match LakeFsWorkspaceIndex.save allocated.StateDirectory sampleIndex with
+                        | Ok value -> value
+                        | Error message -> failwith message
+
+                    Vitest.expect(saved.Generation).toBe 1
+
+                    let resolved =
+                        match LakeFsStateStore.resolve options workspaceRoot (Some allocated.StateId) with
+                        | Ok value -> value
+                        | Error failure -> failwith $"State resolution failed: {failure.Code}"
+
+                    Vitest.expect(resolved.StateDirectory).toBe allocated.StateDirectory
+
+                    match LakeFsWorkspaceIndex.load resolved.StateDirectory with
+                    | LakeFsWorkspaceIndex.Loaded loaded -> Vitest.expect(loaded.Generation).toBe 1
+                    | _ -> failwith "Expected the externally stored index to load."
+
+                    match LakeFsStateStore.resolve options workspaceRoot None with
+                    | Error failure -> Vitest.expect(failure.Code).toBe "provider_state_ref_missing"
+                    | Ok _ -> failwith "Expected an absent state reference to be rejected."
+
+                    match LakeFsStateStore.resolve options workspaceRoot (Some "../escaped") with
+                    | Error failure -> Vitest.expect(failure.Code).toBe "provider_state_ref_invalid"
+                    | Ok _ -> failwith "Expected an escaping state reference to be rejected."
+
+                    do! removeDirectoryAsync allocated.StateDirectory
+
+                    match LakeFsStateStore.resolve options workspaceRoot (Some allocated.StateId) with
+                    | Error failure -> Vitest.expect(failure.Code).toBe "provider_state_missing"
+                    | Ok _ -> failwith "Expected deleted external state to remain missing."
+
+                    let unsafeOptions: LakeFsProviderOptions.LakeFsProviderOptions = {
+                        StateRoot = join [| workspaceRoot; "provider-state" |]
+                    }
+
+                    match LakeFsStateStore.create unsafeOptions workspaceRoot with
+                    | Error failure -> Vitest.expect(failure.Code).toBe "provider_state_inside_workspace"
+                    | Ok _ -> failwith "Expected in-workspace provider state to be rejected."
 
                     do! removeDirectoryAsync root
                 with error ->

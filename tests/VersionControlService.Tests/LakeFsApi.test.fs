@@ -268,6 +268,12 @@ Vitest.describe (
                     |> ignore
 
                 // Access intents: reads granted, writes denied by the server.
+                let stateRoot =
+                    join [|
+                        osDynamic?tmpdir () |> unbox<string>
+                        $"vcs-lakefs-api-state-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}"
+                    |]
+
                 let! server =
                     startFakeServer [
                         "GET", "/api/v1/repositories/repo", 200, """{"id":"repo","default_branch":"main"}"""
@@ -288,7 +294,8 @@ Vitest.describe (
                                 }
                     }
 
-                    let factory = LakeFsProviderFactory.createFactory strategy
+                    let factory =
+                        LakeFsProviderFactory.createFactory { StateRoot = stateRoot } strategy
 
                     let location: RepositoryLocation = {
                         ProviderId = LakeFsProviderFactory.lakeFsProviderId
@@ -343,6 +350,8 @@ Vitest.describe (
                     | Failed _ -> failwith "Expected the bind to succeed."
                 finally
                     server.Close()
+                    fsPromisesDynamic?rm (stateRoot, createObj [ "recursive" ==> true; "force" ==> true ])
+                    |> ignore
             }
         )
 )

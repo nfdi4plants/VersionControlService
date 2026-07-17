@@ -11,6 +11,8 @@ open VersionControlService.LakeFs.LakeFsTypes
 module LakeFsApi = VersionControlService.LakeFs.LakeFsApi
 module LakeFsCredentials = VersionControlService.LakeFs.LakeFsCredentials
 module LakeFsIndex = VersionControlService.LakeFs.LakeFsWorkspaceIndex
+module LakeFsProviderOptions = VersionControlService.LakeFs.LakeFsProviderOptions
+module LakeFsStateStore = VersionControlService.LakeFs.LakeFsStateStore
 module LakeFsObjectTransfer = VersionControlService.LakeFs.LakeFsObjectTransfer
 module LakeFsSelectedRevision = VersionControlService.LakeFs.LakeFsSelectedRevision
 module LakeFsSynchronization = VersionControlService.LakeFs.LakeFsSynchronization
@@ -60,6 +62,7 @@ let private mkProviderRef (value: string) =
 
 type private SessionState = {
     Binding: WorkspaceBinding
+    StateDirectory: string
     Location: LakeFsLocation
     Credentials: LakeFsCredentials.LakeFsCredentialStrategy
     Hooks: LakeFsSessionHooks
@@ -136,19 +139,16 @@ let rec private walkLocalFiles (root: string) (relative: string) : string list =
         NodeFileSystem.readdirSync current
         |> Array.toList
         |> List.collect (fun name ->
-            if name = LakeFsIndex.IndexFileName || name.EndsWith ".tmp" then
-                []
-            else
-                let childRelative = if relative = "" then name else $"{relative}/{name}"
-                let childAbsolute = NodePath.join [| root; childRelative |]
+            let childRelative = if relative = "" then name else $"{relative}/{name}"
+            let childAbsolute = NodePath.join [| root; childRelative |]
 
-                try
-                    if (NodeFileSystem.statSync childAbsolute).isDirectory () then
-                        walkLocalFiles root childRelative
-                    else
-                        [ childRelative ]
-                with _ ->
-                    [])
+            try
+                if (NodeFileSystem.statSync childAbsolute).isDirectory () then
+                    walkLocalFiles root childRelative
+                else
+                    [ childRelative ]
+            with _ ->
+                [])
 
 type private LocalChange = {
     ChangePath: string
@@ -221,7 +221,7 @@ let private withValidatedMutation
         state.Busy <- true
 
         try
-            match LakeFsIndex.load state.Binding.WorkspaceRoot with
+            match LakeFsIndex.load state.StateDirectory with
             | LakeFsIndex.Loaded persisted
                 when persisted.Repository = state.Index.Repository
                      && persisted.WorkspaceBranch = state.Index.WorkspaceBranch
@@ -261,14 +261,14 @@ let private withValidatedMutation
     }
 
 let private saveIndex (state: SessionState) =
-    match LakeFsIndex.save state.Binding.WorkspaceRoot state.Index with
+    match LakeFsIndex.save state.StateDirectory state.Index with
     | Ok saved ->
         state.Index <- saved
         Ok()
     | Error message -> Error(OperationFailure.createRedacted ProviderError "index_write_failed" message)
 
 let private reloadIndex (state: SessionState) =
-    match LakeFsIndex.load state.Binding.WorkspaceRoot with
+    match LakeFsIndex.load state.StateDirectory with
     | LakeFsIndex.Loaded persisted
         when persisted.Repository = state.Index.Repository
              && persisted.WorkspaceBranch = state.Index.WorkspaceBranch
@@ -2341,7 +2341,8 @@ let private createSessionFromState (state: SessionState) : WorkspaceSession =
 /// Opens a session: loads the index or creates the provider-owned workspace
 /// branch (server-visible; filtered only from logical listings) and materializes
 /// the target into the workspace directory.
-let openSession
+let private openSessionFromStateDirectory
+    (stateDirectory: string)
     (hooks: LakeFsSessionHooks)
     (credentials: LakeFsCredentials.LakeFsCredentialStrategy)
     (binding: WorkspaceBinding)
@@ -2386,6 +2387,7 @@ let openSession
 
                             let state = {
                                 Binding = binding
+                                StateDirectory = stateDirectory
                                 Location = location
                                 Credentials = credentials
                                 Hooks = hooks
@@ -2416,7 +2418,7 @@ let openSession
                                 | Ok() -> return Ok state
                 }
 
-                match LakeFsIndex.load binding.WorkspaceRoot with
+                match LakeFsIndex.load stateDirectory with
                 | LakeFsIndex.Corrupt message ->
                     return Failed(OperationFailure.createRedacted ProviderError "index_corrupt" message)
                 | LakeFsIndex.Loaded index ->
@@ -2427,6 +2429,7 @@ let openSession
                     then
                         let state = {
                             Binding = binding
+                            StateDirectory = stateDirectory
                             Location = location
                             Credentials = credentials
                             Hooks = hooks
@@ -2438,17 +2441,39 @@ let openSession
 
                         return OperationResult.succeeded (createSessionFromState state)
                     else
-                        let! retargeted = createOwnedState index.Entries
-
-                        match retargeted with
-                        | Error failure -> return Failed failure
-                        | Ok state -> return OperationResult.succeeded (createSessionFromState state)
+                        return
+                            Failed(
+                                OperationFailure.create
+                                    Concurrency
+                                    "provider_state_mismatch"
+                                    "The external lakeFS state does not match the workspace binding location."
+                            )
                 | LakeFsIndex.Missing ->
                     let! created = createOwnedState [||]
 
                     match created with
                     | Error failure -> return Failed failure
                     | Ok state -> return OperationResult.succeeded (createSessionFromState state)
+    }
+
+let openSession
+    (options: LakeFsProviderOptions.LakeFsProviderOptions)
+    (hooks: LakeFsSessionHooks)
+    (credentials: LakeFsCredentials.LakeFsCredentialStrategy)
+    (binding: WorkspaceBinding)
+    (context: OperationContext)
+    : Async<OperationResult<WorkspaceSession>> =
+    async {
+        match LakeFsStateStore.resolve options binding.WorkspaceRoot binding.ProviderStateRef with
+        | Error failure -> return Failed failure
+        | Ok state ->
+            return!
+                openSessionFromStateDirectory
+                    state.StateDirectory
+                    hooks
+                    credentials
+                    binding
+                    context
     }
 
 let private cleanupPreconditionFailure message expectedHead observedHead =
@@ -2477,7 +2502,8 @@ let private cleanupPreconditionFailure message expectedHead observedHead =
 /// binding is being discarded. lakeFS has no conditional branch delete, so the
 /// implementation checks the head immediately before deletion and verifies absence
 /// afterwards, reporting any observed race instead of claiming clean success.
-let cleanupOwnedWorkspaceBranch
+let private cleanupOwnedWorkspaceBranchFromStateDirectory
+    (stateDirectory: string)
     (hooks: LakeFsSessionHooks)
     (credentials: LakeFsCredentials.LakeFsCredentialStrategy)
     (binding: WorkspaceBinding)
@@ -2490,7 +2516,7 @@ let cleanupOwnedWorkspaceBranch
         | Error message ->
             return Failed(OperationFailure.create Validation "invalid_location" message)
         | Ok location ->
-            match LakeFsIndex.load binding.WorkspaceRoot with
+            match LakeFsIndex.load stateDirectory with
             | LakeFsIndex.Missing ->
                 return OperationResult.noOp (Some "No lakeFS workspace index remains to clean up.") ()
             | LakeFsIndex.Corrupt message ->
@@ -2633,14 +2659,45 @@ let cleanupOwnedWorkspaceBranch
                                                     }
     }
 
+let cleanupOwnedWorkspaceBranch
+    (options: LakeFsProviderOptions.LakeFsProviderOptions)
+    (hooks: LakeFsSessionHooks)
+    (credentials: LakeFsCredentials.LakeFsCredentialStrategy)
+    (binding: WorkspaceBinding)
+    (ownershipToken: string)
+    (expectedHead: string option)
+    (context: OperationContext)
+    : Async<OperationResult<unit>> =
+    async {
+        match LakeFsStateStore.resolve options binding.WorkspaceRoot binding.ProviderStateRef with
+        | Error failure -> return Failed failure
+        | Ok state ->
+            return!
+                cleanupOwnedWorkspaceBranchFromStateDirectory
+                    state.StateDirectory
+                    hooks
+                    credentials
+                    binding
+                    ownershipToken
+                    expectedHead
+                    context
+    }
+
 /// Factory whose Open builds real lakeFS sessions.
-let createFactory
+let createFactoryWithHooks
+    (options: LakeFsProviderOptions.LakeFsProviderOptions)
     (hooks: LakeFsSessionHooks)
     (credentials: LakeFsCredentials.LakeFsCredentialStrategy)
     : ProviderFactory =
-    let baseFactory = LakeFsProviderFactory.createFactory credentials
+    let baseFactory = LakeFsProviderFactory.createFactory options credentials
 
     {
         baseFactory with
-            Open = fun binding context -> openSession hooks credentials binding context
+            Open = fun binding context -> openSession options hooks credentials binding context
     }
+
+let createFactory
+    (options: LakeFsProviderOptions.LakeFsProviderOptions)
+    (credentials: LakeFsCredentials.LakeFsCredentialStrategy)
+    : ProviderFactory =
+    createFactoryWithHooks options LakeFsSessionHooks.none credentials

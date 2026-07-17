@@ -12,15 +12,27 @@ open Vitest
 
 module LakeFsApi = VersionControlService.LakeFs.LakeFsApi
 module LakeFsCredentials = VersionControlService.LakeFs.LakeFsCredentials
+module LakeFsProviderOptions = VersionControlService.LakeFs.LakeFsProviderOptions
+module LakeFsStateStore = VersionControlService.LakeFs.LakeFsStateStore
 module LakeFsSynchronization = VersionControlService.LakeFs.LakeFsSynchronization
 module LakeFsWorkspaceIndex = VersionControlService.LakeFs.LakeFsWorkspaceIndex
 module LakeFsWorkspaceSession = VersionControlService.LakeFs.LakeFsWorkspaceSession
+module RuntimeNodePath = VersionControlService.Runtime.Node.Path
 
 [<Emit("process.env[$0] ?? null")>]
 let private getEnvironmentVariable (_name: string) : string = jsNative
 
 let private fsPromisesDynamic: obj = importAll "fs/promises"
 let private osDynamic: obj = importAll "os"
+
+let lakeFsProviderOptions: LakeFsProviderOptions.LakeFsProviderOptions = {
+    StateRoot = join [| osDynamic?tmpdir () |> unbox<string>; "vcs-lakefs-provider-state" |]
+}
+
+let stateDirectoryForBinding (binding: WorkspaceBinding) =
+    match LakeFsStateStore.resolve lakeFsProviderOptions binding.WorkspaceRoot binding.ProviderStateRef with
+    | Ok state -> state.StateDirectory
+    | Error failure -> failwith $"Resolving test provider state failed ({failure.Code}): {failure.Message}"
 
 let integrationEnabled () =
     getEnvironmentVariable "LAKEFS_INTEGRATION" = "1"
@@ -129,6 +141,7 @@ let private parseLocation (location: RepositoryLocation) =
 
 type private WorkspaceControl = {
     Location: RepositoryLocation
+    Binding: WorkspaceBinding
     mutable RaceMutations: TargetMutation[] option
     mutable SlowTransfer: bool
 }
@@ -137,6 +150,7 @@ let createLakeFsHarness () : ProviderTestHarness =
     let tempRoots = ResizeArray<string>()
     let repositories = ResizeArray<string>()
     let controls = Collections.Generic.Dictionary<string, WorkspaceControl>()
+    let stateDirectories = ResizeArray<string>()
     let mutable counter = 0
     let mutable publishShouldBreak = false
     let mutable failNextConnection = false
@@ -167,14 +181,22 @@ let createLakeFsHarness () : ProviderTestHarness =
         ConnectionProfileId = profile
     }
 
-    let bindingFor (root: string) (location: RepositoryLocation) : WorkspaceBinding = {
-        SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
-        ProviderId = location.ProviderId
-        WorkspaceRoot = root
-        ProviderStateRef = None
-        Location = location
-        ConnectionProfileId = location.ConnectionProfileId
-    }
+    let bindingFor (root: string) (location: RepositoryLocation) : WorkspaceBinding =
+        let state =
+            match LakeFsStateStore.create lakeFsProviderOptions root with
+            | Ok value -> value
+            | Error failure -> failwith $"Creating test provider state failed ({failure.Code}): {failure.Message}"
+
+        stateDirectories.Add state.StateDirectory
+
+        {
+            SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
+            ProviderId = location.ProviderId
+            WorkspaceRoot = root
+            ProviderStateRef = Some state.StateId
+            Location = location
+            ConnectionProfileId = location.ConnectionProfileId
+        }
 
     let advanceRef
         (location: RepositoryLocation)
@@ -242,7 +264,7 @@ let createLakeFsHarness () : ProviderTestHarness =
                         | Some mutations ->
                             control.RaceMutations <- None
 
-                            match LakeFsWorkspaceIndex.load root with
+                            match LakeFsWorkspaceIndex.load (stateDirectoryForBinding control.Binding) with
                             | LakeFsWorkspaceIndex.Loaded index ->
                                 do!
                                     Async.AwaitPromise(
@@ -258,7 +280,7 @@ let createLakeFsHarness () : ProviderTestHarness =
                         | Some mutations ->
                             control.RaceMutations <- None
 
-                            match LakeFsWorkspaceIndex.load root with
+                            match LakeFsWorkspaceIndex.load (stateDirectoryForBinding control.Binding) with
                             | LakeFsWorkspaceIndex.Loaded index ->
                                 do!
                                     Async.AwaitPromise(
@@ -277,7 +299,7 @@ let createLakeFsHarness () : ProviderTestHarness =
                         | Some mutations ->
                             control.RaceMutations <- None
 
-                            match LakeFsWorkspaceIndex.load root with
+                            match LakeFsWorkspaceIndex.load (stateDirectoryForBinding control.Binding) with
                             | LakeFsWorkspaceIndex.Loaded index ->
                                 do!
                                     Async.AwaitPromise(
@@ -315,7 +337,8 @@ let createLakeFsHarness () : ProviderTestHarness =
             })
     }
 
-    let factory = LakeFsWorkspaceSession.createFactory hooks credentials
+    let factory =
+        LakeFsWorkspaceSession.createFactoryWithHooks lakeFsProviderOptions hooks credentials
 
     let createLocationWithProfile profile = promise {
         let repository = $"vcs-{nextId ()}"
@@ -336,6 +359,7 @@ let createLakeFsHarness () : ProviderTestHarness =
 
         controls[binding.WorkspaceRoot] <- {
             Location = binding.Location
+            Binding = binding
             RaceMutations = None
             SlowTransfer = false
         }
@@ -485,9 +509,13 @@ let createLakeFsHarness () : ProviderTestHarness =
                 for root in tempRoots do
                     do! removeDirectoryAsync root
 
+                for stateDirectory in stateDirectories do
+                    do! removeDirectoryAsync stateDirectory
+
                 repositories.Clear()
                 tempRoots.Clear()
                 controls.Clear()
+                stateDirectories.Clear()
                 return ()
             }
     }
@@ -524,6 +552,131 @@ let private expectOperationValue operation = function
 
 let private repositoryPath value =
     RepositoryPath.tryCreate value |> Result.defaultWith failwith
+
+Vitest.describe (
+    "lakeFS provisioning profile external state",
+    fun () ->
+        Vitest.test (
+            "provisioning keeps opaque state outside existing workspaces and rejects invalid reopen state",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root = createTempDirectoryAsync ()
+                let workspaceRoot = join [| root; "existing-workspace" |]
+                let stateRoot = join [| root; "state-root" |]
+                let existingPath = join [| workspaceRoot; "existing.bin" |]
+
+                try
+                    do! writeUtf8FileAsync existingPath "existing user bytes\u0000remain"
+
+                    let credentials =
+                        LakeFsCredentials.fixedConnection {
+                            Endpoint = "http://127.0.0.1:1"
+                            AccessKeyId = "unused"
+                            SecretAccessKey = "unused"
+                        }
+
+                    let options: LakeFsProviderOptions.LakeFsProviderOptions = { StateRoot = stateRoot }
+                    let factory = LakeFsWorkspaceSession.createFactory options credentials
+                    let location: RepositoryLocation = {
+                        ProviderId = ProviderId.tryCreate "lakefs" |> Result.defaultWith failwith
+                        DisplayName = None
+                        ProviderLocation = "lakefs://repository/main"
+                        ConnectionProfileId = Some "profile"
+                    }
+
+                    let! initialized =
+                        factory.Initialize
+                            {
+                                TargetPath = workspaceRoot
+                                Location = Some location
+                            }
+                            (context "external-state-initialize")
+                        |> Async.StartAsPromise
+
+                    let binding = expectOperationValue "external-state initialize" initialized
+                    Vitest.expect(binding.ProviderStateRef.IsSome).toBe true
+                    Vitest.expect(RuntimeNodePath.isAbsolute binding.ProviderStateRef.Value).toBe false
+
+                    let stateDirectory =
+                        match LakeFsStateStore.resolve options workspaceRoot binding.ProviderStateRef with
+                        | Ok state -> state.StateDirectory
+                        | Error failure -> failwith $"State resolution failed: {failure.Code}"
+
+                    Vitest.expect(stateDirectory.StartsWith(stateRoot)).toBe true
+                    let! workspaceFiles = fsPromisesDynamic?readdir (workspaceRoot) |> unbox<JS.Promise<string[]>>
+                    Vitest.expect(workspaceFiles).toEqual [| "existing.bin" |]
+                    let! existing = tryReadUtf8FileAsync existingPath
+                    Vitest.expect(existing).toEqual(Some "existing user bytes\u0000remain")
+
+                    let! cloneIntoNonempty =
+                        factory.Clone
+                            {
+                                Location = location
+                                TargetPath = workspaceRoot
+                                TargetRef = None
+                                MaterializeAllObjects = true
+                            }
+                            (context "external-state-clone-nonempty")
+                        |> Async.StartAsPromise
+
+                    match cloneIntoNonempty with
+                    | Failed failure -> Vitest.expect(failure.Code).toBe "target_not_empty"
+                    | _ -> failwith "Expected clone to retain its strict nonempty-target rule."
+
+                    let! missingReference =
+                        factory.Open
+                            { binding with ProviderStateRef = None }
+                            (context "external-state-missing-ref")
+                        |> Async.StartAsPromise
+
+                    match missingReference with
+                    | Failed failure -> Vitest.expect(failure.Code).toBe "provider_state_ref_missing"
+                    | _ -> failwith "Expected a missing state reference to fail."
+
+                    do! writeUtf8FileAsync (LakeFsWorkspaceIndex.indexPath stateDirectory) "corrupt index {"
+                    let! corrupt = factory.Open binding (context "external-state-corrupt") |> Async.StartAsPromise
+
+                    match corrupt with
+                    | Failed failure -> Vitest.expect(failure.Code).toBe "index_corrupt"
+                    | _ -> failwith "Expected corrupt state to fail without recreation."
+
+                    let mismatchedIndex: LakeFsWorkspaceIndex.WorkspaceIndex = {
+                        SchemaVersion = LakeFsWorkspaceIndex.CurrentSchemaVersion
+                        Repository = "another-repository"
+                        TargetRef = "main"
+                        Prefix = ""
+                        WorkspaceBranch = "vcs-workspace-mismatch-token"
+                        OwnershipToken = "mismatch-token-1234567890"
+                        BaseRevision = None
+                        WorkspaceRevision = None
+                        Generation = 0
+                        Entries = [||]
+                    }
+
+                    match LakeFsWorkspaceIndex.save stateDirectory mismatchedIndex with
+                    | Error message -> failwith message
+                    | Ok _ -> ()
+
+                    let! mismatched = factory.Open binding (context "external-state-mismatch") |> Async.StartAsPromise
+
+                    match mismatched with
+                    | Failed failure -> Vitest.expect(failure.Code).toBe "provider_state_mismatch"
+                    | _ -> failwith "Expected mismatched state to fail without retargeting."
+
+                    do! removeDirectoryAsync stateDirectory
+                    let! missing = factory.Open binding (context "external-state-missing") |> Async.StartAsPromise
+
+                    match missing with
+                    | Failed failure -> Vitest.expect(failure.Code).toBe "provider_state_missing"
+                    | _ -> failwith "Expected missing external state to fail without recreation."
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+)
 
 Vitest.describe (
     "lakeFS / extension suites",
@@ -637,7 +790,7 @@ Vitest.describe (
 
                     let initialStatus = expectOperationValue "initial status" initialStatusResult
                     let initialIndex =
-                        match VersionControlService.LakeFs.LakeFsWorkspaceIndex.load workspace.Binding.WorkspaceRoot with
+                        match VersionControlService.LakeFs.LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
                         | VersionControlService.LakeFs.LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected a persisted workspace index."
 
@@ -721,7 +874,7 @@ Vitest.describe (
 
                     let raceStatus = expectOperationValue "race status" raceStatusResult
                     let indexBeforeRace =
-                        match VersionControlService.LakeFs.LakeFsWorkspaceIndex.load workspace.Binding.WorkspaceRoot with
+                        match VersionControlService.LakeFs.LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
                         | VersionControlService.LakeFs.LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index before the race."
 
@@ -748,7 +901,7 @@ Vitest.describe (
                         Vitest.expect(failure.Code).toBe "precondition_failed"
 
                     let indexAfterRace =
-                        match VersionControlService.LakeFs.LakeFsWorkspaceIndex.load workspace.Binding.WorkspaceRoot with
+                        match VersionControlService.LakeFs.LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
                         | VersionControlService.LakeFs.LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index after the race."
 
@@ -777,7 +930,7 @@ Vitest.describe (
                 try
                     let! workspace = harness.CreateWorkspace()
                     let index =
-                        match LakeFsWorkspaceIndex.load workspace.Binding.WorkspaceRoot with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
                         | LakeFsWorkspaceIndex.Loaded value -> value
                         | _ -> failwith "Expected a persisted workspace index."
 
@@ -920,7 +1073,7 @@ Vitest.describe (
                     do! harness.AdvanceTarget workspace remoteMutations
 
                     let beforeRead =
-                        match LakeFsWorkspaceIndex.load workspace.Binding.WorkspaceRoot with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index before refresh/preview."
 
@@ -956,7 +1109,7 @@ Vitest.describe (
                     Vitest.expect(preview.WouldCreateConflictSession).toBe true
 
                     let afterRead =
-                        match LakeFsWorkspaceIndex.load workspace.Binding.WorkspaceRoot with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index after refresh/preview."
 

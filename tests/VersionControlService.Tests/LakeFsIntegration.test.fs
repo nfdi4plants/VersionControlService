@@ -35,8 +35,8 @@ Vitest.describe (
                     let! first = harness.CreateWorkspace()
                     let! second = harness.CreateLinkedWorkspace first
 
-                    let firstIndex = LakeFsWorkspaceIndex.load first.Binding.WorkspaceRoot
-                    let secondIndex = LakeFsWorkspaceIndex.load second.Binding.WorkspaceRoot
+                    let firstIndex = LakeFsWorkspaceIndex.load (stateDirectoryForBinding first.Binding)
+                    let secondIndex = LakeFsWorkspaceIndex.load (stateDirectoryForBinding second.Binding)
 
                     let firstWorkspaceIndex =
                         match firstIndex with
@@ -112,7 +112,7 @@ Vitest.describe (
 
                     let status = expectValue "interruption status" statusResult
                     let before =
-                        match LakeFsWorkspaceIndex.load workspace.Binding.WorkspaceRoot with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index before interruption."
 
@@ -140,7 +140,7 @@ Vitest.describe (
                     Vitest.expect(interrupted.StateChanged).toBe false
 
                     let afterCleanup =
-                        match LakeFsWorkspaceIndex.load workspace.Binding.WorkspaceRoot with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index after interruption cleanup."
 
@@ -183,7 +183,7 @@ Vitest.describe (
 
                     let movedStatus = expectValue "moved interruption status" movedStatusResult
                     let beforeMoved =
-                        match LakeFsWorkspaceIndex.load workspace.Binding.WorkspaceRoot with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index before the moved interruption."
 
@@ -228,7 +228,7 @@ Vitest.describe (
                     Vitest.expect(Some movedBranch.CommitId).not.toEqual (beforeMoved.WorkspaceRevision)
 
                     let afterMoved =
-                        match LakeFsWorkspaceIndex.load workspace.Binding.WorkspaceRoot with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index after the moved interruption."
 
@@ -262,7 +262,7 @@ Vitest.describe (
                         |]
 
                     let before =
-                        match LakeFsWorkspaceIndex.load workspace.Binding.WorkspaceRoot with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index before the update race."
 
@@ -335,7 +335,7 @@ Vitest.describe (
                     | None -> failwith "The merge changed the workspace branch and must report partial success."
 
                     let after =
-                        match LakeFsWorkspaceIndex.load workspace.Binding.WorkspaceRoot with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index after the update race."
 
@@ -394,7 +394,7 @@ Vitest.describe (
                     expectValue "publish race local revision" revisionResult |> ignore
 
                     let before =
-                        match LakeFsWorkspaceIndex.load workspace.Binding.WorkspaceRoot with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index before the publish race."
 
@@ -473,7 +473,7 @@ Vitest.describe (
                     | None -> failwith "The merge changed the target and must report partial success."
 
                     let after =
-                        match LakeFsWorkspaceIndex.load workspace.Binding.WorkspaceRoot with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index after the publish race."
 
@@ -581,7 +581,7 @@ Vitest.describe (
 
                     let resolution = expectValue "finalize race resolution" resolutionResult
                     let before =
-                        match LakeFsWorkspaceIndex.load workspace.Binding.WorkspaceRoot with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index before the finalize race."
 
@@ -675,7 +675,7 @@ Vitest.describe (
                     Vitest.expect(mergeCommit.Parents).toContain observedDestination
 
                     let afterPartial =
-                        match LakeFsWorkspaceIndex.load workspace.Binding.WorkspaceRoot with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index after the raced finalize."
 
@@ -745,7 +745,7 @@ Vitest.describe (
                 try
                     let! workspace = harness.CreateWorkspace()
                     let index =
-                        match LakeFsWorkspaceIndex.load workspace.Binding.WorkspaceRoot with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index before cleanup."
 
@@ -768,6 +768,7 @@ Vitest.describe (
 
                     let! foreignResult =
                         LakeFsWorkspaceSession.cleanupOwnedWorkspaceBranch
+                            lakeFsProviderOptions
                             LakeFsWorkspaceSession.LakeFsSessionHooks.none
                             credentials
                             workspace.Binding
@@ -819,6 +820,7 @@ Vitest.describe (
 
                     let! racedResult =
                         LakeFsWorkspaceSession.cleanupOwnedWorkspaceBranch
+                            lakeFsProviderOptions
                             raceHooks
                             credentials
                             workspace.Binding
@@ -846,6 +848,7 @@ Vitest.describe (
 
                     let! cleanedResult =
                         LakeFsWorkspaceSession.cleanupOwnedWorkspaceBranch
+                            lakeFsProviderOptions
                             LakeFsWorkspaceSession.LakeFsSessionHooks.none
                             credentials
                             workspace.Binding
@@ -858,6 +861,7 @@ Vitest.describe (
 
                     let! missingResult =
                         LakeFsWorkspaceSession.cleanupOwnedWorkspaceBranch
+                            lakeFsProviderOptions
                             LakeFsWorkspaceSession.LakeFsSessionHooks.none
                             credentials
                             workspace.Binding
@@ -876,7 +880,7 @@ Vitest.describe (
 
                     let! permissionWorkspace = harness.CreateWorkspace()
                     let permissionIndex =
-                        match LakeFsWorkspaceIndex.load permissionWorkspace.Binding.WorkspaceRoot with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding permissionWorkspace.Binding) with
                         | LakeFsWorkspaceIndex.Loaded value -> value
                         | _ -> failwith "Expected an index for permission cleanup."
 
@@ -892,6 +896,7 @@ Vitest.describe (
 
                     let! permissionResult =
                         LakeFsWorkspaceSession.cleanupOwnedWorkspaceBranch
+                            lakeFsProviderOptions
                             LakeFsWorkspaceSession.LakeFsSessionHooks.none
                             unauthorized
                             permissionWorkspace.Binding

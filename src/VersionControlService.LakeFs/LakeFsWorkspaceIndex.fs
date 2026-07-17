@@ -16,7 +16,7 @@ module NodePath = VersionControlService.Runtime.Node.Path
 let CurrentSchemaVersion = 1
 
 [<Literal>]
-let IndexFileName = ".vcs-lakefs-index.json"
+let IndexFileName = "index.json"
 
 type IndexEntry = {
     Path: string
@@ -64,15 +64,15 @@ let createOwnershipToken () = randomToken ()
 /// Hashes local file content for identity confirmation.
 let hashContent (content: string) : string = sha256Hex content
 
-let indexPath (workspaceRoot: string) =
-    NodePath.join [| workspaceRoot; IndexFileName |]
+let indexPath (stateDirectory: string) =
+    NodePath.join [| stateDirectory; IndexFileName |]
 
 /// Atomic save: write to a temporary sibling, then rename over the index file.
 /// An interrupted write never corrupts the previous index.
-let save (workspaceRoot: string) (index: WorkspaceIndex) : Result<WorkspaceIndex, string> =
+let save (stateDirectory: string) (index: WorkspaceIndex) : Result<WorkspaceIndex, string> =
     try
         let next = { index with Generation = index.Generation + 1 }
-        let target = indexPath workspaceRoot
+        let target = indexPath stateDirectory
         let temporary = target + ".tmp"
         NodeFileSystem.writeFileSync temporary (jsonStringify next) NodeFileSystem.TextEncoding.Utf8
         NodeFileSystem.renameSync temporary target
@@ -87,8 +87,8 @@ type LoadResult =
 
 /// Loads and validates the index. Unknown schema versions are migratable by
 /// construction: version 1 is current; anything newer is rejected structurally.
-let load (workspaceRoot: string) : LoadResult =
-    let target = indexPath workspaceRoot
+let load (stateDirectory: string) : LoadResult =
+    let target = indexPath stateDirectory
 
     if not (NodeFileSystem.existsSync target) then
         Missing
