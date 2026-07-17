@@ -470,6 +470,15 @@ module FakeHarness =
                 let mutable canceled = false
                 let mutable step = 0
 
+                if context.OperationId = "large-byte-progress" then
+                    context.ReportProgress {
+                        PhaseCode = "transfer"
+                        Item = None
+                        Completed = Some(3.0 * 1024.0 * 1024.0 * 1024.0)
+                        Total = Some(4.0 * 1024.0 * 1024.0 * 1024.0)
+                        DisplayMessage = Some "Transferring large objects"
+                    }
+
                 while not canceled && step < 200 do
                     do! Async.Sleep 2
                     step <- step + 1
