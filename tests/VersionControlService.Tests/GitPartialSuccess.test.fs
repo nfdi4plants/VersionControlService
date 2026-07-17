@@ -99,6 +99,54 @@ let private createSelectedRevisionFixture () = promise {
     return root, workPath, binding
 }
 
+let private repositoryPath value =
+    RepositoryPath.tryCreate value |> Result.defaultWith failwith
+
+let private sessionStatus (session: WorkspaceSession) = promise {
+    let! result = session.Core.GetStatus(ctx "git-partial-status") |> Async.StartAsPromise
+
+    match result with
+    | Succeeded outcome -> return outcome.Value
+    | PartiallySucceeded _
+    | Failed _ -> return failwith "Expected Git workspace status."
+}
+
+let private synchronization (session: WorkspaceSession) =
+    session.Synchronization |> Option.defaultWith (fun () -> failwith "Expected Git synchronization service.")
+
+let private createPublishFixture hooks = promise {
+    let! root = createTempDirectoryAsync ()
+    let barePath = join [| root; "origin.git" |]
+    let workPath = join [| root; "work" |]
+    let! _ = runGitOk root [| "init"; "--bare"; "-b"; "main"; barePath |]
+    let! _ = runGitOk root [| "init"; "-b"; "main"; workPath |]
+    let! _ = runGitOk workPath [| "config"; "user.name"; "VCS Partial Tests" |]
+    let! _ = runGitOk workPath [| "config"; "user.email"; "partial@example.org" |]
+    let! _ = runGitOk workPath [| "config"; "core.autocrlf"; "false" |]
+    let! _ = runGitOk workPath [| "lfs"; "install"; "--local" |]
+    do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) "base\n"
+    let! _ = runGitOk workPath [| "add"; "base.txt" |]
+    let! _ = runGitOk workPath [| "commit"; "-m"; "init: base" |]
+    let! _ = runGitOk workPath [| "remote"; "add"; "origin"; barePath |]
+    let! _ = runGitOk workPath [| "push"; "-u"; "origin"; "main" |]
+
+    let binding: WorkspaceBinding = {
+        SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
+        ProviderId = gitProviderId
+        WorkspaceRoot = workPath
+        ProviderStateRef = None
+        Location = {
+            ProviderId = gitProviderId
+            DisplayName = None
+            ProviderLocation = barePath
+            ConnectionProfileId = None
+        }
+        ConnectionProfileId = None
+    }
+
+    return root, workPath, barePath, GitWorkspaceSession.createSession hooks binding
+}
+
 Vitest.describe (
     "GitWorkspaceSession v2 partial success",
     fun () ->
@@ -552,6 +600,177 @@ Vitest.describe (
                     Vitest.expect(headAfter.Trim() = headBefore.Trim()).toBe false
                     Vitest.expect(attributesAfter |> Option.exists _.Contains("\"/large.bin\" filter=lfs")).toBe true
                     Vitest.expect(worktreeLarge).toEqual (Some largeContent)
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "explicit LFS upload failure leaves the remote ref unchanged",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let! root, workPath, barePath, session =
+                        createPublishFixture GitWorkspaceSession.GitSessionHooks.none
+
+                    try
+                        do!
+                            writeUtf8FileAsync
+                                (join [| workPath; "missing-upload.bin" |])
+                                (String.replicate (1024 * 1024) "u")
+
+                        let! status = sessionStatus session
+
+                        let! revision =
+                            session.Core.CreateRevision
+                                {
+                                    Message = "test: missing LFS upload"
+                                    Paths = [| repositoryPath "missing-upload.bin" |]
+                                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                }
+                                (ctx "missing-upload-revision")
+                            |> Async.StartAsPromise
+
+                        match revision with
+                        | Succeeded _ -> ()
+                        | _ -> failwith "Expected the LFS-backed revision to be created."
+
+                        let! pointer = runGitOk workPath [| "show"; "HEAD:missing-upload.bin" |]
+
+                        let oid =
+                            pointer.Replace("\r\n", "\n").Split('\n')
+                            |> Array.find _.StartsWith("oid sha256:")
+                            |> fun line -> line.Substring("oid sha256:".Length).Trim()
+
+                        do!
+                            removeDirectoryAsync (
+                                join [|
+                                    workPath
+                                    ".git"
+                                    "lfs"
+                                    "objects"
+                                    oid.Substring(0, 2)
+                                    oid.Substring(2, 2)
+                                    oid
+                                |]
+                            )
+
+                        let! targetBefore = runGitOk barePath [| "rev-parse"; "main" |]
+                        let! publishStatus = sessionStatus session
+
+                        let! result =
+                            (synchronization session).Publish
+                                {
+                                    ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                    ExpectedTargetRevision = None
+                                }
+                                (ctx "missing-upload-publish")
+                            |> Async.StartAsPromise
+
+                        match result with
+                        | Failed failure ->
+                            Vitest.expect(failure.StateChanged).toBe false
+                            Vitest.expect(failure.Retryable).toBe true
+                        | _ -> failwith "Expected explicit LFS upload failure before ref publication."
+
+                        let! targetAfter = runGitOk barePath [| "rev-parse"; "main" |]
+                        Vitest.expect(targetAfter.Trim()).toBe(targetBefore.Trim())
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "verified publish followed by state inspection failure is partial success",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable refPublished = false
+                let mutable refVerified = false
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request operationContext ->
+                            async {
+                                if refVerified then
+                                    return
+                                        OperationResult.failed(
+                                            OperationFailure.create
+                                                ProviderError
+                                                "injected_post_publish_failure"
+                                                "State inspection failed after the remote ref was verified."
+                                        )
+                                else
+                                    let! result = NodeProcess.run request operationContext
+
+                                    if
+                                        request.Arguments |> Array.contains "push"
+                                        && match result with
+                                           | Succeeded outcome -> outcome.Value.ExitCode = 0
+                                           | _ -> false
+                                    then
+                                        refPublished <- true
+                                    elif
+                                        refPublished
+                                        && request.Arguments |> Array.contains "ls-remote"
+                                    then
+                                        refVerified <- true
+
+                                    return result
+                            })
+                    Barrier = None
+                }
+
+                let! root, workPath, barePath, session = createPublishFixture hooks
+
+                try
+                    do! writeUtf8FileAsync (join [| workPath; "published.txt" |]) "published\n"
+                    let! status = sessionStatus session
+
+                    let! revision =
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: verified publish"
+                                Paths = [| repositoryPath "published.txt" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (ctx "verified-publish-revision")
+                        |> Async.StartAsPromise
+
+                    match revision with
+                    | Succeeded _ -> ()
+                    | _ -> failwith "Expected the publication revision to be created."
+
+                    let! localHead = runGitOk workPath [| "rev-parse"; "HEAD" |]
+                    let! publishStatus = sessionStatus session
+
+                    let! result =
+                        (synchronization session).Publish
+                            {
+                                ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                            }
+                            (ctx "verified-publish")
+                        |> Async.StartAsPromise
+
+                    match result with
+                    | PartiallySucceeded(_, failure) ->
+                        Vitest.expect(failure.StateChanged).toBe true
+                        Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual(
+                            Some "retry_publish_verification"
+                        )
+                    | _ -> failwith "Expected post-publication state failure to be partial success."
+
+                    let! targetHead = runGitOk barePath [| "rev-parse"; "main" |]
+                    Vitest.expect(targetHead.Trim()).toBe(localHead.Trim())
                     do! removeDirectoryAsync root
                 with error ->
                     do! removeDirectoryAsync root

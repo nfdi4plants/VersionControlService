@@ -793,15 +793,106 @@ let private reconcileTrackingBranchForCheckout
 let private runSimpleGit (operation: ISimpleGit -> JS.Promise<'T>) (git: ISimpleGit) : JS.Promise<GitResult<'T>> =
     GitInternals.runSimpleGit toFailure operation git
 
-let private reportGitSpawnOutput progressCallback (result: GitSpawnResult) =
-    GitInternals.reportOutputText progressCallback result.StdoutText
-    GitInternals.reportOutputText progressCallback result.StderrText
-    result
+let private exactTransferBytesPattern =
+    Regex(
+        @"(?<processed>\d+(?:\.\d+)?)\s*/\s*(?<total>\d+(?:\.\d+)?)\s*bytes",
+        RegexOptions.IgnoreCase
+    )
 
-let private runGitCapturedWithOutput progressCallback request = promise {
-    let! result = runGitCaptured request
-    return reportGitSpawnOutput progressCallback result
-}
+let private scaledTransferBytesPattern =
+    Regex(
+        @"(?<processed>\d+(?:\.\d+)?)\s*(?<processedUnit>KiB|MiB|GiB|KB|MB|GB|B)\s*/\s*(?<total>\d+(?:\.\d+)?)\s*(?<totalUnit>KiB|MiB|GiB|KB|MB|GB|B)",
+        RegexOptions.IgnoreCase
+    )
+
+let private completedTransferBytesPattern =
+    Regex(
+        @"(?<bytes>\d+(?:\.\d+)?)\s*(?<unit>KiB|MiB|GiB|KB|MB|GB|B)\s*\|\s*\d+(?:\.\d+)?\s*(?:KiB|MiB|GiB|KB|MB|GB|B)/s",
+        RegexOptions.IgnoreCase
+    )
+
+let private tryParseInvariantNumber (value: string) =
+    match Double.TryParse value with
+    | true, parsed -> Some parsed
+    | false, _ -> None
+
+let private transferUnitMultiplier (unitName: string) =
+    match unitName.Trim().ToUpperInvariant() with
+    | "KIB"
+    | "KB" -> 1024.0
+    | "MIB"
+    | "MB" -> 1024.0 * 1024.0
+    | "GIB"
+    | "GB" -> 1024.0 * 1024.0 * 1024.0
+    | _ -> 1.0
+
+let private tryParseTransferBytes (text: string) =
+    let lastMatch (pattern: Regex) =
+        let matches = pattern.Matches text
+
+        if matches.Count = 0 then
+            None
+        else
+            Some matches[matches.Count - 1]
+
+    match lastMatch exactTransferBytesPattern with
+    | Some exact ->
+        match
+            tryParseInvariantNumber exact.Groups["processed"].Value,
+            tryParseInvariantNumber exact.Groups["total"].Value
+        with
+        | Some processed, Some total -> Some(processed, total)
+        | _ -> None
+    | None ->
+        match lastMatch scaledTransferBytesPattern with
+        | Some scaled ->
+            match
+                tryParseInvariantNumber scaled.Groups["processed"].Value,
+                tryParseInvariantNumber scaled.Groups["total"].Value
+            with
+            | Some processed, Some total ->
+                Some(
+                    processed * transferUnitMultiplier scaled.Groups["processedUnit"].Value,
+                    total * transferUnitMultiplier scaled.Groups["totalUnit"].Value
+                )
+            | _ -> None
+        | None ->
+            match lastMatch completedTransferBytesPattern with
+            | Some completed ->
+                tryParseInvariantNumber completed.Groups["bytes"].Value
+                |> Option.map (fun bytes ->
+                    let transferred = bytes * transferUnitMultiplier completed.Groups["unit"].Value
+                    transferred, transferred)
+            | None -> None
+
+let private runGitCapturedWithOutput progressCallback request =
+    let pending = System.Text.StringBuilder()
+    let mutable lastReported: (float * float) option = None
+
+    let observeOutput (chunk: string) =
+        GitInternals.reportOutputText progressCallback chunk
+        pending.Append chunk |> ignore
+
+        if pending.Length > 4096 then
+            pending.Remove(0, pending.Length - 4096) |> ignore
+
+        match tryParseTransferBytes (pending.ToString()) with
+        | Some(processed, total) when lastReported <> Some(processed, total) ->
+            lastReported <- Some(processed, total)
+
+            progressCallback
+            |> Option.iter (fun report ->
+                GitInternals.createProgressDto
+                    (Some "lfs")
+                    (Some "upload")
+                    None
+                    (Some processed)
+                    (Some total)
+                    None
+                |> report)
+        | _ -> ()
+
+    GitLfsAdapter.runGitCapturedWithOutput observeOutput request
 
 // GitService reads the threshold because stage/commit need the value while deciding whether to enforce LFS automatically.
 let private getConfiguredLfsThresholdMb (git: ISimpleGit) : JS.Promise<int> = promise {
@@ -1862,6 +1953,79 @@ let executePushWorkflow
                         failure with
                             Message = appendPushDiagnostics failure.Message diagnostics
                     }
+    }
+
+/// Plans and performs only the explicit LFS portion of a provider publish.
+/// The caller owns the subsequent ref mutation and must set
+/// `GIT_LFS_SKIP_PUSH=1` when this function returns `Ok true`.
+let prepareExplicitLfsPush
+    (arcPath: string)
+    (remoteName: string)
+    (branchName: string)
+    (commandAuth: GitCommandAuthentication)
+    (progressCallback: GitProgressCallback option)
+    (cancelCheck: unit -> bool)
+    : JS.Promise<GitResult<bool>> =
+    promise {
+        if cancelCheck () then
+            return Error(createFailure GitFailureKind.Canceled "Git LFS upload canceled.")
+        else
+            let options = createOptions arcPath syncTimeout progressCallback
+
+            let git =
+                applyCommandAuthentication
+                    (fun currentOptions ->
+                        createGit currentOptions
+                        |> withGitOutputProgress progressCallback)
+                    options
+                    commandAuth
+
+            let runSpawned request =
+                runGitCapturedWithOutput
+                    progressCallback
+                    {
+                        request with
+                            CancelCheck = Some cancelCheck
+                    }
+
+            reportPhase progressCallback "lfs" "Checking Git LFS objects"
+
+            let! planResult =
+                planOutboundPush
+                    runSimpleGit
+                    runSpawned
+                    toFailure
+                    (fun currentGit -> runSimpleGit (fun gitInstance -> gitInstance.status ()) currentGit)
+                    arcPath
+                    remoteName
+                    (Some branchName)
+                    git
+
+            match planResult with
+            | Error failure -> return Error failure
+            | Ok OutboundPushPlan.SkipLfsUpload when cancelCheck () ->
+                return Error(createFailure GitFailureKind.Canceled "Git LFS upload canceled.")
+            | Ok OutboundPushPlan.SkipLfsUpload -> return Ok false
+            | Ok(OutboundPushPlan.UploadLfsObjects objectIds) ->
+                if cancelCheck () then
+                    return Error(createFailure GitFailureKind.Canceled "Git LFS upload canceled.")
+                else
+                    reportPhase progressCallback "lfs" "Uploading Git LFS objects"
+
+                    let! uploadResult =
+                        GitLfsService.uploadObjects
+                            runSpawned
+                            commandAuth
+                            cancelCheck
+                            arcPath
+                            remoteName
+                            branchName
+                            objectIds
+
+                    return
+                        match uploadResult with
+                        | Ok() -> Ok true
+                        | Error error -> Error(toFailure error)
     }
 
 /// Pushes the current or requested branch, uploading referenced LFS objects first when needed.

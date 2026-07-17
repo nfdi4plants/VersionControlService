@@ -365,3 +365,45 @@ Vitest.describe (
             }
         )
 )
+
+Vitest.describe (
+    "Git LFS credentials",
+    fun () ->
+        Vitest.test (
+            "one injected credential resolution scopes both Git and Git LFS transfers",
+            fun () -> promise {
+                let calls = ResizeArray<string * string option>()
+
+                let strategy: GitCredentialStrategy.GitCredentialStrategy = {
+                    ResolveCredential =
+                        fun host profileId ->
+                            async {
+                                calls.Add(host, profileId)
+
+                                return
+                                    Some {
+                                        Username = "oauth2"
+                                        Secret = testSecret
+                                    }
+                            }
+                }
+
+                let! authentication =
+                    GitCredentialStrategy.resolveCommandAuthentication
+                        strategy
+                        testHttpsUrl
+                        (Some "token-profile")
+                        "origin"
+                    |> Async.StartAsPromise
+
+                Vitest.expect(calls.ToArray()).toEqual [| testHost, Some "token-profile" |]
+
+                let arguments = String.concat "\n" authentication.ConfigArgs
+                let expectedHeader = $"http.https://{testHost}/.extraHeader=Authorization: Basic "
+                let expectedLfsUrl = $"lfs.url=https://oauth2:{testSecret}@{testHost}/origin.git/info/lfs"
+
+                Vitest.expect(arguments.Contains expectedHeader).toBe true
+                Vitest.expect(arguments.Contains expectedLfsUrl).toBe true
+            }
+        )
+)

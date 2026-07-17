@@ -268,6 +268,14 @@ let runGitCapturedWithStarted
     : Promise<GitSpawnResult> =
     runGitProcess true onStarted ignore request
 
+/// Assembly-internal streaming variant used by explicit LFS transfers so
+/// provider progress originates from the real child process.
+let internal runGitCapturedWithOutput
+    (onOutput: string -> unit)
+    (request: GitSpawnRequest)
+    : Promise<GitSpawnResult> =
+    runGitProcess true ignore onOutput request
+
 /// Assembly-internal streaming variant used by maintenance operations so
 /// provider progress originates from the real child process.
 let internal runGitCapturedWithStartedAndOutput

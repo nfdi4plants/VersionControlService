@@ -79,6 +79,14 @@ let private codeOfKind (kind: GitFailureKind) =
 let private toOperationFailure (failure: GitService.GitFailure) : OperationFailure =
     OperationFailure.createRedacted (categoryOfKind failure.Kind) (codeOfKind failure.Kind) failure.Message
 
+let private hydrationFailure (operation: string) (detail: string) =
+    let kind = GitService.classifyFailureKind detail
+
+    OperationFailure.createRedacted
+        (categoryOfKind kind)
+        "hydration_failed"
+        $"Large-object hydration failed after a successful {operation}: {detail}"
+
 let private awaitGit (operation: JS.Promise<GitService.GitResult<'T>>) : Async<Result<'T, OperationFailure>> =
     async {
         let! result = Async.AwaitPromise operation
@@ -217,6 +225,13 @@ let private credentialArguments (state: SessionState) : Async<string[]> =
         state.Credentials
         state.Location.ProviderLocation
         state.ConnectionProfileId
+
+let private credentialAuthentication (state: SessionState) (remoteName: string) =
+    GitCredentialStrategy.resolveCommandAuthentication
+        state.Credentials
+        state.Location.ProviderLocation
+        state.ConnectionProfileId
+        remoteName
 
 // ---------------------------------------------------------------------------
 // Status and workspace version
@@ -1864,7 +1879,13 @@ let private update (state: SessionState) (request: UpdateRequest) (context: Oper
                 do! barrier state.Hooks state.RepoPath "update-merge" context
 
                 let! mergeResult =
-                    runGit state.Hooks state.RepoPath [| "merge"; "--no-edit"; targetReference |] None context
+                    runGitEnv
+                        state.Hooks
+                        state.RepoPath
+                        [| "merge"; "--no-edit"; targetReference |]
+                        None
+                        [| "GIT_LFS_SKIP_SMUDGE", "1" |]
+                        context
 
                 match mergeResult with
                 | Error failure -> return Failed failure
@@ -1873,7 +1894,118 @@ let private update (state: SessionState) (request: UpdateRequest) (context: Oper
 
                     match updatedState with
                     | Error failure -> return Failed failure
-                    | Ok newState -> return OperationResult.succeeded newState
+                    | Ok newState ->
+                        let! materializationSetting =
+                            runGit
+                                state.Hooks
+                                state.RepoPath
+                                [| "config"; "--get"; GitService.MaterializeLargeObjectsKey |]
+                                None
+                                context
+
+                        let materializeLargeObjects =
+                            match materializationSetting with
+                            | Ok setting when setting.ExitCode = 0 ->
+                                match setting.StdOut.Trim().ToLowerInvariant() with
+                                | "true"
+                                | "1"
+                                | "yes"
+                                | "on" -> true
+                                | _ -> false
+                            | _ -> false
+
+                        if not materializeLargeObjects then
+                            return OperationResult.succeeded newState
+                        else
+                            let! remoteResult =
+                                match syncState.TargetRef with
+                                | Some target -> configuredUpstreamRemote state target.Name context
+                                | None -> async { return Ok None }
+
+                            let! hydration =
+                                match remoteResult with
+                                | Error failure -> async { return Error failure }
+                                | Ok None ->
+                                    async {
+                                        return
+                                            Error(
+                                                OperationFailure.create
+                                                    Validation
+                                                    "configured_target_invalid"
+                                                    "The configured Git upstream does not identify a remote."
+                                            )
+                                    }
+                                | Ok(Some remote) ->
+                                    async {
+                                        let! authentication = credentialAuthentication state remote
+
+                                        let hydrationRef =
+                                            syncState.TargetRef
+                                            |> Option.bind (fun target ->
+                                                let prefix = remote + "/"
+
+                                                if target.Name.StartsWith(prefix, StringComparison.Ordinal) then
+                                                    Some(target.Name.Substring prefix.Length)
+                                                else
+                                                    None)
+
+                                        return!
+                                            runGitEnv
+                                                state.Hooks
+                                                state.RepoPath
+                                                [|
+                                                    yield! authentication.ConfigArgs
+                                                    "lfs"
+                                                    "pull"
+                                                    remote
+                                                    yield! hydrationRef |> Option.toArray
+                                                |]
+                                                None
+                                                [| "GIT_TERMINAL_PROMPT", "0" |]
+                                                context
+                                    }
+
+                            let affectedPaths =
+                                syncState.RemoteChangedPaths
+                                |> Option.defaultValue [||]
+                                |> Array.map RepositoryPath.value
+
+                            let outcome = {
+                                OperationOutcome.performed newState with
+                                    AffectedPaths = affectedPaths
+                                    ResultingRevision = newState.WorkspaceRevision
+                            }
+
+                            let partial failure =
+                                OperationResult.partiallySucceeded
+                                    outcome
+                                    {
+                                        failure with
+                                            AffectedPaths = affectedPaths
+                                    }
+                                    {
+                                        Code = "retry_materialization"
+                                        Instructions =
+                                            Some "Retry downloading large objects once the object store is reachable."
+                                    }
+
+                            match hydration with
+                            | Ok hydrationOutput when hydrationOutput.ExitCode = 0 -> return Succeeded outcome
+                            | Ok hydrationOutput ->
+                                let detail =
+                                    if String.IsNullOrWhiteSpace hydrationOutput.StdErr then
+                                        hydrationOutput.StdOut
+                                    else
+                                        hydrationOutput.StdErr
+
+                                return
+                                    partial (hydrationFailure "update" detail)
+                            | Error hydrationFailure ->
+                                return
+                                    partial {
+                                        hydrationFailure with
+                                            Code = "hydration_failed"
+                                    }
                 | Ok _ ->
                     // Conflicting merge: the conflict-session cycle turns this into a
                     // provider-managed session; the shell reports the structured code.
@@ -1904,106 +2036,255 @@ let private publish (state: SessionState) (request: PublishRequest) (context: Op
         match branchResult with
         | Error failure -> return Failed failure
         | Ok branch ->
-            // Client-side pre-check against the consumer-observed target revision.
-            let! observedTarget = revParse state $"refs/remotes/origin/{branch}" context
+            let! authentication = credentialAuthentication state "origin"
 
-            let expectedMatches =
-                match request.ExpectedTargetRevision, observedTarget with
-                | None, _ -> true
-                | Some expected, Some observed -> RevisionId.value expected = observed
-                | Some _, None -> false
+            // Validate against remote truth. The local remote-tracking ref can be
+            // stale between refresh and publish, and explicit LFS planning must
+            // never mask a target-revision precondition failure.
+            let! remoteTargetResult =
+                runGitEnv
+                    state.Hooks
+                    state.RepoPath
+                    [|
+                        yield! authentication.ConfigArgs
+                        "ls-remote"
+                        "--refs"
+                        "origin"
+                        $"refs/heads/{branch}"
+                    |]
+                    None
+                    [| "GIT_TERMINAL_PROMPT", "0" |]
+                    context
 
-            if not expectedMatches then
-                return
-                    Failed {
-                        OperationFailure.create
-                            Concurrency
-                            "precondition_failed"
-                            "The publication target advanced past the expected revision." with
-                            RevisionEvidence = [|
-                                yield!
-                                    request.ExpectedTargetRevision
-                                    |> Option.map (fun revision -> "expected_target", revision)
-                                    |> Option.toList
-                                yield!
-                                    observedTarget
-                                    |> Option.map (fun observed -> "observed_target", mkRevisionId observed)
-                                    |> Option.toList
-                            |]
+            let observedTargetResult =
+                match remoteTargetResult with
+                | Error failure -> Error failure
+                | Ok output when output.ExitCode <> 0 ->
+                    Error {
+                        OperationFailure.createRedacted
+                            Network
+                            "target_unreachable"
+                            $"Reading the publication target from origin failed: {output.StdErr + output.StdOut}" with
+                            Retryable = true
                     }
-            else
-                let! workspaceRevision = revParse state "HEAD" context
+                | Ok output ->
+                    output.StdOut.Replace("\r\n", "\n").Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                    |> Array.tryHead
+                    |> Option.bind (fun line ->
+                        line.Split([| '\t'; ' ' |], StringSplitOptions.RemoveEmptyEntries)
+                        |> Array.tryHead)
+                    |> Ok
 
-                if workspaceRevision = observedTarget then
-                    let! stateResult = synchronizationState state context
+            match observedTargetResult with
+            | Error failure -> return Failed failure
+            | Ok observedTarget ->
 
-                    match stateResult with
-                    | Error failure -> return Failed failure
-                    | Ok syncState ->
-                        return
-                            OperationResult.noOp (Some "The target already has every local revision.") syncState
+                let expectedMatches =
+                    match request.ExpectedTargetRevision, observedTarget with
+                    | None, _ -> true
+                    | Some expected, Some observed -> RevisionId.value expected = observed
+                    | Some _, None -> false
+
+                if not expectedMatches then
+                    return
+                        Failed {
+                            OperationFailure.create
+                                Concurrency
+                                "precondition_failed"
+                                "The publication target advanced past the expected revision." with
+                                RevisionEvidence = [|
+                                    yield!
+                                        request.ExpectedTargetRevision
+                                        |> Option.map (fun revision -> "expected_target", revision)
+                                        |> Option.toList
+                                    yield!
+                                        observedTarget
+                                        |> Option.map (fun observed -> "observed_target", mkRevisionId observed)
+                                        |> Option.toList
+                                |]
+                        }
                 else
-                    do! barrier state.Hooks state.RepoPath "publish-precheck-done" context
-                    do! barrier state.Hooks state.RepoPath "transfer-start" context
+                    let! workspaceRevision = revParse state "HEAD" context
 
-                    let! authArguments = credentialArguments state
-
-                    let! pushResult =
-                        runGit
-                            state.Hooks
-                            state.RepoPath
-                            [| yield! authArguments; "push"; "origin"; branch |]
-                            None
-                            context
-
-                    match pushResult with
-                    | Error failure -> return Failed failure
-                    | Ok output when output.ExitCode <> 0 ->
-                        let combined = output.StdErr + output.StdOut
-
-                        if combined.Contains "rejected" || combined.Contains "non-fast-forward" then
-                            let! raced = revParse state $"refs/remotes/origin/{branch}" context
-
-                            return
-                                Failed {
-                                    OperationFailure.createRedacted
-                                        Concurrency
-                                        "precondition_failed"
-                                        "The publication target advanced during publish." with
-                                        Retryable = true
-                                        RevisionEvidence = [|
-                                            yield!
-                                                observedTarget
-                                                |> Option.map (fun observed ->
-                                                    "expected_target", mkRevisionId observed)
-                                                |> Option.toList
-                                            yield!
-                                                raced
-                                                |> Option.map (fun value -> "observed_target", mkRevisionId value)
-                                                |> Option.toList
-                                        |]
-                                }
-                        else
-                            return
-                                Failed {
-                                    OperationFailure.createRedacted
-                                        Network
-                                        "target_unreachable"
-                                        $"Publishing to origin failed: {combined}" with
-                                        Retryable = true
-                                }
-                    | Ok _ ->
+                    if workspaceRevision = observedTarget then
                         let! stateResult = synchronizationState state context
 
                         match stateResult with
                         | Error failure -> return Failed failure
                         | Ok syncState ->
                             return
-                                Succeeded {
-                                    OperationOutcome.performed syncState with
-                                        Publication = Published
-                                        ResultingRevision = syncState.WorkspaceRevision
+                                OperationResult.noOp (Some "The target already has every local revision.") syncState
+                    else
+                        do! barrier state.Hooks state.RepoPath "publish-precheck-done" context
+                        do! barrier state.Hooks state.RepoPath "transfer-start" context
+
+                        let reportLfsProgress (progress: GitProgressDto) =
+                            context.ReportProgress {
+                                PhaseCode = "lfs-upload"
+                                Item = None
+                                Completed = progress.Processed
+                                Total = progress.Total
+                                DisplayMessage = progress.Output |> Option.map Redaction.redact
+                            }
+
+                        let! lfsPreparation =
+                            GitService.prepareExplicitLfsPush
+                                state.RepoPath
+                                "origin"
+                                branch
+                                authentication
+                                (Some reportLfsProgress)
+                                context.Cancellation.IsCancellationRequested
+                            |> Async.AwaitPromise
+
+                        match lfsPreparation with
+                        | Error failure ->
+                            return
+                                Failed {
+                                    toOperationFailure failure with
+                                        Retryable = true
                                 }
+                        | Ok explicitUploadCompleted ->
+                            let pushEnvironment = [|
+                                "GIT_TERMINAL_PROMPT", "0"
+
+                                if explicitUploadCompleted then
+                                    "GIT_LFS_SKIP_PUSH", "1"
+                            |]
+
+                            let! pushResult =
+                                runGitEnv
+                                    state.Hooks
+                                    state.RepoPath
+                                    [|
+                                        yield! authentication.ConfigArgs
+                                        "push"
+                                        "origin"
+                                        branch
+                                    |]
+                                    None
+                                    pushEnvironment
+                                    context
+
+                            match pushResult with
+                            | Error failure -> return Failed failure
+                            | Ok output when output.ExitCode <> 0 ->
+                                let combined = output.StdErr + output.StdOut
+
+                                if combined.Contains "rejected" || combined.Contains "non-fast-forward" then
+                                    let! raced = revParse state $"refs/remotes/origin/{branch}" context
+
+                                    return
+                                        Failed {
+                                            OperationFailure.createRedacted
+                                                Concurrency
+                                                "precondition_failed"
+                                                "The publication target advanced during publish." with
+                                                Retryable = true
+                                                RevisionEvidence = [|
+                                                    yield!
+                                                        observedTarget
+                                                        |> Option.map (fun observed ->
+                                                            "expected_target", mkRevisionId observed)
+                                                        |> Option.toList
+                                                    yield!
+                                                        raced
+                                                        |> Option.map (fun value -> "observed_target", mkRevisionId value)
+                                                        |> Option.toList
+                                                |]
+                                        }
+                                else
+                                    return
+                                        Failed {
+                                            OperationFailure.createRedacted
+                                                Network
+                                                "target_unreachable"
+                                                $"Publishing to origin failed: {combined}" with
+                                                Retryable = true
+                                        }
+                            | Ok _ ->
+                                let! verification =
+                                    runGitEnv
+                                        state.Hooks
+                                        state.RepoPath
+                                        [|
+                                            yield! authentication.ConfigArgs
+                                            "ls-remote"
+                                            "--refs"
+                                            "origin"
+                                            $"refs/heads/{branch}"
+                                        |]
+                                        None
+                                        [| "GIT_TERMINAL_PROMPT", "0" |]
+                                        context
+
+                                let verifiedRevision =
+                                    match verification with
+                                    | Ok verified when verified.ExitCode = 0 ->
+                                        verified.StdOut.Replace("\r\n", "\n").Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                                        |> Array.tryHead
+                                        |> Option.bind (fun line ->
+                                            line.Split('\t', 2, StringSplitOptions.None)
+                                            |> Array.tryHead)
+                                    | _ -> None
+
+                                let publicationVerified =
+                                    match workspaceRevision, verifiedRevision with
+                                    | Some expected, Some observed -> expected = observed
+                                    | _ -> false
+
+                                let! stateResult = synchronizationState state context
+
+                                match stateResult with
+                                | Error failure ->
+                                    let fallbackState = {
+                                        BaseRevision = None
+                                        WorkspaceRevision = workspaceRevision |> Option.map mkRevisionId
+                                        TargetRevision = verifiedRevision |> Option.map mkRevisionId
+                                        TargetRef = None
+                                        LocalRevisionCount = None
+                                        TargetRevisionCount = None
+                                        RemoteChangedPaths = None
+                                        Relationship = UnknownRelationship
+                                    }
+
+                                    return
+                                        OperationResult.partiallySucceeded
+                                            {
+                                                OperationOutcome.performed fallbackState with
+                                                    Publication =
+                                                        if publicationVerified then Published else LocalOnly
+                                                    ResultingRevision = workspaceRevision |> Option.map mkRevisionId
+                                            }
+                                            failure
+                                            {
+                                                Code = "retry_publish_verification"
+                                                Instructions = Some "Verify the remote ref before retrying publication."
+                                            }
+                                | Ok syncState when publicationVerified ->
+                                    return
+                                        Succeeded {
+                                            OperationOutcome.performed syncState with
+                                                Publication = Published
+                                                ResultingRevision = syncState.WorkspaceRevision
+                                        }
+                                | Ok syncState ->
+                                    return
+                                        OperationResult.partiallySucceeded
+                                            {
+                                                OperationOutcome.performed syncState with
+                                                    Publication =
+                                                        if publicationVerified then Published else LocalOnly
+                                                    ResultingRevision = workspaceRevision |> Option.map mkRevisionId
+                                            }
+                                            (OperationFailure.create
+                                                ProviderError
+                                                "publish_verification_failed"
+                                                "The ref push completed, but the resulting remote ref could not be verified.")
+                                            {
+                                                Code = "retry_publish_verification"
+                                                Instructions = Some "Verify the remote ref before retrying publication."
+                                            }
     }
 
 // ---------------------------------------------------------------------------
@@ -2996,11 +3277,12 @@ let createFactoryWithCredentials
         }
     Clone =
         fun request context -> async {
-            let! authArguments =
-                GitCredentialStrategy.resolveAuthArguments
+            let! authentication =
+                GitCredentialStrategy.resolveCommandAuthentication
                     credentials
                     request.Location.ProviderLocation
                     request.Location.ConnectionProfileId
+                    "origin"
 
             // Large objects stay as pointers during the Git transfer; hydration is a
             // separate step so its failure can be reported as partial success.
@@ -3009,13 +3291,16 @@ let createFactoryWithCredentials
                     hooks
                     "."
                     [|
-                        yield! authArguments
+                        yield! authentication.ConfigArgs
                         "clone"
                         request.Location.ProviderLocation
                         request.TargetPath
                     |]
                     None
-                    [| "GIT_LFS_SKIP_SMUDGE", "1" |]
+                    [|
+                        "GIT_TERMINAL_PROMPT", "0"
+                        "GIT_LFS_SKIP_SMUDGE", "1"
+                    |]
                     context
 
             match result with
@@ -3046,24 +3331,33 @@ let createFactoryWithCredentials
                     // partial success with a retry action, never an overall error
                     // that hides the changed workspace.
                     let! hydration =
-                        runGit
+                        runGitEnv
                             hooks
                             request.TargetPath
-                            [| yield! authArguments; "lfs"; "pull" |]
+                            [|
+                                yield! authentication.ConfigArgs
+                                "lfs"
+                                "pull"
+                                "origin"
+                            |]
                             None
+                            [| "GIT_TERMINAL_PROMPT", "0" |]
                             context
 
                     match hydration with
                     | Ok hydrationOutput when hydrationOutput.ExitCode = 0 ->
                         return OperationResult.succeeded binding
                     | Ok hydrationOutput ->
+                        let detail =
+                            if String.IsNullOrWhiteSpace hydrationOutput.StdErr then
+                                hydrationOutput.StdOut
+                            else
+                                hydrationOutput.StdErr
+
                         return
                             OperationResult.partiallySucceeded
                                 (OperationOutcome.performed binding)
-                                (OperationFailure.createRedacted
-                                    DependencyMissing
-                                    "hydration_failed"
-                                    $"Large-object hydration failed after a successful clone: {hydrationOutput.StdErr}")
+                                (hydrationFailure "clone" detail)
                                 {
                                     Code = "retry_materialization"
                                     Instructions =

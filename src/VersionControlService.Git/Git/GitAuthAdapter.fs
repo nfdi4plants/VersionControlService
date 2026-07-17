@@ -195,6 +195,26 @@ let applyAuth
 
     gitFactory scopedOptions
 
+/// Applies already-resolved command authentication to a simple-git instance.
+/// This lets provider sessions resolve an injected strategy once and reuse the
+/// same scoped material for planning, explicit LFS transfer, and ref publish.
+let applyCommandAuthentication
+    (gitFactory: GitFactory)
+    (baseOptions: SimpleGitOptions)
+    (commandAuth: GitCommandAuthentication)
+    : ISimpleGit =
+    let authConfig = toConfigEntries commandAuth.ConfigArgs
+
+    let mergedConfig = [|
+        yield! baseConfigEntries baseOptions
+        yield! authConfig
+    |]
+
+    let scopedOptions: SimpleGitOptions =
+        emitJsExpr (baseOptions, mergedConfig) "{ ...$0, config: $1 }"
+
+    gitFactory scopedOptions |> fun git -> git.env commandAuth.Environment
+
 /// Redacts bearer/basic headers and credential URLs before errors or diagnostics leave the service boundary.
 let redactToken (text: string) : string =
     if String.IsNullOrWhiteSpace text then

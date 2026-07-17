@@ -66,6 +66,14 @@ let private tryReadUtf8FileAsync (path: string) : JS.Promise<string option> = pr
         return None
 }
 
+let private pathExistsAsync (path: string) : JS.Promise<bool> = promise {
+    try
+        let! _ = fsPromisesDynamic?stat path |> unbox<JS.Promise<obj>>
+        return true
+    with _ ->
+        return false
+}
+
 let private runGitIn (cwd: string) (arguments: string[]) : JS.Promise<string> = promise {
     let request = {
         NodeProcess.ProcessRequest.create "git" arguments with
@@ -1529,6 +1537,308 @@ Vitest.describe (
 
                     Vitest.expect(newGit.Compatible).toBe (true)
 
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+)
+
+Vitest.describe (
+    "Git LFS transfer ordering",
+    fun () ->
+        Vitest.test (
+            "update skips implicit smudge and reports failed explicit hydration as partial success",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let observed = ResizeArray<NodeProcess.ProcessRequest>()
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request processContext ->
+                            async {
+                                observed.Add request
+
+                                if
+                                    request.Arguments |> Array.contains "lfs"
+                                    && request.Arguments |> Array.contains "pull"
+                                then
+                                    return
+                                        OperationResult.succeeded {
+                                            NodeProcess.ExitCode = 1
+                                            StdOut = ""
+                                            StdErr = "HTTP 401 Unauthorized during LFS hydration"
+                                        }
+                                else
+                                    return! NodeProcess.run request processContext
+                            })
+                    Barrier = None
+                }
+
+                let! root, workPath, barePath, session = createSyncFixture hooks
+
+                try
+                    let! _ =
+                        runGitIn
+                            workPath
+                            [|
+                                "config"
+                                "--local"
+                                "versioncontrolservice.lfs.materializelargeobjects"
+                                "true"
+                            |]
+
+                    do! advanceTarget root barePath [ "target-lfs.bin", "target content\n" ]
+                    let! status = sessionStatus session
+
+                    let! updateResult =
+                        (syncService session).Update
+                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                            (ctx "lfs-update-hydration")
+                        |> Async.StartAsPromise
+
+                    match updateResult with
+                    | PartiallySucceeded(outcome, failure) ->
+                        Vitest.expect(failure.Category).toEqual Authentication
+                        Vitest.expect(failure.Code).toBe "hydration_failed"
+                        Vitest.expect(failure.StateChanged).toBe true
+                        Vitest.expect(failure.AffectedPaths).toContain "target-lfs.bin"
+                        Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "retry_materialization")
+                        Vitest.expect(outcome.AffectedPaths).toContain "target-lfs.bin"
+                    | Failed failure ->
+                        failwith $"Expected partial hydration result, received {failure.Code}."
+                    | Succeeded _ -> failwith "Expected explicit hydration failure after the successful Git update."
+
+                    let mergeRequest =
+                        observed
+                        |> Seq.find (fun request -> request.Arguments |> Array.contains "merge")
+
+                    Vitest
+                        .expect(mergeRequest.Environment |> Array.contains ("GIT_LFS_SKIP_SMUDGE", "1"))
+                        .toBe true
+
+                    let hydrationIndex =
+                        observed
+                        |> Seq.findIndex (fun request ->
+                            request.Arguments |> Array.contains "lfs"
+                            && request.Arguments |> Array.contains "pull")
+
+                    let mergeIndex =
+                        observed
+                        |> Seq.findIndex (fun request -> request.Arguments |> Array.contains "merge")
+
+                    Vitest.expect(hydrationIndex > mergeIndex).toBe true
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "clone skips implicit smudge before explicit authenticated hydration",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let observed = ResizeArray<NodeProcess.ProcessRequest>()
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request processContext ->
+                            async {
+                                observed.Add request
+
+                                if
+                                    request.Arguments |> Array.contains "lfs"
+                                    && request.Arguments |> Array.contains "pull"
+                                then
+                                    return
+                                        OperationResult.succeeded {
+                                            NodeProcess.ExitCode = 1
+                                            StdOut = ""
+                                            StdErr = "injected clone hydration failure"
+                                        }
+                                else
+                                    return! NodeProcess.run request processContext
+                            })
+                    Barrier = None
+                }
+
+                let! root, _, barePath, _ = createSyncFixture hooks
+                let clonePath = join [| root; "hydrated-clone" |]
+
+                try
+                    let factory = GitWorkspaceSession.createFactory hooks
+
+                    let! cloneResult =
+                        factory.Clone
+                            {
+                                Location = {
+                                    ProviderId = gitProviderId
+                                    DisplayName = None
+                                    ProviderLocation = barePath
+                                    ConnectionProfileId = None
+                                }
+                                TargetPath = clonePath
+                                TargetRef = None
+                                MaterializeAllObjects = true
+                            }
+                            (ctx "lfs-clone-hydration")
+                        |> Async.StartAsPromise
+
+                    match cloneResult with
+                    | PartiallySucceeded(_, failure) ->
+                        Vitest.expect(failure.Code).toBe "hydration_failed"
+                        Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "retry_materialization")
+                    | _ -> failwith "Expected clone hydration failure to preserve the successful clone as partial success."
+
+                    let cloneRequest =
+                        observed
+                        |> Seq.find (fun request -> request.Arguments |> Array.contains "clone")
+
+                    Vitest
+                        .expect(cloneRequest.Environment |> Array.contains ("GIT_LFS_SKIP_SMUDGE", "1"))
+                        .toBe true
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "publish uploads selected-ref LFS objects before a hook-disabled ref push",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let observed = ResizeArray<NodeProcess.ProcessRequest>()
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request processContext ->
+                            async {
+                                observed.Add request
+                                return! NodeProcess.run request processContext
+                            })
+                    Barrier = None
+                }
+
+                let! root, workPath, _, session = createSyncFixture hooks
+
+                try
+                    let barePath = join [| root; "origin.git" |]
+                    let! _ = runGitIn workPath [| "checkout"; "-b"; "unrelated-lfs-history" |]
+
+                    do!
+                        writeUtf8FileAsync
+                            (join [| workPath; "unrelated-large.bin" |])
+                            (String.replicate (1024 * 1024) "u")
+
+                    let! unrelatedStatus = sessionStatus session
+
+                    let! unrelatedRevision =
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: unrelated LFS history"
+                                Paths = [| mkPath "unrelated-large.bin" |]
+                                ExpectedWorkspaceVersion = unrelatedStatus.WorkspaceVersion
+                            }
+                            (ctx "unrelated-lfs-revision")
+                        |> Async.StartAsPromise
+
+                    expectValue "unrelated LFS revision" unrelatedRevision |> ignore
+
+                    let! unrelatedPointer = runGitIn workPath [| "show"; "HEAD:unrelated-large.bin" |]
+                    let unrelatedOid =
+                        unrelatedPointer.Replace("\r\n", "\n").Split('\n')
+                        |> Array.find (fun line -> line.StartsWith "oid sha256:")
+                        |> fun line -> line.Substring("oid sha256:".Length).Trim()
+
+                    let! _ = runGitIn workPath [| "checkout"; "main" |]
+
+                    do!
+                        writeUtf8FileAsync
+                            (join [| workPath; "publish-large.bin" |])
+                            (String.replicate (1024 * 1024) "p")
+
+                    let! saveStatus = sessionStatus session
+
+                    let! revisionResult =
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: publish explicit LFS object"
+                                Paths = [| mkPath "publish-large.bin" |]
+                                ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+                            }
+                            (ctx "lfs-publish-revision")
+                        |> Async.StartAsPromise
+
+                    expectValue "LFS revision" revisionResult |> ignore
+
+                    let! publishedPointer = runGitIn workPath [| "show"; "HEAD:publish-large.bin" |]
+                    let publishedOid =
+                        publishedPointer.Replace("\r\n", "\n").Split('\n')
+                        |> Array.find (fun line -> line.StartsWith "oid sha256:")
+                        |> fun line -> line.Substring("oid sha256:".Length).Trim()
+
+                    observed.Clear()
+
+                    let reports = ResizeArray<OperationProgress>()
+                    let publishContext =
+                        OperationContext.create
+                            "lfs-explicit-publish"
+                            OperationCancellation.none
+                            reports.Add
+
+                    let! publishStatus = sessionStatus session
+
+                    let! publishResult =
+                        (syncService session).Publish
+                            {
+                                ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                            }
+                            publishContext
+                        |> Async.StartAsPromise
+
+                    expectValue "explicit LFS publish" publishResult |> ignore
+
+                    let pushRequest =
+                        observed
+                        |> Seq.find (fun request -> request.Arguments |> Array.contains "push")
+
+                    Vitest
+                        .expect(pushRequest.Environment |> Array.contains ("GIT_LFS_SKIP_PUSH", "1"))
+                        .toBe true
+
+                    Vitest.expect(reports |> Seq.exists (fun report -> report.PhaseCode = "lfs-upload")).toBe true
+                    Vitest
+                        .expect(
+                            reports
+                            |> Seq.exists (fun (report: OperationProgress) ->
+                                report.PhaseCode = "lfs-upload"
+                                && report.Completed.IsSome
+                                && report.Total.IsSome)
+                        )
+                        .toBe true
+
+                    let lfsObjectPath (oid: string) =
+                        join [|
+                            barePath
+                            "lfs"
+                            "objects"
+                            oid.Substring(0, 2)
+                            oid.Substring(2, 2)
+                            oid
+                        |]
+
+                    let! publishedObjectPresent = pathExistsAsync (lfsObjectPath publishedOid)
+                    let! unrelatedObjectPresent = pathExistsAsync (lfsObjectPath unrelatedOid)
+                    Vitest.expect(publishedObjectPresent).toBe true
+                    Vitest.expect(unrelatedObjectPresent).toBe false
                     do! removeDirectoryAsync root
                 with error ->
                     do! removeDirectoryAsync root
