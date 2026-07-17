@@ -19,6 +19,7 @@ module LakeFsSelectedRevision = VersionControlService.LakeFs.LakeFsSelectedRevis
 module LakeFsSynchronization = VersionControlService.LakeFs.LakeFsSynchronization
 module LakeFsConflictSession = VersionControlService.LakeFs.LakeFsConflictSession
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
+module NodeInterop = VersionControlService.Runtime.Node.Interop
 module NodePath = VersionControlService.Runtime.Node.Path
 
 let private workspaceBranchName (workspaceRoot: string) (ownershipToken: string) =
@@ -114,9 +115,19 @@ let private repositoryPath path =
             }
         )
 
-let private tryReadLocal (state: SessionState) (path: string) : string option =
-    LakeFsPathSafety.readUtf8File state.Binding.WorkspaceRoot (repositoryPath path)
+let private tryLocalFilePath (state: SessionState) (path: string) : string option =
+    LakeFsPathSafety.resolveWorkspacePath state.Binding.WorkspaceRoot (repositoryPath path)
     |> LakeFsPathSafety.require
+    |> fun absolute ->
+        if NodeFileSystem.existsSync absolute then Some absolute else None
+
+let private temporaryPath (state: SessionState) label =
+    let directory = NodePath.join [| state.StateDirectory; "temporary" |]
+
+    if not (NodeFileSystem.existsSync directory) then
+        NodeFileSystem.mkdirSync directory (NodeFileSystem.MkdirOptions(recursive = false))
+
+    NodePath.join [| directory; $"{label}-{NodeInterop.randomUuid()}.tmp" |]
 
 let private writeLocal (state: SessionState) (path: string) (content: string) =
     LakeFsPathSafety.writeUtf8File state.Binding.WorkspaceRoot (repositoryPath path) content
@@ -151,11 +162,13 @@ let private classifyWorkspace (state: SessionState) : LocalChange list =
         localFiles
         |> List.map (fun path ->
             let entry = entriesByPath.TryFind path
-            let content = tryReadLocal state path
+            let localHash =
+                tryLocalFilePath state path
+                |> Option.map LakeFsIndex.hashFile
 
             {
                 ChangePath = path
-                State = LakeFsIndex.classifyLocalObject entry content
+                State = LakeFsIndex.classifyLocalObject entry localHash
             })
 
     let deletions =
@@ -181,7 +194,7 @@ let private workspaceVersion (state: SessionState) =
         | Some conflict -> $"c{conflict.HandleVersion}"
         | None -> "none"
 
-    let identityHash = LakeFsIndex.hashContent changesIdentity
+    let identityHash = LakeFsIndex.hashMetadata changesIdentity
     let workspaceRevision = state.Index.WorkspaceRevision |> Option.defaultValue "none"
 
     $"lakefs:{state.Index.Generation}:{workspaceRevision}:{identityHash}:{conflictPart}"
@@ -596,12 +609,13 @@ let private finishSelectedRevision
                     |> Array.choose (fun (pathValue, content, objectState) ->
                         match objectState, content with
                         | LakeFsIndex.DeletedObject, _ -> None
-                        | _, Some fileContent ->
+                        | _, Some sourcePath ->
+                            let stats = NodeFileSystem.statSync sourcePath
                             Some {
                                 LakeFsIndex.Path = pathValue
                                 LakeFsIndex.BaseChecksum = ""
-                                LakeFsIndex.LocalHash = LakeFsIndex.hashContent fileContent
-                                LakeFsIndex.LocalSize = float fileContent.Length
+                                LakeFsIndex.LocalHash = LakeFsIndex.hashFile sourcePath
+                                LakeFsIndex.LocalSize = stats.size
                                 LakeFsIndex.LocalMtimeMs = 0.0
                             }
                         | _, None -> None)
@@ -690,16 +704,18 @@ let private createRevision (state: SessionState) (request: CreateRevisionRequest
                         request.Paths
                         |> Array.map (fun path ->
                             let pathValue = RepositoryPath.value path
-                            let content = tryReadLocal state pathValue
+                            let sourcePath = tryLocalFilePath state pathValue
 
                             pathValue,
-                            content,
-                            LakeFsIndex.classifyLocalObject (entriesByPath.TryFind pathValue) content)
+                            sourcePath,
+                            LakeFsIndex.classifyLocalObject
+                                (entriesByPath.TryFind pathValue)
+                                (sourcePath |> Option.map LakeFsIndex.hashFile))
 
                     let missing =
                         selections
-                        |> Array.filter (fun (pathValue, content, _) ->
-                            content.IsNone && not (entriesByPath.ContainsKey pathValue))
+                        |> Array.filter (fun (pathValue, sourcePath, _) ->
+                            sourcePath.IsNone && not (entriesByPath.ContainsKey pathValue))
                         |> Array.map (fun (pathValue, _, _) -> pathValue)
 
                     if missing.Length > 0 then
@@ -730,10 +746,10 @@ let private createRevision (state: SessionState) (request: CreateRevisionRequest
                             let expectedParent = state.Index.WorkspaceRevision
                             let selectedTransfers: LakeFsObjectTransfer.SelectedObjectTransfer[] =
                                 changed
-                                |> Array.map (fun (pathValue, content, objectState) -> {
+                                |> Array.map (fun (pathValue, sourcePath, objectState) -> {
                                     Path = pathValue
                                     ObjectKey = objectKey state pathValue
-                                    Content = content
+                                    SourcePath = sourcePath
                                     IsDeletion = objectState = LakeFsIndex.DeletedObject
                                 })
 
@@ -883,17 +899,27 @@ let private restorePaths (state: SessionState) (request: RestoreRequest) (contex
                 for path in request.Paths do
                     if failure.IsNone then
                         let pathValue = RepositoryPath.value path
+                        let downloadedPath = temporaryPath state "restore"
 
-                        let! content =
-                            LakeFsApi.getObjectContent
+                        let! downloaded =
+                            LakeFsApi.downloadObjectToFile
                                 resolved
                                 state.Index.Repository
                                 workspaceRef
                                 (objectKey state pathValue)
+                                downloadedPath
                                 context
 
-                        match content with
-                        | Ok objectContent -> writeLocal state pathValue objectContent
+                        match downloaded with
+                        | Ok _ ->
+                            match
+                                LakeFsPathSafety.replaceFileFromTemporary
+                                    state.Binding.WorkspaceRoot
+                                    path
+                                    downloadedPath
+                            with
+                            | Ok() -> ()
+                            | Error replaceFailure -> failure <- Some replaceFailure
                         | Error notFound when notFound.Category = NotFound -> removeLocal state pathValue
                         | Error other -> failure <- Some other
 
@@ -963,26 +989,34 @@ let private materializeRef
                 for repositoryPath, stat in keyedPaths do
                     if failure.IsNone then
                         let path = RepositoryPath.value repositoryPath
-                        let! content =
-                            LakeFsApi.getObjectContent
+                        let downloadedPath = temporaryPath state "materialize"
+                        let! downloaded =
+                            LakeFsApi.downloadObjectToFile
                                 resolved
                                 state.Index.Repository
                                 reference
                                 stat.Path
+                                downloadedPath
                                 context
 
-                        match content with
+                        match downloaded with
                         | Error downloadFailure -> failure <- Some downloadFailure
-                        | Ok objectContent ->
-                            writeLocal state path objectContent
-
-                            entries.Add {
-                                Path = path
-                                BaseChecksum = stat.Checksum
-                                LocalHash = LakeFsIndex.hashContent objectContent
-                                LocalSize = stat.SizeBytes
-                                LocalMtimeMs = stat.Mtime
-                            }
+                        | Ok transfer ->
+                            match
+                                LakeFsPathSafety.replaceFileFromTemporary
+                                    state.Binding.WorkspaceRoot
+                                    repositoryPath
+                                    downloadedPath
+                            with
+                            | Error replaceFailure -> failure <- Some replaceFailure
+                            | Ok() ->
+                                entries.Add {
+                                    Path = path
+                                    BaseChecksum = stat.Checksum
+                                    LocalHash = transfer.Sha256
+                                    LocalSize = transfer.BytesCopied
+                                    LocalMtimeMs = stat.Mtime
+                                }
 
                 match failure with
                 | Some value -> return Error value
@@ -1383,15 +1417,41 @@ let private buildConflictItems
     async {
         let items = ResizeArray<LakeFsConflictSession.ItemState>()
 
+        let candidateFromFile sourcePath : LakeFsConflictSession.CandidateContent =
+            let preview =
+                if (NodeFileSystem.statSync sourcePath).size > float (1024 * 1024) then
+                    UnsupportedPreview(Some "lakeFS object exceeds the text conflict preview limit.")
+                else
+                    let buffer, _ = NodeFileSystem.readBufferNoFollowSync sourcePath
+
+                    if NodeInterop.bufferContainsNul buffer || not (NodeInterop.bufferIsValidUtf8 buffer) then
+                        UnsupportedPreview(Some "Binary lakeFS object; select an original candidate or resolve it manually.")
+                    else
+                        TextPreview(NodeInterop.bufferToUtf8String buffer)
+
+            {
+                SourcePath = sourcePath
+                Preview = preview
+            }
+
         for path in overlapping do
             let key = objectKey state path
 
             let readRef reference =
                 async {
-                    let! content = LakeFsApi.getObjectContent resolved state.Index.Repository reference key context
+                    let downloadedPath = temporaryPath state "conflict-candidate"
+
+                    let! content =
+                        LakeFsApi.downloadObjectToFile
+                            resolved
+                            state.Index.Repository
+                            reference
+                            key
+                            downloadedPath
+                            context
 
                     match content with
-                    | Ok value -> return Some value
+                    | Ok _ -> return Some(candidateFromFile downloadedPath)
                     | Error _ -> return None
                 }
 
@@ -1401,7 +1461,10 @@ let private buildConflictItems
                 | None -> async { return None }
 
             let! targetContent = readRef targetHead
-            let workspaceContent = tryReadLocal state path
+
+            let workspaceContent =
+                tryLocalFilePath state path
+                |> Option.map candidateFromFile
 
             items.Add {
                 ItemPath = path
@@ -2103,18 +2166,26 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                 if resolutionFailure.IsNone then
                                                     match item.ResolvedContent with
                                                     | Some(Some content) ->
+                                                        let sourcePath =
+                                                            match content with
+                                                            | LakeFsConflictSession.ExistingFile path -> path
+                                                            | LakeFsConflictSession.SuppliedText text ->
+                                                                let path = temporaryPath state "conflict-resolution"
+                                                                NodeFileSystem.writeUtf8FileExclusiveAndFlushSync path text
+                                                                path
+
                                                         let! upload =
-                                                            LakeFsApi.uploadObject
+                                                            LakeFsApi.uploadObjectFromFile
                                                                 resolved
                                                                 state.Index.Repository
                                                                 state.Index.WorkspaceBranch
                                                                 (objectKey state item.ItemPath)
-                                                                content
+                                                                sourcePath
                                                                 context
 
                                                         match upload with
                                                         | Error failure -> resolutionFailure <- Some failure
-                                                        | Ok() -> ()
+                                                        | Ok _ -> ()
                                                     | Some None ->
                                                         let! deletion =
                                                             LakeFsApi.deleteObject

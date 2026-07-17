@@ -45,7 +45,7 @@ let private sampleIndex: LakeFsWorkspaceIndex.WorkspaceIndex = {
         {
             Path = "data/vault-a/file.txt"
             BaseChecksum = "chk-1"
-            LocalHash = LakeFsWorkspaceIndex.hashContent "original content\n"
+            LocalHash = LakeFsWorkspaceIndex.hashMetadata "original content\n"
             LocalSize = 17.0
             LocalMtimeMs = 1000.0
         }
@@ -107,14 +107,18 @@ Vitest.describe (
 
                     // Unchanged content — even with a different mtime (touch-only).
                     let touchOnly =
-                        LakeFsWorkspaceIndex.classifyLocalObject entry (Some "original content\n")
+                        LakeFsWorkspaceIndex.classifyLocalObject
+                            entry
+                            (Some(LakeFsWorkspaceIndex.hashMetadata "original content\n"))
 
                     let touchOnlyUnchanged = touchOnly = LakeFsWorkspaceIndex.UnchangedObject
                     Vitest.expect(touchOnlyUnchanged).toBe (true)
 
                     // Content change at identical size.
                     let sameSizeEdit =
-                        LakeFsWorkspaceIndex.classifyLocalObject entry (Some "0riginal content\n")
+                        LakeFsWorkspaceIndex.classifyLocalObject
+                            entry
+                            (Some(LakeFsWorkspaceIndex.hashMetadata "0riginal content\n"))
 
                     let sameSizeModified = sameSizeEdit = LakeFsWorkspaceIndex.ModifiedObject
                     Vitest.expect(sameSizeModified).toBe (true)
@@ -124,7 +128,10 @@ Vitest.describe (
                     let deletedClassified = deleted = LakeFsWorkspaceIndex.DeletedObject
                     Vitest.expect(deletedClassified).toBe (true)
 
-                    let added = LakeFsWorkspaceIndex.classifyLocalObject None (Some "new content\n")
+                    let added =
+                        LakeFsWorkspaceIndex.classifyLocalObject
+                            None
+                            (Some(LakeFsWorkspaceIndex.hashMetadata "new content\n"))
                     let addedClassified = added = LakeFsWorkspaceIndex.AddedObject
                     Vitest.expect(addedClassified).toBe (true)
 

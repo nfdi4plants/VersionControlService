@@ -6,13 +6,22 @@ open VersionControlService.Abstractions
 
 module LakeFsIndex = VersionControlService.LakeFs.LakeFsWorkspaceIndex
 
+type CandidateContent = {
+    SourcePath: string
+    Preview: ConflictPreview
+}
+
+type ResolvedContent =
+    | ExistingFile of sourcePath: string
+    | SuppliedText of content: string
+
 type ItemState = {
     ItemPath: string
-    BaseContent: string option
-    WorkspaceContent: string option
-    TargetContent: string option
+    BaseContent: CandidateContent option
+    WorkspaceContent: CandidateContent option
+    TargetContent: CandidateContent option
     /// None means unresolved; Some None is a resolved deletion.
-    mutable ResolvedContent: string option option
+    mutable ResolvedContent: ResolvedContent option option
 }
 
 type State = {
@@ -89,13 +98,13 @@ let summary
                                 CandidateId = "workspace"
                                 Label = "Workspace version"
                                 Revision = workspaceRevision
-                                Preview = item.WorkspaceContent |> Option.map TextPreview
+                                Preview = item.WorkspaceContent |> Option.map _.Preview
                             }
                             {
                                 CandidateId = "target"
                                 Label = "Target version"
                                 Revision = Some(revisionId active.TargetRevisionAtOpen)
-                                Preview = item.TargetContent |> Option.map TextPreview
+                                Preview = item.TargetContent |> Option.map _.Preview
                             }
                             yield!
                                 match item.BaseContent with
@@ -105,13 +114,19 @@ let summary
                                             CandidateId = "base"
                                             Label = "Base version"
                                             Revision = baseRevision
-                                            Preview = Some(TextPreview baseContent)
+                                            Preview = Some baseContent.Preview
                                         }
                                     |]
                                 | None -> [||]
                         |]
                         CombinedPreview = None
-                        SupportsResolvedContent = true
+                        SupportsResolvedContent =
+                            [ item.BaseContent; item.WorkspaceContent; item.TargetContent ]
+                            |> List.choose id
+                            |> List.forall (fun content ->
+                                match content.Preview with
+                                | TextPreview _ -> true
+                                | UnsupportedPreview _ -> false)
                     })
             |> List.toArray
     })
@@ -131,21 +146,40 @@ let resolve (conflict: State) (path: RepositoryPath) (resolution: ConflictResolu
                 "No unresolved conflict exists for the selected path."
         )
     | Some item ->
+        let supportsResolvedContent =
+            [ item.BaseContent; item.WorkspaceContent; item.TargetContent ]
+            |> List.choose id
+            |> List.forall (fun content ->
+                match content.Preview with
+                | TextPreview _ -> true
+                | UnsupportedPreview _ -> false)
+
         let resolvedContent =
             match resolution with
-            | SupplyResolvedContent content -> Some(Some content)
-            | PickCandidate "workspace" -> Some item.WorkspaceContent
-            | PickCandidate "target" -> Some item.TargetContent
-            | PickCandidate "base" -> Some item.BaseContent
+            | SupplyResolvedContent content when supportsResolvedContent -> Some(Some(SuppliedText content))
+            | SupplyResolvedContent _ -> None
+            | PickCandidate "workspace" ->
+                Some(item.WorkspaceContent |> Option.map (fun value -> ExistingFile value.SourcePath))
+            | PickCandidate "target" ->
+                Some(item.TargetContent |> Option.map (fun value -> ExistingFile value.SourcePath))
+            | PickCandidate "base" ->
+                Some(item.BaseContent |> Option.map (fun value -> ExistingFile value.SourcePath))
             | PickCandidate _ -> None
 
         match resolvedContent with
         | None ->
+            let code, message =
+                if supportsResolvedContent then
+                    "unknown_candidate", "The candidate ID is not part of this conflict item."
+                else
+                    "binary_resolution_required",
+                    "Binary conflicts must be resolved by selecting an original candidate or editing the file manually."
+
             Error(
                 OperationFailure.create
                     Validation
-                    "unknown_candidate"
-                    "The candidate ID is not part of this conflict item."
+                    code
+                    message
             )
         | Some content ->
             item.ResolvedContent <- Some content

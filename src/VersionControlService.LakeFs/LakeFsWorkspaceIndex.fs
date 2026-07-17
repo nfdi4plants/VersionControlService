@@ -53,16 +53,16 @@ let private jsonStringify (_value: obj) : string = jsNative
 [<Emit("JSON.parse($0)")>]
 let private jsonParse (_text: string) : obj = jsNative
 
-[<Emit("require('crypto').createHash('sha256').update($0).digest('hex')")>]
-let private sha256Hex (_content: string) : string = jsNative
+[<Emit("(() => { const fs = require('node:fs'); const crypto = require('node:crypto'); const fd = fs.openSync($0, 'r'); const chunk = Buffer.allocUnsafe(1024 * 1024); const hash = crypto.createHash('sha256'); try { for (;;) { const read = fs.readSync(fd, chunk, 0, chunk.length, null); if (read === 0) break; hash.update(chunk.subarray(0, read)); } return hash.digest('hex'); } finally { fs.closeSync(fd); } })()")>]
+let hashFile (_path: string) : string = jsNative
+
+[<Emit("require('node:crypto').createHash('sha256').update($0, 'utf8').digest('hex')")>]
+let hashMetadata (_content: string) : string = jsNative
 
 [<Emit("require('crypto').randomBytes(16).toString('hex')")>]
 let private randomToken () : string = jsNative
 
 let createOwnershipToken () = randomToken ()
-
-/// Hashes local file content for identity confirmation.
-let hashContent (content: string) : string = sha256Hex content
 
 let indexPath (stateDirectory: string) =
     NodePath.join [| stateDirectory; IndexFileName |]
@@ -124,14 +124,14 @@ type LocalObjectState =
 /// always the authority.
 let classifyLocalObject
     (entry: IndexEntry option)
-    (localContent: string option)
+    (localHash: string option)
     : LocalObjectState =
-    match entry, localContent with
+    match entry, localHash with
     | None, Some _ -> AddedObject
     | None, None -> UnchangedObject
     | Some _, None -> DeletedObject
-    | Some indexEntry, Some content ->
-        if hashContent content = indexEntry.LocalHash then
+    | Some indexEntry, Some observedHash ->
+        if observedHash = indexEntry.LocalHash then
             UnchangedObject
         else
             ModifiedObject

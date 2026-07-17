@@ -122,6 +122,20 @@ let readUtf8FileNoFollowSync (path: string) : string * Stats =
     finally
         fileSystemDynamic?closeSync (descriptor) |> ignore
 
+/// Reads raw bytes through a descriptor opened with O_NOFOLLOW where supported.
+let readBufferNoFollowSync (path: string) : obj * Stats =
+    let noFollow: obj = fileSystemDynamic?constants?O_NOFOLLOW
+    let readOnly: int = unbox fileSystemDynamic?constants?O_RDONLY
+    let flags = if isNullish noFollow then readOnly else readOnly ||| unbox<int> noFollow
+    let descriptor: int = fileSystemDynamic?openSync (path, flags) |> unbox
+
+    try
+        let stats: Stats = fileSystemDynamic?fstatSync (descriptor) |> unbox
+        let content: obj = fileSystemDynamic?readFileSync descriptor |> unbox
+        content, stats
+    finally
+        fileSystemDynamic?closeSync (descriptor) |> ignore
+
 /// Creates a new UTF-8 file exclusively, flushes its bytes, and closes it.
 /// O_EXCL prevents an existing link from being followed at the temporary path.
 let writeUtf8FileExclusiveAndFlushSync (path: string) (content: string) : unit =

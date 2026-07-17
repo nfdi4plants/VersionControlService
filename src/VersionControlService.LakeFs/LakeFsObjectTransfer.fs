@@ -8,7 +8,7 @@ module LakeFsApi = VersionControlService.LakeFs.LakeFsApi
 type SelectedObjectTransfer = {
     Path: string
     ObjectKey: string
-    Content: string option
+    SourcePath: string option
     IsDeletion: bool
 }
 
@@ -33,15 +33,20 @@ let transferSelected
                     if selected.IsDeletion then
                         LakeFsApi.deleteObject connection repository workspaceBranch selected.ObjectKey context
                     else
-                        match selected.Content with
-                        | Some content ->
-                            LakeFsApi.uploadObject
-                                connection
-                                repository
-                                workspaceBranch
-                                selected.ObjectKey
-                                content
-                                context
+                        match selected.SourcePath with
+                        | Some sourcePath ->
+                            async {
+                                let! uploaded =
+                                    LakeFsApi.uploadObjectFromFile
+                                        connection
+                                        repository
+                                        workspaceBranch
+                                        selected.ObjectKey
+                                        sourcePath
+                                        context
+
+                                return uploaded |> Result.map ignore
+                            }
                         | None ->
                             async.Return(
                                 Error(

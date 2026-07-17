@@ -238,6 +238,30 @@ let readUtf8File
                     $"Reading a workspace file failed: {error.Message}"
             )
 
+let readBuffer
+    (workspaceRoot: string)
+    (path: RepositoryPath)
+    : Result<obj option, OperationFailure> =
+    match resolveWorkspacePath workspaceRoot path with
+    | Error failure -> Error failure
+    | Ok absolute when not (NodeFileSystem.existsSync absolute) -> Ok None
+    | Ok absolute ->
+        try
+            let content, openedStats = NodeFileSystem.readBufferNoFollowSync absolute
+            let currentStats = NodeFileSystem.lstatSync absolute
+
+            if currentStats.isSymbolicLink() || not (identityMatches openedStats currentStats) then
+                Error(changedPathFailure path)
+            else
+                Ok(Some content)
+        with error ->
+            Error(
+                OperationFailure.createRedacted
+                    ProviderError
+                    "workspace_read_failed"
+                    $"Reading a workspace file failed: {error.Message}"
+            )
+
 let private ensureParentDirectories (workspaceRoot: string) (path: RepositoryPath) =
     let pathValue = RepositoryPath.value path
     let segments = pathValue.Split '/'
@@ -350,6 +374,36 @@ let removeFile
                     "workspace_delete_failed"
                     $"Deleting a workspace file failed: {error.Message}"
             )
+
+let replaceFileFromTemporary
+    (workspaceRoot: string)
+    (path: RepositoryPath)
+    (temporaryPath: string)
+    : Result<unit, OperationFailure> =
+    match ensureParentDirectories workspaceRoot path with
+    | Error failure -> Error failure
+    | Ok() ->
+        match resolveWorkspacePath workspaceRoot path with
+        | Error failure -> Error failure
+        | Ok targetPath ->
+            try
+                let temporaryStats = NodeFileSystem.lstatSync temporaryPath
+
+                if temporaryStats.isSymbolicLink() || not (temporaryStats.isFile()) then
+                    Error(changedPathFailure path)
+                else
+                    NodeFileSystem.renameSync temporaryPath targetPath
+
+                    match resolveWorkspacePath workspaceRoot path with
+                    | Error failure -> Error failure
+                    | Ok _ -> Ok()
+            with error ->
+                Error(
+                    OperationFailure.createRedacted
+                        ProviderError
+                        "workspace_replace_failed"
+                        $"Replacing a workspace file failed: {error.Message}"
+                )
 
 let walkFiles (workspaceRoot: string) : Result<RepositoryPath[], OperationFailure> =
     let files = ResizeArray<RepositoryPath>()

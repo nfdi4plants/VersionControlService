@@ -796,7 +796,7 @@ Vitest.describe (
                             Some(fun _ point context -> async {
                                 if point = "cleanup-precheck-done" then
                                     let! uploaded =
-                                        LakeFsApi.uploadObject
+                                        uploadTextObject
                                             (connection ())
                                             parsed.Repository
                                             index.WorkspaceBranch

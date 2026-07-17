@@ -10,6 +10,7 @@ open VersionControlService.Abstractions
 open VersionControlService.LakeFs.LakeFsTypes
 
 module NodeCancellation = VersionControlService.Runtime.Node.Cancellation
+module LakeFsBinaryTransfer = VersionControlService.LakeFs.LakeFsBinaryTransfer
 
 [<Emit("Buffer.from($0, 'utf8').toString('base64')")>]
 let private toBase64 (_value: string) : string = jsNative
@@ -320,50 +321,37 @@ let listObjects
                 )
     }
 
-let getObjectContent
+let downloadObjectToFile
     (connection: LakeFsConnection)
     (repository: string)
     (reference: string)
     (path: string)
+    (temporaryPath: string)
     (context: OperationContext)
-    : Async<Result<string, OperationFailure>> =
-    async {
-        let! result =
-            requestChecked
-                connection
-                "GET"
-                ($"/repositories/{encodeUriComponent repository}/refs/{encodeUriComponent reference}/objects"
-                 + $"?path={encodeUriComponent path}")
-                None
-                context
+    =
+    LakeFsBinaryTransfer.downloadObjectToFile
+        connection
+        repository
+        reference
+        path
+        temporaryPath
+        context
 
-        match result with
-        | Error failure -> return Error failure
-        | Ok response -> return Ok response.BodyText
-    }
-
-let uploadObject
+let uploadObjectFromFile
     (connection: LakeFsConnection)
     (repository: string)
     (branch: string)
     (path: string)
-    (content: string)
+    (sourcePath: string)
     (context: OperationContext)
-    : Async<Result<unit, OperationFailure>> =
-    async {
-        let! result =
-            requestChecked
-                connection
-                "POST"
-                ($"/repositories/{encodeUriComponent repository}/branches/{encodeUriComponent branch}/objects"
-                 + $"?path={encodeUriComponent path}")
-                (Some("application/octet-stream", content))
-                context
-
-        match result with
-        | Error failure -> return Error failure
-        | Ok _ -> return Ok()
-    }
+    =
+    LakeFsBinaryTransfer.uploadObjectFromFile
+        connection
+        repository
+        branch
+        path
+        sourcePath
+        context
 
 let deleteObject
     (connection: LakeFsConnection)

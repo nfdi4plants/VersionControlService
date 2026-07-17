@@ -41,6 +41,9 @@ let bufferToUtf8String (buffer: obj) : string = jsNative
 [<Emit("(() => { try { new TextDecoder('utf-8', { fatal: true }).decode($0); return true; } catch (_) { return false; } })()")>]
 let bufferIsValidUtf8 (buffer: obj) : bool = jsNative
 
+[<Emit("$0.indexOf(0) >= 0")>]
+let bufferContainsNul (buffer: obj) : bool = jsNative
+
 [<Emit("require('node:crypto').createHash('sha256')")>]
 let createSha256Hash () : obj = jsNative
 

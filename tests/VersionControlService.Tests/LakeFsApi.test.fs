@@ -16,6 +16,15 @@ let private httpModule: obj = importAll "http"
 let private fsPromisesDynamic: obj = importAll "fs/promises"
 let private osDynamic: obj = importAll "os"
 
+[<Emit("(() => { const b = Buffer.alloc($0, 0xa5); b[0] = 0; b[1] = 255; b[2] = 254; b[3] = 253; return b; })()")>]
+let private invalidUtf8Payload (_length: int) : obj = jsNative
+
+[<Emit("Buffer.concat($0)")>]
+let private concatBuffers (_buffers: obj[]) : obj = jsNative
+
+[<Emit("Buffer.compare($0, $1) === 0")>]
+let private buffersEqual (_left: obj) (_right: obj) : bool = jsNative
+
 let private ctx (name: string) = OperationContext.detached name
 
 /// A recorded request the fake server observed.
@@ -98,6 +107,155 @@ let private connectionFor (server: FakeServer) : LakeFsConnection = {
     AccessKeyId = "AKIA-test"
     SecretAccessKey = "wJalrXUtnFEMI-supersecret"
 }
+
+Vitest.describe (
+    "lakeFS streams binary objects",
+    fun () ->
+        Vitest.test (
+            "round-trips invalid UTF-8 bytes reports chunks and cleans canceled downloads",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let payload = invalidUtf8Payload (4 * 1024 * 1024)
+                let mutable uploaded: obj option = None
+                let mutable slowTimer: int option = None
+
+                let handler =
+                    fun (request: obj) (response: obj) ->
+                        let method: string = unbox request?method
+                        let url: string = unbox request?url
+
+                        if method = "GET" && url.Contains "path=binary.dat" then
+                            response?writeHead (200, createObj [ "Content-Type" ==> "application/octet-stream" ])
+                            |> ignore
+                            response?``end`` (payload) |> ignore
+                        elif method = "POST" && url.Contains "path=binary.dat" then
+                            let chunks = ResizeArray<obj>()
+                            request?on ("data", fun (chunk: obj) -> chunks.Add chunk) |> ignore
+                            request?on (
+                                "end",
+                                fun () ->
+                                    uploaded <- Some(concatBuffers (chunks.ToArray()))
+                                    response?writeHead (201, createObj [ "Content-Type" ==> "application/json" ])
+                                    |> ignore
+                                    response?``end`` ("{}") |> ignore
+                            )
+                            |> ignore
+                        elif method = "GET" && url.Contains "path=slow.dat" then
+                            response?writeHead (200, createObj [ "Content-Type" ==> "application/octet-stream" ])
+                            |> ignore
+
+                            let timer =
+                                JS.setInterval (fun () -> response?write (invalidUtf8Payload (256 * 1024)) |> ignore) 10
+
+                            slowTimer <- Some timer
+                            response?on ("close", fun () -> JS.clearInterval timer) |> ignore
+                        else
+                            response?writeHead 404 |> ignore
+                            response?``end`` () |> ignore
+
+                let server = httpModule?createServer (handler)
+
+                let! port =
+                    Fable.Core.JS.Constructors.Promise.Create(fun resolve _ ->
+                        server?listen (
+                            0,
+                            fun () -> resolve (unbox<int> (server?address ())?port)
+                        )
+                        |> ignore)
+
+                let connection = {
+                    Endpoint = $"http://127.0.0.1:{port}"
+                    AccessKeyId = "binary-access"
+                    SecretAccessKey = "binary-secret"
+                }
+
+                let! root =
+                    fsPromisesDynamic?mkdtemp (join [| osDynamic?tmpdir () |> unbox<string>; "vcs-lakefs-binary-" |])
+                    |> unbox<JS.Promise<string>>
+
+                try
+                    let downloadedPath = join [| root; "downloaded.bin" |]
+                    let progress = ResizeArray<float>()
+                    let downloadContext =
+                        OperationContext.create
+                            "binary-download"
+                            OperationCancellation.none
+                            (fun report -> report.Completed |> Option.iter progress.Add)
+
+                    let! downloaded =
+                        LakeFsApi.downloadObjectToFile
+                            connection
+                            "repo"
+                            "main"
+                            "binary.dat"
+                            downloadedPath
+                            downloadContext
+                        |> Async.StartAsPromise
+
+                    match downloaded with
+                    | Ok result ->
+                        Vitest.expect(result.BytesCopied).toBe (float (4 * 1024 * 1024))
+                        Vitest.expect(progress.Count > 1).toBe true
+                    | Error failure -> failwith $"Binary download failed: {failure.Code}"
+
+                    let! downloadedBytes = fsPromisesDynamic?readFile downloadedPath |> unbox<JS.Promise<obj>>
+                    Vitest.expect(buffersEqual downloadedBytes payload).toBe true
+
+                    let! upload =
+                        LakeFsApi.uploadObjectFromFile
+                            connection
+                            "repo"
+                            "main"
+                            "binary.dat"
+                            downloadedPath
+                            (ctx "binary-upload")
+                        |> Async.StartAsPromise
+
+                    match upload with
+                    | Ok result -> Vitest.expect(result.BytesCopied).toBe (float (4 * 1024 * 1024))
+                    | Error failure -> failwith $"Binary upload failed: {failure.Code}"
+
+                    Vitest.expect(uploaded |> Option.exists (fun bytes -> buffersEqual bytes payload)).toBe true
+
+                    let canceledPath = join [| root; "canceled.bin" |]
+                    let source = OperationCancellation.Source()
+                    let cancelContext =
+                        OperationContext.create
+                            "binary-cancel"
+                            source.Cancellation
+                            (fun report ->
+                                if report.Completed |> Option.defaultValue 0.0 > 0.0 then
+                                    source.Cancel())
+
+                    let! canceled =
+                        LakeFsApi.downloadObjectToFile
+                            connection
+                            "repo"
+                            "main"
+                            "slow.dat"
+                            canceledPath
+                            cancelContext
+                        |> Async.StartAsPromise
+
+                    match canceled with
+                    | Error failure -> Vitest.expect(failure.Category).toEqual Canceled
+                    | Ok _ -> failwith "Expected the streaming download to be canceled."
+
+                    let! canceledExists =
+                        fsPromisesDynamic?access canceledPath
+                        |> unbox<JS.Promise<obj>>
+                        |> Promise.map (fun _ -> true)
+                        |> Promise.catch (fun _ -> false)
+
+                    Vitest.expect(canceledExists).toBe false
+                finally
+                    slowTimer |> Option.iter JS.clearInterval
+                    server?close () |> ignore
+                    fsPromisesDynamic?rm (root, createObj [ "recursive" ==> true; "force" ==> true ])
+                    |> ignore
+            }
+        )
+)
 
 Vitest.describe (
     "lakeFS API operational contract",

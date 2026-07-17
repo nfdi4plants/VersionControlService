@@ -12,6 +12,7 @@ open Vitest
 
 module LakeFsApi = VersionControlService.LakeFs.LakeFsApi
 module LakeFsCredentials = VersionControlService.LakeFs.LakeFsCredentials
+module LakeFsConflictSession = VersionControlService.LakeFs.LakeFsConflictSession
 module LakeFsProviderOptions = VersionControlService.LakeFs.LakeFsProviderOptions
 module LakeFsPathSafety = VersionControlService.LakeFs.LakeFsPathSafety
 module LakeFsStateStore = VersionControlService.LakeFs.LakeFsStateStore
@@ -19,6 +20,8 @@ module LakeFsSynchronization = VersionControlService.LakeFs.LakeFsSynchronizatio
 module LakeFsWorkspaceIndex = VersionControlService.LakeFs.LakeFsWorkspaceIndex
 module LakeFsWorkspaceSession = VersionControlService.LakeFs.LakeFsWorkspaceSession
 module RuntimeNodePath = VersionControlService.Runtime.Node.Path
+module RuntimeNodeFileSystem = VersionControlService.Runtime.Node.FileSystem
+module RuntimeNodeInterop = VersionControlService.Runtime.Node.Interop
 
 [<Emit("process.env[$0] ?? null")>]
 let private getEnvironmentVariable (_name: string) : string = jsNative
@@ -100,6 +103,32 @@ let private context name = OperationContext.detached name
 let private expectApi operation = function
     | Ok value -> value
     | Error failure -> failwith $"{operation} failed ({failure.Category}/{failure.Code}): {failure.Message}"
+
+let uploadTextObject connection repository reference path content context =
+    async {
+        let sourcePath =
+            join [|
+                osDynamic?tmpdir () |> unbox<string>
+                $"vcs-lakefs-upload-{RuntimeNodeInterop.randomUuid()}.tmp"
+            |]
+
+        RuntimeNodeFileSystem.writeUtf8FileExclusiveAndFlushSync sourcePath content
+
+        try
+            let! uploaded =
+                LakeFsApi.uploadObjectFromFile
+                    connection
+                    repository
+                    reference
+                    path
+                    sourcePath
+                    context
+
+            return uploaded |> Result.map ignore
+        finally
+            if RuntimeNodeFileSystem.existsSync sourcePath then
+                RuntimeNodeFileSystem.unlinkSync sourcePath
+    }
 
 let private createRepository (repository: string) = promise {
     let payload =
@@ -210,7 +239,7 @@ let createLakeFsHarness () : ProviderTestHarness =
             let! result =
                 match mutation.Content with
                 | Some content ->
-                    LakeFsApi.uploadObject
+                    uploadTextObject
                         (connection ())
                         parsed.Repository
                         reference
@@ -386,7 +415,7 @@ let createLakeFsHarness () : ProviderTestHarness =
     let seedBase location = promise {
         let parsed = parseLocation location
         let! uploaded =
-            LakeFsApi.uploadObject
+            uploadTextObject
                 (connection ())
                 parsed.Repository
                 parsed.TargetRef
@@ -457,7 +486,7 @@ let createLakeFsHarness () : ProviderTestHarness =
 
                 for path, content in files do
                     let! uploaded =
-                        LakeFsApi.uploadObject
+                        uploadTextObject
                             (connection ())
                             parsed.Repository
                             refName
@@ -785,6 +814,63 @@ Vitest.describe (
                 with error ->
                     do! removeDirectoryAsync root
                     return raise error
+            }
+        )
+)
+
+Vitest.describe (
+    "lakeFS binary conflicts",
+    fun () ->
+        Vitest.test (
+            "uses unsupported previews and preserves original candidate selection",
+            fun () -> promise {
+                let binaryCandidate: LakeFsConflictSession.CandidateContent = {
+                    SourcePath = "external/binary-candidate.dat"
+                    Preview = UnsupportedPreview(Some "binary")
+                }
+
+                let item: LakeFsConflictSession.ItemState = {
+                    ItemPath = "binary.dat"
+                    BaseContent = Some binaryCandidate
+                    WorkspaceContent = Some binaryCandidate
+                    TargetContent = Some binaryCandidate
+                    ResolvedContent = None
+                }
+
+                let conflict = LakeFsConflictSession.create "target-revision" "workspace-revision" [ item ]
+                let summary =
+                    LakeFsConflictSession.summary
+                        (RevisionId.tryCreate "base-revision" |> Result.toOption)
+                        (RevisionId.tryCreate "workspace-revision" |> Result.toOption)
+                        (Some conflict)
+                    |> Option.defaultWith (fun () -> failwith "Expected a binary conflict summary.")
+
+                Vitest.expect(summary.Items[0].SupportsResolvedContent).toBe false
+                Vitest.expect(
+                    summary.Items[0].Candidates
+                    |> Array.forall (fun candidate ->
+                        match candidate.Preview with
+                        | Some(UnsupportedPreview _) -> true
+                        | _ -> false)
+                ).toBe true
+
+                match
+                    LakeFsConflictSession.resolve
+                        conflict
+                        (repositoryPath "binary.dat")
+                        (SupplyResolvedContent "text would corrupt bytes")
+                with
+                | Error failure -> Vitest.expect(failure.Code).toBe "binary_resolution_required"
+                | Ok() -> failwith "Expected supplied text to be rejected for a binary conflict."
+
+                match
+                    LakeFsConflictSession.resolve
+                        conflict
+                        (repositoryPath "binary.dat")
+                        (PickCandidate "target")
+                with
+                | Ok() -> ()
+                | Error failure -> failwith $"Expected original binary candidate selection: {failure.Code}"
             }
         )
 )
