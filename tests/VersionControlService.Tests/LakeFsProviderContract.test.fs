@@ -13,6 +13,7 @@ open Vitest
 module LakeFsApi = VersionControlService.LakeFs.LakeFsApi
 module LakeFsCredentials = VersionControlService.LakeFs.LakeFsCredentials
 module LakeFsProviderOptions = VersionControlService.LakeFs.LakeFsProviderOptions
+module LakeFsPathSafety = VersionControlService.LakeFs.LakeFsPathSafety
 module LakeFsStateStore = VersionControlService.LakeFs.LakeFsStateStore
 module LakeFsSynchronization = VersionControlService.LakeFs.LakeFsSynchronization
 module LakeFsWorkspaceIndex = VersionControlService.LakeFs.LakeFsWorkspaceIndex
@@ -669,6 +670,116 @@ Vitest.describe (
                     match missing with
                     | Failed failure -> Vitest.expect(failure.Code).toBe "provider_state_missing"
                     | _ -> failwith "Expected missing external state to fail without recreation."
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+)
+
+Vitest.describe (
+    "lakeFS rejects unsafe paths and links",
+    fun () ->
+        Vitest.test (
+            "remote keys cannot traverse escape alias or follow a workspace link",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root = createTempDirectoryAsync ()
+                let workspaceRoot = join [| root; "workspace" |]
+                let outsideRoot = join [| root; "outside" |]
+                do! ensureDirectoryAsync workspaceRoot
+                do! ensureDirectoryAsync outsideRoot
+
+                try
+                    for key in [|
+                        ""
+                        "/absolute.txt"
+                        "C:/drive-rooted.txt"
+                        "back\\slash.txt"
+                        "empty//segment.txt"
+                        "dot/./segment.txt"
+                        "dotdot/../escape.txt"
+                        "nul\u0000byte.txt"
+                    |] do
+                        match LakeFsPathSafety.resolveRemotePath workspaceRoot "prefix" $"prefix/{key}" with
+                        | Error failure -> Vitest.expect(failure.Code).toBe "unsafe_repository_path"
+                        | Ok _ -> failwith $"Expected unsafe remote key to be rejected: {key}"
+
+                    match LakeFsPathSafety.resolveRemotePath workspaceRoot "prefix" "another-prefix/file.txt" with
+                    | Ok None -> ()
+                    | _ -> failwith "A key outside the exact prefix must not be materialized."
+
+                    let safePath = repositoryPath "nested/safe.txt"
+
+                    match LakeFsPathSafety.writeUtf8File workspaceRoot safePath "safe content" with
+                    | Ok () -> ()
+                    | Error failure -> failwith $"Safe write failed: {failure.Code}"
+
+                    match LakeFsPathSafety.readUtf8File workspaceRoot safePath with
+                    | Ok(Some content) -> Vitest.expect(content).toBe "safe content"
+                    | _ -> failwith "Expected the safely written file to be readable."
+
+                    match LakeFsPathSafety.walkFiles workspaceRoot with
+                    | Ok paths ->
+                        paths
+                        |> Array.map RepositoryPath.value
+                        |> Vitest.expect
+                        |> _.toContain("nested/safe.txt")
+                    | Error failure -> failwith $"Safe walk failed: {failure.Code}"
+
+                    match LakeFsPathSafety.removeFile workspaceRoot safePath with
+                    | Ok () -> ()
+                    | Error failure -> failwith $"Safe delete failed: {failure.Code}"
+
+                    let linkPath = join [| workspaceRoot; "linked" |]
+                    let! _ = fsPromisesDynamic?symlink (outsideRoot, linkPath, "junction") |> unbox<JS.Promise<obj>>
+                    let linkedPath = repositoryPath "linked/secret.txt"
+
+                    match LakeFsPathSafety.resolveWorkspacePath workspaceRoot linkedPath with
+                    | Error failure ->
+                        Vitest.expect(failure.Code).toBe "symlink_not_supported"
+                        Vitest.expect(failure.AffectedPaths).toContain "linked/secret.txt"
+                    | Ok _ -> failwith "Expected a link-containing parent chain to be rejected."
+
+                    let expectLinkFailure
+                        (operation: string)
+                        (result: Result<'value, OperationFailure>)
+                        =
+                        match result with
+                        | Error failure ->
+                            Vitest.expect(failure.Code).toBe "symlink_not_supported"
+                            Vitest.expect(failure.AffectedPaths).toContain "linked/secret.txt"
+                        | Ok _ -> failwith $"Expected {operation} through a linked parent to fail."
+
+                    LakeFsPathSafety.readUtf8File workspaceRoot linkedPath
+                    |> expectLinkFailure "read"
+
+                    LakeFsPathSafety.writeUtf8File workspaceRoot linkedPath "outside write"
+                    |> expectLinkFailure "write"
+
+                    LakeFsPathSafety.removeFile workspaceRoot linkedPath
+                    |> expectLinkFailure "delete"
+
+                    match LakeFsPathSafety.walkFiles workspaceRoot with
+                    | Error failure -> Vitest.expect(failure.Code).toBe "symlink_not_supported"
+                    | Ok _ -> failwith "Expected walking a workspace containing a link to fail."
+
+                    let casePaths = [| repositoryPath "Data/File.txt"; repositoryPath "data/file.txt" |]
+
+                    match LakeFsPathSafety.validateMaterializationPathsForPlatform "win32" casePaths with
+                    | Error failure -> Vitest.expect(failure.Code).toBe "path_collision"
+                    | Ok () -> failwith "Expected a Windows case collision."
+
+                    let normalizedPaths = [|
+                        repositoryPath "café.txt"
+                        repositoryPath "café.txt"
+                    |]
+
+                    match LakeFsPathSafety.validateMaterializationPathsForPlatform "darwin" normalizedPaths with
+                    | Error failure -> Vitest.expect(failure.Code).toBe "path_collision"
+                    | Ok () -> failwith "Expected a macOS normalization collision."
 
                     do! removeDirectoryAsync root
                 with error ->

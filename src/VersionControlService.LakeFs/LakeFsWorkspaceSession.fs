@@ -13,6 +13,7 @@ module LakeFsCredentials = VersionControlService.LakeFs.LakeFsCredentials
 module LakeFsIndex = VersionControlService.LakeFs.LakeFsWorkspaceIndex
 module LakeFsProviderOptions = VersionControlService.LakeFs.LakeFsProviderOptions
 module LakeFsStateStore = VersionControlService.LakeFs.LakeFsStateStore
+module LakeFsPathSafety = VersionControlService.LakeFs.LakeFsPathSafety
 module LakeFsObjectTransfer = VersionControlService.LakeFs.LakeFsObjectTransfer
 module LakeFsSelectedRevision = VersionControlService.LakeFs.LakeFsSelectedRevision
 module LakeFsSynchronization = VersionControlService.LakeFs.LakeFsSynchronization
@@ -95,60 +96,42 @@ let private objectKey (state: SessionState) (path: string) =
     else
         $"{state.Index.Prefix}/{path}"
 
-let private relativePathOfKey (state: SessionState) (key: string) =
-    if state.Index.Prefix = "" then
-        Some key
-    elif key.StartsWith(state.Index.Prefix + "/") then
-        Some(key.Substring(state.Index.Prefix.Length + 1))
-    else
-        None
+let private repositoryPathOfKey (state: SessionState) (key: string) =
+    LakeFsPathSafety.resolveRemotePath
+        state.Binding.WorkspaceRoot
+        state.Index.Prefix
+        key
+    |> LakeFsPathSafety.require
 
-let private localPath (state: SessionState) (path: string) =
-    NodePath.join [| state.Binding.WorkspaceRoot; path |]
+let private repositoryPath path =
+    match RepositoryPath.tryCreate path with
+    | Ok value -> value
+    | Error message ->
+        raise (
+            LakeFsPathSafety.WorkspacePathFailure {
+                OperationFailure.create Validation "unsafe_repository_path" message with
+                    AffectedPaths = [| path |]
+            }
+        )
 
 let private tryReadLocal (state: SessionState) (path: string) : string option =
-    let absolute = localPath state path
-
-    if NodeFileSystem.existsSync absolute then
-        Some(NodeFileSystem.readFileSync absolute NodeFileSystem.TextEncoding.Utf8)
-    else
-        None
+    LakeFsPathSafety.readUtf8File state.Binding.WorkspaceRoot (repositoryPath path)
+    |> LakeFsPathSafety.require
 
 let private writeLocal (state: SessionState) (path: string) (content: string) =
-    let absolute = localPath state path
-    let parent = NodePath.dirname absolute
-
-    if not (NodeFileSystem.existsSync parent) then
-        NodeFileSystem.mkdirSync parent (NodeFileSystem.MkdirOptions(recursive = true))
-
-    NodeFileSystem.writeFileSync absolute content NodeFileSystem.TextEncoding.Utf8
+    LakeFsPathSafety.writeUtf8File state.Binding.WorkspaceRoot (repositoryPath path) content
+    |> LakeFsPathSafety.require
 
 let private removeLocal (state: SessionState) (path: string) =
-    let absolute = localPath state path
-
-    if NodeFileSystem.existsSync absolute then
-        NodeFileSystem.unlinkSync absolute
+    LakeFsPathSafety.removeFile state.Binding.WorkspaceRoot (repositoryPath path)
+    |> LakeFsPathSafety.require
 
 /// All repo-relative files currently in the workspace directory.
-let rec private walkLocalFiles (root: string) (relative: string) : string list =
-    let current = if relative = "" then root else NodePath.join [| root; relative |]
-
-    if not (NodeFileSystem.existsSync current) then
-        []
-    else
-        NodeFileSystem.readdirSync current
-        |> Array.toList
-        |> List.collect (fun name ->
-            let childRelative = if relative = "" then name else $"{relative}/{name}"
-            let childAbsolute = NodePath.join [| root; childRelative |]
-
-            try
-                if (NodeFileSystem.statSync childAbsolute).isDirectory () then
-                    walkLocalFiles root childRelative
-                else
-                    [ childRelative ]
-            with _ ->
-                [])
+let private walkLocalFiles (state: SessionState) : string list =
+    LakeFsPathSafety.walkFiles state.Binding.WorkspaceRoot
+    |> LakeFsPathSafety.require
+    |> Array.map RepositoryPath.value
+    |> Array.toList
 
 type private LocalChange = {
     ChangePath: string
@@ -162,7 +145,7 @@ let private classifyWorkspace (state: SessionState) : LocalChange list =
         |> Array.map (fun entry -> entry.Path, entry)
         |> Map.ofArray
 
-    let localFiles = walkLocalFiles state.Binding.WorkspaceRoot ""
+    let localFiles = walkLocalFiles state
 
     let localChanges =
         localFiles
@@ -365,7 +348,8 @@ let private targetChangedPaths (state: SessionState) (context: OperationContext)
                         Ok(
                             entries
                             |> Array.toList
-                            |> List.choose (fun entry -> relativePathOfKey state entry.Path)
+                            |> List.choose (fun entry -> repositoryPathOfKey state entry.Path)
+                            |> List.map RepositoryPath.value
                         )
     }
 
@@ -436,9 +420,7 @@ let private getStatus (state: SessionState) (context: OperationContext) =
 
                         let remotePaths =
                             changedObjects
-                            |> Array.choose (fun entry ->
-                                relativePathOfKey state entry.Path
-                                |> Option.bind (RepositoryPath.tryCreate >> Result.toOption))
+                            |> Array.choose (fun entry -> repositoryPathOfKey state entry.Path)
 
                         return
                             OperationResult.succeeded {
@@ -947,64 +929,6 @@ let private listRefs (state: SessionState) (context: OperationContext) =
                     |> OperationResult.succeeded
     }
 
-[<Emit("process.platform")>]
-let private nodePlatform: string = jsNative
-
-[<Emit("$0.normalize('NFC')")>]
-let private normalizeNfc (_text: string) : string = jsNative
-
-let private windowsReservedBaseNames =
-    set [ "con"; "prn"; "aux"; "nul"; "com1"; "com2"; "com3"; "lpt1"; "lpt2"; "lpt3" ]
-
-let private isWindowsInvalidName (path: string) =
-    path.Split '/'
-    |> Array.exists (fun segment ->
-        let baseName = (segment.Split '.').[0].ToLowerInvariant()
-
-        windowsReservedBaseNames.Contains baseName
-        || segment.EndsWith "."
-        || segment.EndsWith " "
-        || segment |> Seq.exists (fun character -> int character < 32 || "<>:\"|?*".Contains(string character)))
-
-/// Byte-exact keys may alias on the local filesystem: detect collisions and
-/// unrepresentable names before materializing.
-let private checkMaterializationSafety (paths: string list) : Result<unit, OperationFailure> =
-    let aliasKey (path: string) =
-        match nodePlatform with
-        | "win32" -> path.ToLowerInvariant()
-        | "darwin" -> (normalizeNfc path).ToLowerInvariant()
-        | _ -> path
-
-    let collisions =
-        paths
-        |> List.groupBy aliasKey
-        |> List.filter (fun (_, group) -> group.Length > 1)
-        |> List.collect snd
-
-    if collisions.Length > 0 then
-        Error {
-            OperationFailure.create
-                Validation
-                "path_collision"
-                "Distinct repository paths alias to one local file on this filesystem." with
-                AffectedPaths = List.toArray collisions
-        }
-    elif nodePlatform = "win32" then
-        let invalid = paths |> List.filter isWindowsInvalidName
-
-        if invalid.Length > 0 then
-            Error {
-                OperationFailure.create
-                    Validation
-                    "unrepresentable_path"
-                    "A repository path cannot be represented on the local filesystem." with
-                    AffectedPaths = List.toArray invalid
-            }
-        else
-            Ok()
-    else
-        Ok()
-
 /// Downloads the given ref's objects (under the prefix) into the workspace and
 /// rebuilds the index entries. Used by open, switch, and update.
 let private materializeRef
@@ -1023,16 +947,22 @@ let private materializeRef
             let keyedPaths =
                 stats
                 |> Array.toList
-                |> List.choose (fun stat -> relativePathOfKey state stat.Path |> Option.map (fun p -> p, stat))
+                |> List.choose (fun stat -> repositoryPathOfKey state stat.Path |> Option.map (fun p -> p, stat))
 
-            match checkMaterializationSafety (keyedPaths |> List.map fst) with
+            match
+                keyedPaths
+                |> List.map fst
+                |> List.toArray
+                |> LakeFsPathSafety.validateMaterializationPaths
+            with
             | Error failure -> return Error failure
             | Ok() ->
                 let mutable failure: OperationFailure option = None
                 let entries = ResizeArray<LakeFsIndex.IndexEntry>()
 
-                for path, stat in keyedPaths do
+                for repositoryPath, stat in keyedPaths do
                     if failure.IsNone then
+                        let path = RepositoryPath.value repositoryPath
                         let! content =
                             LakeFsApi.getObjectContent
                                 resolved
@@ -1059,7 +989,12 @@ let private materializeRef
                 | None ->
                     // Remove previously indexed files that no longer exist on the ref.
                     for entry in state.Index.Entries do
-                        if not (keyedPaths |> List.exists (fun (path, _) -> path = entry.Path)) then
+                        if
+                            not (
+                                keyedPaths
+                                |> List.exists (fun (path, _) -> RepositoryPath.value path = entry.Path)
+                            )
+                        then
                             removeLocal state entry.Path
 
                     state.Index <- {
@@ -1279,7 +1214,8 @@ let private preflightSwitchRef (state: SessionState) (request: SwitchRefRequest)
                         let targetContent =
                             stats
                             |> Array.choose (fun stat ->
-                                relativePathOfKey state stat.Path |> Option.map (fun p -> p, stat.Checksum))
+                                repositoryPathOfKey state stat.Path
+                                |> Option.map (fun p -> RepositoryPath.value p, stat.Checksum))
                             |> Map.ofArray
 
                         let entriesByPath =
@@ -1418,7 +1354,8 @@ let private previewUpdate (state: SessionState) (context: OperationContext) =
                                     Ok(
                                         entries
                                         |> Array.toList
-                                        |> List.choose (fun entry -> relativePathOfKey state entry.Path)
+                                        |> List.choose (fun entry -> repositoryPathOfKey state entry.Path)
+                                        |> List.map RepositoryPath.value
                                         |> Set.ofList
                                     )
                             | Error failure ->
@@ -2295,47 +2232,67 @@ let private createSessionFromState (state: SessionState) : WorkspaceSession =
     }
 
     let core: CoreVersionControl = {
-        GetStatus = fun context -> getStatus state context
-        ListRefs = fun context -> listRefs state context
+        GetStatus = fun context -> getStatus state context |> LakeFsPathSafety.guard
+        ListRefs = fun context -> listRefs state context |> LakeFsPathSafety.guard
         CreateRef =
             fun request context ->
                 withValidatedMutation state request.ExpectedWorkspaceVersion (fun () ->
                     createRef state request context)
+                |> LakeFsPathSafety.guard
         PreflightSwitchRef =
             fun request context ->
                 withValidatedMutation state request.ExpectedWorkspaceVersion (fun () ->
                     preflightSwitchRef state request context)
+                |> LakeFsPathSafety.guard
         SwitchRef =
             fun request context ->
                 withValidatedMutation state request.ExpectedWorkspaceVersion (fun () ->
                     switchRef state request context)
+                |> LakeFsPathSafety.guard
         CreateRevision =
             fun request context ->
                 withValidatedMutation state request.ExpectedWorkspaceVersion (fun () ->
                     createRevision state request context)
+                |> LakeFsPathSafety.guard
         RestorePaths =
             fun request context ->
                 withValidatedMutation state request.ExpectedWorkspaceVersion (fun () ->
                     restorePaths state request context)
-        GetDiffSummary = fun context -> getDiffSummary state context
+                |> LakeFsPathSafety.guard
+        GetDiffSummary = fun context -> getDiffSummary state context |> LakeFsPathSafety.guard
+    }
+
+    let conflictResolution = createConflictService state
+
+    let guardedConflictResolution = {
+        GetActiveSession =
+            fun context -> conflictResolution.GetActiveSession context |> LakeFsPathSafety.guard
+        Resolve =
+            fun request context -> conflictResolution.Resolve request context |> LakeFsPathSafety.guard
+        Finalize =
+            fun request context -> conflictResolution.Finalize request context |> LakeFsPathSafety.guard
+        Cancel =
+            fun request context -> conflictResolution.Cancel request context |> LakeFsPathSafety.guard
     }
 
     {
         WorkspaceSession.createCoreOnly descriptor core with
             Synchronization =
                 Some {
-                    Refresh = fun context -> refresh state context
-                    PreviewUpdate = fun context -> previewUpdate state context
+                    Refresh = fun context -> refresh state context |> LakeFsPathSafety.guard
+                    PreviewUpdate = fun context -> previewUpdate state context |> LakeFsPathSafety.guard
                     Update =
                         fun request context ->
                             withValidatedMutation state request.ExpectedWorkspaceVersion (fun () ->
                                 update state request context)
+                            |> LakeFsPathSafety.guard
                     Publish =
                         fun request context ->
                             withValidatedMutation state request.ExpectedWorkspaceVersion (fun () ->
                                 publish state request context)
+                            |> LakeFsPathSafety.guard
                 }
-            ConflictResolution = Some(createConflictService state)
+            ConflictResolution = Some guardedConflictResolution
     }
 
 /// Opens a session: loads the index or creates the provider-owned workspace
@@ -2474,6 +2431,7 @@ let openSession
                     credentials
                     binding
                     context
+                |> LakeFsPathSafety.guard
     }
 
 let private cleanupPreconditionFailure message expectedHead observedHead =

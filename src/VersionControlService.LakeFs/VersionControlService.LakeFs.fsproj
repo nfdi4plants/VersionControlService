@@ -8,6 +8,7 @@
     <Compile Include="LakeFsTypes.fs" />
     <Compile Include="LakeFsProviderOptions.fs" />
     <Compile Include="LakeFsStateStore.fs" />
+    <Compile Include="LakeFsPathSafety.fs" />
     <Compile Include="LakeFsApi.fs" />
     <Compile Include="LakeFsCredentials.fs" />
     <Compile Include="LakeFsWorkspaceIndex.fs" />
