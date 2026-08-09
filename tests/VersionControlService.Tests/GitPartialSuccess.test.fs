@@ -535,6 +535,178 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "selected revision rejects growth when the staged entry path contains a literal tab",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, binding = createSelectedRevisionFixture ()
+
+                try
+                    let literalTabPath = "growing\tfile.bin"
+                    let isWindows = (osDynamic?platform () |> unbox<string>) = "win32"
+                    // NTFS rejects literal tabs, so Windows injects the exact raw
+                    // ls-files record that Git emits for the portable Unix case.
+                    let relativePath = if isWindows then "growing-file.bin" else literalTabPath
+                    let selectedPath = join [| workPath; relativePath |]
+                    let grownContent = String.replicate (1024 * 1024) "g"
+                    do! writeUtf8FileAsync selectedPath "small\n"
+                    let! headBefore = runGitOk workPath [| "rev-parse"; "HEAD" |]
+                    let mutable barrierRan = false
+
+                    let hooks: GitWorkspaceSession.GitSessionHooks = {
+                        RunBytesProcess = None
+                        RunProcess =
+                            Some(fun request operationContext -> async {
+                                let! result = NodeProcess.run request operationContext
+
+                                if
+                                    isWindows
+                                    && request.Arguments =
+                                        [| "--literal-pathspecs"; "ls-files"; "--stage"; "-z"; "--"; relativePath |]
+                                then
+                                    match result with
+                                    | Succeeded outcome ->
+                                        let rewritten =
+                                            outcome.Value.StdOut.Replace(
+                                                $"\t{relativePath}\000",
+                                                $"\t{literalTabPath}\000"
+                                            )
+
+                                        return
+                                            Succeeded {
+                                                outcome with
+                                                    Value = { outcome.Value with StdOut = rewritten }
+                                            }
+                                    | _ -> return result
+                                else
+                                    return result
+                            })
+                        Barrier =
+                            Some(fun _ point _ -> async {
+                                if point = "selected-revision-post-metadata-check" then
+                                    barrierRan <- true
+                                    do! writeUtf8FileAsync selectedPath grownContent |> Async.AwaitPromise
+                            })
+                    }
+
+                    let session = GitWorkspaceSession.createSession hooks binding
+                    let! statusResult = session.Core.GetStatus(ctx "tab-growing-lfs-status") |> Async.StartAsPromise
+                    let status =
+                        match statusResult with
+                        | Succeeded outcome -> outcome.Value
+                        | _ -> failwith "Expected selected-revision status."
+
+                    let! revisionResult =
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: reject tab-path stale LFS classification"
+                                Paths = [| repositoryPath relativePath |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (ctx "tab-growing-lfs-revision")
+                        |> Async.StartAsPromise
+
+                    Vitest.expect(barrierRan).toBe true
+
+                    match revisionResult with
+                    | Failed failure ->
+                        Vitest.expect(failure.Category).toEqual Concurrency
+                        Vitest.expect(failure.Code).toBe "selected_content_changed"
+                        Vitest.expect(failure.StateChanged).toBe false
+                        Vitest.expect(failure.AffectedPaths).toEqual [| relativePath |]
+                    | _ -> failwith "Expected the tabbed staged-entry LFS race to fail before ref movement."
+
+                    let! headAfter = runGitOk workPath [| "rev-parse"; "HEAD" |]
+                    let! selectedAfter = tryReadUtf8FileAsync selectedPath
+                    Vitest.expect(headAfter.Trim()).toBe (headBefore.Trim())
+                    Vitest.expect(selectedAfter).toEqual (Some grownContent)
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "selected revision reports malformed staged metadata before ref movement",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, binding = createSelectedRevisionFixture ()
+
+                try
+                    let relativePath = "growing-malformed.bin"
+                    let selectedPath = join [| workPath; relativePath |]
+                    let grownContent = String.replicate (1024 * 1024) "m"
+                    do! writeUtf8FileAsync selectedPath "small\n"
+                    let! headBefore = runGitOk workPath [| "rev-parse"; "HEAD" |]
+
+                    let hooks: GitWorkspaceSession.GitSessionHooks = {
+                        RunBytesProcess = None
+                        RunProcess =
+                            Some(fun request operationContext -> async {
+                                let! result = NodeProcess.run request operationContext
+
+                                if
+                                    request.Arguments =
+                                        [| "--literal-pathspecs"; "ls-files"; "--stage"; "-z"; "--"; relativePath |]
+                                then
+                                    match result with
+                                    | Succeeded outcome ->
+                                        return
+                                            Succeeded {
+                                                outcome with
+                                                    Value = {
+                                                        outcome.Value with
+                                                            StdOut = $"malformed\t{relativePath}\000"
+                                                    }
+                                            }
+                                    | _ -> return result
+                                else
+                                    return result
+                            })
+                        Barrier =
+                            Some(fun _ point _ -> async {
+                                if point = "selected-revision-post-metadata-check" then
+                                    do! writeUtf8FileAsync selectedPath grownContent |> Async.AwaitPromise
+                            })
+                    }
+
+                    let session = GitWorkspaceSession.createSession hooks binding
+                    let! statusResult = session.Core.GetStatus(ctx "malformed-staged-status") |> Async.StartAsPromise
+                    let status =
+                        match statusResult with
+                        | Succeeded outcome -> outcome.Value
+                        | _ -> failwith "Expected selected-revision status."
+
+                    let! revisionResult =
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: reject malformed staged metadata"
+                                Paths = [| repositoryPath relativePath |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (ctx "malformed-staged-revision")
+                        |> Async.StartAsPromise
+
+                    match revisionResult with
+                    | Failed failure ->
+                        Vitest.expect(failure.Category).toEqual ProviderError
+                        Vitest.expect(failure.Code).toBe "temporary_index_entry_invalid"
+                        Vitest.expect(failure.StateChanged).toBe false
+                        Vitest.expect(failure.AffectedPaths).toEqual [| relativePath |]
+                    | _ -> failwith "Expected malformed staged metadata to fail before ref movement."
+
+                    let! headAfter = runGitOk workPath [| "rev-parse"; "HEAD" |]
+                    let! selectedAfter = tryReadUtf8FileAsync selectedPath
+                    Vitest.expect(headAfter.Trim()).toBe (headBefore.Trim())
+                    Vitest.expect(selectedAfter).toEqual (Some grownContent)
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
             "selected revision reports an unsafe attributes path as a structured failure",
             TestOptions(timeout = 120000),
             fun () -> promise {

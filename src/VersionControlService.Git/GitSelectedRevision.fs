@@ -318,7 +318,17 @@ let private updateTemporaryIndexEntry
 type private TemporaryIndexEntry = {
     Mode: string
     BlobId: string
+    Path: string
 }
+
+let private invalidTemporaryIndexEntry path =
+    {
+        OperationFailure.create
+            ProviderError
+            "temporary_index_entry_invalid"
+            "Git returned malformed staged metadata for a selected file." with
+            AffectedPaths = [| path |]
+    }
 
 let private tryTemporaryIndexEntry
     (runGit: GitRunner)
@@ -338,16 +348,28 @@ let private tryTemporaryIndexEntry
         | Ok output ->
             let entry = output.StdOut.Split '\000' |> Array.tryFind (String.IsNullOrEmpty >> not)
 
-            return
-                entry
-                |> Option.bind (fun value ->
-                    match value.Split '\t' with
-                    | [| metadata; _ |] ->
-                        match metadata.Split(' ', StringSplitOptions.RemoveEmptyEntries) with
-                        | [| mode; blobId; "0" |] -> Some { Mode = mode; BlobId = blobId }
-                        | _ -> None
-                    | _ -> None)
-                |> Ok
+            match entry with
+            | None -> return Ok None
+            | Some value ->
+                let separatorIndex = value.IndexOf '\t'
+
+                if separatorIndex <= 0 || separatorIndex = value.Length - 1 then
+                    return Error(invalidTemporaryIndexEntry path)
+                else
+                    let metadata = value.Substring(0, separatorIndex)
+                    let entryPath = value.Substring(separatorIndex + 1)
+
+                    match metadata.Split(' ', StringSplitOptions.RemoveEmptyEntries) with
+                    | [| mode; blobId; "0" |] ->
+                        return
+                            Ok(
+                                Some {
+                                    Mode = mode
+                                    BlobId = blobId
+                                    Path = entryPath
+                                }
+                            )
+                    | _ -> return Error(invalidTemporaryIndexEntry path)
     }
 
 let private temporaryIndexMode
