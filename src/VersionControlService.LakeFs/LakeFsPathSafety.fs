@@ -9,6 +9,9 @@ module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodeInterop = VersionControlService.Runtime.Node.Interop
 module NodePath = VersionControlService.Runtime.Node.Path
 
+[<Emit("$0?.code ?? ''")>]
+let private errorCode (_error: exn) : string = jsNative
+
 exception WorkspacePathFailure of OperationFailure
 
 type InspectedFile = {
@@ -489,24 +492,98 @@ let replaceFileFromTemporary
         match resolveWorkspacePath workspaceRoot path with
         | Error failure -> Error failure
         | Ok targetPath ->
-            try
+            let verifyPreparedSource () =
                 let temporaryStats = NodeFileSystem.lstatSync temporaryPath
 
                 if temporaryStats.isSymbolicLink() || not (temporaryStats.isFile()) then
                     Error(changedPathFailure path)
                 else
-                    NodeFileSystem.renameSync temporaryPath targetPath
+                    Ok()
 
-                    match resolveWorkspacePath workspaceRoot path with
+            let verifyInstalledTarget () =
+                match resolveWorkspacePath workspaceRoot path with
+                | Error failure -> Error failure
+                | Ok _ -> Ok()
+
+            let installedFailure failure = {
+                failure with
+                    StateChanged = true
+                    AffectedPaths = [| RepositoryPath.value path |]
+            }
+
+            let replaceAcrossVolumes () =
+                let pathValue = RepositoryPath.value path
+                let nonce = Guid.NewGuid().ToString "N"
+                let stagingValue = $"{pathValue}.vcs-{nonce}.tmp"
+
+                match RepositoryPath.tryCreate stagingValue with
+                | Error message -> Error(pathFailure "unsafe_repository_path" message pathValue)
+                | Ok stagingPath ->
+                    match resolveWorkspacePath workspaceRoot stagingPath with
                     | Error failure -> Error failure
-                    | Ok _ -> Ok()
+                    | Ok stagingAbsolute ->
+                        let mutable createdIdentity: NodeFileSystem.Stats option = None
+
+                        try
+                            try
+                                let created =
+                                    NodeFileSystem.copyFileExclusiveAndFlushWithIdentitySync
+                                        temporaryPath
+                                        stagingAbsolute
+
+                                createdIdentity <- Some created
+
+                                match resolveWorkspacePath workspaceRoot stagingPath with
+                                | Error failure -> Error failure
+                                | Ok verifiedStaging ->
+                                    let current = NodeFileSystem.lstatSync verifiedStaging
+
+                                    if
+                                        current.isSymbolicLink()
+                                        || not (current.isFile())
+                                        || current.dev <> created.dev
+                                        || current.ino <> created.ino
+                                    then
+                                        Error(changedPathFailure path)
+                                    else
+                                        match resolveWorkspacePath workspaceRoot path with
+                                        | Error failure -> Error failure
+                                        | Ok verifiedTarget ->
+                                            NodeFileSystem.renameSync verifiedStaging verifiedTarget
+                                            verifyInstalledTarget ()
+                                            |> Result.mapError installedFailure
+                            with error ->
+                                Error(
+                                    OperationFailure.createRedacted
+                                        ProviderError
+                                        "workspace_replace_failed"
+                                        $"Replacing a workspace file failed: {error.Message}"
+                                )
+                        finally
+                            createdIdentity
+                            |> Option.iter (fun identity ->
+                                NodeFileSystem.removeFileIfIdentityMatchesSync
+                                    stagingAbsolute
+                                    identity
+                                |> ignore)
+
+            try
+                match verifyPreparedSource () with
+                | Error failure -> Error failure
+                | Ok() ->
+                    NodeFileSystem.renameSync temporaryPath targetPath
+                    verifyInstalledTarget ()
+                    |> Result.mapError installedFailure
             with error ->
-                Error(
-                    OperationFailure.createRedacted
-                        ProviderError
-                        "workspace_replace_failed"
-                        $"Replacing a workspace file failed: {error.Message}"
-                )
+                if errorCode error = "EXDEV" then
+                    replaceAcrossVolumes ()
+                else
+                    Error(
+                        OperationFailure.createRedacted
+                            ProviderError
+                            "workspace_replace_failed"
+                            $"Replacing a workspace file failed: {error.Message}"
+                    )
 
 let walkFiles (workspaceRoot: string) : Result<RepositoryPath[], OperationFailure> =
     let files = ResizeArray<RepositoryPath>()

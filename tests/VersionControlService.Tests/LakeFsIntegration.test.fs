@@ -193,6 +193,125 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "lakeFS restore materialization reports exact partial recovery",
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
+            fun () -> promise {
+                if not (integrationEnabled ()) then
+                    return failwith "lakeFS integration skipped: Docker not available"
+
+                let harness = createLakeFsHarness ()
+                let mutable appliedObjects = 0
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    do! workspace.WriteFile "000-restore-first.txt" "tracked first bytes\n"
+                    do! workspace.WriteFile "zzz-restore-second.txt" "tracked second bytes\n"
+
+                    let! revisionStatusResult =
+                        workspace.Session.Core.GetStatus
+                            (OperationContext.detached "restore-materialization-revision-status")
+                        |> Async.StartAsPromise
+
+                    let revisionStatus = expectValue "restore materialization revision status" revisionStatusResult
+                    let! revisionResult =
+                        workspace.Session.Core.CreateRevision
+                            {
+                                Message = "test: tracked restore objects"
+                                Paths = [|
+                                    repositoryPath "000-restore-first.txt"
+                                    repositoryPath "zzz-restore-second.txt"
+                                |]
+                                ExpectedWorkspaceVersion = revisionStatus.WorkspaceVersion
+                            }
+                            (OperationContext.detached "restore-materialization-revision")
+                        |> Async.StartAsPromise
+
+                    expectValue "restore materialization revision" revisionResult |> ignore
+                    do! workspace.WriteFile "000-restore-first.txt" "dirty first bytes\n"
+                    do! workspace.WriteFile "zzz-restore-second.txt" "dirty second bytes\n"
+
+                    let hooks: LakeFsWorkspaceSession.LakeFsSessionHooks = {
+                        Barrier =
+                            Some(fun _ point _ -> async {
+                                if point = "materialization-apply-object" then
+                                    appliedObjects <- appliedObjects + 1
+
+                                    if appliedObjects = 1 then
+                                        failwith "injected restore materialization failure"
+                            })
+                    }
+
+                    let factory =
+                        LakeFsWorkspaceSession.createFactoryWithHooks
+                            lakeFsProviderOptions
+                            hooks
+                            (LakeFsCredentials.fixedConnection (connection ()))
+
+                    let! reopened =
+                        factory.Open
+                            workspace.Binding
+                            (OperationContext.detached "restore-materialization-open")
+                        |> Async.StartAsPromise
+
+                    let session = expectValue "restore materialization open" reopened
+                    let stateDirectory = stateDirectoryForBinding workspace.Binding
+                    let before =
+                        match LakeFsWorkspaceIndex.load stateDirectory with
+                        | LakeFsWorkspaceIndex.Loaded index -> index
+                        | _ -> failwith "Expected an index before interrupted restore."
+
+                    let! statusResult =
+                        session.Core.GetStatus
+                            (OperationContext.detached "restore-materialization-status")
+                        |> Async.StartAsPromise
+
+                    let status = expectValue "restore materialization status" statusResult
+                    let! restored =
+                        session.Core.RestorePaths
+                            {
+                                Paths = [|
+                                    repositoryPath "000-restore-first.txt"
+                                    repositoryPath "zzz-restore-second.txt"
+                                |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (OperationContext.detached "restore-materialization-restore")
+                        |> Async.StartAsPromise
+
+                    let outcome, failure =
+                        match restored with
+                        | PartiallySucceeded(outcome, failure) -> outcome, failure
+                        | Failed failure ->
+                            failwith $"Visible restore mutation was concealed as Failed: {failure.Code}"
+                        | Succeeded _ -> failwith "Injected restore materialization failure unexpectedly succeeded."
+
+                    Vitest.expect(appliedObjects).toBe 1
+                    Vitest.expect(failure.StateChanged).toBe true
+                    Vitest.expect(failure.AffectedPaths).toEqual [| "000-restore-first.txt" |]
+                    Vitest.expect(outcome.AffectedPaths).toEqual [| "000-restore-first.txt" |]
+                    Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "reconcile_materialization")
+                    let! first = workspace.ReadFile "000-restore-first.txt"
+                    let! second = workspace.ReadFile "zzz-restore-second.txt"
+                    Vitest.expect(first).toEqual(Some "tracked first bytes\n")
+                    Vitest.expect(second).toEqual(Some "dirty second bytes\n")
+
+                    match LakeFsWorkspaceIndex.load stateDirectory with
+                    | LakeFsWorkspaceIndex.Loaded after ->
+                        Vitest.expect(after.WorkspaceRevision).toEqual before.WorkspaceRevision
+                        Vitest.expect(after.Entries).toEqual before.Entries
+                    | _ -> failwith "Expected interrupted restore to preserve the published index."
+
+                    Vitest.expect(
+                        NodeFileSystem.readdirSync (NodePath.join [| stateDirectory; "transactions" |])
+                    ).toEqual [||]
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
             "lakeFS selected revision rejects a parent junction swapped in after source classification",
             TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
             fun () -> promise {
@@ -426,6 +545,443 @@ Vitest.describe (
                     do! harness.Cleanup()
                 with error ->
                     cleanupRace ()
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "lakeFS materialization prepare cancellation leaves the workspace unchanged",
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
+            fun () -> promise {
+                if not (integrationEnabled ()) then
+                    return failwith "lakeFS integration skipped: Docker not available"
+
+                let harness = createLakeFsHarness ()
+                let cancellation = OperationCancellation.Source()
+                let mutable preparedObjects = 0
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let parsed =
+                        LakeFsTypes.LakeFsLocation.tryParse workspace.Binding.Location.ProviderLocation
+                        |> Result.defaultWith failwith
+
+                    let branchName = "materialization-prepare-cancel"
+                    let! created =
+                        LakeFsApi.createBranch
+                            (connection ())
+                            parsed.Repository
+                            branchName
+                            parsed.TargetRef
+                            (OperationContext.detached "materialization-prepare-create-branch")
+                        |> Async.StartAsPromise
+
+                    created |> Result.defaultWith (fun failure -> failwith failure.Message) |> ignore
+
+                    for path, content in [|
+                        "prepared-first.txt", "prepared first bytes\n"
+                        "prepared-second.txt", "prepared second bytes\n"
+                    |] do
+                        let! uploaded =
+                            uploadTextObject
+                                (connection ())
+                                parsed.Repository
+                                branchName
+                                path
+                                content
+                                (OperationContext.detached "materialization-prepare-upload")
+                            |> Async.StartAsPromise
+
+                        uploaded |> Result.defaultWith (fun failure -> failwith failure.Message) |> ignore
+
+                    let! committed =
+                        LakeFsApi.commit
+                            (connection ())
+                            parsed.Repository
+                            branchName
+                            "test: prepare cancellation target"
+                            (OperationContext.detached "materialization-prepare-commit")
+                        |> Async.StartAsPromise
+
+                    committed |> Result.defaultWith (fun failure -> failwith failure.Message) |> ignore
+
+                    let hooks: LakeFsWorkspaceSession.LakeFsSessionHooks = {
+                        Barrier =
+                            Some(fun _ point _ -> async {
+                                if point = "materialization-prepare-object" then
+                                    preparedObjects <- preparedObjects + 1
+
+                                    if preparedObjects = 1 then
+                                        cancellation.Cancel()
+                            })
+                    }
+
+                    let factory =
+                        LakeFsWorkspaceSession.createFactoryWithHooks
+                            lakeFsProviderOptions
+                            hooks
+                            (LakeFsCredentials.fixedConnection (connection ()))
+
+                    let! opened =
+                        factory.Open
+                            workspace.Binding
+                            (OperationContext.detached "materialization-prepare-open")
+                        |> Async.StartAsPromise
+
+                    let session = expectValue "materialization prepare open" opened
+                    let before =
+                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        | LakeFsWorkspaceIndex.Loaded index -> index
+                        | _ -> failwith "Expected an index before prepare cancellation."
+
+                    let! statusResult =
+                        session.Core.GetStatus(OperationContext.detached "materialization-prepare-status")
+                        |> Async.StartAsPromise
+
+                    let status = expectValue "materialization prepare status" statusResult
+                    let switchContext =
+                        OperationContext.create
+                            "materialization-prepare-switch"
+                            cancellation.Cancellation
+                            ignore
+
+                    let! switched =
+                        session.Core.SwitchRef
+                            {
+                                TargetRef = ProviderRef.tryCreate $"lakefs:{branchName}" |> Result.defaultWith failwith
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            switchContext
+                        |> Async.StartAsPromise
+
+                    let failure =
+                        match switched with
+                        | Failed failure -> failure
+                        | PartiallySucceeded _ ->
+                            failwith "Prepare cancellation must not report visible partial mutation."
+                        | Succeeded _ -> failwith "Prepare cancellation unexpectedly switched the workspace."
+
+                    Vitest.expect(preparedObjects).toBe 1
+                    Vitest.expect(failure.Category).toEqual FailureCategory.Canceled
+                    Vitest.expect(failure.StateChanged).toBe false
+                    let! first = workspace.ReadFile "prepared-first.txt"
+                    let! second = workspace.ReadFile "prepared-second.txt"
+                    Vitest.expect(first).toEqual None
+                    Vitest.expect(second).toEqual None
+
+                    match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                    | LakeFsWorkspaceIndex.Loaded after ->
+                        Vitest.expect(after.WorkspaceRevision).toEqual before.WorkspaceRevision
+                        Vitest.expect(after.Entries).toEqual before.Entries
+                    | _ -> failwith "Expected prepare cancellation to preserve the index."
+
+                    let transactionsDirectory =
+                        NodePath.join [| stateDirectoryForBinding workspace.Binding; "transactions" |]
+
+                    Vitest.expect(NodeFileSystem.readdirSync transactionsDirectory).toEqual [||]
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "lakeFS materialization apply failure reports exact partial recovery",
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
+            fun () -> promise {
+                if not (integrationEnabled ()) then
+                    return failwith "lakeFS integration skipped: Docker not available"
+
+                let harness = createLakeFsHarness ()
+                let mutable appliedObjects = 0
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let parsed =
+                        LakeFsTypes.LakeFsLocation.tryParse workspace.Binding.Location.ProviderLocation
+                        |> Result.defaultWith failwith
+
+                    let branchName = "materialization-apply-failure"
+                    let! created =
+                        LakeFsApi.createBranch
+                            (connection ())
+                            parsed.Repository
+                            branchName
+                            parsed.TargetRef
+                            (OperationContext.detached "materialization-apply-create-branch")
+                        |> Async.StartAsPromise
+
+                    created |> Result.defaultWith (fun failure -> failwith failure.Message) |> ignore
+
+                    for path, content in [|
+                        "000-apply-first.txt", "new first bytes\n"
+                        "zzz-apply-second.txt", "new second bytes\n"
+                    |] do
+                        let! uploaded =
+                            uploadTextObject
+                                (connection ())
+                                parsed.Repository
+                                branchName
+                                path
+                                content
+                                (OperationContext.detached "materialization-apply-upload")
+                            |> Async.StartAsPromise
+
+                        uploaded |> Result.defaultWith (fun failure -> failwith failure.Message) |> ignore
+
+                    let! committedResult =
+                        LakeFsApi.commit
+                            (connection ())
+                            parsed.Repository
+                            branchName
+                            "test: apply failure target"
+                            (OperationContext.detached "materialization-apply-commit")
+                        |> Async.StartAsPromise
+
+                    let committed =
+                        committedResult |> Result.defaultWith (fun failure -> failwith failure.Message)
+
+                    do! workspace.WriteFile "000-apply-first.txt" "old first bytes\n"
+                    do! workspace.WriteFile "zzz-apply-second.txt" "old second bytes\n"
+
+                    let hooks: LakeFsWorkspaceSession.LakeFsSessionHooks = {
+                        Barrier =
+                            Some(fun _ point _ -> async {
+                                if point = "materialization-apply-object" then
+                                    appliedObjects <- appliedObjects + 1
+
+                                    if appliedObjects = 1 then
+                                        failwith "injected materialization apply failure"
+                            })
+                    }
+
+                    let factory =
+                        LakeFsWorkspaceSession.createFactoryWithHooks
+                            lakeFsProviderOptions
+                            hooks
+                            (LakeFsCredentials.fixedConnection (connection ()))
+
+                    let! opened =
+                        factory.Open
+                            workspace.Binding
+                            (OperationContext.detached "materialization-apply-open")
+                        |> Async.StartAsPromise
+
+                    let session = expectValue "materialization apply open" opened
+                    let stateDirectory = stateDirectoryForBinding workspace.Binding
+                    let before =
+                        match LakeFsWorkspaceIndex.load stateDirectory with
+                        | LakeFsWorkspaceIndex.Loaded index -> index
+                        | _ -> failwith "Expected an index before apply failure."
+
+                    let! statusResult =
+                        session.Core.GetStatus(OperationContext.detached "materialization-apply-status")
+                        |> Async.StartAsPromise
+
+                    let status = expectValue "materialization apply status" statusResult
+                    let! switched =
+                        session.Core.SwitchRef
+                            {
+                                TargetRef = ProviderRef.tryCreate $"lakefs:{branchName}" |> Result.defaultWith failwith
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (OperationContext.detached "materialization-apply-switch")
+                        |> Async.StartAsPromise
+
+                    let outcome, failure =
+                        match switched with
+                        | PartiallySucceeded(outcome, failure) -> outcome, failure
+                        | Failed failure ->
+                            failwith $"Visible apply mutation was concealed as Failed: {failure.Code}"
+                        | Succeeded _ -> failwith "Injected apply failure unexpectedly switched the workspace."
+
+                    Vitest.expect(appliedObjects).toBe 1
+                    Vitest.expect(failure.StateChanged).toBe true
+                    Vitest.expect(failure.Code).toBe "materialization_apply_failed"
+                    Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "reconcile_materialization")
+                    Vitest.expect(outcome.AffectedPaths).toEqual [| "000-apply-first.txt" |]
+                    Vitest.expect(failure.AffectedPaths).toEqual [| "000-apply-first.txt" |]
+                    let evidence = failure.RevisionEvidence |> Map.ofArray
+                    Vitest.expect(evidence["expected_workspace"] |> RevisionId.value).toEqual before.WorkspaceRevision.Value
+                    Vitest.expect(evidence["observed_materialization"] |> RevisionId.value).toBe committed.Id
+
+                    let! first = workspace.ReadFile "000-apply-first.txt"
+                    let! second = workspace.ReadFile "zzz-apply-second.txt"
+                    Vitest.expect(first).toEqual(Some "new first bytes\n")
+                    Vitest.expect(second).toEqual(Some "old second bytes\n")
+
+                    match LakeFsWorkspaceIndex.load stateDirectory with
+                    | LakeFsWorkspaceIndex.Loaded after ->
+                        Vitest.expect(after.WorkspaceRevision).toEqual before.WorkspaceRevision
+                        Vitest.expect(after.Entries).toEqual before.Entries
+                    | _ -> failwith "Expected apply failure to preserve the published index."
+
+                    let transactionsDirectory = NodePath.join [| stateDirectory; "transactions" |]
+                    let recoveryDirectory = NodePath.join [| stateDirectory; "recovery" |]
+                    Vitest.expect(NodeFileSystem.readdirSync transactionsDirectory).toEqual [||]
+                    let recoveryFiles = NodeFileSystem.readdirSync recoveryDirectory
+                    Vitest.expect(recoveryFiles.Length).toBe 1
+                    let recoveryText =
+                        NodeFileSystem.readFileSync
+                            (NodePath.join [| recoveryDirectory; recoveryFiles[0] |])
+                            NodeFileSystem.TextEncoding.Utf8
+
+                    Vitest.expect(recoveryText.Contains "000-apply-first.txt").toBe true
+                    Vitest.expect(recoveryText.Contains "zzz-apply-second.txt").toBe false
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "lakeFS materialization apply cancellation reports exact partial recovery",
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
+            fun () -> promise {
+                if not (integrationEnabled ()) then
+                    return failwith "lakeFS integration skipped: Docker not available"
+
+                let harness = createLakeFsHarness ()
+                let cancellation = OperationCancellation.Source()
+                let mutable appliedObjects = 0
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let parsed =
+                        LakeFsTypes.LakeFsLocation.tryParse workspace.Binding.Location.ProviderLocation
+                        |> Result.defaultWith failwith
+
+                    let branchName = "materialization-apply-cancellation"
+                    let! created =
+                        LakeFsApi.createBranch
+                            (connection ())
+                            parsed.Repository
+                            branchName
+                            parsed.TargetRef
+                            (OperationContext.detached "materialization-apply-cancel-create-branch")
+                        |> Async.StartAsPromise
+
+                    created |> Result.defaultWith (fun failure -> failwith failure.Message) |> ignore
+
+                    for path, content in [|
+                        "000-cancel-first.txt", "new first bytes\n"
+                        "zzz-cancel-second.txt", "new second bytes\n"
+                    |] do
+                        let! uploaded =
+                            uploadTextObject
+                                (connection ())
+                                parsed.Repository
+                                branchName
+                                path
+                                content
+                                (OperationContext.detached "materialization-apply-cancel-upload")
+                            |> Async.StartAsPromise
+
+                        uploaded |> Result.defaultWith (fun failure -> failwith failure.Message) |> ignore
+
+                    let! committedResult =
+                        LakeFsApi.commit
+                            (connection ())
+                            parsed.Repository
+                            branchName
+                            "test: apply cancellation target"
+                            (OperationContext.detached "materialization-apply-cancel-commit")
+                        |> Async.StartAsPromise
+
+                    let committed =
+                        committedResult |> Result.defaultWith (fun failure -> failwith failure.Message)
+
+                    do! workspace.WriteFile "000-cancel-first.txt" "old first bytes\n"
+                    do! workspace.WriteFile "zzz-cancel-second.txt" "old second bytes\n"
+
+                    let hooks: LakeFsWorkspaceSession.LakeFsSessionHooks = {
+                        Barrier =
+                            Some(fun _ point _ -> async {
+                                if point = "materialization-apply-object" then
+                                    appliedObjects <- appliedObjects + 1
+
+                                    if appliedObjects = 1 then
+                                        cancellation.Cancel()
+                            })
+                    }
+
+                    let factory =
+                        LakeFsWorkspaceSession.createFactoryWithHooks
+                            lakeFsProviderOptions
+                            hooks
+                            (LakeFsCredentials.fixedConnection (connection ()))
+
+                    let! opened =
+                        factory.Open
+                            workspace.Binding
+                            (OperationContext.detached "materialization-apply-cancel-open")
+                        |> Async.StartAsPromise
+
+                    let session = expectValue "materialization apply cancellation open" opened
+                    let stateDirectory = stateDirectoryForBinding workspace.Binding
+                    let before =
+                        match LakeFsWorkspaceIndex.load stateDirectory with
+                        | LakeFsWorkspaceIndex.Loaded index -> index
+                        | _ -> failwith "Expected an index before apply cancellation."
+
+                    let! statusResult =
+                        session.Core.GetStatus(OperationContext.detached "materialization-apply-cancel-status")
+                        |> Async.StartAsPromise
+
+                    let status = expectValue "materialization apply cancellation status" statusResult
+                    let switchContext =
+                        OperationContext.create
+                            "materialization-apply-cancel-switch"
+                            cancellation.Cancellation
+                            ignore
+
+                    let! switched =
+                        session.Core.SwitchRef
+                            {
+                                TargetRef = ProviderRef.tryCreate $"lakefs:{branchName}" |> Result.defaultWith failwith
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            switchContext
+                        |> Async.StartAsPromise
+
+                    let outcome, failure =
+                        match switched with
+                        | PartiallySucceeded(outcome, failure) -> outcome, failure
+                        | Failed failure ->
+                            failwith $"Visible apply cancellation was concealed as Failed: {failure.Code}"
+                        | Succeeded _ -> failwith "Canceled apply unexpectedly switched the workspace."
+
+                    Vitest.expect(appliedObjects).toBe 1
+                    Vitest.expect(failure.Category).toEqual FailureCategory.Canceled
+                    Vitest.expect(failure.StateChanged).toBe true
+                    Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "reconcile_materialization")
+                    Vitest.expect(outcome.AffectedPaths).toEqual [| "000-cancel-first.txt" |]
+                    Vitest.expect(failure.AffectedPaths).toEqual [| "000-cancel-first.txt" |]
+                    let evidence = failure.RevisionEvidence |> Map.ofArray
+                    Vitest.expect(evidence["expected_workspace"] |> RevisionId.value).toEqual before.WorkspaceRevision.Value
+                    Vitest.expect(evidence["observed_materialization"] |> RevisionId.value).toBe committed.Id
+
+                    let! first = workspace.ReadFile "000-cancel-first.txt"
+                    let! second = workspace.ReadFile "zzz-cancel-second.txt"
+                    Vitest.expect(first).toEqual(Some "new first bytes\n")
+                    Vitest.expect(second).toEqual(Some "old second bytes\n")
+
+                    match LakeFsWorkspaceIndex.load stateDirectory with
+                    | LakeFsWorkspaceIndex.Loaded after ->
+                        Vitest.expect(after.WorkspaceRevision).toEqual before.WorkspaceRevision
+                        Vitest.expect(after.Entries).toEqual before.Entries
+                    | _ -> failwith "Expected apply cancellation to preserve the published index."
+
+                    let transactionsDirectory = NodePath.join [| stateDirectory; "transactions" |]
+                    let recoveryDirectory = NodePath.join [| stateDirectory; "recovery" |]
+                    Vitest.expect(NodeFileSystem.readdirSync transactionsDirectory).toEqual [||]
+                    let recoveryFiles = NodeFileSystem.readdirSync recoveryDirectory
+                    Vitest.expect(recoveryFiles.Length).toBe 1
+                    do! harness.Cleanup()
+                with error ->
                     do! harness.Cleanup()
                     return raise error
             }

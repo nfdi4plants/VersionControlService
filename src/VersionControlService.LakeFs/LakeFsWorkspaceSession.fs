@@ -292,6 +292,50 @@ let private conflictSummary (state: SessionState) : ConflictSessionSummary optio
         (state.Index.WorkspaceRevision |> Option.map mkRevisionId)
         state.Conflict
 
+let private mapOutcomeValue (value: 'T) (outcome: OperationOutcome<'U>) : OperationOutcome<'T> = {
+    Value = value
+    Effect = outcome.Effect
+    Warnings = outcome.Warnings
+    AffectedPaths = outcome.AffectedPaths
+    ResultingRevision = outcome.ResultingRevision
+    ResultingWorkspaceVersion = outcome.ResultingWorkspaceVersion
+    Publication = outcome.Publication
+}
+
+let private localWorkspaceStatus (state: SessionState) : WorkspaceStatus =
+    let changes =
+        classifyWorkspace state
+        |> List.choose (fun change ->
+            match RepositoryPath.tryCreate change.ChangePath with
+            | Error _ -> None
+            | Ok path ->
+                let kind =
+                    match change.State with
+                    | LakeFsIndex.AddedObject -> AddedChange
+                    | LakeFsIndex.DeletedObject -> DeletedChange
+                    | _ -> ModifiedChange
+
+                Some {
+                    Path = path
+                    OldPath = None
+                    Kind = kind
+                })
+        |> List.toArray
+
+    {
+        CurrentRef =
+            Some {
+                Name = state.Index.TargetRef
+                ProviderRef = mkProviderRef $"lakefs:{state.Index.TargetRef}"
+                Kind = LocalRef
+                IsCurrent = true
+            }
+        WorkspaceVersion = workspaceVersion state
+        Changes = changes
+        ActiveConflictSession = conflictSummary state
+        Synchronization = None
+    }
+
 let private synchronizationState (state: SessionState) (targetHead: string option) : SynchronizationState =
     let baseRevision = state.Index.BaseRevision
     let workspaceRevision = state.Index.WorkspaceRevision
@@ -918,38 +962,115 @@ let private restorePaths (state: SessionState) (request: RestoreRequest) (contex
                     let workspaceRef =
                         state.Index.WorkspaceRevision |> Option.defaultValue state.Index.WorkspaceBranch
 
-                    let mutable failure: OperationFailure option = None
+                    let! listed =
+                        LakeFsApi.listObjects
+                            resolved
+                            state.Index.Repository
+                            workspaceRef
+                            state.Index.Prefix
+                            context
 
-                    for path in request.Paths do
-                        if failure.IsNone then
-                            let pathValue = RepositoryPath.value path
-                            let downloadedPath = temporaryPath state "restore"
+                    match listed with
+                    | Error failure -> return Failed failure
+                    | Ok stats ->
+                        let statsByPath =
+                            stats
+                            |> Array.choose (fun stat ->
+                                repositoryPathOfKey state stat.Path
+                                |> Option.map (fun path -> RepositoryPath.value path, stat))
+                            |> Map.ofArray
 
-                            let! downloaded =
-                                LakeFsApi.downloadObjectToFile
-                                    resolved
-                                    state.Index.Repository
-                                    workspaceRef
-                                    (objectKey state pathValue)
-                                    downloadedPath
-                                    context
+                        let materializationObjects =
+                            ResizeArray<LakeFsMaterialization.MaterializationObject>()
 
-                            match downloaded with
-                            | Ok _ ->
+                        let removals = ResizeArray<RepositoryPath * string>()
+                        let mutable validationFailure: OperationFailure option = None
+
+                        for path in request.Paths do
+                            if validationFailure.IsNone then
                                 match
-                                    LakeFsPathSafety.replaceFileFromTemporary
+                                    LakeFsPathSafety.resolveWorkspacePath
                                         state.Binding.WorkspaceRoot
                                         path
-                                        downloadedPath
                                 with
-                                | Ok() -> ()
-                                | Error replaceFailure -> failure <- Some replaceFailure
-                            | Error notFound when notFound.Category = NotFound -> removeLocal state pathValue
-                            | Error other -> failure <- Some other
+                                | Error failure -> validationFailure <- Some failure
+                                | Ok targetPath ->
+                                    match statsByPath.TryFind(RepositoryPath.value path) with
+                                    | Some stat ->
+                                        materializationObjects.Add {
+                                            Path = path
+                                            ObjectKey = stat.Path
+                                            TargetPath = targetPath
+                                            BaseChecksum = stat.Checksum
+                                            Mtime = stat.Mtime
+                                        }
+                                    | None -> removals.Add(path, targetPath)
 
-                    match failure with
-                    | Some value -> return Failed value
-                    | None -> return OperationResult.succeeded ()
+                        match validationFailure with
+                        | Some failure -> return Failed failure
+                        | None ->
+                            let transactionsDirectory =
+                                NodePath.join [| state.StateDirectory; "transactions" |]
+
+                            let! prepared =
+                                LakeFsMaterialization.prepareSelected
+                                    transactionsDirectory
+                                    state.Index
+                                    false
+                                    (materializationObjects.ToArray())
+                                    (removals.ToArray())
+                                    (fun preparedObject downloadedPath downloadContext ->
+                                        LakeFsApi.downloadObjectToFile
+                                            resolved
+                                            state.Index.Repository
+                                            workspaceRef
+                                            preparedObject.ObjectKey
+                                            downloadedPath
+                                            downloadContext)
+                                    (fun point barrierContext -> barrier state point barrierContext)
+                                    context
+
+                            match prepared with
+                            | Error failure -> return Failed failure
+                            | Ok plan ->
+                                let recoveryDirectory =
+                                    NodePath.join [| state.StateDirectory; "recovery" |]
+
+                                let! applied =
+                                    LakeFsMaterialization.apply
+                                        state.Binding.WorkspaceRoot
+                                        state.StateDirectory
+                                        recoveryDirectory
+                                        state.Index.WorkspaceRevision
+                                        workspaceRef
+                                        plan
+                                        (fun point barrierContext -> barrier state point barrierContext)
+                                        context
+
+                                match applied with
+                                | LakeFsMaterialization.Materialized(saved, affectedPaths) ->
+                                    state.Index <- saved
+
+                                    return
+                                        Succeeded {
+                                            OperationOutcome.performed () with
+                                                AffectedPaths = affectedPaths
+                                                ResultingWorkspaceVersion = Some(workspaceVersion state)
+                                        }
+                                | LakeFsMaterialization.MaterializationFailed failure ->
+                                    return Failed failure
+                                | LakeFsMaterialization.MaterializationPartiallyApplied(saved, failure) ->
+                                    saved |> Option.iter (fun index -> state.Index <- index)
+
+                                    return
+                                        PartiallySucceeded(
+                                            {
+                                                OperationOutcome.performed () with
+                                                    AffectedPaths = failure.AffectedPaths
+                                                    ResultingWorkspaceVersion = Some(workspaceVersion state)
+                                            },
+                                            failure
+                                        )
     }
 
 let private listRefs (state: SessionState) (context: OperationContext) =
@@ -981,19 +1102,48 @@ let private listRefs (state: SessionState) (context: OperationContext) =
 
 /// Downloads the given ref's objects (under the prefix) into the workspace and
 /// rebuilds the index entries. Used by open, switch, and update.
+let private materializationRecoveryFailure
+    (expectedRevision: string option)
+    (observedRevision: string)
+    (affectedPaths: string[])
+    (source: OperationFailure)
+    =
+    {
+        source with
+            StateChanged = true
+            Retryable = true
+            AffectedPaths = affectedPaths
+            RecoveryAction =
+                Some {
+                    Code = "reconcile_materialization"
+                    Instructions =
+                        Some
+                            "Refresh the workspace, inspect the listed paths, and retry materialization deliberately."
+                }
+            RevisionEvidence = [|
+                yield! source.RevisionEvidence
+                yield!
+                    expectedRevision
+                    |> Option.map (fun revision -> "expected_workspace", mkRevisionId revision)
+                    |> Option.toList
+                "observed_materialization", mkRevisionId observedRevision
+            |]
+    }
+
 let private materializeRef
     (state: SessionState)
     (resolved: LakeFsConnection)
     (reference: string)
     (preserveExistingFiles: bool)
+    (finalizeIndex: LakeFsIndex.WorkspaceIndex -> LakeFsIndex.WorkspaceIndex)
     (context: OperationContext)
-    : Async<Result<unit, OperationFailure>> =
+    : Async<OperationResult<unit>> =
     async {
         let! objects =
             LakeFsApi.listObjects resolved state.Index.Repository reference state.Index.Prefix context
 
         match objects with
-        | Error failure -> return Error failure
+        | Error failure -> return Failed failure
         | Ok stats ->
             let keyedPaths =
                 stats
@@ -1006,89 +1156,124 @@ let private materializeRef
                 |> List.toArray
                 |> LakeFsPathSafety.validateMaterializationPaths
             with
-            | Error failure -> return Error failure
+            | Error failure -> return Failed failure
             | Ok() ->
-                let mutable failure: OperationFailure option = None
-                let entries = ResizeArray<LakeFsIndex.IndexEntry>()
+                let mutable validationFailure: OperationFailure option = None
+                let materializationObjects = ResizeArray<LakeFsMaterialization.MaterializationObject>()
+                let removals = ResizeArray<RepositoryPath * string>()
 
                 for repositoryPath, stat in keyedPaths do
-                    if failure.IsNone then
-                        let path = RepositoryPath.value repositoryPath
-                        let downloadedPath = temporaryPath state "materialize"
-                        let! downloaded =
-                            LakeFsApi.downloadObjectToFile
-                                resolved
-                                state.Index.Repository
-                                reference
-                                stat.Path
-                                downloadedPath
-                                context
+                    if validationFailure.IsNone then
+                        match
+                            LakeFsPathSafety.resolveWorkspacePath
+                                state.Binding.WorkspaceRoot
+                                repositoryPath
+                        with
+                        | Error pathFailure -> validationFailure <- Some pathFailure
+                        | Ok targetPath ->
+                            materializationObjects.Add {
+                                Path = repositoryPath
+                                ObjectKey = stat.Path
+                                TargetPath = targetPath
+                                BaseChecksum = stat.Checksum
+                                Mtime = stat.Mtime
+                            }
 
-                        match downloaded with
-                        | Error downloadFailure -> failure <- Some downloadFailure
-                        | Ok transfer ->
-                            let targetPath =
+                for entry in state.Index.Entries do
+                    if
+                        validationFailure.IsNone
+                        && not (
+                            keyedPaths
+                            |> List.exists (fun (path, _) -> RepositoryPath.value path = entry.Path)
+                        )
+                    then
+                        match RepositoryPath.tryCreate entry.Path with
+                        | Error message ->
+                            validationFailure <-
+                                Some {
+                                    OperationFailure.create
+                                        Validation
+                                        "unsafe_repository_path"
+                                        message with
+                                        AffectedPaths = [| entry.Path |]
+                                }
+                        | Ok removalPath ->
+                            match
                                 LakeFsPathSafety.resolveWorkspacePath
                                     state.Binding.WorkspaceRoot
-                                    repositoryPath
+                                    removalPath
+                            with
+                            | Error pathFailure -> validationFailure <- Some pathFailure
+                            | Ok targetPath -> removals.Add(removalPath, targetPath)
 
-                            match targetPath with
-                            | Error pathFailure -> failure <- Some pathFailure
-                            | Ok targetPath when preserveExistingFiles && NodeFileSystem.existsSync targetPath ->
-                                try
-                                    NodeFileSystem.unlinkSync downloadedPath
-
-                                    entries.Add {
-                                        Path = path
-                                        BaseChecksum = stat.Checksum
-                                        LocalHash = transfer.Sha256
-                                        LocalSize = transfer.BytesCopied
-                                        LocalMtimeMs = stat.Mtime
-                                    }
-                                with error ->
-                                    failure <-
-                                        Some(
-                                            OperationFailure.createRedacted
-                                                ProviderError
-                                                "provider_state_cleanup_failed"
-                                                $"Cleaning a prepared lakeFS object failed: {error.Message}"
-                                        )
-                            | Ok _ ->
-                                match
-                                    LakeFsPathSafety.replaceFileFromTemporary
-                                        state.Binding.WorkspaceRoot
-                                        repositoryPath
-                                        downloadedPath
-                                with
-                                | Error replaceFailure -> failure <- Some replaceFailure
-                                | Ok() ->
-                                    entries.Add {
-                                        Path = path
-                                        BaseChecksum = stat.Checksum
-                                        LocalHash = transfer.Sha256
-                                        LocalSize = transfer.BytesCopied
-                                        LocalMtimeMs = stat.Mtime
-                                    }
-
-                match failure with
-                | Some value -> return Error value
+                match validationFailure with
+                | Some failure -> return Failed failure
                 | None ->
-                    // Remove previously indexed files that no longer exist on the ref.
-                    for entry in state.Index.Entries do
-                        if
-                            not (
-                                keyedPaths
-                                |> List.exists (fun (path, _) -> RepositoryPath.value path = entry.Path)
-                            )
-                        then
-                            removeLocal state entry.Path
+                    let transactionsDirectory =
+                        NodePath.join [| state.StateDirectory; "transactions" |]
 
-                    state.Index <- {
-                        state.Index with
-                            Entries = entries.ToArray()
-                    }
+                    let! prepared =
+                        LakeFsMaterialization.prepare
+                            transactionsDirectory
+                            state.Index
+                            preserveExistingFiles
+                            (materializationObjects.ToArray())
+                            (removals.ToArray())
+                            (fun preparedObject downloadedPath downloadContext ->
+                                LakeFsApi.downloadObjectToFile
+                                    resolved
+                                    state.Index.Repository
+                                    reference
+                                    preparedObject.ObjectKey
+                                    downloadedPath
+                                    downloadContext)
+                            (fun point barrierContext -> barrier state point barrierContext)
+                            context
 
-                    return Ok()
+                    match prepared with
+                    | Error failure -> return Failed failure
+                    | Ok plan ->
+                        let plan = {
+                            plan with
+                                NextIndex = finalizeIndex plan.NextIndex
+                        }
+
+                        let recoveryDirectory =
+                            NodePath.join [| state.StateDirectory; "recovery" |]
+
+                        let! applied =
+                            LakeFsMaterialization.apply
+                                state.Binding.WorkspaceRoot
+                                state.StateDirectory
+                                recoveryDirectory
+                                state.Index.WorkspaceRevision
+                                reference
+                                plan
+                                (fun point barrierContext -> barrier state point barrierContext)
+                                context
+
+                        match applied with
+                        | LakeFsMaterialization.Materialized(saved, affectedPaths) ->
+                            state.Index <- saved
+
+                            return
+                                Succeeded {
+                                    OperationOutcome.performed () with
+                                        AffectedPaths = affectedPaths
+                                }
+                        | LakeFsMaterialization.MaterializationFailed failure ->
+                            return Failed failure
+                        | LakeFsMaterialization.MaterializationPartiallyApplied(saved, failure) ->
+                            saved |> Option.iter (fun index -> state.Index <- index)
+
+                            return
+                                PartiallySucceeded(
+                                    {
+                                        OperationOutcome.performed () with
+                                            AffectedPaths = failure.AffectedPaths
+                                    },
+                                    failure
+                                )
     }
 
 // ---------------------------------------------------------------------------
@@ -1195,32 +1380,47 @@ let private switchWorkspaceToRef
     (context: OperationContext)
     =
     async {
-        let! materialized = materializeRef state resolved targetRevision false context
+        let expectedWorkspace = state.Index.WorkspaceRevision
+        let finalizeIndex (index: LakeFsIndex.WorkspaceIndex) = {
+            index with
+                TargetRef = targetName
+                BaseRevision = Some targetRevision
+                WorkspaceRevision = Some targetRevision
+        }
+
+        let! materialized =
+            materializeRef state resolved targetRevision false finalizeIndex context
 
         match materialized with
-        | Error failure -> return Error failure
-        | Ok() ->
+        | Failed failure -> return Failed failure
+        | PartiallySucceeded(outcome, failure) ->
+            return PartiallySucceeded(outcome, failure)
+        | Succeeded materializationOutcome ->
             let! reset =
                 resetOwnedWorkspaceBranch
                     state
                     resolved
-                    state.Index.WorkspaceRevision
+                    expectedWorkspace
                     targetRevision
                     context
 
             match reset with
-            | Error failure -> return Error { failure with StateChanged = true }
+            | Error failure ->
+                return
+                    PartiallySucceeded(
+                        materializationOutcome,
+                        materializationRecoveryFailure
+                            expectedWorkspace
+                            targetRevision
+                            materializationOutcome.AffectedPaths
+                            failure
+                    )
             | Ok() ->
-                state.Index <- {
-                    state.Index with
-                        TargetRef = targetName
-                        BaseRevision = Some targetRevision
-                        WorkspaceRevision = Some targetRevision
-                }
-
-                match saveIndex state with
-                | Error failure -> return Error { failure with StateChanged = true }
-                | Ok() -> return Ok()
+                return
+                    Succeeded {
+                        materializationOutcome with
+                            ResultingWorkspaceVersion = Some(workspaceVersion state)
+                    }
     }
 
 let private createRef (state: SessionState) (request: CreateRefRequest) (context: OperationContext) =
@@ -1263,8 +1463,21 @@ let private createRef (state: SessionState) (request: CreateRefRequest) (context
                                 switchWorkspaceToRef state resolved request.Name branch.CommitId context
 
                             match switched with
-                            | Error failure -> return Failed { failure with StateChanged = true }
-                            | Ok() ->
+                            | Failed failure -> return Failed { failure with StateChanged = true }
+                            | PartiallySucceeded(outcome, failure) ->
+                                let logicalRef = {
+                                    Name = request.Name
+                                    ProviderRef = mkProviderRef $"lakefs:{request.Name}"
+                                    Kind = LocalRef
+                                    IsCurrent = false
+                                }
+
+                                return
+                                    PartiallySucceeded(
+                                        mapOutcomeValue logicalRef outcome,
+                                        { failure with StateChanged = true }
+                                    )
+                            | Succeeded _ ->
                                 return
                                     OperationResult.succeeded {
                                         Name = request.Name
@@ -1343,8 +1556,14 @@ let private switchRef (state: SessionState) (request: SwitchRefRequest) (context
                         switchWorkspaceToRef state resolved targetName targetBranch.CommitId context
 
                     match switched with
-                    | Error failure -> return Failed failure
-                    | Ok() -> return! getStatus state context
+                    | Failed failure -> return Failed failure
+                    | PartiallySucceeded(outcome, failure) ->
+                        return
+                            PartiallySucceeded(
+                                mapOutcomeValue (localWorkspaceStatus state) outcome,
+                                failure
+                            )
+                    | Succeeded _ -> return! getStatus state context
     }
 
 let private getDiffSummary (state: SessionState) (context: OperationContext) =
@@ -1746,32 +1965,55 @@ let private update (state: SessionState) (request: UpdateRequest) (context: Oper
                                                     else
                                                         state.Index.WorkspaceBranch
 
+                                                let resultingWorkspace =
+                                                    if canFastForwardToTarget then
+                                                        head
+                                                    else
+                                                        mergeResult.Reference
+
+                                                let finalizeIndex (index: LakeFsIndex.WorkspaceIndex) = {
+                                                    index with
+                                                        BaseRevision = Some head
+                                                        WorkspaceRevision = Some resultingWorkspace
+                                                }
+
                                                 let! materialized =
-                                                    materializeRef state resolved materializationRef false context
+                                                    materializeRef
+                                                        state
+                                                        resolved
+                                                        materializationRef
+                                                        false
+                                                        finalizeIndex
+                                                        context
 
                                                 match materialized with
-                                                | Error failure ->
-                                                    return Failed { failure with StateChanged = true }
-                                                | Ok() ->
-                                                    let resultingWorkspace =
-                                                        if canFastForwardToTarget then
-                                                            head
-                                                        else
-                                                            mergeResult.Reference
-
-                                                    state.Index <- {
-                                                        state.Index with
-                                                            BaseRevision = Some head
-                                                            WorkspaceRevision = Some resultingWorkspace
-                                                    }
-
-                                                    match saveIndex state with
-                                                    | Error failure ->
-                                                        return Failed { failure with StateChanged = true }
-                                                    | Ok() ->
-                                                        return
+                                                | Failed failure ->
+                                                    let outcome =
+                                                        OperationOutcome.performed (
                                                             synchronizationState state (Some head)
-                                                            |> OperationResult.succeeded
+                                                        )
+
+                                                    return
+                                                        PartiallySucceeded(
+                                                            outcome,
+                                                            materializationRecoveryFailure
+                                                                expectedWorkspace
+                                                                materializationRef
+                                                                [||]
+                                                                failure
+                                                        )
+                                                | PartiallySucceeded(outcome, failure) ->
+                                                    return
+                                                        PartiallySucceeded(
+                                                            mapOutcomeValue
+                                                                (synchronizationState state (Some head))
+                                                                outcome,
+                                                            failure
+                                                        )
+                                                | Succeeded _ ->
+                                                    return
+                                                        synchronizationState state (Some head)
+                                                        |> OperationResult.succeeded
     }
 
 let private publish (state: SessionState) (request: PublishRequest) (context: OperationContext) =
@@ -1994,23 +2236,41 @@ let private completeConflictFinalize
     (context: OperationContext)
     =
     async {
+        let finalizeIndex (index: LakeFsIndex.WorkspaceIndex) = {
+            index with
+                BaseRevision = Some targetRevision
+                WorkspaceRevision = Some resultingRevision
+        }
+
         let! materialized =
-            materializeRef state resolved state.Index.WorkspaceBranch false context
+            materializeRef
+                state
+                resolved
+                state.Index.WorkspaceBranch
+                false
+                finalizeIndex
+                context
 
         match materialized with
-        | Error failure -> return Failed { failure with StateChanged = true }
-        | Ok() ->
-            state.Index <- {
-                state.Index with
-                    BaseRevision = Some targetRevision
-                    WorkspaceRevision = Some resultingRevision
-            }
-
-            match saveIndex state with
-            | Error failure -> return Failed { failure with StateChanged = true }
-            | Ok() ->
-                state.Conflict <- None
-                return OperationResult.succeeded (Some(mkRevisionId resultingRevision))
+        | Failed failure ->
+            return
+                PartiallySucceeded(
+                    OperationOutcome.performed (Some(mkRevisionId resultingRevision)),
+                    materializationRecoveryFailure
+                        state.Index.WorkspaceRevision
+                        resultingRevision
+                        [||]
+                        failure
+                )
+        | PartiallySucceeded(outcome, failure) ->
+            return
+                PartiallySucceeded(
+                    mapOutcomeValue (Some(mkRevisionId resultingRevision)) outcome,
+                    failure
+                )
+        | Succeeded _ ->
+            state.Conflict <- None
+            return OperationResult.succeeded (Some(mkRevisionId resultingRevision))
     }
 
 let private partialConflictFinalize
@@ -2450,7 +2710,7 @@ let private openSessionFromStateDirectory
                         LakeFsApi.getBranch resolved location.Repository location.TargetRef context
 
                     match targetBranch with
-                    | Error failure -> return Error failure
+                    | Error failure -> return Failed failure
                     | Ok target ->
                         let ownershipToken = LakeFsIndex.createOwnershipToken ()
                         let workspaceBranch = workspaceBranchName binding.WorkspaceRoot ownershipToken
@@ -2464,7 +2724,7 @@ let private openSessionFromStateDirectory
                                 context
 
                         match created with
-                        | Error failure -> return Error failure
+                        | Error failure -> return Failed failure
                         | Ok() ->
                             if not (NodeFileSystem.existsSync binding.WorkspaceRoot) then
                                 NodeFileSystem.mkdirSync
@@ -2503,17 +2763,97 @@ let private openSessionFromStateDirectory
                                     resolved
                                     workspaceBranch
                                     preserveExistingFiles
+                                    id
                                     context
 
                             match materialized with
-                            | Error failure -> return Error failure
-                            | Ok() ->
-                                match saveIndex state with
-                                | Error failure -> return Error failure
-                                | Ok() ->
-                                    match LakeFsStateStore.markReady providerState with
-                                    | Error failure -> return Error failure
-                                    | Ok _ -> return Ok state
+                            | Failed failure ->
+                                let! deleted =
+                                    LakeFsApi.deleteBranch
+                                        resolved
+                                        state.Index.Repository
+                                        workspaceBranch
+                                        (OperationContext.detached $"{context.OperationId}-cleanup")
+
+                                match deleted with
+                                | Ok() -> return Failed failure
+                                | Error cleanupFailure ->
+                                    return
+                                        Failed {
+                                            cleanupFailure with
+                                                StateChanged = true
+                                                Retryable = true
+                                                Details =
+                                                    Array.append
+                                                        cleanupFailure.Details
+                                                        [| failure.Code; failure.Message |]
+                                                RevisionEvidence = [|
+                                                    "observed_materialization",
+                                                    mkRevisionId target.CommitId
+                                                |]
+                                                RecoveryAction =
+                                                    Some {
+                                                        Code = "review_workspace_branch"
+                                                        Instructions =
+                                                            Some
+                                                                "Review and remove the provider-owned workspace branch before retrying."
+                                                    }
+                                        }
+                            | PartiallySucceeded(outcome, failure) ->
+                                let indexPreparation =
+                                    match LakeFsIndex.load state.StateDirectory with
+                                    | LakeFsIndex.Loaded saved ->
+                                        state.Index <- saved
+                                        Ok()
+                                    | LakeFsIndex.Missing ->
+                                        match LakeFsIndex.save state.StateDirectory state.Index with
+                                        | Ok saved ->
+                                            state.Index <- saved
+                                            Ok()
+                                        | Error message -> Error message
+                                    | LakeFsIndex.Corrupt message -> Error message
+
+                                let readiness =
+                                    match indexPreparation with
+                                    | Ok() -> LakeFsStateStore.markReady providerState
+                                    | Error message ->
+                                        Error(
+                                            OperationFailure.createRedacted
+                                                ProviderError
+                                                "index_write_failed"
+                                                message
+                                        )
+                                let extraDetails = [|
+                                    match indexPreparation with
+                                    | Error message -> yield Redaction.redact message
+                                    | Ok() -> ()
+
+                                    match readiness with
+                                    | Error readyFailure -> yield readyFailure.Code
+                                    | Ok _ -> ()
+                                |]
+
+                                return
+                                    PartiallySucceeded(
+                                        mapOutcomeValue state outcome,
+                                        {
+                                            failure with
+                                                Details = Array.append failure.Details extraDetails
+                                        }
+                                    )
+                            | Succeeded outcome ->
+                                match LakeFsStateStore.markReady providerState with
+                                | Error failure ->
+                                    return
+                                        PartiallySucceeded(
+                                            mapOutcomeValue state outcome,
+                                            materializationRecoveryFailure
+                                                state.Index.WorkspaceRevision
+                                                target.CommitId
+                                                outcome.AffectedPaths
+                                                failure
+                                        )
+                                | Ok _ -> return OperationResult.succeeded state
                 }
 
                 match LakeFsIndex.load providerState.StateDirectory with
@@ -2564,8 +2904,15 @@ let private openSessionFromStateDirectory
                         let! created = createOwnedState [||]
 
                         match created with
-                        | Error failure -> return Failed failure
-                        | Ok state -> return OperationResult.succeeded (createSessionFromState state)
+                        | Failed failure -> return Failed failure
+                        | PartiallySucceeded(outcome, failure) ->
+                            return
+                                PartiallySucceeded(
+                                    mapOutcomeValue (createSessionFromState outcome.Value) outcome,
+                                    failure
+                                )
+                        | Succeeded outcome ->
+                            return Succeeded(mapOutcomeValue (createSessionFromState outcome.Value) outcome)
     }
 
 let openSession

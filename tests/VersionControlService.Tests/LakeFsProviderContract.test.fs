@@ -13,6 +13,7 @@ open Vitest
 module LakeFsApi = VersionControlService.LakeFs.LakeFsApi
 module LakeFsCredentials = VersionControlService.LakeFs.LakeFsCredentials
 module LakeFsConflictSession = VersionControlService.LakeFs.LakeFsConflictSession
+module LakeFsMaterialization = VersionControlService.LakeFs.LakeFsMaterialization
 module LakeFsProviderOptions = VersionControlService.LakeFs.LakeFsProviderOptions
 module LakeFsPathSafety = VersionControlService.LakeFs.LakeFsPathSafety
 module LakeFsStateStore = VersionControlService.LakeFs.LakeFsStateStore
@@ -28,6 +29,12 @@ let private getEnvironmentVariable (_name: string) : string = jsNative
 
 let private fsPromisesDynamic: obj = importAll "fs/promises"
 let private osDynamic: obj = importAll "os"
+
+[<Emit("(() => { const fs = require('node:fs'); const moduleApi = require('node:module'); const original = fs.renameSync; let pending = true; fs.renameSync = (...args) => { if (pending) { pending = false; const error = new Error('injected cross-volume rename'); error.code = 'EXDEV'; throw error; } return original(...args); }; moduleApi.syncBuiltinESMExports(); return () => { fs.renameSync = original; moduleApi.syncBuiltinESMExports(); }; })()")>]
+let private injectNextCrossVolumeRename () : (unit -> unit) = jsNative
+
+[<Emit("((targetPath) => { const fs = require('node:fs'); const moduleApi = require('node:module'); const originalRename = fs.renameSync; const originalLstat = fs.lstatSync; let installed = false; fs.renameSync = (...args) => { const result = originalRename(...args); if (args[1] === targetPath) installed = true; return result; }; fs.lstatSync = (path, ...args) => { const stats = originalLstat(path, ...args); if (installed && path === targetPath) return new Proxy(stats, { get(value, property) { if (property === 'isSymbolicLink') return () => true; return Reflect.get(value, property); } }); return stats; }; moduleApi.syncBuiltinESMExports(); return () => { fs.renameSync = originalRename; fs.lstatSync = originalLstat; moduleApi.syncBuiltinESMExports(); }; })($0)")>]
+let private injectPostRenameLinkObservation (_targetPath: string) : (unit -> unit) = jsNative
 
 let lakeFsProviderOptions: LakeFsProviderOptions.LakeFsProviderOptions = {
     StateRoot = join [| osDynamic?tmpdir () |> unbox<string>; "vcs-lakefs-provider-state" |]
@@ -859,6 +866,315 @@ Vitest.describe (
                     | Error failure -> Vitest.expect(failure.Code).toBe "path_collision"
                     | Ok () -> failwith "Expected a macOS normalization collision."
 
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+)
+
+Vitest.describe (
+    "lakeFS materialization",
+    fun () ->
+        Vitest.test (
+            "lakeFS materialization reports post-replacement validation as changed",
+            fun () -> promise {
+                let! root = createTempDirectoryAsync ()
+                let workspaceRoot = join [| root; "workspace" |]
+                let externalRoot = join [| root; "external-state" |]
+                let preparedPath = join [| externalRoot; "prepared-object.tmp" |]
+                let targetPath = join [| workspaceRoot; "post-rename.bin" |]
+                let restoreFileSystem = injectPostRenameLinkObservation targetPath
+
+                try
+                    do! ensureDirectoryAsync workspaceRoot
+                    do! ensureDirectoryAsync externalRoot
+                    do! writeUtf8FileAsync targetPath "old target bytes\n"
+                    do! writeUtf8FileAsync preparedPath "installed target bytes\n"
+
+                    let failure =
+                        match
+                            LakeFsPathSafety.replaceFileFromTemporary
+                                workspaceRoot
+                                (repositoryPath "post-rename.bin")
+                                preparedPath
+                        with
+                        | Ok() -> failwith "Post-rename validation unexpectedly succeeded."
+                        | Error failure -> failure
+
+                    Vitest.expect(failure.StateChanged).toBe true
+                    Vitest.expect(failure.AffectedPaths).toEqual [| "post-rename.bin" |]
+                    restoreFileSystem ()
+                    let! installed = tryReadUtf8FileAsync targetPath
+                    Vitest.expect(installed).toEqual(Some "installed target bytes\n")
+                    do! removeDirectoryAsync root
+                with error ->
+                    restoreFileSystem ()
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "lakeFS materialization crosses state volumes atomically",
+            fun () -> promise {
+                let! root = createTempDirectoryAsync ()
+                let workspaceRoot = join [| root; "workspace" |]
+                let externalRoot = join [| root; "external-state" |]
+                let preparedPath = join [| externalRoot; "prepared-object.tmp" |]
+                let targetPath = join [| workspaceRoot; "cross-volume.bin" |]
+                let restoreRename = injectNextCrossVolumeRename ()
+
+                try
+                    do! ensureDirectoryAsync workspaceRoot
+                    do! ensureDirectoryAsync externalRoot
+                    do! writeUtf8FileAsync preparedPath "prepared cross-volume bytes\n"
+
+                    match
+                        LakeFsPathSafety.replaceFileFromTemporary
+                            workspaceRoot
+                            (repositoryPath "cross-volume.bin")
+                            preparedPath
+                    with
+                    | Error failure ->
+                        failwith $"Cross-volume materialization failed ({failure.Code}): {failure.Message}"
+                    | Ok() -> ()
+
+                    let! target = tryReadUtf8FileAsync targetPath
+                    Vitest.expect(target).toEqual(Some "prepared cross-volume bytes\n")
+                    Vitest.expect(
+                        RuntimeNodeFileSystem.readdirSync workspaceRoot
+                        |> Array.filter (fun path -> path.Contains ".vcs-")
+                    ).toEqual [||]
+                    restoreRename ()
+                    do! removeDirectoryAsync root
+                with error ->
+                    restoreRename ()
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "lakeFS materialization is transactional",
+            fun () -> promise {
+                let! root = createTempDirectoryAsync ()
+                let workspaceRoot = join [| root; "workspace" |]
+                let stateDirectory = join [| root; "state" |]
+                let transactionsDirectory = join [| stateDirectory; "transactions" |]
+                let recoveryDirectory = join [| stateDirectory; "recovery" |]
+                let firstPath = repositoryPath "000-first.txt"
+                let secondPath = repositoryPath "zzz-second.txt"
+                let firstTarget = join [| workspaceRoot; RepositoryPath.value firstPath |]
+                let secondTarget = join [| workspaceRoot; RepositoryPath.value secondPath |]
+
+                try
+                    do! ensureDirectoryAsync workspaceRoot
+                    do! ensureDirectoryAsync stateDirectory
+                    do! ensureDirectoryAsync transactionsDirectory
+                    do! ensureDirectoryAsync recoveryDirectory
+                    do! writeUtf8FileAsync firstTarget "old first bytes\n"
+                    do! writeUtf8FileAsync secondTarget "old second bytes\n"
+
+                    let currentIndex: LakeFsWorkspaceIndex.WorkspaceIndex = {
+                        SchemaVersion = LakeFsWorkspaceIndex.CurrentSchemaVersion
+                        Repository = "transactional-repository"
+                        TargetRef = "main"
+                        Prefix = ""
+                        WorkspaceBranch = "vcs-workspace-transactional"
+                        OwnershipToken = "transactional-ownership-token"
+                        BaseRevision = Some "expected-revision"
+                        WorkspaceRevision = Some "expected-revision"
+                        Generation = 0
+                        Entries = [||]
+                    }
+
+                    let objects: LakeFsMaterialization.MaterializationObject[] = [|
+                        {
+                            Path = firstPath
+                            ObjectKey = "000-first.txt"
+                            TargetPath = firstTarget
+                            BaseChecksum = "first-checksum"
+                            Mtime = 1.0
+                        }
+                        {
+                            Path = secondPath
+                            ObjectKey = "zzz-second.txt"
+                            TargetPath = secondTarget
+                            BaseChecksum = "second-checksum"
+                            Mtime = 2.0
+                        }
+                    |]
+
+                    let mutable downloadCount = 0
+                    let! failedPrepare =
+                        LakeFsMaterialization.prepare
+                            transactionsDirectory
+                            currentIndex
+                            false
+                            objects
+                            [||]
+                            (fun prepared temporaryPath _ -> async {
+                                downloadCount <- downloadCount + 1
+
+                                if downloadCount = 2 then
+                                    return
+                                        Error(
+                                            OperationFailure.create
+                                                Network
+                                                "injected_second_download_failure"
+                                                "The second prepared object failed."
+                                        )
+                                else
+                                    RuntimeNodeFileSystem.writeUtf8FileExclusiveAndFlushSync
+                                        temporaryPath
+                                        $"new {RepositoryPath.value prepared.Path} bytes\n"
+
+                                    return
+                                        Ok {
+                                            BytesCopied = 20.0
+                                            Sha256 = $"hash-{RepositoryPath.value prepared.Path}"
+                                        }
+                            })
+                            (fun _ _ -> async.Return())
+                            (context "transactional-prepare-failure")
+                        |> Async.StartAsPromise
+
+                    match failedPrepare with
+                    | Ok _ -> failwith "The injected second download failure unexpectedly prepared a plan."
+                    | Error failure ->
+                        Vitest.expect(failure.Code).toBe "injected_second_download_failure"
+                        Vitest.expect(failure.StateChanged).toBe false
+
+                    Vitest.expect(downloadCount).toBe 2
+                    let! firstBeforeApply = tryReadUtf8FileAsync firstTarget
+                    let! secondBeforeApply = tryReadUtf8FileAsync secondTarget
+                    Vitest.expect(firstBeforeApply).toEqual(Some "old first bytes\n")
+                    Vitest.expect(secondBeforeApply).toEqual(Some "old second bytes\n")
+                    Vitest.expect(RuntimeNodeFileSystem.readdirSync transactionsDirectory).toEqual [||]
+
+                    let! prepared =
+                        LakeFsMaterialization.prepare
+                            transactionsDirectory
+                            currentIndex
+                            false
+                            objects
+                            [||]
+                            (fun prepared temporaryPath _ -> async {
+                                let content =
+                                    if prepared.Path = firstPath then
+                                        "new first bytes\n"
+                                    else
+                                        "new second bytes\n"
+
+                                RuntimeNodeFileSystem.writeUtf8FileExclusiveAndFlushSync temporaryPath content
+
+                                return
+                                    Ok {
+                                        BytesCopied = float content.Length
+                                        Sha256 = $"hash-{RepositoryPath.value prepared.Path}"
+                                    }
+                            })
+                            (fun _ _ -> async.Return())
+                            (context "transactional-prepare-success")
+                        |> Async.StartAsPromise
+
+                    let plan = prepared |> Result.defaultWith (fun failure -> failwith failure.Message)
+                    let mutable applied = 0
+                    let! appliedResult =
+                        LakeFsMaterialization.apply
+                            workspaceRoot
+                            stateDirectory
+                            recoveryDirectory
+                            currentIndex.WorkspaceRevision
+                            "observed-revision"
+                            plan
+                            (fun point _ -> async {
+                                if point = "materialization-apply-object" then
+                                    applied <- applied + 1
+
+                                    if applied = 1 then
+                                        failwith "injected apply failure"
+                            })
+                            (context "transactional-apply-failure")
+                        |> Async.StartAsPromise
+
+                    match appliedResult with
+                    | LakeFsMaterialization.MaterializationPartiallyApplied(None, failure) ->
+                        Vitest.expect(failure.Code).toBe "materialization_apply_failed"
+                        Vitest.expect(failure.StateChanged).toBe true
+                        Vitest.expect(failure.AffectedPaths).toEqual [| "000-first.txt" |]
+                        Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "reconcile_materialization")
+                    | LakeFsMaterialization.MaterializationPartiallyApplied(Some _, _) ->
+                        failwith "The index was published after an interrupted apply."
+                    | LakeFsMaterialization.MaterializationFailed failure ->
+                        failwith $"Visible apply mutation was concealed as Failed: {failure.Code}"
+                    | LakeFsMaterialization.Materialized _ ->
+                        failwith "The injected apply failure unexpectedly completed."
+
+                    let! firstAfterApply = tryReadUtf8FileAsync firstTarget
+                    let! secondAfterApply = tryReadUtf8FileAsync secondTarget
+                    Vitest.expect(firstAfterApply).toEqual(Some "new first bytes\n")
+                    Vitest.expect(secondAfterApply).toEqual(Some "old second bytes\n")
+                    Vitest.expect(RuntimeNodeFileSystem.readdirSync transactionsDirectory).toEqual [||]
+                    Vitest.expect(RuntimeNodeFileSystem.readdirSync recoveryDirectory).toHaveLength 1
+
+                    let! successfulPlanResult =
+                        LakeFsMaterialization.prepare
+                            transactionsDirectory
+                            currentIndex
+                            false
+                            objects
+                            [||]
+                            (fun prepared temporaryPath _ -> async {
+                                let content =
+                                    if prepared.Path = firstPath then
+                                        "final first bytes\n"
+                                    else
+                                        "final second bytes\n"
+
+                                RuntimeNodeFileSystem.writeUtf8FileExclusiveAndFlushSync temporaryPath content
+
+                                return
+                                    Ok {
+                                        BytesCopied = float content.Length
+                                        Sha256 = $"final-hash-{RepositoryPath.value prepared.Path}"
+                                    }
+                            })
+                            (fun _ _ -> async.Return())
+                            (context "transactional-prepare-final")
+                        |> Async.StartAsPromise
+
+                    let successfulPlan =
+                        successfulPlanResult |> Result.defaultWith (fun failure -> failwith failure.Message)
+
+                    let! successfulApply =
+                        LakeFsMaterialization.apply
+                            workspaceRoot
+                            stateDirectory
+                            recoveryDirectory
+                            currentIndex.WorkspaceRevision
+                            "observed-revision"
+                            successfulPlan
+                            (fun _ _ -> async.Return())
+                            (context "transactional-apply-final")
+                        |> Async.StartAsPromise
+
+                    match successfulApply with
+                    | LakeFsMaterialization.Materialized(saved, affectedPaths) ->
+                        Vitest.expect(affectedPaths).toEqual [| "000-first.txt"; "zzz-second.txt" |]
+                        Vitest.expect(saved.Entries.Length).toBe 2
+                    | LakeFsMaterialization.MaterializationFailed failure
+                    | LakeFsMaterialization.MaterializationPartiallyApplied(_, failure) ->
+                        failwith $"Successful materialization failed ({failure.Code}): {failure.Message}"
+
+                    match LakeFsWorkspaceIndex.load stateDirectory with
+                    | LakeFsWorkspaceIndex.Loaded saved ->
+                        Vitest.expect(saved.Entries.Length).toBe 2
+                    | _ -> failwith "Successful materialization did not publish its index."
+
+                    Vitest.expect(RuntimeNodeFileSystem.readdirSync transactionsDirectory).toEqual [||]
                     do! removeDirectoryAsync root
                 with error ->
                     do! removeDirectoryAsync root

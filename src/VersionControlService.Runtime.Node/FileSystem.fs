@@ -239,6 +239,77 @@ let writeUtf8FileExclusiveAndFlushWithIdentitySync (path: string) (content: stri
 let writeUtf8FileExclusiveAndFlushSync (path: string) (content: string) : unit =
     writeUtf8FileExclusiveAndFlushWithIdentitySync path content |> ignore
 
+/// Copies a regular file into a new destination inode, never replacing an
+/// existing path, and flushes the copied bytes before returning its identity.
+let copyFileExclusiveAndFlushWithIdentitySync (sourcePath: string) (destinationPath: string) : Stats =
+    let sourceDescriptor, sourceStats = openReadOnlyNoFollowSync sourcePath
+
+    try
+        if not (sourceStats.isFile ()) || sourceStats.isSymbolicLink () then
+            invalidOp "The prepared materialization source is not a regular file."
+
+        let flags: int =
+            (unbox<int> fileSystemDynamic?constants?O_WRONLY)
+            ||| (unbox<int> fileSystemDynamic?constants?O_CREAT)
+            ||| (unbox<int> fileSystemDynamic?constants?O_EXCL)
+
+        let destinationDescriptor: int =
+            fileSystemDynamic?openSync (destinationPath, flags, 384) |> unbox
+
+        let mutable destinationClosed = false
+        let mutable createdIdentity: Stats option = None
+
+        try
+            let created: Stats = fileSystemDynamic?fstatSync destinationDescriptor |> unbox
+            createdIdentity <- Some created
+            let chunk: obj = bufferDynamic?Buffer?allocUnsafe (1024 * 1024)
+            let mutable copying = true
+
+            while copying do
+                let bytesRead: int =
+                    fileSystemDynamic?readSync (sourceDescriptor, chunk, 0, 1024 * 1024, null)
+                    |> unbox
+
+                if bytesRead = 0 then
+                    copying <- false
+                else
+                    let mutable written = 0
+
+                    while written < bytesRead do
+                        let bytesWritten: int =
+                            fileSystemDynamic?writeSync (
+                                destinationDescriptor,
+                                chunk,
+                                written,
+                                bytesRead - written,
+                                null
+                            )
+                            |> unbox
+
+                        if bytesWritten <= 0 then
+                            invalidOp "Copying the prepared materialization object made no progress."
+
+                        written <- written + bytesWritten
+
+            fileSystemDynamic?fsyncSync destinationDescriptor |> ignore
+            fileSystemDynamic?closeSync destinationDescriptor |> ignore
+            destinationClosed <- true
+            created
+        with error ->
+            if not destinationClosed then
+                try
+                    fileSystemDynamic?closeSync destinationDescriptor |> ignore
+                with _ ->
+                    ()
+
+            createdIdentity
+            |> Option.iter (fun created ->
+                removeFileIfIdentityMatchesSync destinationPath created |> ignore)
+
+            raise error
+    finally
+        closeFileDescriptorSync sourceDescriptor
+
 /// Opens a read handle without following a leaf symlink on platforms where
 /// Node exposes O_NOFOLLOW. Windows does not expose that flag, so callers must
 /// additionally compare handle/path identity after validating parent components.
