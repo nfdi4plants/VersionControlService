@@ -30,6 +30,11 @@ let private writeUtf8FileAsync (path: string) (content: string) : JS.Promise<uni
     return ()
 }
 
+let private createDirectoryJunctionAsync (targetPath: string) (linkPath: string) : JS.Promise<unit> = promise {
+    let! _ = fsPromisesDynamic?symlink (targetPath, linkPath, "junction") |> unbox<JS.Promise<obj>>
+    return ()
+}
+
 let private tryReadUtf8FileAsync (path: string) : JS.Promise<string option> = promise {
     try
         let! content = fsPromisesDynamic?readFile (path, "utf8") |> unbox<JS.Promise<string>>
@@ -409,6 +414,192 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "selected revision accepts an oversized file that is already LFS tracked",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, binding = createSelectedRevisionFixture ()
+
+                try
+                    let attributesContent =
+                        "\"/large.bin\" filter=lfs diff=lfs merge=lfs -text\n"
+
+                    let attributesPath = join [| workPath; ".gitattributes" |]
+                    do! writeUtf8FileAsync attributesPath attributesContent
+                    let! _ = runGitOk workPath [| "add"; ".gitattributes" |]
+                    let! _ = runGitOk workPath [| "commit"; "-m"; "test: pretrack large file" |]
+                    do!
+                        writeUtf8FileAsync
+                            (join [| workPath; "large.bin" |])
+                            (String.replicate (1024 * 1024) "t")
+
+                    let session =
+                        GitWorkspaceSession.createSession GitWorkspaceSession.GitSessionHooks.none binding
+
+                    let! statusResult = session.Core.GetStatus(ctx "pretracked-lfs-status") |> Async.StartAsPromise
+                    let status =
+                        match statusResult with
+                        | Succeeded outcome -> outcome.Value
+                        | _ -> failwith "Expected selected-revision status."
+
+                    let! revisionResult =
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: commit pretracked LFS file"
+                                Paths = [| repositoryPath "large.bin" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (ctx "pretracked-lfs-revision")
+                        |> Async.StartAsPromise
+
+                    match revisionResult with
+                    | Succeeded outcome ->
+                        Vitest.expect(outcome.AffectedPaths |> Array.contains "large.bin").toBe true
+                    | _ -> failwith "Expected the already tracked LFS file revision to succeed."
+
+                    let! committed = runGitOk workPath [| "show"; "HEAD:large.bin" |]
+                    let! attributesAfter = tryReadUtf8FileAsync attributesPath
+                    Vitest.expect(committed.Contains "git-lfs").toBe true
+                    Vitest.expect(attributesAfter).toEqual (Some attributesContent)
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "selected revision rejects a file that grows across the LFS threshold before staging",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, binding = createSelectedRevisionFixture ()
+
+                try
+                    let selectedPath = join [| workPath; "growing.bin" |]
+                    let grownContent = String.replicate (1024 * 1024) "g"
+                    do! writeUtf8FileAsync selectedPath "small\n"
+                    let! headBefore = runGitOk workPath [| "rev-parse"; "HEAD" |]
+                    let! stagedBefore = runGitOk workPath [| "diff"; "--cached"; "--name-only" |]
+                    let mutable barrierRan = false
+
+                    let hooks: GitWorkspaceSession.GitSessionHooks = {
+                        RunBytesProcess = None
+                        RunProcess = None
+                        Barrier =
+                            Some(fun _ point _ -> async {
+                                if point = "selected-revision-post-metadata-check" then
+                                    barrierRan <- true
+                                    do! writeUtf8FileAsync selectedPath grownContent |> Async.AwaitPromise
+                            })
+                    }
+
+                    let session = GitWorkspaceSession.createSession hooks binding
+                    let! statusResult = session.Core.GetStatus(ctx "growing-lfs-status") |> Async.StartAsPromise
+                    let status =
+                        match statusResult with
+                        | Succeeded outcome -> outcome.Value
+                        | _ -> failwith "Expected selected-revision status."
+
+                    let! revisionResult =
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: reject stale LFS classification"
+                                Paths = [| repositoryPath "growing.bin" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (ctx "growing-lfs-revision")
+                        |> Async.StartAsPromise
+
+                    Vitest.expect(barrierRan).toBe true
+
+                    match revisionResult with
+                    | Failed failure ->
+                        Vitest.expect(failure.Category).toEqual Concurrency
+                        Vitest.expect(failure.Code).toBe "selected_content_changed"
+                        Vitest.expect(failure.StateChanged).toBe false
+                        Vitest.expect(failure.AffectedPaths).toEqual [| "growing.bin" |]
+                    | _ -> failwith "Expected the stale LFS classification to fail before ref movement."
+
+                    let! headAfter = runGitOk workPath [| "rev-parse"; "HEAD" |]
+                    let! stagedAfter = runGitOk workPath [| "diff"; "--cached"; "--name-only" |]
+                    let! attributesAfter = tryReadUtf8FileAsync (join [| workPath; ".gitattributes" |])
+                    let! selectedAfter = tryReadUtf8FileAsync selectedPath
+                    Vitest.expect(headAfter.Trim()).toBe (headBefore.Trim())
+                    Vitest.expect(stagedAfter).toBe stagedBefore
+                    Vitest.expect(attributesAfter).toEqual None
+                    Vitest.expect(selectedAfter).toEqual (Some grownContent)
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "selected revision reports an unsafe attributes path as a structured failure",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, binding = createSelectedRevisionFixture ()
+
+                try
+                    do!
+                        writeUtf8FileAsync
+                            (join [| workPath; "large.bin" |])
+                            (String.replicate (1024 * 1024) "u")
+
+                    let linkedRepo = join [| root; "work-junction" |]
+                    do! createDirectoryJunctionAsync workPath linkedRepo
+                    let linkedBinding = {
+                        binding with
+                            WorkspaceRoot = linkedRepo
+                            Location = {
+                                binding.Location with
+                                    ProviderLocation = linkedRepo
+                            }
+                    }
+
+                    let! headBefore = runGitOk workPath [| "rev-parse"; "HEAD" |]
+                    let! stagedBefore = runGitOk workPath [| "diff"; "--cached"; "--name-only" |]
+                    let session =
+                        GitWorkspaceSession.createSession GitWorkspaceSession.GitSessionHooks.none linkedBinding
+
+                    let! statusResult = session.Core.GetStatus(ctx "unsafe-attributes-status") |> Async.StartAsPromise
+                    let status =
+                        match statusResult with
+                        | Succeeded outcome -> outcome.Value
+                        | _ -> failwith "Expected selected-revision status."
+
+                    let! revisionResult =
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: reject unsafe attributes path"
+                                Paths = [| repositoryPath "large.bin" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (ctx "unsafe-attributes-revision")
+                        |> Async.StartAsPromise
+
+                    match revisionResult with
+                    | Failed failure ->
+                        Vitest.expect(failure.Category).toEqual ProviderError
+                        Vitest.expect(failure.Code).toBe "attributes_read_failed"
+                        Vitest.expect(failure.StateChanged).toBe false
+                        Vitest.expect(failure.AffectedPaths).toEqual [| ".gitattributes" |]
+                    | _ -> failwith "Expected the unsafe attributes path to fail structurally."
+
+                    let! headAfter = runGitOk workPath [| "rev-parse"; "HEAD" |]
+                    let! stagedAfter = runGitOk workPath [| "diff"; "--cached"; "--name-only" |]
+                    let! attributesAfter = tryReadUtf8FileAsync (join [| workPath; ".gitattributes" |])
+                    Vitest.expect(headAfter.Trim()).toBe (headBefore.Trim())
+                    Vitest.expect(stagedAfter).toBe stagedBefore
+                    Vitest.expect(attributesAfter).toEqual None
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
             "selected revision LFS preparation failure preserves ref index worktree and attributes",
             TestOptions(timeout = 120000),
             fun () -> promise {
@@ -529,6 +720,74 @@ Vitest.describe (
                     Vitest.expect(headAfter.Trim()).toBe (headBefore.Trim())
                     Vitest.expect(statusAfter).toBe statusBefore
                     Vitest.expect(attributesAfter).toEqual None
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "selected revision LFS reconciliation preserves an in-place attributes edit after ref movement",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, binding = createSelectedRevisionFixture ()
+
+                try
+                    let attributesBefore = "# baseline\n"
+                    let attributesConcurrentEdit = "# consumer\n"
+                    let attributesPath = join [| workPath; ".gitattributes" |]
+                    do! writeUtf8FileAsync attributesPath attributesBefore
+                    let! _ = runGitOk workPath [| "add"; ".gitattributes" |]
+                    let! _ = runGitOk workPath [| "commit"; "-m"; "test: baseline attributes" |]
+                    do!
+                        writeUtf8FileAsync
+                            (join [| workPath; "large.bin" |])
+                            (String.replicate (1024 * 1024) "r")
+
+                    let! headBefore = runGitOk workPath [| "rev-parse"; "HEAD" |]
+
+                    let hooks: GitWorkspaceSession.GitSessionHooks = {
+                        RunBytesProcess = None
+                        RunProcess = None
+                        Barrier =
+                            Some(fun _ point _ -> async {
+                                if point = "selected-revision-post-update-ref" then
+                                    do! writeUtf8FileAsync attributesPath attributesConcurrentEdit |> Async.AwaitPromise
+                            })
+                    }
+
+                    let session = GitWorkspaceSession.createSession hooks binding
+                    let! statusResult = session.Core.GetStatus(ctx "attributes-race-status") |> Async.StartAsPromise
+                    let status =
+                        match statusResult with
+                        | Succeeded outcome -> outcome.Value
+                        | _ -> failwith "Expected selected-revision status."
+
+                    let! revisionResult =
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: preserve concurrent attributes edit"
+                                Paths = [| repositoryPath "large.bin" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (ctx "attributes-race-revision")
+                        |> Async.StartAsPromise
+
+                    match revisionResult with
+                    | PartiallySucceeded(outcome, failure) ->
+                        Vitest.expect(failure.StateChanged).toBe true
+                        Vitest.expect(failure.Code).toBe "attributes_reconciliation_failed"
+                        Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "reconcile_index")
+                        Vitest.expect(outcome.AffectedPaths |> Array.contains "large.bin").toBe true
+                        Vitest.expect(outcome.AffectedPaths |> Array.contains ".gitattributes").toBe true
+                        Vitest.expect(outcome.ResultingRevision.IsSome).toBe true
+                    | _ -> failwith "Expected the post-ref attributes race to return partial success."
+
+                    let! headAfter = runGitOk workPath [| "rev-parse"; "HEAD" |]
+                    let! attributesAfter = tryReadUtf8FileAsync attributesPath
+                    Vitest.expect(headAfter.Trim() = headBefore.Trim()).toBe false
+                    Vitest.expect(attributesAfter).toEqual (Some attributesConcurrentEdit)
                     do! removeDirectoryAsync root
                 with error ->
                     do! removeDirectoryAsync root

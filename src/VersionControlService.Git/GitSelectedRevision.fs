@@ -64,9 +64,11 @@ let private validateSubmoduleBoundary
         Ok()
 
 type private SelectedLfsPlan = {
+    ThresholdBytes: float
     OversizedPaths: string[]
     GeneratedAttributesContent: string option
     AttributesOriginalIdentity: NodeFileSystem.Stats option
+    AttributesOriginalContent: string
 }
 
 let private invalidThresholdFailure () =
@@ -124,9 +126,11 @@ let private checkSelectedMetadata
             if oversizedPaths.Length = 0 then
                 return
                     Ok {
+                        ThresholdBytes = thresholdBytes
                         OversizedPaths = [||]
                         GeneratedAttributesContent = None
                         AttributesOriginalIdentity = None
+                        AttributesOriginalContent = ""
                     }
             else
                 let! lfsVersion = runGit [| "lfs"; "version" |] None [||]
@@ -162,18 +166,32 @@ let private checkSelectedMetadata
                     | Ok _ ->
                         let attributesPath = NodePath.join [| repoPath; ".gitattributes" |]
 
-                        let attributesContent, originalIdentity =
-                            GitLfsService.readAttributesNoFollow attributesPath
+                        let attributesReadResult =
+                            try
+                                Ok(GitLfsService.readAttributesNoFollow attributesPath)
+                            with error ->
+                                Error {
+                                    OperationFailure.createRedacted
+                                        ProviderError
+                                        "attributes_read_failed"
+                                        error.Message with
+                                        AffectedPaths = [| ".gitattributes" |]
+                                }
 
-                        let updatedAttributes, generated =
-                            GitLfsService.addLiteralTrackingRules attributesContent oversizedPaths
+                        match attributesReadResult with
+                        | Error failure -> return Error failure
+                        | Ok(attributesContent, originalIdentity) ->
+                            let updatedAttributes, generated =
+                                GitLfsService.addLiteralTrackingRules attributesContent oversizedPaths
 
-                        return
-                            Ok {
-                                OversizedPaths = oversizedPaths
-                                GeneratedAttributesContent = if generated then Some updatedAttributes else None
-                                AttributesOriginalIdentity = originalIdentity
-                            }
+                            return
+                                Ok {
+                                    ThresholdBytes = thresholdBytes
+                                    OversizedPaths = oversizedPaths
+                                    GeneratedAttributesContent = if generated then Some updatedAttributes else None
+                                    AttributesOriginalIdentity = originalIdentity
+                                    AttributesOriginalContent = attributesContent
+                                }
     }
 
 let private tryPointerOid (pointerText: string) =
@@ -297,7 +315,12 @@ let private updateTemporaryIndexEntry
         | Ok _ -> return Ok()
     }
 
-let private temporaryIndexMode
+type private TemporaryIndexEntry = {
+    Mode: string
+    BlobId: string
+}
+
+let private tryTemporaryIndexEntry
     (runGit: GitRunner)
     (environment: (string * string)[])
     (path: string)
@@ -315,16 +338,90 @@ let private temporaryIndexMode
         | Ok output ->
             let entry = output.StdOut.Split '\000' |> Array.tryFind (String.IsNullOrEmpty >> not)
 
-            match entry |> Option.bind (fun value -> value.Split ' ' |> Array.tryHead) with
-            | Some mode when mode <> "" -> return Ok mode
-            | _ ->
-                return
-                    Error(
-                        OperationFailure.create
-                            ProviderError
-                            "temporary_index_entry_missing"
-                            "The oversized selected file was not present in the temporary index."
-                    )
+            return
+                entry
+                |> Option.bind (fun value ->
+                    match value.Split '\t' with
+                    | [| metadata; _ |] ->
+                        match metadata.Split(' ', StringSplitOptions.RemoveEmptyEntries) with
+                        | [| mode; blobId; "0" |] -> Some { Mode = mode; BlobId = blobId }
+                        | _ -> None
+                    | _ -> None)
+                |> Ok
+    }
+
+let private temporaryIndexMode
+    (runGit: GitRunner)
+    (environment: (string * string)[])
+    (path: string)
+    =
+    async {
+        match! tryTemporaryIndexEntry runGit environment path with
+        | Error failure -> return Error failure
+        | Ok(Some entry) -> return Ok entry.Mode
+        | Ok None ->
+            return
+                Error(
+                    OperationFailure.create
+                        ProviderError
+                        "temporary_index_entry_missing"
+                        "The oversized selected file was not present in the temporary index."
+                )
+    }
+
+let private validateLfsPlanAgainstTemporaryIndex
+    (runGit: GitRunner)
+    (environment: (string * string)[])
+    (paths: RepositoryPath[])
+    (plan: SelectedLfsPlan)
+    =
+    async {
+        let mutable failure = None
+        let plannedOversized = plan.OversizedPaths |> Set.ofArray
+        let mutable newlyOversized = Set.empty
+
+        for path in paths |> Array.map RepositoryPath.value do
+            match failure with
+            | Some _ -> ()
+            | None when plannedOversized.Contains path -> ()
+            | None ->
+                match! tryTemporaryIndexEntry runGit environment path with
+                | Error currentFailure -> failure <- Some currentFailure
+                | Ok None -> ()
+                | Ok(Some entry) when entry.Mode.StartsWith("100", StringComparison.Ordinal) ->
+                    let! sizeResult = runGit [| "cat-file"; "-s"; entry.BlobId |] None [||]
+
+                    match sizeResult with
+                    | Error currentFailure -> failure <- Some currentFailure
+                    | Ok output when output.ExitCode <> 0 ->
+                        failure <- Some(failedRun "git cat-file -s" output)
+                    | Ok output ->
+                        match Int64.TryParse(output.StdOut.Trim()) with
+                        | true, size when float size >= plan.ThresholdBytes ->
+                            newlyOversized <- newlyOversized.Add path
+                        | true, _ -> ()
+                        | _ ->
+                            failure <-
+                                Some(
+                                    OperationFailure.create
+                                        ProviderError
+                                        "staged_blob_size_invalid"
+                                        "Git returned an invalid size for a staged selected file."
+                                )
+                | Ok(Some _) -> ()
+
+        match failure with
+        | Some currentFailure -> return Error currentFailure
+        | None when newlyOversized.IsEmpty -> return Ok()
+        | None ->
+            return
+                Error {
+                    OperationFailure.create
+                        Concurrency
+                        "selected_content_changed"
+                        "A selected file crossed the automatic LFS threshold while the revision was being prepared." with
+                        AffectedPaths = newlyOversized |> Set.toArray
+                }
     }
 
 let private applyLfsPlanToTemporaryIndex
@@ -464,6 +561,8 @@ let createRevision
                     match metadataResult with
                     | Error failure -> return Failed failure
                     | Ok lfsPlan ->
+                        do! barrier "selected-revision-post-metadata-check"
+
                         // Isolated temporary index inside the resolved git dir.
                         let! gitDirOutput = runGit [| "rev-parse"; "--absolute-git-dir" |] None [||]
 
@@ -541,26 +640,32 @@ let createRevision
                                         else
                                             return Failed(failedRun "git add (temporary index)" addOutput)
                                     | Ok _ ->
-                                        let! preparedTree =
-                                            async {
-                                                match!
-                                                    applyLfsPlanToTemporaryIndex
-                                                        runGit
-                                                        repoPath
-                                                        commonGitDir
-                                                        environment
-                                                        lfsPlan
-                                                with
-                                                | Error failure -> return Error failure
-                                                | Ok() ->
-                                                    let! treeResult = runGit [| "write-tree" |] None environment
+                                        let! stagedPlanValidation =
+                                            validateLfsPlanAgainstTemporaryIndex runGit environment paths lfsPlan
 
-                                                    match treeResult with
+                                        let! preparedTree =
+                                            match stagedPlanValidation with
+                                            | Error failure -> async { return Error failure }
+                                            | Ok() ->
+                                                async {
+                                                    match!
+                                                        applyLfsPlanToTemporaryIndex
+                                                            runGit
+                                                            repoPath
+                                                            commonGitDir
+                                                            environment
+                                                            lfsPlan
+                                                    with
                                                     | Error failure -> return Error failure
-                                                    | Ok treeOutput when treeOutput.ExitCode <> 0 ->
-                                                        return Error(failedRun "git write-tree" treeOutput)
-                                                    | Ok treeOutput -> return Ok(treeOutput.StdOut.Trim())
-                                            }
+                                                    | Ok() ->
+                                                        let! treeResult = runGit [| "write-tree" |] None environment
+
+                                                        match treeResult with
+                                                        | Error failure -> return Error failure
+                                                        | Ok treeOutput when treeOutput.ExitCode <> 0 ->
+                                                            return Error(failedRun "git write-tree" treeOutput)
+                                                        | Ok treeOutput -> return Ok(treeOutput.StdOut.Trim())
+                                                }
 
                                         match preparedTree with
                                         | Error failure ->
@@ -711,6 +816,7 @@ let createRevision
                                                                     GitLfsService.replaceAttributesAtomically
                                                                         attributesFile
                                                                         lfsPlan.AttributesOriginalIdentity
+                                                                        lfsPlan.AttributesOriginalContent
                                                                         attributesContent
 
                                                                     Ok()

@@ -247,6 +247,7 @@ let readAttributesNoFollow (attributesPath: string) =
 let replaceAttributesAtomically
     (attributesPath: string)
     (originalIdentity: NodeFileSystem.Stats option)
+    (originalContent: string)
     (content: string)
     =
     let tempPath = attributesPath + $".vcs-{Guid.NewGuid():N}.tmp"
@@ -260,9 +261,12 @@ let replaceAttributesAtomically
             if not (NodeFileSystem.existsSync attributesPath) then
                 invalidOp "The Git attributes file disappeared before its policy could be replaced."
 
-            ensurePathHasNoLinks attributesPath
+            let currentContent, currentIdentity = readAttributesNoFollow attributesPath
 
-            if not (sameFileIdentity expected (NodeFileSystem.lstatSync attributesPath)) then
+            if
+                currentContent <> originalContent
+                || (currentIdentity |> Option.exists (sameFileIdentity expected) |> not)
+            then
                 invalidOp "The Git attributes file changed before its policy could be replaced."
         | None when NodeFileSystem.existsSync attributesPath ->
             invalidOp "The Git attributes file appeared before its policy could be created."
@@ -308,7 +312,7 @@ let private rewriteLiteralTrackingRule repoPath relativePath enabled =
                 removeExactAttributeRule canonicalRule content
 
         if updated <> content then
-            replaceAttributesAtomically attributesPath originalIdentity updated
+            replaceAttributesAtomically attributesPath originalIdentity content updated
 
         Ok()
     with error ->
