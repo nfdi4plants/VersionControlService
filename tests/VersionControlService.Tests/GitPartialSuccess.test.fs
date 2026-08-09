@@ -13,6 +13,9 @@ module NodeProcess = VersionControlService.Runtime.Node.Process
 let private fsPromisesDynamic: obj = importAll "fs/promises"
 let private osDynamic: obj = importAll "os"
 
+[<Import("vi", "vitest")>]
+let private vitestTimers: obj = jsNative
+
 let private createTempDirectoryAsync () : JS.Promise<string> =
     let prefix = join [| osDynamic?tmpdir () |> unbox<string>; "vcs-git-partial-" |]
     fsPromisesDynamic?mkdtemp (prefix) |> unbox<JS.Promise<string>>
@@ -1904,6 +1907,67 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "rename publication reports both removed source and added destination paths",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, barePath, session =
+                    createPublishFixture GitWorkspaceSession.GitSessionHooks.none
+
+                try
+                    let! _ = runGitOk workPath [| "config"; "diff.renames"; "true" |]
+                    do!
+                        renameAsync
+                            (join [| workPath; "base.txt" |])
+                            (join [| workPath; "renamed.txt" |])
+
+                    let! status = sessionStatus session
+
+                    let! revision =
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: publish rename"
+                                Paths = [| repositoryPath "base.txt"; repositoryPath "renamed.txt" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (ctx "publish-rename-revision")
+                        |> Async.StartAsPromise
+
+                    match revision with
+                    | Succeeded _ -> ()
+                    | _ -> failwith "Expected the rename revision to be created."
+
+                    let! localHead = runGitOk workPath [| "rev-parse"; "HEAD" |]
+                    let! publishStatus = sessionStatus session
+
+                    let! result =
+                        (synchronization session).Publish
+                            {
+                                ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                            }
+                            (ctx "publish-rename")
+                        |> Async.StartAsPromise
+
+                    match result with
+                    | Succeeded outcome ->
+                        Vitest.expect(outcome.Publication).toEqual Published
+                        Vitest.expect(outcome.AffectedPaths).toEqual [| "base.txt"; "renamed.txt" |]
+                        Vitest.expect(outcome.ResultingRevision |> Option.map RevisionId.value).toEqual (
+                            Some(localHead.Trim())
+                        )
+                    | PartiallySucceeded(_, failure)
+                    | Failed failure -> failwith $"Expected rename publication success, got {failure.Code}."
+
+                    let! targetHead = runGitOk barePath [| "rev-parse"; "main" |]
+                    Vitest.expect(targetHead.Trim()).toBe(localHead.Trim())
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
             "push execution failure after remote advancement reports partial success",
             TestOptions(timeout = 120000),
             fun () -> promise {
@@ -2639,6 +2703,174 @@ Vitest.describe (
                     Vitest.expect(targetHead.Trim()).toBe localHead
                     do! removeDirectoryAsync root
                 with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "detached exact verification deadline cancels a blocked process and stays inconclusive",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let callerCancellation = OperationCancellation.Source()
+                let mutable pushAdvancedRemote = false
+                let mutable corePushCount = 0
+                let mutable verificationStartedUncanceled = false
+                let mutable verificationCancellationObserved = false
+                let mutable verificationSafetyReleased = false
+                let mutable signalFakeTimersEnabled: unit -> unit = ignore
+                let mutable signalVerificationStarted: unit -> unit = ignore
+
+                let fakeTimersEnabled =
+                    JS.Constructors.Promise.Create(fun resolve _ ->
+                        signalFakeTimersEnabled <- fun () -> resolve ())
+
+                let verificationStarted =
+                    JS.Constructors.Promise.Create(fun resolve _ ->
+                        signalVerificationStarted <- fun () -> resolve ())
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request operationContext ->
+                            async {
+                                if request.Arguments |> Array.contains "push" then
+                                    corePushCount <- corePushCount + 1
+                                    let! pushResult = NodeProcess.run request operationContext
+
+                                    match pushResult with
+                                    | Succeeded outcome when outcome.Value.ExitCode = 0 ->
+                                        pushAdvancedRemote <- true
+                                        callerCancellation.Cancel()
+                                        vitestTimers?useFakeTimers ()
+                                        signalFakeTimersEnabled ()
+
+                                        return
+                                            OperationResult.failed {
+                                                OperationFailure.createRedacted
+                                                    Network
+                                                    "injected_push_response_loss"
+                                                    "The response was lost after the remote accepted the ref." with
+                                                    Retryable = true
+                                            }
+                                    | _ -> return pushResult
+                                elif
+                                    pushAdvancedRemote
+                                    && request.Arguments |> Array.contains "ls-remote"
+                                then
+                                    verificationStartedUncanceled <-
+                                        not (operationContext.Cancellation.IsCancellationRequested())
+
+                                    signalVerificationStarted ()
+
+                                    return!
+                                        Async.FromContinuations(fun (succeed, _, _) ->
+                                            let mutable completed = false
+
+                                            operationContext.Cancellation.Register(fun () ->
+                                                if not completed then
+                                                    completed <- true
+                                                    verificationCancellationObserved <- true
+
+                                                    succeed (
+                                                        OperationResult.canceled
+                                                            "The detached verification process was canceled."
+                                                    ))
+
+                                            JS.setTimeout
+                                                (fun () ->
+                                                    if not completed then
+                                                        completed <- true
+                                                        verificationSafetyReleased <- true
+
+                                                        succeed (
+                                                            OperationResult.failed {
+                                                                OperationFailure.createRedacted
+                                                                    Network
+                                                                    "injected_verification_safety_release"
+                                                                    "The test released an unbounded verifier." with
+                                                                    Retryable = true
+                                                            }
+                                                        ))
+                                                60_000
+                                            |> ignore)
+                                else
+                                    return! NodeProcess.run request operationContext
+                            })
+                    Barrier = None
+                }
+
+                let! root, workPath, barePath, session = createPublishFixture hooks
+
+                try
+                    let! localHead, publishStatus =
+                        createTextPublishRevision
+                            session
+                            workPath
+                            "verification-deadline.txt"
+                            "verification-deadline"
+
+                    let! result =
+                        promise {
+                            try
+                                let publishPromise =
+                                    (synchronization session).Publish
+                                        {
+                                            ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                            ExpectedTargetRevision = None
+                                        }
+                                        (OperationContext.create
+                                            "verification-deadline-publish"
+                                            callerCancellation.Cancellation
+                                            ignore)
+                                    |> Async.StartAsPromise
+
+                                do! fakeTimersEnabled
+
+                                let! _ =
+                                    vitestTimers?advanceTimersByTimeAsync (0)
+                                    |> unbox<JS.Promise<obj>>
+
+                                do! verificationStarted
+
+                                let! _ =
+                                    vitestTimers?advanceTimersByTimeAsync (60_000)
+                                    |> unbox<JS.Promise<obj>>
+
+                                return! publishPromise
+                            finally
+                                vitestTimers?useRealTimers ()
+                        }
+
+                    Vitest.expect(pushAdvancedRemote).toBe true
+                    Vitest.expect(corePushCount).toBe 1
+                    Vitest.expect(callerCancellation.IsCancellationRequested).toBe true
+                    Vitest.expect(verificationStartedUncanceled).toBe true
+                    Vitest.expect(verificationCancellationObserved).toBe true
+                    Vitest.expect(verificationSafetyReleased).toBe false
+
+                    match result with
+                    | Failed failure ->
+                        Vitest.expect(failure.Category).toEqual Network
+                        Vitest.expect(failure.Code).toBe "injected_push_response_loss"
+                        Vitest.expect(failure.StateChanged).toBe true
+                        Vitest.expect(failure.Retryable).toBe true
+                        Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (
+                            Some "retry_publish_verification"
+                        )
+                        Vitest.expect(
+                            failure.Details
+                            |> Array.exists _.Contains("publish_verification_timeout")
+                        ).toBe true
+                    | PartiallySucceeded _ ->
+                        failwith "A timed-out verifier cannot claim that publication was observed."
+                    | Succeeded _ -> failwith "A timed-out verifier cannot report success."
+
+                    let! targetHead = runGitOk barePath [| "rev-parse"; "main" |]
+                    Vitest.expect(targetHead.Trim()).toBe localHead
+                    do! removeDirectoryAsync root
+                with error ->
+                    vitestTimers?useRealTimers ()
                     do! removeDirectoryAsync root
                     return raise error
             }

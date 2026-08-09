@@ -39,6 +39,8 @@ module GitSessionHooks =
 [<Emit("Date.now()")>]
 let private nowMilliseconds () : float = jsNative
 
+let private publicationVerificationTimeoutMilliseconds = 30_000
+
 let private gitProviderId =
     match ProviderId.tryCreate "git" with
     | Ok providerId -> providerId
@@ -1785,7 +1787,8 @@ let private publicationChangedPaths
     async {
         let arguments =
             match previousRevision with
-            | Some previous -> [| "diff"; "--name-only"; "-z"; previous; publishedRevision |]
+            | Some previous ->
+                [| "diff"; "--no-renames"; "--name-only"; "-z"; previous; publishedRevision |]
             | None ->
                 [|
                     "ls-tree"
@@ -2301,13 +2304,41 @@ let private publish (state: SessionState) (request: PublishRequest) (context: Op
                             // A push response is ambiguous until the exact target ref is read.
                             // This follow-up is deliberately read-only and ignores caller
                             // cancellation so a cancellation cannot conceal an accepted ref.
+                            let verificationCancellation = OperationCancellation.Source()
+                            let mutable verificationCompleted = false
+                            let mutable verificationTimedOut = false
+
+                            Async.StartImmediate(
+                                async {
+                                    do! Async.Sleep publicationVerificationTimeoutMilliseconds
+
+                                    if not verificationCompleted then
+                                        verificationTimedOut <- true
+                                        verificationCancellation.Cancel()
+                                }
+                            )
+
                             let verificationContext = {
                                 context with
-                                    Cancellation = OperationCancellation.none
+                                    Cancellation = verificationCancellation.Cancellation
                             }
 
-                            let! verification =
+                            let! verificationResult =
                                 readRemoteBranchRevision state authentication branch verificationContext
+
+                            verificationCompleted <- true
+
+                            let verification =
+                                if verificationTimedOut then
+                                    Error {
+                                        OperationFailure.create
+                                            Timeout
+                                            "publish_verification_timeout"
+                                            "Reading the exact remote ref exceeded the publication verification deadline." with
+                                            Retryable = true
+                                    }
+                                else
+                                    verificationResult
 
                             let reconcilePublished = {
                                 Code = "retry_publish_verification"
