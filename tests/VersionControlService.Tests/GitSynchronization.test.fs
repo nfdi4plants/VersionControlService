@@ -1359,6 +1359,7 @@ Vitest.describe (
                         match result with
                         | Failed failure ->
                             Vitest.expect(failure.Category).toEqual (Canceled)
+                            Vitest.expect(failure.Code).toBe ("operation_canceled")
                             Vitest.expect(failure.StateChanged).toBe (false)
                         | Succeeded _
                         | PartiallySucceeded _ -> failwith $"Expected {operationName} to report a canceled failure."

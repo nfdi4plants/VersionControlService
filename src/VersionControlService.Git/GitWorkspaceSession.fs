@@ -2190,26 +2190,6 @@ let private publish (state: SessionState) (request: PublishRequest) (context: Op
                             return
                                 OperationResult.noOp (Some "The target already has every local revision.") syncState
                     else
-                        let! pathResult =
-                            match workspaceRevision with
-                            | Some publishedRevision ->
-                                publicationChangedPaths
-                                    state
-                                    observedTarget
-                                    publishedRevision
-                                    context
-                            | None ->
-                                async {
-                                    return
-                                        Error {
-                                            OperationFailure.create
-                                                ProviderError
-                                                "publish_evidence_failed"
-                                                "The intended publication revision could not be read." with
-                                                Retryable = true
-                                        }
-                                }
-
                         let reportLfsProgress (progress: GitProgressDto) =
                             context.ReportProgress {
                                 PhaseCode = "lfs-upload"
@@ -2221,6 +2201,29 @@ let private publish (state: SessionState) (request: PublishRequest) (context: Op
 
                         let! publicationPreparation =
                             async {
+                                do! barrier state.Hooks state.RepoPath "publish-precheck-done" context
+                                do! barrier state.Hooks state.RepoPath "transfer-start" context
+
+                                let! pathResult =
+                                    match workspaceRevision with
+                                    | Some publishedRevision ->
+                                        publicationChangedPaths
+                                            state
+                                            observedTarget
+                                            publishedRevision
+                                            context
+                                    | None ->
+                                        async {
+                                            return
+                                                Error {
+                                                    OperationFailure.create
+                                                        ProviderError
+                                                        "publish_evidence_failed"
+                                                        "The intended publication revision could not be read." with
+                                                        Retryable = true
+                                                }
+                                        }
+
                                 match pathResult with
                                 | Error failure ->
                                     return
@@ -2229,9 +2232,6 @@ let private publish (state: SessionState) (request: PublishRequest) (context: Op
                                                 StateChanged = false
                                         }
                                 | Ok affectedPaths ->
-                                    do! barrier state.Hooks state.RepoPath "publish-precheck-done" context
-                                    do! barrier state.Hooks state.RepoPath "transfer-start" context
-
                                     let! lfsPreparation =
                                         GitService.prepareExplicitLfsPush
                                             state.RepoPath
