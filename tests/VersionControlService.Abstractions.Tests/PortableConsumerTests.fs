@@ -95,7 +95,7 @@ let portableConsumerTests =
             let! statusResult = session.Core.GetStatus context
             let status = expectSucceeded "get status" statusResult
 
-            Expect.equal status.WorkspaceVersion "fake-revision-1" "The fake session returns its workspace version."
+            Expect.equal status.WorkspaceVersion "fake-v1" "The fake session returns its workspace version."
         }
 
         testCaseAsync "a portable opened session returns every final SPI value through optional service results"
