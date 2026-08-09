@@ -1074,10 +1074,10 @@ Vitest.describe (
 )
 
 Vitest.describe (
-    "GitWorkspaceSession v2 synchronization",
+    "Git workspace synchronization",
     fun () ->
         Vitest.test (
-            "v2 conflicting update opens a versioned conflict session and rejects stale tokens before verified finalize",
+            "conflicting update opens a versioned conflict session and rejects stale tokens before verified finalize",
             TestOptions(timeout = 120000),
             fun () -> promise {
                 // A barrier that can advance the local branch between the finalize
@@ -1330,7 +1330,7 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "v2 cancellation stops refresh update publish and clone with structured canceled results",
+            "cancellation stops refresh update publish and clone with structured canceled results",
             TestOptions(timeout = 120000),
             fun () -> promise {
                 // Deterministic interruption: the transfer-start barrier cancels the
@@ -1485,7 +1485,7 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "v2 preview includes dirty workspace and requires Git 2.38",
+            "preview includes dirty workspace and requires Git 2.38",
             TestOptions(timeout = 120000),
             fun () -> promise {
                 let! root, workPath, barePath, session =

@@ -499,7 +499,7 @@ type ISimpleGit =
     abstract member clean: mode: string * ?options: TaskOptions -> Promise<CleanSummary>
     abstract member clean: ?options: TaskOptions -> Promise<CleanSummary>
 
-    [<System.Obsolete("Deprecated upstream. Removed in v2; prefer abort-plugin configuration for pending task cancellation.")>]
+    [<System.Obsolete("Deprecated upstream; prefer abort-plugin configuration for pending task cancellation.")>]
     abstract member clearQueue: unit -> ISimpleGit
 
     abstract member clone: repoPath: string * ?localPath: string * ?options: TaskOptions -> Promise<string>

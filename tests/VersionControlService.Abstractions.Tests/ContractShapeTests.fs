@@ -417,7 +417,7 @@ let contractShapeTests =
             let! statusResult = session.Core.GetStatus context
             let status = expectSucceeded "core status" statusResult
 
-            Expect.equal status.WorkspaceVersion "fake-v1" "The core works without any optional service."
+            Expect.equal status.WorkspaceVersion "fake-revision-1" "The core works without any optional service."
         }
 
         testCaseAsync "a synchronization provider needs no object-storage extension"
@@ -474,7 +474,7 @@ let contractShapeTests =
                     {
                         Message = "stale attempt"
                         Paths = [||]
-                        ExpectedWorkspaceVersion = "fake-v999"
+                        ExpectedWorkspaceVersion = "fake-stale-revision"
                     }
                     context
 

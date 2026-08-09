@@ -1,13 +1,10 @@
-/// v2 Git provider: factory and per-workspace sessions over the extracted Git
-/// internals. The initial shell deliberately wraps the current v1 behaviors so
-/// the recorded defects stay observable; the Task 8/9/10 behavior cycles replace
-/// them one row at a time.
+/// Git provider factory and per-workspace sessions over internal Git machinery.
 module VersionControlService.Git.GitWorkspaceSession
 
 open System
 open Fable.Core
 open VersionControlService.Abstractions
-open VersionControlService.Contracts.Git
+open VersionControlService.Git.GitEngineTypes
 
 module GitService = VersionControlService.Git.GitService
 module GitRefs = VersionControlService.Git.GitRefs
@@ -191,7 +188,7 @@ let private toFileChange (isConflicted: bool) (file: GitFileStatusDto) : FileCha
 
 /// Cooperative in-process mutation lock: JS is single-threaded, so a busy flag
 /// with async polling serializes session mutations without blocking reads.
-type MutationLock() =
+type private MutationLock() =
     let mutable busy = false
 
     member _.Acquire() : Async<unit> =
@@ -1092,7 +1089,7 @@ let private getWorkspaceStatus (state: SessionState) (context: OperationContext)
     }
 
 // ---------------------------------------------------------------------------
-// Core operations (shell: wraps the recorded v1 behaviors)
+// Core workspace operations
 // ---------------------------------------------------------------------------
 
 let private refNameOfProviderRef (reference: ProviderRef) =
@@ -1423,7 +1420,7 @@ let private switchRef (state: SessionState) (request: SwitchRefRequest) (context
         let refRunner: GitRefs.GitRunner =
             fun arguments stdinData -> runGit state.Hooks state.RepoPath arguments stdinData context
 
-        // Large objects stay as pointers during branch switches (Swate behavior).
+        // Large objects stay as pointers during branch switches.
         let checkoutEnvironment = [| "GIT_LFS_SKIP_SMUDGE", "1" |]
 
         let checkout (arguments: string[]) =

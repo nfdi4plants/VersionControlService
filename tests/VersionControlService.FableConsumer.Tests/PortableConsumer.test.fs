@@ -108,7 +108,7 @@ let private createFakeObjectMaterialization () : ObjectMaterializationService = 
 let private createFakeCore () : CoreVersionControl =
     let status = {
         CurrentRef = None
-        WorkspaceVersion = "fake-v1"
+        WorkspaceVersion = "fake-revision-1"
         Changes = [||]
         ActiveConflictSession = None
         Synchronization = None
@@ -258,7 +258,7 @@ Vitest.describe (
                 }
 
                 let! status = Async.StartAsPromise workflow
-                Vitest.expect(status.WorkspaceVersion).toBe ("fake-v1")
+                Vitest.expect(status.WorkspaceVersion).toBe ("fake-revision-1")
             }
         )
 

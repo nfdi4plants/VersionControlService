@@ -1,9 +1,9 @@
-module VersionControlService.Git.GitProvisioningService
+module internal VersionControlService.Git.GitProvisioningService
 
 open System
 open Fable.Core
 open Fable.Core.JsInterop
-open VersionControlService.Contracts.Git
+open VersionControlService.Git.GitEngineTypes
 open VersionControlService.Runtime.Node.FileSystem
 open VersionControlService.Runtime.Node.Path
 open VersionControlService.Bindings.SimpleGit

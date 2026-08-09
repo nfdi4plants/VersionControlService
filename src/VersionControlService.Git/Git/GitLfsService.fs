@@ -1,4 +1,4 @@
-module VersionControlService.Git.GitLfsService
+module internal VersionControlService.Git.GitLfsService
 
 open System
 open System.Collections.Generic
@@ -6,8 +6,7 @@ open System.Text.RegularExpressions
 open Fable.Core
 open VersionControlService.Abstractions
 open VersionControlService.Support
-open VersionControlService.Contracts.FileSystem
-open VersionControlService.Contracts.Git
+open VersionControlService.Git.GitEngineTypes
 open VersionControlService.Runtime.Node.Interop
 open VersionControlService.Bindings.SimpleGit
 open VersionControlService.Git.GitLfsAdapter

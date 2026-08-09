@@ -1,4 +1,4 @@
-module VersionControlService.Tests.Contracts.SwateSelectableSuite
+module VersionControlService.Tests.Contracts.ConsumerWorkflowSuite
 
 open Fable.Core
 open VersionControlService.Abstractions
@@ -6,10 +6,10 @@ open VersionControlService.Tests.Contracts.ProviderHarness
 open VersionControlService.Tests.Contracts.ProviderHarness.SuiteHelpers
 open Vitest
 
-/// Swate-selectable profile: the actual Swate save/update/branch/discard/conflict
+/// Consumer workflow profile: selected save/update/branch/discard/conflict
 /// scenarios expressed without any provider-kind conditional.
 let register (harness: ProviderTestHarness) : string * (unit -> int) =
-    let profileName = $"{harness.Name} / Swate-selectable profile"
+    let profileName = $"{harness.Name} / consumer workflow profile"
     let mutable testCount = 0
 
     Vitest.describe (
@@ -35,7 +35,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                                 Paths = [| mkPath "assay.txt" |]
                                 ExpectedWorkspaceVersion = status.WorkspaceVersion
                             }
-                            (ctx "swate-save")
+                            (ctx "consumer-save")
                     )
 
                 expectPerformed "selected save" saveResult |> ignore
@@ -50,7 +50,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                                 ExpectedWorkspaceVersion = afterSave.WorkspaceVersion
                                 ExpectedTargetRevision = None
                             }
-                            (ctx "swate-publish")
+                            (ctx "consumer-publish")
                     )
 
                 let published = expectPerformed "publish after save" publishResult
@@ -64,7 +64,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     run (
                         (syncService linked.Session).Update
                             { ExpectedWorkspaceVersion = linkedStatus.WorkspaceVersion }
-                            (ctx "swate-linked-update")
+                            (ctx "consumer-linked-update")
                     )
 
                 expectOutcome "linked update" linkedUpdate |> ignore
@@ -90,7 +90,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                                 Paths = [| mkPath "pending.txt" |]
                                 ExpectedWorkspaceVersion = status.WorkspaceVersion
                             }
-                            (ctx "swate-pending-save")
+                            (ctx "consumer-pending-save")
                     )
 
                 let saved = expectPerformed "save" saveResult
@@ -106,7 +106,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                                 ExpectedWorkspaceVersion = preBroken.WorkspaceVersion
                                 ExpectedTargetRevision = None
                             }
-                            (ctx "swate-broken-publish")
+                            (ctx "consumer-broken-publish")
                     )
 
                 let failure = expectFailure "broken publish" brokenPublish
@@ -122,7 +122,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                                 ExpectedWorkspaceVersion = preRetry.WorkspaceVersion
                                 ExpectedTargetRevision = None
                             }
-                            (ctx "swate-retry-publish")
+                            (ctx "consumer-retry-publish")
                     )
 
                 let retried = expectPerformed "retried publish" retryPublish
@@ -143,7 +143,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 do! workspace.WriteFile "base.txt" "my version\n"
 
-                // Save the local change first, exactly like the Swate save-then-update flow.
+                // Save the local change first, as in a consumer save-then-update flow.
                 let! saveStatus = getStatus workspace
 
                 let! saveResult =
@@ -154,13 +154,13 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                                 Paths = [| mkPath "base.txt" |]
                                 ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
                             }
-                            (ctx "swate-conflict-save")
+                            (ctx "consumer-conflict-save")
                     )
 
                 expectPerformed "conflicting save" saveResult |> ignore
 
                 // Preview before updating.
-                let! previewResult = run ((syncService workspace.Session).PreviewUpdate(ctx "swate-preview"))
+                let! previewResult = run ((syncService workspace.Session).PreviewUpdate(ctx "consumer-preview"))
                 let preview = expectValue "preview" previewResult
                 Vitest.expect(preview.WouldCreateConflictSession).toBe (true)
 
@@ -170,14 +170,14 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     run (
                         (syncService workspace.Session).Update
                             { ExpectedWorkspaceVersion = status.WorkspaceVersion }
-                            (ctx "swate-conflict-update")
+                            (ctx "consumer-conflict-update")
                     )
 
                 let failure = carriedFailure "conflicting update" updateResult
                 Vitest.expect(failure.Code).toBe (ConformanceCodes.ConflictsDetected)
 
                 let conflicts = conflictService workspace.Session
-                let! sessionResult = run (conflicts.GetActiveSession(ctx "swate-conflict-session"))
+                let! sessionResult = run (conflicts.GetActiveSession(ctx "consumer-conflict-session"))
 
                 let summary =
                     match expectValue "conflict session" sessionResult with
@@ -195,7 +195,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                                 Path = mkPath "base.txt"
                                 Resolution = PickCandidate "target"
                             }
-                            (ctx "swate-pick")
+                            (ctx "consumer-pick")
                     )
 
                 let resolution = expectValue "version pick" resolveResult
@@ -209,7 +209,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                                 ExpectedWorkspaceVersion = preFinalize.WorkspaceVersion
                                 Message = Some "resolve update conflict"
                             }
-                            (ctx "swate-finalize")
+                            (ctx "consumer-finalize")
                     )
 
                 expectValue "finalize" finalizeResult |> ignore
@@ -232,7 +232,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                                 SwitchTo = true
                                 ExpectedWorkspaceVersion = status.WorkspaceVersion
                             }
-                            (ctx "swate-branch")
+                            (ctx "consumer-branch")
                     )
 
                 expectValue "create-and-switch" createResult |> ignore
@@ -252,7 +252,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                                 Paths = [| mkPath "experiment.txt" |]
                                 ExpectedWorkspaceVersion = branchStatus.WorkspaceVersion
                             }
-                            (ctx "swate-branch-save")
+                            (ctx "consumer-branch-save")
                     )
 
                 expectPerformed "save on branch" saveResult |> ignore
@@ -273,7 +273,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                                 Paths = [| mkPath "base.txt" |]
                                 ExpectedWorkspaceVersion = status.WorkspaceVersion
                             }
-                            (ctx "swate-discard")
+                            (ctx "consumer-discard")
                     )
 
                 expectValue "discard" discardResult |> ignore
@@ -307,7 +307,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                                 Paths = [| mkPath "base.txt" |]
                                 ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
                             }
-                            (ctx "swate-text-save")
+                            (ctx "consumer-text-save")
                     )
 
                 expectPerformed "text save" saveResult |> ignore
@@ -317,13 +317,13 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     run (
                         (syncService workspace.Session).Update
                             { ExpectedWorkspaceVersion = status.WorkspaceVersion }
-                            (ctx "swate-text-update")
+                            (ctx "consumer-text-update")
                     )
 
                 carriedFailure "conflicting update" updateResult |> ignore
 
                 let conflicts = conflictService workspace.Session
-                let! sessionResult = run (conflicts.GetActiveSession(ctx "swate-text-session"))
+                let! sessionResult = run (conflicts.GetActiveSession(ctx "consumer-text-session"))
 
                 let summary =
                     match expectValue "conflict session" sessionResult with
@@ -343,7 +343,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                                 Path = mkPath "base.txt"
                                 Resolution = SupplyResolvedContent "our text\ntheir text\n"
                             }
-                            (ctx "swate-supply")
+                            (ctx "consumer-supply")
                     )
 
                 let resolution = expectValue "supplied content" resolveResult
@@ -357,7 +357,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                                 ExpectedWorkspaceVersion = preFinalize.WorkspaceVersion
                                 Message = Some "merge both texts"
                             }
-                            (ctx "swate-text-finalize")
+                            (ctx "consumer-text-finalize")
                     )
 
                 expectValue "finalize" finalizeResult |> ignore
@@ -370,7 +370,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
             <| fun () -> promise {
                 let! workspace = harness.CreateWorkspace()
 
-                // The Swate UI enables object controls only when the services exist.
+                // Consumers enable object controls only when the services exist.
                 let objectControlsVisible =
                     workspace.Session.ObjectMaterialization.IsSome
                     || workspace.Session.StoragePolicy.IsSome

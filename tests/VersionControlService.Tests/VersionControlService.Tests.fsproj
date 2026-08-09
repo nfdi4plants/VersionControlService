@@ -5,8 +5,6 @@
   <ItemGroup>
     <Compile Include="VitestBindings.fs" />
     <Compile Include="Scaffold.test.fs" />
-    <Compile Include="GitService.test.fs" />
-    <Compile Include="GitValidation.test.fs" />
     <Compile Include="Contracts\ProviderHarness.fs" />
     <Compile Include="Contracts\CoreProviderSuite.fs" />
     <Compile Include="Contracts\SynchronizationProviderSuite.fs" />
@@ -14,10 +12,9 @@
     <Compile Include="Contracts\ProvisioningProviderSuite.fs" />
     <Compile Include="Contracts\OperationalProviderSuite.fs" />
     <Compile Include="Contracts\ExtensionProviderSuites.fs" />
-    <Compile Include="Contracts\SwateSelectableSuite.fs" />
+    <Compile Include="Contracts\ConsumerWorkflowSuite.fs" />
     <Compile Include="GitProviderContract.test.fs" />
     <Compile Include="GitDependency.test.fs" />
-    <Compile Include="GitProvider.test.fs" />
     <Compile Include="GitSynchronization.test.fs" />
     <Compile Include="GitCredentials.test.fs" />
     <Compile Include="GitPartialSuccess.test.fs" />

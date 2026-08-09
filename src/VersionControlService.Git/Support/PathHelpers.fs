@@ -3,7 +3,7 @@ namespace VersionControlService.Support
 open System
 
 [<RequireQualifiedAccess>]
-module PathHelpers =
+module internal PathHelpers =
 
     let formatContractErrors (errors: string[]) =
         errors |> Array.map string |> String.concat "\n"

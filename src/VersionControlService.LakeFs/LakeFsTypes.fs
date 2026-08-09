@@ -1,4 +1,4 @@
-/// DTOs for the pinned lakeFS v1.83.0 API surface. Parsed dynamically from JSON;
+/// DTOs for the pinned lakeFS API surface. Parsed dynamically from JSON;
 /// only the fields this provider consumes are modeled.
 module VersionControlService.LakeFs.LakeFsTypes
 

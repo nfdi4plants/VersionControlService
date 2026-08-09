@@ -4,7 +4,7 @@ namespace VersionControlService.Abstractions
 /// flags — controls feature discovery: a consumer checks presence once and enables
 /// matching UI; it never calls a required stub that returns Unsupported.
 ///
-/// After v2 ships this record and the service records it exposes are frozen: new
+/// After prerelease stabilization this record and its service records are frozen: new
 /// capabilities are added as new optional service records, never as new members
 /// on already-published records.
 type WorkspaceSession = {

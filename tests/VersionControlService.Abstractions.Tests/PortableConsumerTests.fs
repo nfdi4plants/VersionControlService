@@ -95,7 +95,7 @@ let portableConsumerTests =
             let! statusResult = session.Core.GetStatus context
             let status = expectSucceeded "get status" statusResult
 
-            Expect.equal status.WorkspaceVersion "fake-v1" "The fake session returns its workspace version."
+            Expect.equal status.WorkspaceVersion "fake-revision-1" "The fake session returns its workspace version."
         }
 
         testCaseAsync "a portable opened session returns every final SPI value through optional service results"
@@ -195,7 +195,7 @@ let portableConsumerTests =
             Expect.allEqual progressPhases "fake-step" "All progress reports carry the stable phase code."
         }
 
-        testCase "the abstractions project references no Fable, Node, SimpleGit, Git, lakeFS, or Swate dependency"
+        testCase "the abstractions project references no Fable, Node, provider, or application dependency"
         <| fun () ->
             let repositoryRoot = findRepositoryRoot ()
 
@@ -215,7 +215,6 @@ let portableConsumerTests =
                 "SimpleGit"
                 "simple-git"
                 "Node"
-                "Swate"
                 "LakeFs"
                 "ARCtrl"
                 "YAMLicious"

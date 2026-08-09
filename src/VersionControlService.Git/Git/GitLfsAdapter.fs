@@ -1,9 +1,9 @@
-module VersionControlService.Git.GitLfsAdapter
+module internal VersionControlService.Git.GitLfsAdapter
 
 open System
 open Fable.Core.JsInterop
 open Fable.Core.JS
-open VersionControlService.Contracts.Git
+open VersionControlService.Git.GitEngineTypes
 open VersionControlService.Runtime.Node.Interop
 open VersionControlService.Git.GitAuthAdapter
 

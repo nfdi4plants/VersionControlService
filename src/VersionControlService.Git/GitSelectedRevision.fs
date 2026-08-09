@@ -1,7 +1,7 @@
 /// Isolated selected-revision transaction: a temporary index seeded from HEAD,
 /// exact selected paths, commit-tree, and a compare-and-swap ref update that
 /// never disturbs the real index or unrelated working-tree state.
-module VersionControlService.Git.GitSelectedRevision
+module internal VersionControlService.Git.GitSelectedRevision
 
 open System
 open VersionControlService.Abstractions
@@ -148,7 +148,7 @@ let private checkSelectedMetadata
                         |> Array.exists (fun path -> RepositoryPath.value path = ".gitattributes")
 
                     let! attributesStatus =
-                        runGit [| "status"; "--porcelain=v1"; "-z"; "--"; ".gitattributes" |] None [||]
+                        runGit [| "status"; "--porcelain"; "-z"; "--"; ".gitattributes" |] None [||]
 
                     match attributesStatus with
                     | Error failure -> return Error failure

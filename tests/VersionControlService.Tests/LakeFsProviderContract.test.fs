@@ -566,7 +566,7 @@ let private registerProfiles () = [|
     ProvisioningProviderSuite.register lakeFsHarness
     OperationalProviderSuite.register lakeFsHarness
     ExtensionProviderSuites.register lakeFsHarness
-    SwateSelectableSuite.register lakeFsHarness
+    ConsumerWorkflowSuite.register lakeFsHarness
 |]
 
 let private registrations =

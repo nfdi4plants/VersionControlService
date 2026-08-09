@@ -1,11 +1,11 @@
-/// Git LFS as optional v2 services: object materialization, storage policy, and
+/// Git LFS as optional services: object materialization, storage policy, and
 /// local storage maintenance. Core Git never requires these; each operation
 /// reports its own dependency status when git-lfs is unavailable.
-module VersionControlService.Git.GitLfsExtensions
+module internal VersionControlService.Git.GitLfsExtensions
 
 open Fable.Core
 open VersionControlService.Abstractions
-open VersionControlService.Contracts.Git
+open VersionControlService.Git.GitEngineTypes
 
 module GitService = VersionControlService.Git.GitService
 module GitLfsService = VersionControlService.Git.GitLfsService

@@ -261,7 +261,7 @@ Vitest.describe (
     "lakeFS API operational contract",
     fun () ->
         Vitest.test (
-            "lakeFS v1.83 API classifies errors paginates and redacts",
+            "lakeFS API classifies errors paginates and redacts",
             TestOptions(timeout = 120000),
             fun () -> promise {
                 // Pagination: two pages of objects.

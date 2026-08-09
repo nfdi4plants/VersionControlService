@@ -7,7 +7,7 @@ type PathCaseSensitivity =
     | CaseSensitive
     | CaseInsensitive
 
-/// Injected, instance-scoped provider resolution for the v2 session API.
+/// Injected, instance-scoped provider resolution for the workspace-session API.
 /// The host constructs one catalog at its composition root and passes it wherever
 /// resolution is needed.
 module ProviderResolver =

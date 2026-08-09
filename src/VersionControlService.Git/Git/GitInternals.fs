@@ -1,9 +1,9 @@
-module VersionControlService.Git.GitInternals
+module internal VersionControlService.Git.GitInternals
 
 open System
 open Fable.Core
 open Fable.Core.JsInterop
-open VersionControlService.Contracts.Git
+open VersionControlService.Git.GitEngineTypes
 open VersionControlService.Bindings.SimpleGit
 open VersionControlService.Git.GitAuthAdapter
 

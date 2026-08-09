@@ -1,4 +1,4 @@
-/// Pinned lakeFS v1.83.0 API client: only the endpoints this provider needs,
+/// Pinned lakeFS API client: only the endpoints this provider needs,
 /// with structured error classification, exhaustive pagination, injected Basic
 /// credentials, cancellation through the portable contract, and redaction.
 module VersionControlService.LakeFs.LakeFsApi

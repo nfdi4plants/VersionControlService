@@ -1,41 +1,22 @@
 module VersionControlService.Tests.ScaffoldTests
 
-open Thoth.Json.Core
-open VersionControlService.Bindings.SimpleGit
-open VersionControlService.Contracts.FileSystem
-open VersionControlService.Contracts.Git
-open VersionControlService.Support
-open VersionControlService.Tests.NodePath
+open VersionControlService.Abstractions
 open VersionControlService.Tests.VitestBindings
 
-describe("VersionControlService scaffold", fun () ->
-    test("exposes support modules required by the Git extraction", fun () ->
-        let lfsInfo: GitLfsLsFileInfo = {
-            name = "folder/file.txt"
-            size = 42.0
-            checkout = true
-            downloaded = true
-            ``oid_type`` = "sha256"
-            oid = "abc"
-            version = "v1"
-        }
+module GitWorkspaceSession = VersionControlService.Git.GitWorkspaceSession
 
-        toEqual (expect (PathHelpers.normalizeSeparators "folder\\file.txt"), "folder/file.txt")
-        toEqual (expect lfsInfo.name, "folder/file.txt")
-        toEqual (expect GitLfsSkipSmudgeEnvKey, "GIT_LFS_SKIP_SMUDGE")
+describe("VersionControlService provider scaffold", fun () ->
+    test("exposes the Git provider through the public factory contract", fun () ->
+        let factory = GitWorkspaceSession.createFactory GitWorkspaceSession.GitSessionHooks.none
+        toEqual (expect (ProviderId.value factory.Id), "git")
     )
 
-    test("loads public SimpleGit binding used by the Git module", fun () ->
-        let joined = join [| "folder"; "file.txt" |] |> PathHelpers.normalizeSeparators
-        let git = SimpleGit.create ()
+    test("keeps repository path validation in the provider-neutral abstraction", fun () ->
+        toEqual (
+            expect (RepositoryPath.tryCreate "folder/file.txt" |> Result.map RepositoryPath.value),
+            Ok "folder/file.txt"
+        )
 
-        toEqual (expect joined, "folder/file.txt")
-        toBe (expect (isNull (box git)), false)
-    )
-
-    test("loads JSON decoding dependency used by the Git LFS service", fun () ->
-        let decoded = ARCtrl.Json.Decode.fromJsonString Decode.string "\"ok\""
-
-        toEqual (expect decoded, "ok")
+        toBe (expect (RepositoryPath.tryCreate "../outside.txt" |> Result.isError), true)
     )
 )

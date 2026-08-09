@@ -2,7 +2,7 @@
 /// Selected paths are exact repository-relative file names, never pathspecs;
 /// path lists travel over stdin so selection size is not bounded by platform
 /// command-line length limits.
-module VersionControlService.Git.GitPathTransport
+module internal VersionControlService.Git.GitPathTransport
 
 open VersionControlService.Abstractions
 

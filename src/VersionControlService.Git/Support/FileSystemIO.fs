@@ -1,4 +1,4 @@
-module VersionControlService.Support.FileSystemIO
+module internal VersionControlService.Support.FileSystemIO
 
 open Fable.Core
 

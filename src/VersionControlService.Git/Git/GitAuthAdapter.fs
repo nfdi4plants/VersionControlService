@@ -1,4 +1,4 @@
-module VersionControlService.Git.GitAuthAdapter
+module internal VersionControlService.Git.GitAuthAdapter
 
 open System
 open System.Text.RegularExpressions

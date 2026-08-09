@@ -2,13 +2,11 @@
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <PackageId>VersionControlService.Git</PackageId>
-    <Description>Git provider for VersionControlService: v2 workspace sessions over SimpleGit/Git CLI plus the frozen v1 implementation during migration.</Description>
+    <Description>Git and Git LFS provider for VersionControlService workspace sessions.</Description>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="Git\GitEngineTypes.fs" />
     <Compile Include="Support\PathHelpers.fs" />
-    <Compile Include="Contracts\FileSystem.fs" />
-    <Compile Include="Contracts\Git.fs" />
-    <Compile Include="Contracts\VersionControl.fs" />
     <Compile Include="Support\FileSystemIO.fs" />
     <Compile Include="Git\JsonDecoder.fs" />
     <Compile Include="Git\GitCommandResolver.fs" />
@@ -19,7 +17,6 @@
     <Compile Include="Git\GitInternals.fs" />
     <Compile Include="Git\GitService.fs" />
     <Compile Include="Git\GitProvisioningService.fs" />
-    <Compile Include="Git\GitProvider.fs" />
     <Compile Include="GitPathTransport.fs" />
     <Compile Include="GitCredentialStrategy.fs" />
     <Compile Include="GitRefs.fs" />

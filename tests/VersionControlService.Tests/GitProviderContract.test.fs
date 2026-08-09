@@ -4,15 +4,12 @@ open System
 open Fable.Core
 open Fable.Core.JsInterop
 open VersionControlService.Abstractions
-open VersionControlService.Contracts.Git
 open VersionControlService.Tests.Contracts
 open VersionControlService.Tests.Contracts.ProviderHarness
 open VersionControlService.Tests.NodePath
 open Vitest
 
 module GitWorkspaceSession = VersionControlService.Git.GitWorkspaceSession
-module GitLfsExtensions = VersionControlService.Git.GitLfsExtensions
-module GitLfsService = VersionControlService.Git.GitLfsService
 module NodeProcess = VersionControlService.Runtime.Node.Process
 
 let private fsPromisesDynamic: obj = importAll "fs/promises"
@@ -492,7 +489,7 @@ let private registrations = [|
     ProvisioningProviderSuite.register gitHarness
     OperationalProviderSuite.register gitHarness
     ExtensionProviderSuites.register gitHarness
-    SwateSelectableSuite.register gitHarness
+    ConsumerWorkflowSuite.register gitHarness
 |]
 
 let private expectProviderValue (operationName: string) (result: OperationResult<'T>) : 'T =
@@ -510,7 +507,7 @@ let private expectProviderFailure (operationName: string) (result: OperationResu
     | PartiallySucceeded _ -> failwith $"Expected {operationName} to fail."
 
 Vitest.describe (
-    "Git / Swate-selectable profile",
+    "Git / consumer workflow profile",
     fun () ->
         Vitest.test (
             "configured upstream target identity is exposed through the neutral synchronization state",
@@ -726,6 +723,218 @@ let private processOutput exitCode stdout stderr : NodeProcess.ProcessOutput = {
 }
 
 Vitest.describe (
+    "Git provider validation",
+    fun () ->
+        Vitest.test (
+            "rejects invalid ref names through the provider contract",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+
+                    for invalidName in [| ""; "-force"; ".foo"; "foo/.bar"; "foo//bar"; "name\000suffix" |] do
+                        let! statusResult =
+                            workspace.Session.Core.GetStatus(OperationContext.detached "invalid-ref-status")
+                            |> Async.StartAsPromise
+
+                        let status = expectProviderValue "invalid ref status" statusResult
+
+                        let! createResult =
+                            workspace.Session.Core.CreateRef
+                                {
+                                    Name = invalidName
+                                    BaseRef = None
+                                    SwitchTo = false
+                                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                }
+                                (OperationContext.detached "invalid-ref-create")
+                            |> Async.StartAsPromise
+
+                        let failure = expectProviderFailure $"create invalid ref '{invalidName}'" createResult
+                        Vitest.expect(failure.Category).toEqual Validation
+                        Vitest.expect(failure.Code).toBe "invalid_ref_name"
+                        Vitest.expect(failure.StateChanged).toBe false
+
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "passes an option-like remote as one literal location and reports rejection structurally",
+            fun () -> promise {
+                let mutable observedArguments: string[] = [||]
+                let providerLocation = "https://example.invalid/repository.git -c protocol.file.allow=always"
+
+                let hooks = {
+                    GitWorkspaceSession.GitSessionHooks.none with
+                        RunProcess =
+                            Some(fun request _ ->
+                                async {
+                                    observedArguments <- request.Arguments
+                                    return OperationResult.succeeded (processOutput 128 "" "fatal: repository rejected")
+                                })
+                }
+
+                let factory = GitWorkspaceSession.createFactory hooks
+
+                let! result =
+                    factory.VerifyLocation
+                        {
+                            Location = {
+                                ProviderId = gitProviderId
+                                DisplayName = None
+                                ProviderLocation = providerLocation
+                                ConnectionProfileId = None
+                            }
+                            Intents = [| ReadIntent |]
+                        }
+                        (OperationContext.detached "literal-remote-rejection")
+                    |> Async.StartAsPromise
+
+                let failure = expectProviderFailure "option-like remote rejection" result
+                Vitest.expect(failure.Code).toBe "location_unreachable"
+                Vitest.expect(failure.StateChanged).toBe false
+                Vitest.expect(observedArguments |> Array.contains providerLocation).toBe true
+                Vitest.expect(observedArguments |> Array.contains "protocol.file.allow=always").toBe false
+            }
+        )
+
+        Vitest.test (
+            "converts supported origin forms into credential-free repository browser URLs",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let browser =
+                        workspace.Session.RepositoryBrowser
+                        |> Option.defaultWith (fun () -> failwith "Expected Git repository browser service.")
+
+                    let cases = [|
+                        "https://github.com/example/version-control-service.git",
+                        "https://github.com/example/version-control-service"
+                        "https://gitlab.example/group/project",
+                        "https://gitlab.example/group/project"
+                        "ssh://git@gitlab.example/group/project.git",
+                        "https://gitlab.example/group/project"
+                        "https://oauth2:secret@gitlab.example/group/project.git",
+                        "https://gitlab.example/group/project"
+                    |]
+
+                    for remoteUrl, expectedUrl in cases do
+                        let! _ =
+                            runGitIn
+                                workspace.Binding.WorkspaceRoot
+                                [||]
+                                [| "remote"; "set-url"; "origin"; remoteUrl |]
+                                None
+
+                        let! result =
+                            browser.GetRepositoryWebUrl(OperationContext.detached "repository-browser-url")
+                            |> Async.StartAsPromise
+
+                        Vitest.expect(expectProviderValue "repository browser URL" result).toEqual (Some expectedUrl)
+
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "rejects submodule-internal and gitlink selections without moving the ref",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let repoPath = workspace.Binding.WorkspaceRoot
+                    let childPath = join [| dirname repoPath; "child-repository" |]
+
+                    let! _ = runGitIn (dirname repoPath) [||] [| "init"; "-b"; "main"; childPath |] None
+                    do! writeUtf8FileAsync (join [| childPath; "inner.txt" |]) "inner base\n"
+                    do! configureUser childPath
+                    let! _ = runGitIn childPath [||] [| "add"; "-A" |] None
+                    let! _ = runGitIn childPath [||] [| "commit"; "-m"; "test: child base" |] None
+
+                    let! _ =
+                        runGitIn
+                            repoPath
+                            [||]
+                            [|
+                                "-c"
+                                "protocol.file.allow=always"
+                                "submodule"
+                                "add"
+                                childPath.Replace("\\", "/")
+                                "sub"
+                            |]
+                            None
+
+                    let! _ = runGitIn repoPath [||] [| "commit"; "-m"; "test: add submodule" |] None
+                    let! statusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "submodule-status")
+                        |> Async.StartAsPromise
+
+                    let status = expectProviderValue "submodule status" statusResult
+
+                    let! innerResult =
+                        workspace.Session.Core.CreateRevision
+                            {
+                                Message = "test: submodule-internal selection"
+                                Paths = [| RepositoryPath.tryCreate "sub/inner.txt" |> Result.defaultWith failwith |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (OperationContext.detached "submodule-internal-selection")
+                        |> Async.StartAsPromise
+
+                    let innerFailure = expectProviderFailure "submodule-internal selection" innerResult
+                    Vitest.expect(innerFailure.Category).toEqual Validation
+                    Vitest.expect(innerFailure.Code).toBe "submodule_internal_path"
+
+                    let checkedOutChild = join [| repoPath; "sub" |]
+                    do! configureUser checkedOutChild
+                    do! writeUtf8FileAsync (join [| checkedOutChild; "inner.txt" |]) "inner changed\n"
+                    let! _ = runGitIn checkedOutChild [||] [| "add"; "-A" |] None
+                    let! _ = runGitIn checkedOutChild [||] [| "commit"; "-m"; "test: advance submodule" |] None
+                    let! headBefore = runGitIn repoPath [||] [| "rev-parse"; "HEAD" |] None
+                    let! freshStatusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "gitlink-status")
+                        |> Async.StartAsPromise
+
+                    let freshStatus = expectProviderValue "gitlink status" freshStatusResult
+
+                    let! gitlinkResult =
+                        workspace.Session.Core.CreateRevision
+                            {
+                                Message = "test: gitlink selection"
+                                Paths = [| RepositoryPath.tryCreate "sub" |> Result.defaultWith failwith |]
+                                ExpectedWorkspaceVersion = freshStatus.WorkspaceVersion
+                            }
+                            (OperationContext.detached "gitlink-selection")
+                        |> Async.StartAsPromise
+
+                    let gitlinkFailure = expectProviderFailure "gitlink selection" gitlinkResult
+                    Vitest.expect(gitlinkFailure.Code).toBe "submodule_internal_path"
+                    let! headAfter = runGitIn repoPath [||] [| "rev-parse"; "HEAD" |] None
+                    Vitest.expect(headAfter.Trim()).toBe (headBefore.Trim())
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+)
+
+Vitest.describe (
     "Git / extension suites",
     fun () ->
         Vitest.test (
@@ -837,9 +1046,27 @@ Vitest.describe (
                     let! outsideBefore = readFileBase64Async attributesPath
                     let linkedRepo = workspace.Binding.WorkspaceRoot + "-junction"
                     do! createDirectoryJunctionAsync workspace.Binding.WorkspaceRoot linkedRepo
+                    let factory = GitWorkspaceSession.createFactory GitWorkspaceSession.GitSessionHooks.none
 
-                    let! result = GitLfsService.trackLiteral linkedRepo "selected.bin"
-                    Vitest.expect(Result.isError result).toBe true
+                    let! openResult =
+                        factory.Open
+                            { workspace.Binding with WorkspaceRoot = linkedRepo }
+                            (OperationContext.detached "open-junction-workspace")
+                        |> Async.StartAsPromise
+
+                    let linkedSession = expectProviderValue "open junction workspace" openResult
+                    let linkedStoragePolicy =
+                        linkedSession.StoragePolicy
+                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
+
+                    let! result =
+                        linkedStoragePolicy.SetPathPolicy
+                            (RepositoryPath.tryCreate "selected.bin" |> Result.defaultWith failwith)
+                            true
+                            (OperationContext.detached "track-through-junction")
+                        |> Async.StartAsPromise
+
+                    expectProviderFailure "track through junction" result |> ignore
                     let! outsideAfter = readFileBase64Async attributesPath
                     Vitest.expect(outsideAfter).toBe outsideBefore
                     do! harness.Cleanup()
@@ -1346,7 +1573,11 @@ Vitest.describe (
 
                     Vitest.expect(threshold.Trim()).toBe "4"
                     Vitest.expect(materialize.Trim()).toBe "true"
-                    Vitest.expect(localConfig.Contains "swate.lfs.").toBe false
+                    let providerSettings =
+                        localConfig.Replace("\r\n", "\n").Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                        |> Array.filter (fun entry -> entry.StartsWith "versioncontrolservice.lfs.")
+
+                    Vitest.expect(providerSettings.Length).toBe 2
 
                     let fourMiB = 4 * 1024 * 1024
                     do! workspace.WriteFile "configured-below.bin" (String.replicate (fourMiB - 1) "b")
@@ -1391,13 +1622,20 @@ Vitest.describe (
                     let configuredAttributes = configuredAttributes |> Option.defaultValue ""
                     Vitest.expect(configuredAttributes.Contains "\"/configured exact \\\\[file\\\\].bin\" filter=lfs").toBe true
 
-                    Vitest.expect(
-                        GitLfsService.literalTrackingRule "literal[auto]* name.bin"
-                    ).toBe "\"/literal\\\\[auto\\\\]\\\\* name.bin\" filter=lfs diff=lfs merge=lfs -text"
+                    let! literalRuleResult =
+                        storagePolicy.SetPathPolicy
+                            (RepositoryPath.tryCreate "literal[auto]* name.bin" |> Result.defaultWith failwith)
+                            true
+                            (OperationContext.detached "literal-rule-policy")
+                        |> Async.StartAsPromise
+
+                    expectProviderValue "literal rule policy" literalRuleResult |> ignore
+                    let! literalAttributes = workspace.ReadFile ".gitattributes"
 
                     Vitest.expect(
-                        GitLfsService.literalTrackingRule "literal\\path.bin"
-                    ).toBe "\"/literal\\\\path.bin\" filter=lfs diff=lfs merge=lfs -text"
+                        literalAttributes
+                        |> Option.exists _.Contains("\"/literal\\\\[auto\\\\]\\\\* name.bin\" filter=lfs diff=lfs merge=lfs -text")
+                    ).toBe true
 
                     Vitest.expect(RepositoryPath.tryCreate "literal\\path.bin" |> Result.isError).toBe true
 

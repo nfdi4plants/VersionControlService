@@ -1,7 +1,7 @@
 /// Provider-managed Git conflict sessions over the real merge state: candidate
 /// content from index stages, literal-path resolution, and handle bookkeeping
 /// helpers. The session module owns handle storage and validation.
-module VersionControlService.Git.GitConflictSession
+module internal VersionControlService.Git.GitConflictSession
 
 open VersionControlService.Abstractions
 

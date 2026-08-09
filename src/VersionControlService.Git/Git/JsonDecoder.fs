@@ -1,9 +1,9 @@
-module VersionControlService.Git.JsonDecoder
+module internal VersionControlService.Git.JsonDecoder
 
 open System
 open Thoth.Json.Core
 open VersionControlService.Support
-open VersionControlService.Contracts.FileSystem
+open VersionControlService.Git.GitEngineTypes
 
 let private normalizedNonEmptyNameDecoder: Decoder<string> =
     Decode.string

@@ -1,5 +1,5 @@
 /// Injected per-factory/per-connection-profile credential resolution for the
-/// v2 Git provider. Anonymous HTTPS, SSH-agent, and local/file remotes need no
+/// Git provider. Anonymous HTTPS, SSH-agent, and local/file remotes need no
 /// strategy at all; token flows scope their credential to one host and never
 /// place secrets in bindings, requests, or output.
 module VersionControlService.Git.GitCredentialStrategy
@@ -35,7 +35,7 @@ let private encodeUriComponent (_value: string) : string = jsNative
 /// Scoped `-c` arguments injecting a Basic credential for exactly the remote's
 /// host. Non-HTTPS remotes (SSH, scp-like, local paths) get no header: git's own
 /// transport auth applies.
-let buildScopedAuthArguments (remoteUrl: string) (credential: GitCredential option) : string[] =
+let internal buildScopedAuthArguments (remoteUrl: string) (credential: GitCredential option) : string[] =
     match credential with
     | None -> [||]
     | Some resolved ->
@@ -53,7 +53,7 @@ let buildScopedAuthArguments (remoteUrl: string) (credential: GitCredential opti
 /// Git and explicit Git LFS processes. The credential-bearing LFS endpoint is
 /// supplied only through `-c` arguments and is never persisted in repository
 /// configuration or a workspace binding.
-let buildScopedCommandAuthentication
+let internal buildScopedCommandAuthentication
     (remoteName: string)
     (remoteUrl: string)
     (credential: GitCredential option)
@@ -84,7 +84,7 @@ let buildScopedCommandAuthentication
     }
 
 /// Resolves the scoped auth arguments for a repository location.
-let resolveAuthArguments
+let internal resolveAuthArguments
     (strategy: GitCredentialStrategy)
     (providerLocation: string)
     (connectionProfileId: string option)
@@ -102,7 +102,7 @@ let resolveAuthArguments
 /// Resolves the injected strategy once and returns command-scoped material for
 /// the complete Git/LFS operation. Local, file, and SSH transports remain
 /// anonymous and use Git's native credential mechanisms.
-let resolveCommandAuthentication
+let internal resolveCommandAuthentication
     (strategy: GitCredentialStrategy)
     (providerLocation: string)
     (connectionProfileId: string option)

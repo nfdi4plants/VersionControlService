@@ -1,4 +1,4 @@
-module VersionControlService.Git.GitCommandResolver
+module internal VersionControlService.Git.GitCommandResolver
 
 open System
 open System.Collections.Generic

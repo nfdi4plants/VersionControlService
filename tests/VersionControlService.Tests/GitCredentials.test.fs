@@ -31,6 +31,14 @@ let private writeUtf8FileAsync (path: string) (content: string) : JS.Promise<uni
     return ()
 }
 
+let private pathExistsAsync (path: string) : JS.Promise<bool> = promise {
+    try
+        let! _ = fsPromisesDynamic?access (path) |> unbox<JS.Promise<obj>>
+        return true
+    with _ ->
+        return false
+}
+
 let private runGitIn (cwd: string) (arguments: string[]) : JS.Promise<string> = promise {
     let request = {
         NodeProcess.ProcessRequest.create "git" arguments with
@@ -75,10 +83,37 @@ let private testHttpsUrl = $"https://{testHost}/origin.git"
 let private testSecret = "secret-token-123"
 
 Vitest.describe (
-    "GitWorkspaceSession v2 credential strategies",
+    "credential redaction",
+    fun () ->
+        let cases = [|
+            "Authorization: Bearer abc123", "Authorization: [REDACTED]"
+            "authorization:bearer XYZ", "authorization: [REDACTED]"
+            "PRIVATE-TOKEN: abc123", "PRIVATE-TOKEN: [REDACTED]"
+            "X-Access-Token: abc123", "X-Access-Token: [REDACTED]"
+            "fatal: unable to access 'https://user:secret@example.test/repository.git/'",
+            "fatal: unable to access 'https://[REDACTED]@example.test/repository.git/'"
+            "clean message", "clean message"
+        |]
+
+        for input, expected in cases do
+            Vitest.test (
+                $"redacts credential material in '{input}'",
+                fun () -> Vitest.expect(Redaction.redact input).toBe expected
+            )
+
+        Vitest.test (
+            "keeps null unchanged",
+            fun () ->
+                let redacted: string = Redaction.redact null
+                Vitest.expect(isNull redacted).toBe true
+        )
+)
+
+Vitest.describe (
+    "Git workspace credential strategies",
     fun () ->
         Vitest.test (
-            "v2 credential strategies support anonymous token SSH and local remotes",
+            "credential strategies support anonymous token SSH and local remotes",
             TestOptions(timeout = 120000),
             fun () -> promise {
                 let! root = createTempDirectoryAsync ()
@@ -108,7 +143,7 @@ Vitest.describe (
 
                     let! _ = runGitIn workPath [| "push"; "-u"; "origin"; "main" |]
 
-                    // Process spy: records every v2 invocation to observe injected auth.
+                    // Process spy: records every provider invocation to observe injected auth.
                     let observedCommands = ResizeArray<string[]>()
 
                     let hooks = {
@@ -184,9 +219,61 @@ Vitest.describe (
 
                     Vitest.expect(fetchHasScopedAuth).toBe (true)
 
-                    // The strategy saw the host and the session's connection profile.
-                    Vitest.expect(strategyCalls |> Seq.exists (fun (host, profile) ->
-                        host = testHost && profile = Some "token-profile")).toBe (true)
+                    // Refresh resolves exactly one scoped core-Git credential.
+                    Vitest.expect(strategyCalls.ToArray()).toEqual [| testHost, Some "token-profile" |]
+
+                    do! writeUtf8FileAsync (join [| workPath; "authenticated-publish.txt" |]) "published\n"
+                    let! revisionStatusResult = session.Core.GetStatus(ctx "credential-revision-status") |> Async.StartAsPromise
+                    let revisionStatus = expectValue "credential revision status" revisionStatusResult
+
+                    let! revisionResult =
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: authenticated publish"
+                                Paths =
+                                    [|
+                                        RepositoryPath.tryCreate "authenticated-publish.txt"
+                                        |> Result.defaultWith failwith
+                                    |]
+                                ExpectedWorkspaceVersion = revisionStatus.WorkspaceVersion
+                            }
+                            (ctx "credential-revision")
+                        |> Async.StartAsPromise
+
+                    expectValue "credential revision" revisionResult |> ignore
+                    let! publishStatusResult = session.Core.GetStatus(ctx "credential-publish-status") |> Async.StartAsPromise
+                    let publishStatus = expectValue "credential publish status" publishStatusResult
+
+                    let! publishResult =
+                        syncService.Publish
+                            {
+                                ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                            }
+                            (ctx "credential-publish")
+                        |> Async.StartAsPromise
+
+                    expectValue "credential publish" publishResult |> ignore
+                    let pushCommands =
+                        observedCommands
+                        |> Seq.filter (fun arguments -> arguments |> Array.contains "push")
+                        |> Seq.toArray
+
+                    let expectedLfsUrl = $"lfs.url=https://oauth2:{testSecret}@{testHost}/origin.git/info/lfs"
+                    Vitest.expect(pushCommands.Length > 0).toBe true
+
+                    Vitest.expect(
+                        pushCommands
+                        |> Array.forall (fun arguments ->
+                            arguments |> Array.exists (fun argument -> argument.StartsWith expectedHeaderPrefix)
+                            && arguments |> Array.contains expectedLfsUrl)
+                    ).toBe true
+
+                    // Publish resolves once and reuses that scoped material for core Git and LFS.
+                    Vitest.expect(strategyCalls.ToArray()).toEqual [|
+                        testHost, Some "token-profile"
+                        testHost, Some "token-profile"
+                    |]
 
                     // Anonymous local-path remote: a session with the anonymous strategy
                     // and no global token machinery synchronizes fine.
@@ -282,128 +369,71 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "v2 publish never creates a remote repository",
+            "publish never creates a missing remote repository",
             TestOptions(timeout = 120000),
             fun () -> promise {
                 let! root = createTempDirectoryAsync ()
 
-                // A provisioning spy that must never be invoked by core publish.
-                let mutable provisioningCalls = 0
-
-                VersionControlService.Git.GitTokenProvider.RemoteProvisioning.setProvider {
-                    CreateProject =
-                        fun _ -> promise {
-                            provisioningCalls <- provisioningCalls + 1
-                            return Error "provisioning must not run"
-                        }
-                }
-
                 try
-                    try
-                        let workPath = join [| root; "work" |]
-                        let! _ = runGitIn root [| "init"; "-b"; "main"; workPath |]
-                        let! _ = runGitIn workPath [| "config"; "user.name"; "VCS Cred Tests" |]
-                        let! _ = runGitIn workPath [| "config"; "user.email"; "cred@example.org" |]
-                        do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) "base\n"
-                        let! _ = runGitIn workPath [| "add"; "-A" |]
-                        let! _ = runGitIn workPath [| "commit"; "-m"; "init: base" |]
+                    let workPath = join [| root; "work" |]
+                    let! _ = runGitIn root [| "init"; "-b"; "main"; workPath |]
+                    let! _ = runGitIn workPath [| "config"; "user.name"; "VCS Cred Tests" |]
+                    let! _ = runGitIn workPath [| "config"; "user.email"; "cred@example.org" |]
+                    do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) "base\n"
+                    let! _ = runGitIn workPath [| "add"; "-A" |]
+                    let! _ = runGitIn workPath [| "commit"; "-m"; "init: base" |]
 
-                        // The configured target does not exist.
-                        let missingRemote = join [| root; "missing-remote.git" |]
-                        let! _ = runGitIn workPath [| "remote"; "add"; "origin"; missingRemote |]
+                    // The configured target does not exist.
+                    let missingRemote = join [| root; "missing-remote.git" |]
+                    let! _ = runGitIn workPath [| "remote"; "add"; "origin"; missingRemote |]
 
-                        let binding: WorkspaceBinding = {
-                            SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
+                    let binding: WorkspaceBinding = {
+                        SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
+                        ProviderId = gitProviderId
+                        WorkspaceRoot = workPath
+                        ProviderStateRef = None
+                        Location = {
                             ProviderId = gitProviderId
-                            WorkspaceRoot = workPath
-                            ProviderStateRef = None
-                            Location = {
-                                ProviderId = gitProviderId
-                                DisplayName = None
-                                ProviderLocation = missingRemote
-                                ConnectionProfileId = None
-                            }
+                            DisplayName = None
+                            ProviderLocation = missingRemote
                             ConnectionProfileId = None
                         }
+                        ConnectionProfileId = None
+                    }
 
-                        let session =
-                            GitWorkspaceSession.createSession GitWorkspaceSession.GitSessionHooks.none binding
+                    let session =
+                        GitWorkspaceSession.createSession GitWorkspaceSession.GitSessionHooks.none binding
 
-                        let syncService =
-                            match session.Synchronization with
-                            | Some service -> service
-                            | None -> failwith "Expected the synchronization service."
+                    let syncService =
+                        match session.Synchronization with
+                        | Some service -> service
+                        | None -> failwith "Expected the synchronization service."
 
-                        let! statusResult = Async.StartAsPromise(session.Core.GetStatus(ctx "prov-status"))
-                        let status = expectValue "status" statusResult
+                    let! statusResult = Async.StartAsPromise(session.Core.GetStatus(ctx "missing-remote-status"))
+                    let status = expectValue "status" statusResult
 
-                        let! publishResult =
-                            Async.StartAsPromise(
-                                syncService.Publish
-                                    {
-                                        ExpectedWorkspaceVersion = status.WorkspaceVersion
-                                        ExpectedTargetRevision = None
-                                    }
-                                    (ctx "prov-publish")
-                            )
+                    let! publishResult =
+                        Async.StartAsPromise(
+                            syncService.Publish
+                                {
+                                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                    ExpectedTargetRevision = None
+                                }
+                                (ctx "missing-remote-publish")
+                        )
 
-                        // Publish fails structurally — and never provisions a project.
-                        match publishResult with
-                        | Failed failure -> Vitest.expect(failure.Retryable).toBe (true)
-                        | Succeeded _
-                        | PartiallySucceeded _ -> failwith "Expected publish to a missing remote to fail."
+                    match publishResult with
+                    | Failed failure -> Vitest.expect(failure.Retryable).toBe (true)
+                    | Succeeded _
+                    | PartiallySucceeded _ -> failwith "Expected publish to a missing remote to fail."
 
-                        Vitest.expect(provisioningCalls).toBe (0)
+                    let! remoteExists = pathExistsAsync missingRemote
+                    Vitest.expect(remoteExists).toBe false
 
-                        do! removeDirectoryAsync root
-                    with error ->
-                        do! removeDirectoryAsync root
-                        return raise error
-                finally
-                    VersionControlService.Git.GitTokenProvider.RemoteProvisioning.setProvider
-                        VersionControlService.Git.GitTokenProvider.RemoteProvisioning.defaultProvider
-            }
-        )
-)
-
-Vitest.describe (
-    "Git LFS credentials",
-    fun () ->
-        Vitest.test (
-            "one injected credential resolution scopes both Git and Git LFS transfers",
-            fun () -> promise {
-                let calls = ResizeArray<string * string option>()
-
-                let strategy: GitCredentialStrategy.GitCredentialStrategy = {
-                    ResolveCredential =
-                        fun host profileId ->
-                            async {
-                                calls.Add(host, profileId)
-
-                                return
-                                    Some {
-                                        Username = "oauth2"
-                                        Secret = testSecret
-                                    }
-                            }
-                }
-
-                let! authentication =
-                    GitCredentialStrategy.resolveCommandAuthentication
-                        strategy
-                        testHttpsUrl
-                        (Some "token-profile")
-                        "origin"
-                    |> Async.StartAsPromise
-
-                Vitest.expect(calls.ToArray()).toEqual [| testHost, Some "token-profile" |]
-
-                let arguments = String.concat "\n" authentication.ConfigArgs
-                let expectedHeader = $"http.https://{testHost}/.extraHeader=Authorization: Basic "
-                let expectedLfsUrl = $"lfs.url=https://oauth2:{testSecret}@{testHost}/origin.git/info/lfs"
-
-                Vitest.expect(arguments.Contains expectedHeader).toBe true
-                Vitest.expect(arguments.Contains expectedLfsUrl).toBe true
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
             }
         )
 )

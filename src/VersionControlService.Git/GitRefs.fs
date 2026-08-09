@@ -1,6 +1,6 @@
 /// Authoritative Git ref validation: basic argument safety, then Git's own
 /// `check-ref-format --branch` as the single source of truth.
-module VersionControlService.Git.GitRefs
+module internal VersionControlService.Git.GitRefs
 
 open System
 open VersionControlService.Abstractions

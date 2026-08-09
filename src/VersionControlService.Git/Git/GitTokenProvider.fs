@@ -1,4 +1,4 @@
-module VersionControlService.Git.GitTokenProvider
+module internal VersionControlService.Git.GitTokenProvider
 
 open System
 open Fable.Core

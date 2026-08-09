@@ -1,11 +1,20 @@
-module VersionControlService.Contracts.Git
+module internal VersionControlService.Git.GitEngineTypes
 
 open Fable.Core
+
+type GitLfsLsFileInfo = {
+    name: string
+    size: float
+    checkout: bool
+    downloaded: bool
+    ``oid_type``: string
+    oid: string
+    version: string
+}
 
 [<Literal>]
 let GitLfsSkipSmudgeEnvKey = "GIT_LFS_SKIP_SMUDGE"
 
-// GIT LFS Types
 type GitLfsCommand =
     | Pull
     | Fetch

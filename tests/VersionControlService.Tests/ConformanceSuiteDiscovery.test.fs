@@ -16,7 +16,7 @@ let private registrations = [|
     ProvisioningProviderSuite.register fakeHarness
     OperationalProviderSuite.register fakeHarness
     ExtensionProviderSuites.register fakeHarness
-    SwateSelectableSuite.register fakeHarness
+    ConsumerWorkflowSuite.register fakeHarness
 |]
 
 Vitest.describe (
@@ -34,10 +34,12 @@ Vitest.describe (
                     "fake / provisioning profile"
                     "fake / operational profile"
                     "fake / extension suites"
-                    "fake / Swate-selectable profile"
+                    "fake / consumer workflow profile"
                 |]
 
-                Vitest.expect(registrations |> Array.map fst).toEqual (expectedProfiles)
+                let registeredProfiles = registrations |> Array.map fst
+                Vitest.expect(registeredProfiles).toEqual (expectedProfiles)
+                Vitest.expect(registeredProfiles |> Array.exists (fun name -> name.Contains "selectable")).toBe (false)
 
                 // The getters are evaluated now, after Vitest's collection phase
                 // has run every describe callback.

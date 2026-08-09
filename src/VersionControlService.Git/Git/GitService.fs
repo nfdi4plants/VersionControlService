@@ -1,12 +1,11 @@
-module VersionControlService.Git.GitService
+module internal VersionControlService.Git.GitService
 
 open System
 open System.IO
 open System.Text.RegularExpressions
 open Fable.Core
 open Fable.Core.JsInterop
-open VersionControlService.Contracts.FileSystem
-open VersionControlService.Contracts.Git
+open VersionControlService.Git.GitEngineTypes
 open VersionControlService.Runtime.Node.Interop
 open VersionControlService.Runtime.Node.FileSystem
 open VersionControlService.Runtime.Node.Path
@@ -517,7 +516,7 @@ let private tryResolveArcRelativePath (arcPath: string) (requestedPath: string) 
             Ok(safeRelativePath, absolutePath)
 
 let private createTemporaryLfsBackupPath (absolutePath: string) =
-    $"{absolutePath}.swate-lfs-backup-{Guid.NewGuid():N}"
+    $"{absolutePath}.vcs-lfs-backup-{Guid.NewGuid():N}"
 
 let private restoreTemporaryLfsBackup backupPath absolutePath =
     if existsSync backupPath then

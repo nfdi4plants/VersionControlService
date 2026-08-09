@@ -219,10 +219,10 @@ let private createTextPublishRevision
     }
 
 Vitest.describe (
-    "GitWorkspaceSession v2 partial success",
+    "Git workspace partial success",
     fun () ->
         Vitest.test (
-            "v2 reports transfer success with hydration recovery",
+            "reports transfer success with hydration recovery",
             TestOptions(timeout = 120000),
             fun () -> promise {
                 // Requires git-lfs; report a pass with a skip note when unavailable.
@@ -305,7 +305,7 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "v2 large-object listing preserves operational failures",
+            "large-object listing preserves operational failures",
             TestOptions(timeout = 120000),
             fun () -> promise {
                 let! root = createTempDirectoryAsync ()
@@ -353,6 +353,83 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "object materialization preserves dirty consumer content on rejection",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let! root, workPath, _, session =
+                        createPublishFixture GitWorkspaceSession.GitSessionHooks.none
+
+                    try
+                        let objectPath = join [| workPath; "guarded.bin" |]
+                        let! _ = runGitOk workPath [| "lfs"; "track"; "guarded.bin" |]
+                        do! writeUtf8FileAsync objectPath "tracked object content\n"
+                        let! _ = runGitOk workPath [| "add"; ".gitattributes"; "guarded.bin" |]
+                        let! _ = runGitOk workPath [| "commit"; "-m"; "test: tracked object" |]
+                        let! _ = runGitOk workPath [| "push"; "origin"; "main" |]
+
+                        let materialization =
+                            session.ObjectMaterialization
+                            |> Option.defaultWith (fun () -> failwith "Expected Git object materialization service.")
+
+                        let consumerEdit = "dirty consumer content\n"
+                        do! writeUtf8FileAsync objectPath consumerEdit
+
+                        let! dematerializeResult =
+                            materialization.Dematerialize
+                                (repositoryPath "guarded.bin")
+                                (ctx "dirty-dematerialize")
+                            |> Async.StartAsPromise
+
+                        match dematerializeResult with
+                        | Failed failure -> Vitest.expect(failure.StateChanged).toBe false
+                        | Succeeded _
+                        | PartiallySucceeded _ -> failwith "Dirty object dematerialization must fail."
+
+                        let! afterDematerialize = tryReadUtf8FileAsync objectPath
+                        Vitest.expect(afterDematerialize).toEqual (Some consumerEdit)
+
+                        let! _ = runGitOk workPath [| "checkout"; "--"; "guarded.bin" |]
+
+                        let! cleanDematerialize =
+                            materialization.Dematerialize
+                                (repositoryPath "guarded.bin")
+                                (ctx "clean-dematerialize")
+                            |> Async.StartAsPromise
+
+                        match cleanDematerialize with
+                        | Succeeded _ -> ()
+                        | PartiallySucceeded(_, failure)
+                        | Failed failure -> failwith $"Clean dematerialization failed ({failure.Code})."
+
+                        let dirtyPointerEdit = "dirty pointer replacement\n"
+                        do! writeUtf8FileAsync objectPath dirtyPointerEdit
+
+                        let! materializeResult =
+                            materialization.Materialize
+                                (repositoryPath "guarded.bin")
+                                (ctx "dirty-materialize")
+                            |> Async.StartAsPromise
+
+                        match materializeResult with
+                        | Failed failure -> Vitest.expect(failure.StateChanged).toBe false
+                        | Succeeded _
+                        | PartiallySucceeded _ -> failwith "Dirty object materialization must fail."
+
+                        let! afterMaterialize = tryReadUtf8FileAsync objectPath
+                        Vitest.expect(afterMaterialize).toEqual (Some dirtyPointerEdit)
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
             "selected revision LFS reconciliation rejects unrelated dirty attributes before ref movement",
             TestOptions(timeout = 120000),
             fun () -> promise {
@@ -367,7 +444,7 @@ Vitest.describe (
                             (String.replicate (1024 * 1024) "x")
 
                     let! headBefore = runGitOk workPath [| "rev-parse"; "HEAD" |]
-                    let! statusBefore = runGitOk workPath [| "status"; "--porcelain=v1" |]
+                    let! statusBefore = runGitOk workPath [| "status"; "--porcelain" |]
                     let session =
                         GitWorkspaceSession.createSession GitWorkspaceSession.GitSessionHooks.none binding
 
@@ -396,7 +473,7 @@ Vitest.describe (
                     | _ -> failwith "Expected unrelated dirty attributes to fail before ref movement."
 
                     let! headAfter = runGitOk workPath [| "rev-parse"; "HEAD" |]
-                    let! statusAfter = runGitOk workPath [| "status"; "--porcelain=v1" |]
+                    let! statusAfter = runGitOk workPath [| "status"; "--porcelain" |]
                     let! attributesAfter = tryReadUtf8FileAsync (join [| workPath; ".gitattributes" |])
                     Vitest.expect(headAfter.Trim()).toBe (headBefore.Trim())
                     Vitest.expect(statusAfter).toBe statusBefore
@@ -421,7 +498,7 @@ Vitest.describe (
                             (String.replicate (1024 * 1024) "m")
 
                     let! headBefore = runGitOk workPath [| "rev-parse"; "HEAD" |]
-                    let! statusBefore = runGitOk workPath [| "status"; "--porcelain=v1" |]
+                    let! statusBefore = runGitOk workPath [| "status"; "--porcelain" |]
 
                     let hooks: GitWorkspaceSession.GitSessionHooks = {
                         RunBytesProcess = None
@@ -467,7 +544,7 @@ Vitest.describe (
                     | _ -> failwith "Expected the missing Git LFS dependency to fail before ref movement."
 
                     let! headAfter = runGitOk workPath [| "rev-parse"; "HEAD" |]
-                    let! statusAfter = runGitOk workPath [| "status"; "--porcelain=v1" |]
+                    let! statusAfter = runGitOk workPath [| "status"; "--porcelain" |]
                     let! attributesAfter = tryReadUtf8FileAsync (join [| workPath; ".gitattributes" |])
                     Vitest.expect(headAfter.Trim()).toBe (headBefore.Trim())
                     Vitest.expect(statusAfter).toBe statusBefore
@@ -903,7 +980,7 @@ Vitest.describe (
                     let largeContent = String.replicate (1024 * 1024) "p"
                     do! writeUtf8FileAsync (join [| workPath; "large.bin" |]) largeContent
                     let! headBefore = runGitOk workPath [| "rev-parse"; "HEAD" |]
-                    let! statusBefore = runGitOk workPath [| "status"; "--porcelain=v1" |]
+                    let! statusBefore = runGitOk workPath [| "status"; "--porcelain" |]
 
                     let hooks: GitWorkspaceSession.GitSessionHooks = {
                         RunBytesProcess = None
@@ -949,7 +1026,7 @@ Vitest.describe (
                     | _ -> failwith "Expected LFS preparation to fail before ref movement."
 
                     let! headAfter = runGitOk workPath [| "rev-parse"; "HEAD" |]
-                    let! statusAfter = runGitOk workPath [| "status"; "--porcelain=v1" |]
+                    let! statusAfter = runGitOk workPath [| "status"; "--porcelain" |]
                     let! attributesAfter = tryReadUtf8FileAsync (join [| workPath; ".gitattributes" |])
                     let! worktreeAfter = tryReadUtf8FileAsync (join [| workPath; "large.bin" |])
                     Vitest.expect(headAfter.Trim()).toBe (headBefore.Trim())
@@ -976,7 +1053,7 @@ Vitest.describe (
                             (String.replicate (1024 * 1024) "c")
 
                     let! headBefore = runGitOk workPath [| "rev-parse"; "HEAD" |]
-                    let! statusBefore = runGitOk workPath [| "status"; "--porcelain=v1" |]
+                    let! statusBefore = runGitOk workPath [| "status"; "--porcelain" |]
                     let session = GitWorkspaceSession.createSession GitWorkspaceSession.GitSessionHooks.none binding
                     let! statusResult = session.Core.GetStatus(ctx "cancel-lfs-status") |> Async.StartAsPromise
                     let status =
@@ -1009,7 +1086,7 @@ Vitest.describe (
                     | _ -> failwith "Expected automatic LFS revision cancellation."
 
                     let! headAfter = runGitOk workPath [| "rev-parse"; "HEAD" |]
-                    let! statusAfter = runGitOk workPath [| "status"; "--porcelain=v1" |]
+                    let! statusAfter = runGitOk workPath [| "status"; "--porcelain" |]
                     let! attributesAfter = tryReadUtf8FileAsync (join [| workPath; ".gitattributes" |])
                     Vitest.expect(headAfter.Trim()).toBe (headBefore.Trim())
                     Vitest.expect(statusAfter).toBe statusBefore

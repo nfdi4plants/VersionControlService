@@ -16,7 +16,7 @@ let private expectHandleRejection (operationName: string) (result: OperationResu
         .toEqual (Some ConflictRecovery.RefreshConflictSession)
 
 /// Opens a real conflict: the target and the workspace change base.txt differently
-/// (the workspace side saved as a revision, matching the Swate save-then-update
+/// (the workspace side saved as a revision, matching a consumer save-then-update
 /// flow), then Update reports conflicts and opens a provider-managed session.
 let private openConflict (harness: ProviderTestHarness) = promise {
     let! workspace = harness.CreateWorkspace()
