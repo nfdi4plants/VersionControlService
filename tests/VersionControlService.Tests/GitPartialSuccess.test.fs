@@ -186,6 +186,35 @@ let private createPublishFixture hooks = promise {
     return root, workPath, barePath, GitWorkspaceSession.createSession hooks binding
 }
 
+let private createTextPublishRevision
+    (session: WorkspaceSession)
+    (workPath: string)
+    (path: string)
+    (operationName: string)
+    =
+    promise {
+        do! writeUtf8FileAsync (join [| workPath; path |]) "published\n"
+        let! status = sessionStatus session
+
+        let! revision =
+            session.Core.CreateRevision
+                {
+                    Message = $"test: {operationName}"
+                    Paths = [| repositoryPath path |]
+                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                }
+                (ctx $"{operationName}-revision")
+            |> Async.StartAsPromise
+
+        match revision with
+        | Succeeded _ -> ()
+        | _ -> failwith "Expected the publication revision to be created."
+
+        let! localHead = runGitOk workPath [| "rev-parse"; "HEAD" |]
+        let! publishStatus = sessionStatus session
+        return localHead.Trim(), publishStatus
+    }
+
 Vitest.describe (
     "GitWorkspaceSession v2 partial success",
     fun () ->
@@ -1871,6 +1900,588 @@ Vitest.describe (
                     with error ->
                         do! removeDirectoryAsync root
                         return raise error
+            }
+        )
+
+        Vitest.test (
+            "push execution failure after remote advancement reports partial success",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable pushAdvancedRemote = false
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request operationContext ->
+                            async {
+                                if request.Arguments |> Array.contains "push" then
+                                    let! pushResult = NodeProcess.run request operationContext
+
+                                    match pushResult with
+                                    | Succeeded outcome when outcome.Value.ExitCode = 0 ->
+                                        pushAdvancedRemote <- true
+
+                                        return
+                                            OperationResult.failed {
+                                                OperationFailure.createRedacted
+                                                    Network
+                                                    "injected_push_response_loss"
+                                                    "The push response was lost after https://secret@example.invalid accepted it." with
+                                                    Retryable = true
+                                                    Details = [| "authorization: secret" |] |> Array.map Redaction.redact
+                                            }
+                                    | _ -> return pushResult
+                                else
+                                    return! NodeProcess.run request operationContext
+                            })
+                    Barrier = None
+                }
+
+                let! root, workPath, barePath, session = createPublishFixture hooks
+
+                try
+                    do! writeUtf8FileAsync (join [| workPath; "response-loss.txt" |]) "published\n"
+                    let! status = sessionStatus session
+
+                    let! revision =
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: publish before response loss"
+                                Paths = [| repositoryPath "response-loss.txt" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (ctx "push-response-loss-revision")
+                        |> Async.StartAsPromise
+
+                    match revision with
+                    | Succeeded _ -> ()
+                    | _ -> failwith "Expected the publication revision to be created."
+
+                    let! previousTarget = runGitOk barePath [| "rev-parse"; "main" |]
+                    let! localHead = runGitOk workPath [| "rev-parse"; "HEAD" |]
+                    let! publishStatus = sessionStatus session
+
+                    let! result =
+                        (synchronization session).Publish
+                            {
+                                ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                            }
+                            (ctx "push-response-loss")
+                        |> Async.StartAsPromise
+
+                    Vitest.expect(pushAdvancedRemote).toBe true
+
+                    match result with
+                    | PartiallySucceeded(outcome, failure) ->
+                        Vitest.expect(outcome.Publication).toEqual Published
+                        Vitest.expect(outcome.AffectedPaths).toEqual [| "response-loss.txt" |]
+                        Vitest.expect(failure.AffectedPaths).toEqual [| "response-loss.txt" |]
+                        Vitest.expect(outcome.ResultingRevision |> Option.map RevisionId.value).toEqual (
+                            Some(localHead.Trim())
+                        )
+                        Vitest.expect(failure.Category).toEqual Network
+                        Vitest.expect(failure.Code).toBe "injected_push_response_loss"
+                        Vitest.expect(failure.StateChanged).toBe true
+                        Vitest.expect(failure.Retryable).toBe true
+                        Vitest.expect(failure.Message.Contains "secret").toBe false
+                        Vitest.expect(failure.Details |> Array.exists _.Contains("secret")).toBe false
+                        Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (
+                            Some "retry_publish_verification"
+                        )
+                        Vitest.expect(
+                            failure.RevisionEvidence
+                            |> Array.contains ("previous_target", previousTarget.Trim() |> RevisionId.tryCreate |> Result.defaultWith failwith)
+                        ).toBe true
+                        Vitest.expect(
+                            failure.RevisionEvidence
+                            |> Array.contains ("published_revision", localHead.Trim() |> RevisionId.tryCreate |> Result.defaultWith failwith)
+                        ).toBe true
+                        Vitest.expect(
+                            failure.RevisionEvidence
+                            |> Array.contains ("observed_target", localHead.Trim() |> RevisionId.tryCreate |> Result.defaultWith failwith)
+                        ).toBe true
+                    | Failed failure ->
+                        failwith $"Remote advancement was concealed as Failed ({failure.Code})."
+                    | Succeeded _ -> failwith "Expected the lost push response to remain visible as a warning."
+
+                    let! targetHead = runGitOk barePath [| "rev-parse"; "main" |]
+                    Vitest.expect(targetHead.Trim()).toBe(localHead.Trim())
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "new branch ambiguity reports every newly visible path",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request operationContext ->
+                            async {
+                                if request.Arguments |> Array.contains "push" then
+                                    let! pushResult = NodeProcess.run request operationContext
+
+                                    match pushResult with
+                                    | Succeeded outcome when outcome.Value.ExitCode = 0 ->
+                                        return
+                                            OperationResult.failed {
+                                                OperationFailure.createRedacted
+                                                    Network
+                                                    "injected_new_branch_response_loss"
+                                                    "The new branch response was lost after acceptance." with
+                                                    Retryable = true
+                                            }
+                                    | _ -> return pushResult
+                                else
+                                    return! NodeProcess.run request operationContext
+                            })
+                    Barrier = None
+                }
+
+                let! root, workPath, barePath, session = createPublishFixture hooks
+
+                try
+                    let! _ = runGitOk barePath [| "update-ref"; "-d"; "refs/heads/main" |]
+
+                    let! localHead, publishStatus =
+                        createTextPublishRevision session workPath "new-branch.txt" "new-branch-response-loss"
+
+                    let! result =
+                        (synchronization session).Publish
+                            {
+                                ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                            }
+                            (ctx "new-branch-response-loss")
+                        |> Async.StartAsPromise
+
+                    match result with
+                    | PartiallySucceeded(outcome, failure) ->
+                        Vitest.expect(outcome.Publication).toEqual Published
+                        Vitest.expect(outcome.AffectedPaths).toEqual [| "base.txt"; "new-branch.txt" |]
+                        Vitest.expect(failure.AffectedPaths).toEqual [| "base.txt"; "new-branch.txt" |]
+                        Vitest.expect(
+                            failure.RevisionEvidence
+                            |> Array.contains ("published_revision", localHead |> RevisionId.tryCreate |> Result.defaultWith failwith)
+                        ).toBe true
+                        Vitest.expect(
+                            failure.RevisionEvidence
+                            |> Array.contains ("observed_target", localHead |> RevisionId.tryCreate |> Result.defaultWith failwith)
+                        ).toBe true
+                    | _ -> failwith "Expected accepted new-branch ambiguity to report partial success."
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "push nonzero exit after remote advancement reports partial success",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable pushAdvancedRemote = false
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request operationContext ->
+                            async {
+                                if request.Arguments |> Array.contains "push" then
+                                    let! pushResult = NodeProcess.run request operationContext
+
+                                    match pushResult with
+                                    | Succeeded outcome when outcome.Value.ExitCode = 0 ->
+                                        pushAdvancedRemote <- true
+
+                                        return
+                                            OperationResult.succeeded {
+                                                ExitCode = 1
+                                                StdOut = ""
+                                                StdErr = "transport closed after the remote accepted the ref"
+                                            }
+                                    | _ -> return pushResult
+                                else
+                                    return! NodeProcess.run request operationContext
+                            })
+                    Barrier = None
+                }
+
+                let! root, workPath, barePath, session = createPublishFixture hooks
+
+                try
+                    do! writeUtf8FileAsync (join [| workPath; "nonzero-response.txt" |]) "published\n"
+                    let! status = sessionStatus session
+
+                    let! revision =
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: publish before nonzero response"
+                                Paths = [| repositoryPath "nonzero-response.txt" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (ctx "push-nonzero-revision")
+                        |> Async.StartAsPromise
+
+                    match revision with
+                    | Succeeded _ -> ()
+                    | _ -> failwith "Expected the publication revision to be created."
+
+                    let! previousTarget = runGitOk barePath [| "rev-parse"; "main" |]
+                    let! localHead = runGitOk workPath [| "rev-parse"; "HEAD" |]
+                    let! publishStatus = sessionStatus session
+
+                    let! result =
+                        (synchronization session).Publish
+                            {
+                                ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                            }
+                            (ctx "push-nonzero")
+                        |> Async.StartAsPromise
+
+                    Vitest.expect(pushAdvancedRemote).toBe true
+
+                    match result with
+                    | PartiallySucceeded(outcome, failure) ->
+                        Vitest.expect(outcome.Publication).toEqual Published
+                        Vitest.expect(outcome.AffectedPaths).toEqual [| "nonzero-response.txt" |]
+                        Vitest.expect(failure.AffectedPaths).toEqual [| "nonzero-response.txt" |]
+                        Vitest.expect(outcome.ResultingRevision |> Option.map RevisionId.value).toEqual (
+                            Some(localHead.Trim())
+                        )
+                        Vitest.expect(failure.Category).toEqual Network
+                        Vitest.expect(failure.Code).toBe "target_unreachable"
+                        Vitest.expect(failure.StateChanged).toBe true
+                        Vitest.expect(failure.Retryable).toBe true
+                        Vitest.expect(failure.Message.Contains "transport closed").toBe true
+                        Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (
+                            Some "retry_publish_verification"
+                        )
+                        Vitest.expect(
+                            failure.RevisionEvidence
+                            |> Array.contains ("previous_target", previousTarget.Trim() |> RevisionId.tryCreate |> Result.defaultWith failwith)
+                        ).toBe true
+                        Vitest.expect(
+                            failure.RevisionEvidence
+                            |> Array.contains ("published_revision", localHead.Trim() |> RevisionId.tryCreate |> Result.defaultWith failwith)
+                        ).toBe true
+                        Vitest.expect(
+                            failure.RevisionEvidence
+                            |> Array.contains ("observed_target", localHead.Trim() |> RevisionId.tryCreate |> Result.defaultWith failwith)
+                        ).toBe true
+                    | Failed failure ->
+                        failwith $"Remote advancement was concealed as Failed ({failure.Code})."
+                    | Succeeded _ -> failwith "Expected the nonzero push response to remain visible as a warning."
+
+                    let! targetHead = runGitOk barePath [| "rev-parse"; "main" |]
+                    Vitest.expect(targetHead.Trim()).toBe(localHead.Trim())
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "raced third revision reports changed-state concurrency evidence",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable bareTarget = ""
+                let mutable armRace = false
+                let mutable racedRevision = ""
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request operationContext ->
+                            async {
+                                if request.Arguments |> Array.contains "push" && armRace then
+                                    armRace <- false
+                                    let! parent = runGitOk bareTarget [| "rev-parse"; "main" |] |> Async.AwaitPromise
+                                    let! tree = runGitOk bareTarget [| "rev-parse"; "main^{tree}" |] |> Async.AwaitPromise
+                                    let! _ = runGitOk bareTarget [| "config"; "user.name"; "VCS Race Tests" |] |> Async.AwaitPromise
+                                    let! _ = runGitOk bareTarget [| "config"; "user.email"; "race@example.org" |] |> Async.AwaitPromise
+                                    let! concurrent =
+                                        runGitOk
+                                            bareTarget
+                                            [| "commit-tree"; tree.Trim(); "-p"; parent.Trim(); "-m"; "race: third revision" |]
+                                        |> Async.AwaitPromise
+
+                                    racedRevision <- concurrent.Trim()
+                                    let! _ =
+                                        runGitOk
+                                            bareTarget
+                                            [| "update-ref"; "refs/heads/main"; racedRevision; parent.Trim() |]
+                                        |> Async.AwaitPromise
+
+                                    ()
+
+                                return! NodeProcess.run request operationContext
+                            })
+                    Barrier = None
+                }
+
+                let! root, workPath, barePath, session = createPublishFixture hooks
+                bareTarget <- barePath
+
+                try
+                    let! previousTarget = runGitOk barePath [| "rev-parse"; "main" |]
+                    let! _, publishStatus =
+                        createTextPublishRevision session workPath "raced-third.txt" "raced-third-revision"
+
+                    armRace <- true
+
+                    let! result =
+                        (synchronization session).Publish
+                            {
+                                ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                            }
+                            (ctx "raced-third-publish")
+                        |> Async.StartAsPromise
+
+                    match result with
+                    | Failed failure ->
+                        Vitest.expect(failure.Category).toEqual Concurrency
+                        Vitest.expect(failure.Code).toBe "precondition_failed"
+                        Vitest.expect(failure.StateChanged).toBe true
+                        Vitest.expect(failure.Retryable).toBe true
+                        Vitest.expect(
+                            failure.RevisionEvidence
+                            |> Array.contains ("expected_target", previousTarget.Trim() |> RevisionId.tryCreate |> Result.defaultWith failwith)
+                        ).toBe true
+                        Vitest.expect(
+                            failure.RevisionEvidence
+                            |> Array.contains ("observed_target", racedRevision |> RevisionId.tryCreate |> Result.defaultWith failwith)
+                        ).toBe true
+                    | _ -> failwith "Expected a raced third revision to return changed-state concurrency."
+
+                    let! targetHead = runGitOk barePath [| "rev-parse"; "main" |]
+                    Vitest.expect(targetHead.Trim()).toBe racedRevision
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "successful push with inconclusive verification does not claim local-only state",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable pushCompleted = false
+                let mutable verificationAttempted = false
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request operationContext ->
+                            async {
+                                if
+                                    pushCompleted
+                                    && request.Arguments |> Array.contains "ls-remote"
+                                then
+                                    verificationAttempted <- true
+
+                                    return
+                                        OperationResult.failed {
+                                            OperationFailure.createRedacted
+                                                Network
+                                                "injected_verification_unreachable"
+                                                "Verification failed at https://secret@example.invalid." with
+                                                Retryable = true
+                                        }
+                                else
+                                    let! result = NodeProcess.run request operationContext
+
+                                    if
+                                        request.Arguments |> Array.contains "push"
+                                        && match result with
+                                           | Succeeded outcome -> outcome.Value.ExitCode = 0
+                                           | _ -> false
+                                    then
+                                        pushCompleted <- true
+
+                                    return result
+                            })
+                    Barrier = None
+                }
+
+                let! root, workPath, barePath, session = createPublishFixture hooks
+
+                try
+                    let! previousTarget = runGitOk barePath [| "rev-parse"; "main" |]
+                    let! localHead, publishStatus =
+                        createTextPublishRevision
+                            session
+                            workPath
+                            "inconclusive-verification.txt"
+                            "inconclusive-verification"
+
+                    let! result =
+                        (synchronization session).Publish
+                            {
+                                ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                            }
+                            (ctx "inconclusive-verification-publish")
+                        |> Async.StartAsPromise
+
+                    Vitest.expect(pushCompleted).toBe true
+                    Vitest.expect(verificationAttempted).toBe true
+
+                    match result with
+                    | Failed failure ->
+                        Vitest.expect(failure.Category).toEqual Network
+                        Vitest.expect(failure.Code).toBe "injected_verification_unreachable"
+                        Vitest.expect(failure.StateChanged).toBe true
+                        Vitest.expect(failure.Retryable).toBe true
+                        Vitest.expect(failure.Message.Contains "secret").toBe false
+                        Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (
+                            Some "retry_publish_verification"
+                        )
+                        Vitest.expect(
+                            failure.RevisionEvidence
+                            |> Array.contains ("expected_target", previousTarget.Trim() |> RevisionId.tryCreate |> Result.defaultWith failwith)
+                        ).toBe true
+                        Vitest.expect(
+                            failure.RevisionEvidence
+                            |> Array.exists (fun (label, _) -> label = "published_revision")
+                        ).toBe false
+                    | PartiallySucceeded(outcome, _) ->
+                        failwith $"Inconclusive verification falsely claimed {outcome.Publication}."
+                    | Succeeded _ -> failwith "Inconclusive verification cannot report success."
+
+                    let! targetHead = runGitOk barePath [| "rev-parse"; "main" |]
+                    Vitest.expect(targetHead.Trim()).toBe localHead
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "push cancellation after remote advancement verifies with a noncanceled context",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let cancellation = OperationCancellation.Source()
+                let mutable pushAdvancedRemote = false
+                let mutable verificationUsedNonCanceledContext = false
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request operationContext ->
+                            async {
+                                if request.Arguments |> Array.contains "push" then
+                                    let! pushResult = NodeProcess.run request operationContext
+
+                                    match pushResult with
+                                    | Succeeded outcome when outcome.Value.ExitCode = 0 ->
+                                        pushAdvancedRemote <- true
+                                        cancellation.Cancel()
+
+                                        return
+                                            OperationResult.canceled
+                                                "The caller canceled after the remote accepted the ref."
+                                    | _ -> return pushResult
+                                elif
+                                    pushAdvancedRemote
+                                    && request.Arguments |> Array.contains "ls-remote"
+                                then
+                                    verificationUsedNonCanceledContext <-
+                                        not (operationContext.Cancellation.IsCancellationRequested())
+
+                                    return! NodeProcess.run request operationContext
+                                else
+                                    return! NodeProcess.run request operationContext
+                            })
+                    Barrier = None
+                }
+
+                let! root, workPath, barePath, session = createPublishFixture hooks
+
+                try
+                    do! writeUtf8FileAsync (join [| workPath; "canceled-response.txt" |]) "published\n"
+                    let! status = sessionStatus session
+
+                    let! revision =
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: publish before caller cancellation"
+                                Paths = [| repositoryPath "canceled-response.txt" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (ctx "push-canceled-revision")
+                        |> Async.StartAsPromise
+
+                    match revision with
+                    | Succeeded _ -> ()
+                    | _ -> failwith "Expected the publication revision to be created."
+
+                    let! previousTarget = runGitOk barePath [| "rev-parse"; "main" |]
+                    let! localHead = runGitOk workPath [| "rev-parse"; "HEAD" |]
+                    let! publishStatus = sessionStatus session
+                    let publishContext = OperationContext.create "push-canceled" cancellation.Cancellation ignore
+
+                    let! result =
+                        (synchronization session).Publish
+                            {
+                                ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                            }
+                            publishContext
+                        |> Async.StartAsPromise
+
+                    Vitest.expect(pushAdvancedRemote).toBe true
+                    Vitest.expect(cancellation.IsCancellationRequested).toBe true
+                    Vitest.expect(verificationUsedNonCanceledContext).toBe true
+
+                    match result with
+                    | PartiallySucceeded(outcome, failure) ->
+                        Vitest.expect(outcome.Publication).toEqual Published
+                        Vitest.expect(outcome.AffectedPaths).toEqual [| "canceled-response.txt" |]
+                        Vitest.expect(failure.AffectedPaths).toEqual [| "canceled-response.txt" |]
+                        Vitest.expect(outcome.ResultingRevision |> Option.map RevisionId.value).toEqual (
+                            Some(localHead.Trim())
+                        )
+                        Vitest.expect(failure.Category).toEqual Canceled
+                        Vitest.expect(failure.Code).toBe "operation_canceled"
+                        Vitest.expect(failure.StateChanged).toBe true
+                        Vitest.expect(failure.Message.Contains "caller canceled").toBe true
+                        Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (
+                            Some "retry_publish_verification"
+                        )
+                        Vitest.expect(
+                            failure.RevisionEvidence
+                            |> Array.contains ("previous_target", previousTarget.Trim() |> RevisionId.tryCreate |> Result.defaultWith failwith)
+                        ).toBe true
+                        Vitest.expect(
+                            failure.RevisionEvidence
+                            |> Array.contains ("published_revision", localHead.Trim() |> RevisionId.tryCreate |> Result.defaultWith failwith)
+                        ).toBe true
+                        Vitest.expect(
+                            failure.RevisionEvidence
+                            |> Array.contains ("observed_target", localHead.Trim() |> RevisionId.tryCreate |> Result.defaultWith failwith)
+                        ).toBe true
+                    | Failed failure ->
+                        failwith $"Remote advancement was concealed as Failed ({failure.Code})."
+                    | Succeeded _ -> failwith "Expected cancellation to remain visible after publication."
+
+                    let! targetHead = runGitOk barePath [| "rev-parse"; "main" |]
+                    Vitest.expect(targetHead.Trim()).toBe(localHead.Trim())
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
             }
         )
 

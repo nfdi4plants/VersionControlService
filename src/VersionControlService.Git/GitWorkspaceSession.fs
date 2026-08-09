@@ -1733,6 +1733,109 @@ let private synchronizationState (state: SessionState) (context: OperationContex
                     }
     }
 
+let private readRemoteBranchRevision
+    (state: SessionState)
+    (authentication: VersionControlService.Git.GitAuthAdapter.GitCommandAuthentication)
+    (branch: string)
+    (context: OperationContext)
+    =
+    async {
+        let! result =
+            runGitEnv
+                state.Hooks
+                state.RepoPath
+                [|
+                    yield! authentication.ConfigArgs
+                    "ls-remote"
+                    "--refs"
+                    "origin"
+                    $"refs/heads/{branch}"
+                |]
+                None
+                [| "GIT_TERMINAL_PROMPT", "0" |]
+                context
+
+        match result with
+        | Error failure -> return Error failure
+        | Ok output when output.ExitCode <> 0 ->
+            return
+                Error {
+                    OperationFailure.createRedacted
+                        Network
+                        "target_unreachable"
+                        $"Reading the publication target from origin failed: {output.StdErr + output.StdOut}" with
+                        Retryable = true
+                }
+        | Ok output ->
+            return
+                output.StdOut.Replace("\r\n", "\n").Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                |> Array.tryHead
+                |> Option.bind (fun line ->
+                    line.Split([| '\t'; ' ' |], StringSplitOptions.RemoveEmptyEntries)
+                    |> Array.tryHead)
+                |> Ok
+    }
+
+let private publicationChangedPaths
+    (state: SessionState)
+    (previousRevision: string option)
+    (publishedRevision: string)
+    (context: OperationContext)
+    =
+    async {
+        let arguments =
+            match previousRevision with
+            | Some previous -> [| "diff"; "--name-only"; "-z"; previous; publishedRevision |]
+            | None ->
+                [|
+                    "ls-tree"
+                    "-r"
+                    "--name-only"
+                    "-z"
+                    publishedRevision
+                |]
+
+        let! result = runGit state.Hooks state.RepoPath arguments None context
+
+        match result with
+        | Error failure -> return Error failure
+        | Ok output when output.ExitCode <> 0 ->
+            return
+                Error {
+                    OperationFailure.createRedacted
+                        ProviderError
+                        "publish_evidence_failed"
+                        $"Reading the published path evidence failed: {output.StdErr + output.StdOut}" with
+                        Retryable = true
+                }
+        | Ok output ->
+            let entries =
+                output.StdOut.Split('\000', StringSplitOptions.RemoveEmptyEntries)
+
+            let mutable invalidPath = None
+
+            let paths =
+                entries
+                |> Array.choose (fun entry ->
+                    match tryCreateRepositoryPath entry with
+                    | Ok path -> Some(RepositoryPath.value path)
+                    | Error message ->
+                        invalidPath <- Some message
+                        None)
+
+            match invalidPath with
+            | Some message ->
+                return
+                    Error {
+                        OperationFailure.createRedacted
+                            ProviderError
+                            "publish_evidence_failed"
+                            $"The published path evidence contained an unsafe path: {message}" with
+                            Retryable = true
+                    }
+            | None -> return Ok paths
+    }
+
 let private refresh (state: SessionState) (context: OperationContext) =
     async {
         let! upstreamResult = tryConfiguredUpstream state context
@@ -2041,39 +2144,8 @@ let private publish (state: SessionState) (request: PublishRequest) (context: Op
             // Validate against remote truth. The local remote-tracking ref can be
             // stale between refresh and publish, and explicit LFS planning must
             // never mask a target-revision precondition failure.
-            let! remoteTargetResult =
-                runGitEnv
-                    state.Hooks
-                    state.RepoPath
-                    [|
-                        yield! authentication.ConfigArgs
-                        "ls-remote"
-                        "--refs"
-                        "origin"
-                        $"refs/heads/{branch}"
-                    |]
-                    None
-                    [| "GIT_TERMINAL_PROMPT", "0" |]
-                    context
-
-            let observedTargetResult =
-                match remoteTargetResult with
-                | Error failure -> Error failure
-                | Ok output when output.ExitCode <> 0 ->
-                    Error {
-                        OperationFailure.createRedacted
-                            Network
-                            "target_unreachable"
-                            $"Reading the publication target from origin failed: {output.StdErr + output.StdOut}" with
-                            Retryable = true
-                    }
-                | Ok output ->
-                    output.StdOut.Replace("\r\n", "\n").Split('\n', StringSplitOptions.RemoveEmptyEntries)
-                    |> Array.tryHead
-                    |> Option.bind (fun line ->
-                        line.Split([| '\t'; ' ' |], StringSplitOptions.RemoveEmptyEntries)
-                        |> Array.tryHead)
-                    |> Ok
+            let! observedTargetResult =
+                readRemoteBranchRevision state authentication branch context
 
             match observedTargetResult with
             | Error failure -> return Failed failure
@@ -2166,125 +2238,333 @@ let private publish (state: SessionState) (request: PublishRequest) (context: Op
                                     pushEnvironment
                                     context
 
-                            match pushResult with
-                            | Error failure -> return Failed failure
-                            | Ok output when output.ExitCode <> 0 ->
-                                let combined = output.StdErr + output.StdOut
+                            let pushFailure =
+                                match pushResult with
+                                | Error failure -> Some failure
+                                | Ok output when output.ExitCode <> 0 ->
+                                    let combined = output.StdErr + output.StdOut
 
-                                if combined.Contains "rejected" || combined.Contains "non-fast-forward" then
-                                    let! raced = revParse state $"refs/remotes/origin/{branch}" context
-
-                                    return
-                                        Failed {
+                                    if combined.Contains "rejected" || combined.Contains "non-fast-forward" then
+                                        Some {
                                             OperationFailure.createRedacted
                                                 Concurrency
                                                 "precondition_failed"
                                                 "The publication target advanced during publish." with
                                                 Retryable = true
-                                                RevisionEvidence = [|
-                                                    yield!
-                                                        observedTarget
-                                                        |> Option.map (fun observed ->
-                                                            "expected_target", mkRevisionId observed)
-                                                        |> Option.toList
-                                                    yield!
-                                                        raced
-                                                        |> Option.map (fun value -> "observed_target", mkRevisionId value)
-                                                        |> Option.toList
-                                                |]
                                         }
-                                else
-                                    return
-                                        Failed {
+                                    else
+                                        Some {
                                             OperationFailure.createRedacted
                                                 Network
                                                 "target_unreachable"
                                                 $"Publishing to origin failed: {combined}" with
                                                 Retryable = true
                                         }
-                            | Ok _ ->
-                                let! verification =
-                                    runGitEnv
-                                        state.Hooks
-                                        state.RepoPath
-                                        [|
-                                            yield! authentication.ConfigArgs
-                                            "ls-remote"
-                                            "--refs"
-                                            "origin"
-                                            $"refs/heads/{branch}"
+                                | Ok _ -> None
+
+                            // A push response is ambiguous until the exact target ref is read.
+                            // This follow-up is deliberately read-only and ignores caller
+                            // cancellation so a cancellation cannot conceal an accepted ref.
+                            let verificationContext = {
+                                context with
+                                    Cancellation = OperationCancellation.none
+                            }
+
+                            let! verification =
+                                readRemoteBranchRevision state authentication branch verificationContext
+
+                            let reconcilePublished = {
+                                Code = "retry_publish_verification"
+                                Instructions =
+                                    Some
+                                        "The intended revision is published; refresh and reconcile synchronization state before deciding whether another publish is needed."
+                            }
+
+                            let verifyBeforeRetry = {
+                                Code = "retry_publish_verification"
+                                Instructions =
+                                    Some
+                                        "Read the exact remote ref and reconcile its revision before retrying publication."
+                            }
+
+                            let appendDetails (details: string[]) (failure: OperationFailure) = {
+                                failure with
+                                    Details =
+                                        Array.append failure.Details (details |> Array.map Redaction.redact)
+                            }
+
+                            let combineEvidence existing current =
+                                Array.append existing current |> Array.distinct
+
+                            let targetEvidence verifiedRevision = [|
+                                yield!
+                                    observedTarget
+                                    |> Option.map (fun revision -> "previous_target", mkRevisionId revision)
+                                    |> Option.toList
+                                yield!
+                                    observedTarget
+                                    |> Option.map (fun revision -> "expected_target", mkRevisionId revision)
+                                    |> Option.toList
+                                yield!
+                                    verifiedRevision
+                                    |> Option.map (fun revision -> "observed_target", mkRevisionId revision)
+                                    |> Option.toList
+                            |]
+
+                            let publishedEvidence verifiedRevision = [|
+                                yield! targetEvidence verifiedRevision
+                                yield!
+                                    workspaceRevision
+                                    |> Option.map (fun revision -> "published_revision", mkRevisionId revision)
+                                    |> Option.toList
+                            |]
+
+                            let fallbackState verifiedRevision relationship = {
+                                BaseRevision = None
+                                WorkspaceRevision = workspaceRevision |> Option.map mkRevisionId
+                                TargetRevision = verifiedRevision |> Option.map mkRevisionId
+                                TargetRef = None
+                                LocalRevisionCount = None
+                                TargetRevisionCount = None
+                                RemoteChangedPaths = None
+                                Relationship = relationship
+                            }
+
+                            match verification with
+                            | Error verificationFailure ->
+                                match pushFailure with
+                                | Some originalFailure ->
+                                    // Verification could not establish whether the ref changed.
+                                    // `StateChanged = true` means "may have changed" here; it
+                                    // prevents callers from treating a retry as automatically safe.
+                                    let failureWithVerification =
+                                        originalFailure
+                                        |> appendDetails [|
+                                            yield! verificationFailure.Details
+                                            $"Remote verification failed ({verificationFailure.Code}): {verificationFailure.Message}"
                                         |]
-                                        None
-                                        [| "GIT_TERMINAL_PROMPT", "0" |]
-                                        context
 
-                                let verifiedRevision =
-                                    match verification with
-                                    | Ok verified when verified.ExitCode = 0 ->
-                                        verified.StdOut.Replace("\r\n", "\n").Split('\n', StringSplitOptions.RemoveEmptyEntries)
-                                        |> Array.tryHead
-                                        |> Option.bind (fun line ->
-                                            line.Split('\t', 2, StringSplitOptions.None)
-                                            |> Array.tryHead)
-                                    | _ -> None
-
+                                    return
+                                        Failed {
+                                            failureWithVerification with
+                                                StateChanged = true
+                                                Retryable = true
+                                                RecoveryAction = Some verifyBeforeRetry
+                                                RevisionEvidence =
+                                                    combineEvidence
+                                                        originalFailure.RevisionEvidence
+                                                        (targetEvidence None)
+                                        }
+                                | None ->
+                                    return
+                                        Failed {
+                                            verificationFailure with
+                                                StateChanged = true
+                                                Retryable = true
+                                                RecoveryAction = Some verifyBeforeRetry
+                                                RevisionEvidence =
+                                                    combineEvidence
+                                                        verificationFailure.RevisionEvidence
+                                                        (targetEvidence None)
+                                        }
+                            | Ok verifiedRevision ->
                                 let publicationVerified =
                                     match workspaceRevision, verifiedRevision with
                                     | Some expected, Some observed -> expected = observed
                                     | _ -> false
 
-                                let! stateResult = synchronizationState state context
+                                match pushFailure with
+                                | Some originalFailure when publicationVerified ->
+                                    let publishedRevision = workspaceRevision |> Option.defaultValue ""
+                                    let! pathResult =
+                                        publicationChangedPaths
+                                            state
+                                            observedTarget
+                                            publishedRevision
+                                            verificationContext
 
-                                match stateResult with
-                                | Error failure ->
-                                    let fallbackState = {
-                                        BaseRevision = None
-                                        WorkspaceRevision = workspaceRevision |> Option.map mkRevisionId
-                                        TargetRevision = verifiedRevision |> Option.map mkRevisionId
-                                        TargetRef = None
-                                        LocalRevisionCount = None
-                                        TargetRevisionCount = None
-                                        RemoteChangedPaths = None
-                                        Relationship = UnknownRelationship
-                                    }
+                                    let affectedPaths, pathWarnings, pathDetails =
+                                        match pathResult with
+                                        | Ok paths -> paths, [||], [||]
+                                        | Error failure ->
+                                            [||],
+                                            [|
+                                                {
+                                                    Code = "publish_path_evidence_unavailable"
+                                                    Message = failure.Message
+                                                }
+                                            |],
+                                            [| $"Published path evidence failed ({failure.Code}): {failure.Message}" |]
+
+                                    let! stateResult = synchronizationState state verificationContext
+
+                                    let exactState, stateDetails =
+                                        match stateResult with
+                                        | Ok syncState ->
+                                            {
+                                                syncState with
+                                                    BaseRevision = workspaceRevision |> Option.map mkRevisionId
+                                                    WorkspaceRevision = workspaceRevision |> Option.map mkRevisionId
+                                                    TargetRevision = verifiedRevision |> Option.map mkRevisionId
+                                                    RemoteChangedPaths = None
+                                                    Relationship = UpToDate
+                                            },
+                                            [||]
+                                        | Error failure ->
+                                            fallbackState verifiedRevision UpToDate,
+                                            [| $"State inspection failed ({failure.Code}): {failure.Message}" |]
+
+                                    let failureWithEvidence =
+                                        originalFailure
+                                        |> appendDetails (Array.append pathDetails stateDetails)
+
+                                    let failureAffectedPaths =
+                                        Array.append originalFailure.AffectedPaths affectedPaths
+                                        |> Array.distinct
 
                                     return
                                         OperationResult.partiallySucceeded
                                             {
-                                                OperationOutcome.performed fallbackState with
-                                                    Publication =
-                                                        if publicationVerified then Published else LocalOnly
+                                                OperationOutcome.performed exactState with
+                                                    Warnings = pathWarnings
+                                                    AffectedPaths = affectedPaths
+                                                    Publication = Published
                                                     ResultingRevision = workspaceRevision |> Option.map mkRevisionId
                                             }
-                                            failure
                                             {
-                                                Code = "retry_publish_verification"
-                                                Instructions = Some "Verify the remote ref before retrying publication."
+                                                failureWithEvidence with
+                                                    AffectedPaths = failureAffectedPaths
+                                                    RevisionEvidence =
+                                                        combineEvidence
+                                                            originalFailure.RevisionEvidence
+                                                            (publishedEvidence verifiedRevision)
                                             }
-                                | Ok syncState when publicationVerified ->
+                                            reconcilePublished
+                                | Some originalFailure when verifiedRevision = observedTarget ->
                                     return
-                                        Succeeded {
-                                            OperationOutcome.performed syncState with
-                                                Publication = Published
-                                                ResultingRevision = syncState.WorkspaceRevision
+                                        Failed {
+                                            originalFailure with
+                                                StateChanged = false
+                                                RevisionEvidence =
+                                                    combineEvidence
+                                                        originalFailure.RevisionEvidence
+                                                        (targetEvidence verifiedRevision)
                                         }
-                                | Ok syncState ->
+                                | Some originalFailure ->
+                                    let racedFailure =
+                                        OperationFailure.createRedacted
+                                            Concurrency
+                                            "precondition_failed"
+                                            "The publication target advanced during publish."
+                                        |> appendDetails [|
+                                            yield! originalFailure.Details
+                                            $"Original push failure ({originalFailure.Code}): {originalFailure.Message}"
+                                        |]
+
                                     return
-                                        OperationResult.partiallySucceeded
-                                            {
-                                                OperationOutcome.performed syncState with
-                                                    Publication =
-                                                        if publicationVerified then Published else LocalOnly
-                                                    ResultingRevision = workspaceRevision |> Option.map mkRevisionId
+                                        Failed {
+                                            racedFailure with
+                                                StateChanged = true
+                                                Retryable = true
+                                                AffectedPaths = originalFailure.AffectedPaths
+                                                RevisionEvidence =
+                                                    combineEvidence
+                                                        originalFailure.RevisionEvidence
+                                                        (targetEvidence verifiedRevision)
+                                        }
+                                | None ->
+                                    let! stateResult = synchronizationState state verificationContext
+
+                                    let syncState, stateFailure =
+                                        match stateResult with
+                                        | Ok value -> value, None
+                                        | Error failure ->
+                                            fallbackState verifiedRevision UnknownRelationship, Some failure
+
+                                    if publicationVerified then
+                                        let exactState = {
+                                            syncState with
+                                                BaseRevision = workspaceRevision |> Option.map mkRevisionId
+                                                WorkspaceRevision = workspaceRevision |> Option.map mkRevisionId
+                                                TargetRevision = verifiedRevision |> Option.map mkRevisionId
+                                                RemoteChangedPaths = None
+                                                Relationship = UpToDate
+                                        }
+
+                                        let outcome = {
+                                            OperationOutcome.performed exactState with
+                                                Publication = Published
+                                                ResultingRevision = workspaceRevision |> Option.map mkRevisionId
+                                        }
+
+                                        match stateFailure with
+                                        | None -> return Succeeded outcome
+                                        | Some failure ->
+                                            let publishedRevision = workspaceRevision |> Option.defaultValue ""
+                                            let! pathResult =
+                                                publicationChangedPaths
+                                                    state
+                                                    observedTarget
+                                                    publishedRevision
+                                                    verificationContext
+
+                                            let affectedPaths, pathWarnings =
+                                                match pathResult with
+                                                | Ok paths -> paths, [||]
+                                                | Error pathFailure ->
+                                                    [||],
+                                                    [|
+                                                        {
+                                                            Code = "publish_path_evidence_unavailable"
+                                                            Message = pathFailure.Message
+                                                        }
+                                                    |]
+
+                                            let partialOutcome = {
+                                                outcome with
+                                                    Warnings = pathWarnings
+                                                    AffectedPaths = affectedPaths
                                             }
-                                            (OperationFailure.create
-                                                ProviderError
-                                                "publish_verification_failed"
-                                                "The ref push completed, but the resulting remote ref could not be verified.")
-                                            {
-                                                Code = "retry_publish_verification"
-                                                Instructions = Some "Verify the remote ref before retrying publication."
-                                            }
+
+                                            return
+                                                OperationResult.partiallySucceeded
+                                                    partialOutcome
+                                                    {
+                                                        failure with
+                                                            AffectedPaths =
+                                                                Array.append failure.AffectedPaths affectedPaths
+                                                                |> Array.distinct
+                                                            RevisionEvidence =
+                                                                combineEvidence
+                                                                    failure.RevisionEvidence
+                                                                    (publishedEvidence verifiedRevision)
+                                                    }
+                                                    reconcilePublished
+                                    else
+                                        let failure =
+                                            match stateFailure with
+                                            | Some value -> value
+                                            | None ->
+                                                OperationFailure.create
+                                                    ProviderError
+                                                    "publish_verification_failed"
+                                                    "The ref push completed, but the resulting remote ref could not be verified."
+
+                                        return
+                                            OperationResult.partiallySucceeded
+                                                {
+                                                    OperationOutcome.performed syncState with
+                                                        Publication = LocalOnly
+                                                        ResultingRevision = workspaceRevision |> Option.map mkRevisionId
+                                                }
+                                                {
+                                                    failure with
+                                                        RevisionEvidence =
+                                                            combineEvidence
+                                                                failure.RevisionEvidence
+                                                                (targetEvidence verifiedRevision)
+                                                }
+                                                verifyBeforeRetry
     }
 
 // ---------------------------------------------------------------------------
