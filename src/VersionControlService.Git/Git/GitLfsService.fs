@@ -277,6 +277,164 @@ let replaceAttributesAtomically
         if NodeFileSystem.existsSync tempPath then
             NodeFileSystem.unlinkSync tempPath
 
+type AttributesReplacement = private {
+    AttributesPath: string
+    TempPath: string
+    OriginalContent: string
+    mutable OriginalHandle: NodeFileSystem.FileHandle option
+}
+
+let private readHandleUtf8FromStart (handle: NodeFileSystem.FileHandle) =
+    async {
+        let chunkSize = 64 * 1024
+        let decoder = createUtf8StringDecoder ()
+        let content = System.Text.StringBuilder()
+        let mutable position = 0.0
+        let mutable finished = false
+
+        while not finished do
+            let buffer = bufferAlloc chunkSize
+            let! readResult = handle.read(buffer, 0, chunkSize, position) |> Async.AwaitPromise
+
+            if readResult.bytesRead = 0 then
+                finished <- true
+            else
+                content.Append(
+                    decodeUtf8Chunk
+                        decoder
+                        (bufferSubarray readResult.buffer 0 readResult.bytesRead)
+                )
+                |> ignore
+
+                position <- position + float readResult.bytesRead
+
+        content.Append(finishUtf8Decoding decoder) |> ignore
+        return content.ToString()
+    }
+
+let private cleanupAttributesReplacement (replacement: AttributesReplacement) =
+    async {
+        match replacement.OriginalHandle with
+        | Some handle ->
+            replacement.OriginalHandle <- None
+            do! handle.close () |> Async.AwaitPromise
+        | None -> ()
+
+        if NodeFileSystem.existsSync replacement.TempPath then
+            NodeFileSystem.unlinkSync replacement.TempPath
+    }
+
+let abortAttributesReplacement (replacement: AttributesReplacement) =
+    cleanupAttributesReplacement replacement
+
+let prepareAttributesReplacement
+    (attributesPath: string)
+    (originalIdentity: NodeFileSystem.Stats option)
+    (originalContent: string)
+    (content: string)
+    =
+    async {
+        let tempPath = attributesPath + $".vcs-{Guid.NewGuid():N}.tmp"
+        NodeFileSystem.writeUtf8FileExclusiveAndFlushSync tempPath content
+
+        try
+            ensurePathHasNoLinks (NodePath.dirname attributesPath)
+
+            match originalIdentity with
+            | Some expected ->
+                if not (NodeFileSystem.existsSync attributesPath) then
+                    invalidOp "The Git attributes file disappeared before its policy could be replaced."
+
+                ensurePathHasNoLinks attributesPath
+                let! handle = NodeFileSystem.openReadNoFollowAsync attributesPath |> Async.AwaitPromise
+
+                try
+                    let! openedStats = handle.stat () |> Async.AwaitPromise
+                    let! currentContent = readHandleUtf8FromStart handle
+                    let afterStats = NodeFileSystem.lstatSync attributesPath
+
+                    if
+                        currentContent <> originalContent
+                        || not (sameFileIdentity expected openedStats)
+                        || not (sameFileIdentity expected afterStats)
+                    then
+                        invalidOp "The Git attributes file changed before its policy could be replaced."
+
+                    return {
+                        AttributesPath = attributesPath
+                        TempPath = tempPath
+                        OriginalContent = originalContent
+                        OriginalHandle = Some handle
+                    }
+                with error ->
+                    do! handle.close () |> Async.AwaitPromise
+                    return raise error
+            | None when NodeFileSystem.existsSync attributesPath ->
+                return invalidOp "The Git attributes file appeared before its policy could be created."
+            | None ->
+                return {
+                    AttributesPath = attributesPath
+                    TempPath = tempPath
+                    OriginalContent = originalContent
+                    OriginalHandle = None
+                }
+        with error ->
+            if NodeFileSystem.existsSync tempPath then
+                NodeFileSystem.unlinkSync tempPath
+
+            return raise error
+    }
+
+let private restoreAttributesContentAtomically (attributesPath: string) (content: string) =
+    let tempPath = attributesPath + $".vcs-{Guid.NewGuid():N}.tmp"
+
+    try
+        NodeFileSystem.writeUtf8FileExclusiveAndFlushSync tempPath content
+        ensurePathHasNoLinks (NodePath.dirname attributesPath)
+        NodeFileSystem.renameSync tempPath attributesPath
+    finally
+        if NodeFileSystem.existsSync tempPath then
+            NodeFileSystem.unlinkSync tempPath
+
+let completeAttributesReplacement (replacement: AttributesReplacement) =
+    async {
+        let mutable completionError: exn option = None
+
+        try
+            match replacement.OriginalHandle with
+            | None when NodeFileSystem.existsSync replacement.AttributesPath ->
+                invalidOp "The Git attributes file appeared before its policy could be created."
+            | _ -> ()
+
+            NodeFileSystem.renameSync replacement.TempPath replacement.AttributesPath
+
+            match replacement.OriginalHandle with
+            | Some handle ->
+                let! lateContent = readHandleUtf8FromStart handle
+
+                if lateContent <> replacement.OriginalContent then
+                    restoreAttributesContentAtomically replacement.AttributesPath lateContent
+                    completionError <-
+                        Some(
+                            InvalidOperationException(
+                                "The Git attributes file changed during replacement; the concurrent content was preserved."
+                            )
+                        )
+            | None -> ()
+        with error ->
+            completionError <- Some error
+
+        try
+            do! cleanupAttributesReplacement replacement
+        with cleanupError ->
+            if completionError.IsNone then
+                completionError <- Some cleanupError
+
+        match completionError with
+        | Some error -> return raise error
+        | None -> return ()
+    }
+
 let addLiteralTrackingRules (content: string) (relativePaths: string[]) =
     let lineEnding = if content.Contains("\r\n") then "\r\n" else "\n"
     let mutable updated = content

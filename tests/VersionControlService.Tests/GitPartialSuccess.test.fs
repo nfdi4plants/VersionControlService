@@ -35,6 +35,14 @@ let private createDirectoryJunctionAsync (targetPath: string) (linkPath: string)
     return ()
 }
 
+[<Emit("(() => { const fs = require('node:fs'); const moduleApi = require('node:module'); const original = fs.renameSync; fs.renameSync = (fromPath, toPath) => { if (toPath === $0 && String(fromPath).startsWith($0 + '.vcs-') && !$1()) fs.writeFileSync($0, $2, 'utf8'); return original(fromPath, toPath); }; moduleApi.syncBuiltinESMExports(); return () => { fs.renameSync = original; moduleApi.syncBuiltinESMExports(); }; })()")>]
+let private injectLateAttributesEditBeforeRename
+    (_attributesPath: string)
+    (_barrierRan: unit -> bool)
+    (_content: string)
+    : unit -> unit =
+    jsNative
+
 let private tryReadUtf8FileAsync (path: string) : JS.Promise<string option> = promise {
     try
         let! content = fsPromisesDynamic?readFile (path, "utf8") |> unbox<JS.Promise<string>>
@@ -414,6 +422,62 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "selected revision validates every staged descendant of a selected directory",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, binding = createSelectedRevisionFixture ()
+
+                try
+                    let directoryPath = join [| workPath; "selected" |]
+                    let! _ = fsPromisesDynamic?mkdir (directoryPath) |> unbox<JS.Promise<obj>>
+                    do! writeUtf8FileAsync (join [| directoryPath; "a-small.bin" |]) "small\n"
+                    let largeContent = String.replicate (1024 * 1024) "d"
+                    do! writeUtf8FileAsync (join [| directoryPath; "z-large.bin" |]) largeContent
+                    let! headBefore = runGitOk workPath [| "rev-parse"; "HEAD" |]
+                    let! stagedBefore = runGitOk workPath [| "diff"; "--cached"; "--name-only" |]
+                    let session =
+                        GitWorkspaceSession.createSession GitWorkspaceSession.GitSessionHooks.none binding
+
+                    let! statusResult = session.Core.GetStatus(ctx "directory-lfs-status") |> Async.StartAsPromise
+                    let status =
+                        match statusResult with
+                        | Succeeded outcome -> outcome.Value
+                        | _ -> failwith "Expected selected-revision status."
+
+                    let! revisionResult =
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: validate every selected directory descendant"
+                                Paths = [| repositoryPath "selected" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (ctx "directory-lfs-revision")
+                        |> Async.StartAsPromise
+
+                    match revisionResult with
+                    | Failed failure ->
+                        Vitest.expect(failure.Category).toEqual Concurrency
+                        Vitest.expect(failure.Code).toBe "selected_content_changed"
+                        Vitest.expect(failure.StateChanged).toBe false
+                        Vitest.expect(failure.AffectedPaths).toEqual [| "selected/z-large.bin" |]
+                    | _ -> failwith "Expected every staged directory descendant to be LFS-validated."
+
+                    let! headAfter = runGitOk workPath [| "rev-parse"; "HEAD" |]
+                    let! stagedAfter = runGitOk workPath [| "diff"; "--cached"; "--name-only" |]
+                    let! attributesAfter = tryReadUtf8FileAsync (join [| workPath; ".gitattributes" |])
+                    let! largeAfter = tryReadUtf8FileAsync (join [| directoryPath; "z-large.bin" |])
+                    Vitest.expect(headAfter.Trim()).toBe (headBefore.Trim())
+                    Vitest.expect(stagedAfter).toBe stagedBefore
+                    Vitest.expect(attributesAfter).toEqual None
+                    Vitest.expect(largeAfter).toEqual (Some largeContent)
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
             "selected revision accepts an oversized file that is already LFS tracked",
             TestOptions(timeout = 120000),
             fun () -> promise {
@@ -612,7 +676,7 @@ Vitest.describe (
                         Vitest.expect(failure.Category).toEqual Concurrency
                         Vitest.expect(failure.Code).toBe "selected_content_changed"
                         Vitest.expect(failure.StateChanged).toBe false
-                        Vitest.expect(failure.AffectedPaths).toEqual [| relativePath |]
+                        Vitest.expect(failure.AffectedPaths).toEqual [| literalTabPath |]
                     | _ -> failwith "Expected the tabbed staged-entry LFS race to fail before ref movement."
 
                     let! headAfter = runGitOk workPath [| "rev-parse"; "HEAD" |]
@@ -960,6 +1024,90 @@ Vitest.describe (
                     let! attributesAfter = tryReadUtf8FileAsync attributesPath
                     Vitest.expect(headAfter.Trim() = headBefore.Trim()).toBe false
                     Vitest.expect(attributesAfter).toEqual (Some attributesConcurrentEdit)
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "selected revision preserves an attributes edit in the final replacement window",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, binding = createSelectedRevisionFixture ()
+
+                try
+                    let attributesBefore = "# baseline\n"
+                    let attributesConcurrentEdit = "# final consumer edit\n"
+                    let attributesPath = join [| workPath; ".gitattributes" |]
+                    do! writeUtf8FileAsync attributesPath attributesBefore
+                    let! _ = runGitOk workPath [| "add"; ".gitattributes" |]
+                    let! _ = runGitOk workPath [| "commit"; "-m"; "test: baseline final-window attributes" |]
+                    do!
+                        writeUtf8FileAsync
+                            (join [| workPath; "large.bin" |])
+                            (String.replicate (1024 * 1024) "w")
+
+                    let mutable finalBarrierRan = false
+                    let restoreRename =
+                        injectLateAttributesEditBeforeRename
+                            attributesPath
+                            (fun () -> finalBarrierRan)
+                            attributesConcurrentEdit
+
+                    let hooks: GitWorkspaceSession.GitSessionHooks = {
+                        RunBytesProcess = None
+                        RunProcess = None
+                        Barrier =
+                            Some(fun _ point _ -> async {
+                                if point = "selected-revision-attributes-replacement-ready" then
+                                    finalBarrierRan <- true
+                                    do! writeUtf8FileAsync attributesPath attributesConcurrentEdit |> Async.AwaitPromise
+                            })
+                    }
+
+                    let session = GitWorkspaceSession.createSession hooks binding
+                    let! statusResult = session.Core.GetStatus(ctx "final-attributes-race-status") |> Async.StartAsPromise
+                    let status =
+                        match statusResult with
+                        | Succeeded outcome -> outcome.Value
+                        | _ -> failwith "Expected selected-revision status."
+
+                    let! revisionResult =
+                        promise {
+                            try
+                                return!
+                                    session.Core.CreateRevision
+                                        {
+                                            Message = "test: preserve final-window attributes edit"
+                                            Paths = [| repositoryPath "large.bin" |]
+                                            ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                        }
+                                        (ctx "final-attributes-race-revision")
+                                    |> Async.StartAsPromise
+                            finally
+                                restoreRename ()
+                        }
+
+                    let! attributesAfter = tryReadUtf8FileAsync attributesPath
+                    Vitest.expect(attributesAfter).toEqual (Some attributesConcurrentEdit)
+                    Vitest.expect(finalBarrierRan).toBe true
+
+                    match revisionResult with
+                    | PartiallySucceeded(outcome, failure) ->
+                        Vitest.expect(failure.StateChanged).toBe true
+                        Vitest.expect(failure.Code).toBe "attributes_reconciliation_failed"
+                        Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "reconcile_index")
+                        Vitest.expect(failure.RecoveryAction |> Option.bind _.Instructions).toEqual (
+                            Some
+                                "Merge the generated literal Git LFS rules into the current .gitattributes without discarding concurrent edits, then reconcile the affected paths in the index (for example with git reset)."
+                        )
+                        Vitest.expect(outcome.AffectedPaths |> Array.contains "large.bin").toBe true
+                        Vitest.expect(outcome.AffectedPaths |> Array.contains ".gitattributes").toBe true
+                        Vitest.expect(outcome.ResultingRevision.IsSome).toBe true
+                    | _ -> failwith "Expected the final attributes replacement race to return partial success."
+
                     do! removeDirectoryAsync root
                 with error ->
                     do! removeDirectoryAsync root

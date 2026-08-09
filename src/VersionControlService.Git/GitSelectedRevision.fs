@@ -330,7 +330,7 @@ let private invalidTemporaryIndexEntry path =
             AffectedPaths = [| path |]
     }
 
-let private tryTemporaryIndexEntry
+let private listTemporaryIndexEntries
     (runGit: GitRunner)
     (environment: (string * string)[])
     (path: string)
@@ -346,30 +346,33 @@ let private tryTemporaryIndexEntry
         | Error failure -> return Error failure
         | Ok output when output.ExitCode <> 0 -> return Error(failedRun "git ls-files --stage" output)
         | Ok output ->
-            let entry = output.StdOut.Split '\000' |> Array.tryFind (String.IsNullOrEmpty >> not)
+            let mutable failure = None
+            let entries = ResizeArray<TemporaryIndexEntry>()
 
-            match entry with
-            | None -> return Ok None
-            | Some value ->
-                let separatorIndex = value.IndexOf '\t'
+            for value in output.StdOut.Split '\000' |> Array.filter (String.IsNullOrEmpty >> not) do
+                match failure with
+                | Some _ -> ()
+                | None ->
+                    let separatorIndex = value.IndexOf '\t'
 
-                if separatorIndex <= 0 || separatorIndex = value.Length - 1 then
-                    return Error(invalidTemporaryIndexEntry path)
-                else
-                    let metadata = value.Substring(0, separatorIndex)
-                    let entryPath = value.Substring(separatorIndex + 1)
+                    if separatorIndex <= 0 || separatorIndex = value.Length - 1 then
+                        failure <- Some(invalidTemporaryIndexEntry path)
+                    else
+                        let metadata = value.Substring(0, separatorIndex)
+                        let entryPath = value.Substring(separatorIndex + 1)
 
-                    match metadata.Split(' ', StringSplitOptions.RemoveEmptyEntries) with
-                    | [| mode; blobId; "0" |] ->
-                        return
-                            Ok(
-                                Some {
-                                    Mode = mode
-                                    BlobId = blobId
-                                    Path = entryPath
-                                }
-                            )
-                    | _ -> return Error(invalidTemporaryIndexEntry path)
+                        match metadata.Split(' ', StringSplitOptions.RemoveEmptyEntries) with
+                        | [| mode; blobId; "0" |] ->
+                            entries.Add {
+                                Mode = mode
+                                BlobId = blobId
+                                Path = entryPath
+                            }
+                        | _ -> failure <- Some(invalidTemporaryIndexEntry path)
+
+            match failure with
+            | Some currentFailure -> return Error currentFailure
+            | None -> return Ok(entries.ToArray())
     }
 
 let private temporaryIndexMode
@@ -378,17 +381,19 @@ let private temporaryIndexMode
     (path: string)
     =
     async {
-        match! tryTemporaryIndexEntry runGit environment path with
+        match! listTemporaryIndexEntries runGit environment path with
         | Error failure -> return Error failure
-        | Ok(Some entry) -> return Ok entry.Mode
-        | Ok None ->
-            return
-                Error(
-                    OperationFailure.create
-                        ProviderError
-                        "temporary_index_entry_missing"
-                        "The oversized selected file was not present in the temporary index."
-                )
+        | Ok entries ->
+            match entries |> Array.tryFind (fun entry -> entry.Path = path) with
+            | Some entry -> return Ok entry.Mode
+            | None ->
+                return
+                    Error(
+                        OperationFailure.create
+                            ProviderError
+                            "temporary_index_entry_missing"
+                            "The oversized selected file was not present in the temporary index."
+                    )
     }
 
 let private validateLfsPlanAgainstTemporaryIndex
@@ -405,32 +410,35 @@ let private validateLfsPlanAgainstTemporaryIndex
         for path in paths |> Array.map RepositoryPath.value do
             match failure with
             | Some _ -> ()
-            | None when plannedOversized.Contains path -> ()
             | None ->
-                match! tryTemporaryIndexEntry runGit environment path with
+                match! listTemporaryIndexEntries runGit environment path with
                 | Error currentFailure -> failure <- Some currentFailure
-                | Ok None -> ()
-                | Ok(Some entry) when entry.Mode.StartsWith("100", StringComparison.Ordinal) ->
-                    let! sizeResult = runGit [| "cat-file"; "-s"; entry.BlobId |] None [||]
+                | Ok entries ->
+                    for entry in entries do
+                        match failure with
+                        | Some _ -> ()
+                        | None when plannedOversized.Contains entry.Path -> ()
+                        | None when entry.Mode.StartsWith("100", StringComparison.Ordinal) ->
+                            let! sizeResult = runGit [| "cat-file"; "-s"; entry.BlobId |] None [||]
 
-                    match sizeResult with
-                    | Error currentFailure -> failure <- Some currentFailure
-                    | Ok output when output.ExitCode <> 0 ->
-                        failure <- Some(failedRun "git cat-file -s" output)
-                    | Ok output ->
-                        match Int64.TryParse(output.StdOut.Trim()) with
-                        | true, size when float size >= plan.ThresholdBytes ->
-                            newlyOversized <- newlyOversized.Add path
-                        | true, _ -> ()
-                        | _ ->
-                            failure <-
-                                Some(
-                                    OperationFailure.create
-                                        ProviderError
-                                        "staged_blob_size_invalid"
-                                        "Git returned an invalid size for a staged selected file."
-                                )
-                | Ok(Some _) -> ()
+                            match sizeResult with
+                            | Error currentFailure -> failure <- Some currentFailure
+                            | Ok output when output.ExitCode <> 0 ->
+                                failure <- Some(failedRun "git cat-file -s" output)
+                            | Ok output ->
+                                match Int64.TryParse(output.StdOut.Trim()) with
+                                | true, size when float size >= plan.ThresholdBytes ->
+                                    newlyOversized <- newlyOversized.Add entry.Path
+                                | true, _ -> ()
+                                | _ ->
+                                    failure <-
+                                        Some(
+                                            OperationFailure.create
+                                                ProviderError
+                                                "staged_blob_size_invalid"
+                                                "Git returned an invalid size for a staged selected file."
+                                        )
+                        | None -> ()
 
         match failure with
         | Some currentFailure -> return Error currentFailure
@@ -824,31 +832,49 @@ let createRevision
                                                                     Code = "reconcile_index"
                                                                     Instructions =
                                                                         Some
-                                                                            "Restore the generated .gitattributes content and run git reset on the committed paths."
+                                                                            "Merge the generated literal Git LFS rules into the current .gitattributes without discarding concurrent edits, then reconcile the affected paths in the index (for example with git reset)."
                                                                 }
 
-                                                        let attributesWriteResult =
+                                                        let! attributesWriteResult =
                                                             match lfsPlan.GeneratedAttributesContent with
-                                                            | None -> Ok()
+                                                            | None -> async { return Ok() }
                                                             | Some attributesContent ->
-                                                                try
-                                                                    let attributesFile =
-                                                                        NodePath.join [| repoPath; ".gitattributes" |]
+                                                                async {
+                                                                    let mutable replacement = None
 
-                                                                    GitLfsService.replaceAttributesAtomically
-                                                                        attributesFile
-                                                                        lfsPlan.AttributesOriginalIdentity
-                                                                        lfsPlan.AttributesOriginalContent
-                                                                        attributesContent
+                                                                    try
+                                                                        let attributesFile =
+                                                                            NodePath.join [| repoPath; ".gitattributes" |]
 
-                                                                    Ok()
-                                                                with error ->
-                                                                    Error(
-                                                                        OperationFailure.createRedacted
-                                                                            ProviderError
-                                                                            "attributes_reconciliation_failed"
-                                                                            error.Message
-                                                                    )
+                                                                        let! prepared =
+                                                                            GitLfsService.prepareAttributesReplacement
+                                                                                attributesFile
+                                                                                lfsPlan.AttributesOriginalIdentity
+                                                                                lfsPlan.AttributesOriginalContent
+                                                                                attributesContent
+
+                                                                        replacement <- Some prepared
+                                                                        do! barrier "selected-revision-attributes-replacement-ready"
+                                                                        do! GitLfsService.completeAttributesReplacement prepared
+                                                                        replacement <- None
+                                                                        return Ok()
+                                                                    with error ->
+                                                                        match replacement with
+                                                                        | Some prepared ->
+                                                                            try
+                                                                                do! GitLfsService.abortAttributesReplacement prepared
+                                                                            with _ ->
+                                                                                ()
+                                                                        | None -> ()
+
+                                                                        return
+                                                                            Error(
+                                                                                OperationFailure.createRedacted
+                                                                                    ProviderError
+                                                                                    "attributes_reconciliation_failed"
+                                                                                    error.Message
+                                                                            )
+                                                                }
 
                                                         // Reconcile only the committed paths in the
                                                         // real index (unrelated staged state untouched).
