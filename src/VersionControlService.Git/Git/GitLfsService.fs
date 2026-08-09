@@ -281,7 +281,11 @@ type AttributesReplacement = private {
     AttributesPath: string
     TempPath: string
     OriginalContent: string
+    GeneratedContent: string
+    AppendContent: string option
     mutable OriginalHandle: NodeFileSystem.FileHandle option
+    mutable InstalledIdentity: NodeFileSystem.Stats option
+    mutable InstalledContent: string option
 }
 
 let private readHandleUtf8FromStart (handle: NodeFileSystem.FileHandle) =
@@ -314,14 +318,28 @@ let private readHandleUtf8FromStart (handle: NodeFileSystem.FileHandle) =
 
 let private cleanupAttributesReplacement (replacement: AttributesReplacement) =
     async {
+        let mutable cleanupError: exn option = None
+
         match replacement.OriginalHandle with
         | Some handle ->
             replacement.OriginalHandle <- None
-            do! handle.close () |> Async.AwaitPromise
+
+            try
+                do! handle.close () |> Async.AwaitPromise
+            with error ->
+                cleanupError <- Some error
         | None -> ()
 
-        if NodeFileSystem.existsSync replacement.TempPath then
-            NodeFileSystem.unlinkSync replacement.TempPath
+        try
+            if NodeFileSystem.existsSync replacement.TempPath then
+                NodeFileSystem.unlinkSync replacement.TempPath
+        with error ->
+            if cleanupError.IsNone then
+                cleanupError <- Some error
+
+        match cleanupError with
+        | Some error -> return raise error
+        | None -> return ()
     }
 
 let abortAttributesReplacement (replacement: AttributesReplacement) =
@@ -334,6 +352,16 @@ let prepareAttributesReplacement
     (content: string)
     =
     async {
+        let appendContent =
+            match originalIdentity with
+            | Some _
+                when content.StartsWith(originalContent, StringComparison.Ordinal)
+                     && content.Length > originalContent.Length ->
+                Some(content.Substring(originalContent.Length))
+            | Some _ ->
+                invalidOp "The generated Git attributes content did not preserve the validated original prefix."
+            | None -> None
+
         let tempPath = attributesPath + $".vcs-{Guid.NewGuid():N}.tmp"
         NodeFileSystem.writeUtf8FileExclusiveAndFlushSync tempPath content
 
@@ -364,7 +392,11 @@ let prepareAttributesReplacement
                         AttributesPath = attributesPath
                         TempPath = tempPath
                         OriginalContent = originalContent
+                        GeneratedContent = content
+                        AppendContent = appendContent
                         OriginalHandle = Some handle
+                        InstalledIdentity = None
+                        InstalledContent = None
                     }
                 with error ->
                     do! handle.close () |> Async.AwaitPromise
@@ -376,7 +408,11 @@ let prepareAttributesReplacement
                     AttributesPath = attributesPath
                     TempPath = tempPath
                     OriginalContent = originalContent
+                    GeneratedContent = content
+                    AppendContent = appendContent
                     OriginalHandle = None
+                    InstalledIdentity = None
+                    InstalledContent = None
                 }
         with error ->
             if NodeFileSystem.existsSync tempPath then
@@ -385,42 +421,116 @@ let prepareAttributesReplacement
             return raise error
     }
 
-let private restoreAttributesContentAtomically (attributesPath: string) (content: string) =
-    let tempPath = attributesPath + $".vcs-{Guid.NewGuid():N}.tmp"
+let private validateOriginalAttributesPath
+    (replacement: AttributesReplacement)
+    (handle: NodeFileSystem.FileHandle)
+    =
+    async {
+        if not (NodeFileSystem.existsSync replacement.AttributesPath) then
+            invalidOp "The Git attributes file disappeared before its policy could be reconciled."
 
-    try
-        NodeFileSystem.writeUtf8FileExclusiveAndFlushSync tempPath content
-        ensurePathHasNoLinks (NodePath.dirname attributesPath)
-        NodeFileSystem.renameSync tempPath attributesPath
-    finally
-        if NodeFileSystem.existsSync tempPath then
-            NodeFileSystem.unlinkSync tempPath
+        ensurePathHasNoLinks replacement.AttributesPath
+        let! openedStats = handle.stat () |> Async.AwaitPromise
+        let! currentContent = readHandleUtf8FromStart handle
+        let pathStats = NodeFileSystem.lstatSync replacement.AttributesPath
+
+        if
+            currentContent <> replacement.OriginalContent
+            || not (sameFileIdentity openedStats pathStats)
+        then
+            invalidOp "The Git attributes file changed before its policy could be reconciled."
+
+        return openedStats
+    }
+
+let applyAttributesReplacement (replacement: AttributesReplacement) =
+    async {
+        match replacement.OriginalHandle, replacement.AppendContent with
+        | Some originalHandle, Some appendContent ->
+            let! originalStats = validateOriginalAttributesPath replacement originalHandle
+            let! appendHandle =
+                NodeFileSystem.openAppendNoFollowAsync replacement.AttributesPath
+                |> Async.AwaitPromise
+
+            let mutable appendError: exn option = None
+
+            try
+                ensurePathHasNoLinks replacement.AttributesPath
+                let! appendStats = appendHandle.stat () |> Async.AwaitPromise
+                let pathStats = NodeFileSystem.lstatSync replacement.AttributesPath
+
+                if
+                    not (sameFileIdentity originalStats appendStats)
+                    || not (sameFileIdentity originalStats pathStats)
+                then
+                    invalidOp "The Git attributes file changed before its policy could be appended."
+
+                do! appendHandle.writeFile (box appendContent) |> Async.AwaitPromise
+                do! appendHandle.sync () |> Async.AwaitPromise
+            with error ->
+                appendError <- Some error
+
+            try
+                do! appendHandle.close () |> Async.AwaitPromise
+            with error ->
+                if appendError.IsNone then
+                    appendError <- Some error
+
+            match appendError with
+            | Some error -> return raise error
+            | None ->
+                if not (NodeFileSystem.existsSync replacement.AttributesPath) then
+                    invalidOp "The Git attributes file disappeared while its policy was being appended."
+
+                ensurePathHasNoLinks replacement.AttributesPath
+                let! installedIdentity = originalHandle.stat () |> Async.AwaitPromise
+                let! installedContent = readHandleUtf8FromStart originalHandle
+                let pathStats = NodeFileSystem.lstatSync replacement.AttributesPath
+
+                if
+                    installedContent <> replacement.GeneratedContent
+                    || not (sameFileIdentity installedIdentity pathStats)
+                then
+                    invalidOp
+                        "The Git attributes file changed while its policy was being appended; concurrent bytes were preserved."
+
+                replacement.InstalledIdentity <- Some installedIdentity
+                replacement.InstalledContent <- Some installedContent
+        | None, None ->
+            ensurePathHasNoLinks (NodePath.dirname replacement.AttributesPath)
+
+            if NodeFileSystem.existsSync replacement.AttributesPath then
+                invalidOp "The Git attributes file appeared before its policy could be created."
+
+            NodeFileSystem.linkSync replacement.TempPath replacement.AttributesPath
+            let installedContent, installedIdentity = readAttributesNoFollow replacement.AttributesPath
+
+            match installedIdentity with
+            | Some identity when installedContent = replacement.GeneratedContent ->
+                replacement.InstalledIdentity <- Some identity
+                replacement.InstalledContent <- Some installedContent
+            | _ ->
+                invalidOp
+                    "The Git attributes file changed while its policy was being created; concurrent bytes were preserved."
+        | _ -> invalidOp "The Git attributes replacement transaction was invalid."
+    }
 
 let completeAttributesReplacement (replacement: AttributesReplacement) =
     async {
         let mutable completionError: exn option = None
 
         try
-            match replacement.OriginalHandle with
-            | None when NodeFileSystem.existsSync replacement.AttributesPath ->
-                invalidOp "The Git attributes file appeared before its policy could be created."
-            | _ -> ()
+            match replacement.InstalledIdentity, replacement.InstalledContent with
+            | Some expectedIdentity, Some expectedContent ->
+                let currentContent, currentIdentity = readAttributesNoFollow replacement.AttributesPath
 
-            NodeFileSystem.renameSync replacement.TempPath replacement.AttributesPath
-
-            match replacement.OriginalHandle with
-            | Some handle ->
-                let! lateContent = readHandleUtf8FromStart handle
-
-                if lateContent <> replacement.OriginalContent then
-                    restoreAttributesContentAtomically replacement.AttributesPath lateContent
-                    completionError <-
-                        Some(
-                            InvalidOperationException(
-                                "The Git attributes file changed during replacement; the concurrent content was preserved."
-                            )
-                        )
-            | None -> ()
+                if
+                    currentContent <> expectedContent
+                    || (currentIdentity |> Option.exists (sameFileIdentity expectedIdentity) |> not)
+                then
+                    invalidOp
+                        "The Git attributes file changed after its policy was installed; concurrent bytes were preserved."
+            | _ -> invalidOp "The Git attributes replacement transaction was not installed."
         with error ->
             completionError <- Some error
 

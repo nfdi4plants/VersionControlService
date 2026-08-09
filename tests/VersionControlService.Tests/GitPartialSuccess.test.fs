@@ -35,11 +35,32 @@ let private createDirectoryJunctionAsync (targetPath: string) (linkPath: string)
     return ()
 }
 
+let private renameAsync (sourcePath: string) (destinationPath: string) : JS.Promise<unit> = promise {
+    let! _ = fsPromisesDynamic?rename (sourcePath, destinationPath) |> unbox<JS.Promise<obj>>
+    return ()
+}
+
+[<Emit("(() => { const fs = require('node:fs'); const moduleApi = require('node:module'); const original = fs.lstatSync; fs.lstatSync = path => { const stats = original(path); if (path === $0 && $1()) return new Proxy(stats, { get(target, property, receiver) { return property === 'isSymbolicLink' ? (() => true) : Reflect.get(target, property, receiver); } }); return stats; }; moduleApi.syncBuiltinESMExports(); return () => { fs.lstatSync = original; moduleApi.syncBuiltinESMExports(); }; })()")>]
+let private injectAttributesSymlinkIdentity
+    (_attributesPath: string)
+    (_enabled: unit -> bool)
+    : unit -> unit =
+    jsNative
+
 [<Emit("(() => { const fs = require('node:fs'); const moduleApi = require('node:module'); const original = fs.renameSync; fs.renameSync = (fromPath, toPath) => { if (toPath === $0 && String(fromPath).startsWith($0 + '.vcs-') && !$1()) fs.writeFileSync($0, $2, 'utf8'); return original(fromPath, toPath); }; moduleApi.syncBuiltinESMExports(); return () => { fs.renameSync = original; moduleApi.syncBuiltinESMExports(); }; })()")>]
 let private injectLateAttributesEditBeforeRename
     (_attributesPath: string)
     (_barrierRan: unit -> bool)
     (_content: string)
+    : unit -> unit =
+    jsNative
+
+[<Emit("(() => { const fs = require('node:fs'); const moduleApi = require('node:module'); const originalRename = fs.renameSync; let injected = false; fs.renameSync = (fromPath, toPath) => { const shouldInject = !injected && toPath === $0 && String(fromPath).startsWith($0 + '.vcs-') && !$1(); if (shouldInject) { injected = true; fs.writeFileSync($0, $2, 'utf8'); } const result = originalRename(fromPath, toPath); if (shouldInject) fs.writeFileSync($0, $3, 'utf8'); return result; }; moduleApi.syncBuiltinESMExports(); return () => { fs.renameSync = originalRename; moduleApi.syncBuiltinESMExports(); }; })()")>]
+let private injectInstalledAttributesEditAfterRename
+    (_attributesPath: string)
+    (_barrierRan: unit -> bool)
+    (_lateOldContent: string)
+    (_newestInstalledContent: string)
     : unit -> unit =
     jsNative
 
@@ -1032,6 +1053,152 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "selected revision does not replace a different attributes inode after preparation",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, binding = createSelectedRevisionFixture ()
+
+                try
+                    let attributesBefore = "# baseline\n"
+                    let replacementContent = "# replacement consumer file\n"
+                    let attributesPath = join [| workPath; ".gitattributes" |]
+                    let originalPath = join [| workPath; ".gitattributes.original" |]
+                    do! writeUtf8FileAsync attributesPath attributesBefore
+                    let! _ = runGitOk workPath [| "add"; ".gitattributes" |]
+                    let! _ = runGitOk workPath [| "commit"; "-m"; "test: baseline attributes inode" |]
+                    do!
+                        writeUtf8FileAsync
+                            (join [| workPath; "large.bin" |])
+                            (String.replicate (1024 * 1024) "i")
+
+                    let hooks: GitWorkspaceSession.GitSessionHooks = {
+                        RunBytesProcess = None
+                        RunProcess = None
+                        Barrier =
+                            Some(fun _ point _ -> async {
+                                if point = "selected-revision-attributes-replacement-ready" then
+                                    do! renameAsync attributesPath originalPath |> Async.AwaitPromise
+                                    do! writeUtf8FileAsync attributesPath replacementContent |> Async.AwaitPromise
+                            })
+                    }
+
+                    let session = GitWorkspaceSession.createSession hooks binding
+                    let! statusResult = session.Core.GetStatus(ctx "attributes-inode-swap-status") |> Async.StartAsPromise
+                    let status =
+                        match statusResult with
+                        | Succeeded outcome -> outcome.Value
+                        | _ -> failwith "Expected selected-revision status."
+
+                    let! revisionResult =
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: preserve replacement attributes inode"
+                                Paths = [| repositoryPath "large.bin" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (ctx "attributes-inode-swap-revision")
+                        |> Async.StartAsPromise
+
+                    let! attributesAfter = tryReadUtf8FileAsync attributesPath
+                    let! originalAfter = tryReadUtf8FileAsync originalPath
+                    Vitest.expect(attributesAfter).toEqual (Some replacementContent)
+                    Vitest.expect(originalAfter).toEqual (Some attributesBefore)
+
+                    match revisionResult with
+                    | PartiallySucceeded(outcome, failure) ->
+                        Vitest.expect(failure.StateChanged).toBe true
+                        Vitest.expect(failure.Code).toBe "attributes_reconciliation_failed"
+                        Vitest.expect(outcome.AffectedPaths |> Array.contains ".gitattributes").toBe true
+                        Vitest.expect(outcome.ResultingRevision.IsSome).toBe true
+                    | _ -> failwith "Expected the attributes inode swap to return partial success."
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "selected revision does not replace an attributes path observed as a symlink after preparation",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, binding = createSelectedRevisionFixture ()
+
+                try
+                    let attributesBefore = "# baseline\n"
+                    let targetContent = "# consumer symlink target\n"
+                    let attributesPath = join [| workPath; ".gitattributes" |]
+                    let originalPath = join [| workPath; ".gitattributes.original" |]
+                    do! writeUtf8FileAsync attributesPath attributesBefore
+                    let! _ = runGitOk workPath [| "add"; ".gitattributes" |]
+                    let! _ = runGitOk workPath [| "commit"; "-m"; "test: baseline attributes symlink" |]
+                    do!
+                        writeUtf8FileAsync
+                            (join [| workPath; "large.bin" |])
+                            (String.replicate (1024 * 1024) "s")
+
+                    let mutable symlinkSwapObserved = false
+                    let restoreLstat =
+                        injectAttributesSymlinkIdentity attributesPath (fun () -> symlinkSwapObserved)
+
+                    let hooks: GitWorkspaceSession.GitSessionHooks = {
+                        RunBytesProcess = None
+                        RunProcess = None
+                        Barrier =
+                            Some(fun _ point _ -> async {
+                                if point = "selected-revision-attributes-replacement-ready" then
+                                    do! renameAsync attributesPath originalPath |> Async.AwaitPromise
+                                    do! writeUtf8FileAsync attributesPath targetContent |> Async.AwaitPromise
+                                    symlinkSwapObserved <- true
+                            })
+                    }
+
+                    let session = GitWorkspaceSession.createSession hooks binding
+                    let! statusResult = session.Core.GetStatus(ctx "attributes-symlink-swap-status") |> Async.StartAsPromise
+                    let status =
+                        match statusResult with
+                        | Succeeded outcome -> outcome.Value
+                        | _ -> failwith "Expected selected-revision status."
+
+                    let! revisionResult =
+                        promise {
+                            try
+                                return!
+                                    session.Core.CreateRevision
+                                        {
+                                            Message = "test: preserve attributes symlink"
+                                            Paths = [| repositoryPath "large.bin" |]
+                                            ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                        }
+                                        (ctx "attributes-symlink-swap-revision")
+                                    |> Async.StartAsPromise
+                            finally
+                                restoreLstat ()
+                        }
+
+                    let! targetAfter = tryReadUtf8FileAsync attributesPath
+                    let! originalAfter = tryReadUtf8FileAsync originalPath
+                    Vitest.expect(symlinkSwapObserved).toBe true
+                    Vitest.expect(targetAfter).toEqual (Some targetContent)
+                    Vitest.expect(originalAfter).toEqual (Some attributesBefore)
+
+                    match revisionResult with
+                    | PartiallySucceeded(outcome, failure) ->
+                        Vitest.expect(failure.StateChanged).toBe true
+                        Vitest.expect(failure.Code).toBe "attributes_reconciliation_failed"
+                        Vitest.expect(outcome.AffectedPaths |> Array.contains ".gitattributes").toBe true
+                        Vitest.expect(outcome.ResultingRevision.IsSome).toBe true
+                    | _ -> failwith "Expected the attributes symlink swap to return partial success."
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
             "selected revision preserves an attributes edit in the final replacement window",
             TestOptions(timeout = 120000),
             fun () -> promise {
@@ -1107,6 +1274,88 @@ Vitest.describe (
                         Vitest.expect(outcome.AffectedPaths |> Array.contains ".gitattributes").toBe true
                         Vitest.expect(outcome.ResultingRevision.IsSome).toBe true
                     | _ -> failwith "Expected the final attributes replacement race to return partial success."
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "selected revision preserves newer attributes bytes after generated content is installed",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, binding = createSelectedRevisionFixture ()
+
+                try
+                    let attributesBefore = "# baseline\n"
+                    let lateOldContent = "# late old inode edit\n"
+                    let newestInstalledContent = "# newest installed path edit\n"
+                    let attributesPath = join [| workPath; ".gitattributes" |]
+                    do! writeUtf8FileAsync attributesPath attributesBefore
+                    let! _ = runGitOk workPath [| "add"; ".gitattributes" |]
+                    let! _ = runGitOk workPath [| "commit"; "-m"; "test: baseline installed attributes" |]
+                    do!
+                        writeUtf8FileAsync
+                            (join [| workPath; "large.bin" |])
+                            (String.replicate (1024 * 1024) "n")
+
+                    let mutable installedBarrierRan = false
+                    let restoreRename =
+                        injectInstalledAttributesEditAfterRename
+                            attributesPath
+                            (fun () -> installedBarrierRan)
+                            lateOldContent
+                            newestInstalledContent
+
+                    let hooks: GitWorkspaceSession.GitSessionHooks = {
+                        RunBytesProcess = None
+                        RunProcess = None
+                        Barrier =
+                            Some(fun _ point _ -> async {
+                                if point = "selected-revision-attributes-installed" then
+                                    installedBarrierRan <- true
+                                    do! writeUtf8FileAsync attributesPath newestInstalledContent |> Async.AwaitPromise
+                            })
+                    }
+
+                    let session = GitWorkspaceSession.createSession hooks binding
+                    let! statusResult = session.Core.GetStatus(ctx "installed-attributes-race-status") |> Async.StartAsPromise
+                    let status =
+                        match statusResult with
+                        | Succeeded outcome -> outcome.Value
+                        | _ -> failwith "Expected selected-revision status."
+
+                    let! revisionResult =
+                        promise {
+                            try
+                                return!
+                                    session.Core.CreateRevision
+                                        {
+                                            Message = "test: preserve newest installed attributes"
+                                            Paths = [| repositoryPath "large.bin" |]
+                                            ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                        }
+                                        (ctx "installed-attributes-race-revision")
+                                    |> Async.StartAsPromise
+                            finally
+                                restoreRename ()
+                        }
+
+                    let! attributesAfter = tryReadUtf8FileAsync attributesPath
+                    Vitest.expect(attributesAfter).toEqual (Some newestInstalledContent)
+                    Vitest.expect(installedBarrierRan).toBe true
+
+                    match revisionResult with
+                    | PartiallySucceeded(outcome, failure) ->
+                        Vitest.expect(failure.StateChanged).toBe true
+                        Vitest.expect(failure.Code).toBe "attributes_reconciliation_failed"
+                        Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "reconcile_index")
+                        Vitest.expect(outcome.AffectedPaths |> Array.contains "large.bin").toBe true
+                        Vitest.expect(outcome.AffectedPaths |> Array.contains ".gitattributes").toBe true
+                        Vitest.expect(outcome.ResultingRevision.IsSome).toBe true
+                    | _ -> failwith "Expected the installed attributes race to return partial success."
 
                     do! removeDirectoryAsync root
                 with error ->

@@ -68,6 +68,9 @@ let copyFileSync (sourcePath: string) (destinationPath: string) : unit = jsNativ
 [<Import("renameSync", "fs")>]
 let renameSync (oldPath: string) (newPath: string) : unit = jsNative
 
+[<Import("linkSync", "fs")>]
+let linkSync (existingPath: string) (newPath: string) : unit = jsNative
+
 [<Import("unlinkSync", "fs")>]
 let unlinkSync (path: string) : unit = jsNative
 
@@ -164,6 +167,21 @@ let openReadNoFollowAsync (path: string) : JS.Promise<FileHandle> =
         else
             let readOnly: int = unbox fileSystemDynamic?constants?O_RDONLY
             box (readOnly ||| unbox<int> noFollow)
+
+    fileSystemPromisesDynamic?``open`` (path, flags) |> unbox<JS.Promise<FileHandle>>
+
+/// Opens a write handle whose writes are forced to the end of the opened file,
+/// without following a leaf symlink on platforms where O_NOFOLLOW is available.
+let openAppendNoFollowAsync (path: string) : JS.Promise<FileHandle> =
+    let noFollow: obj = fileSystemDynamic?constants?O_NOFOLLOW
+    let writeOnly: int = unbox fileSystemDynamic?constants?O_WRONLY
+    let append: int = unbox fileSystemDynamic?constants?O_APPEND
+
+    let flags =
+        if isNullish noFollow then
+            writeOnly ||| append
+        else
+            writeOnly ||| append ||| unbox<int> noFollow
 
     fileSystemPromisesDynamic?``open`` (path, flags) |> unbox<JS.Promise<FileHandle>>
 

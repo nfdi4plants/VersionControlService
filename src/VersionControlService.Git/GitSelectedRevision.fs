@@ -855,6 +855,8 @@ let createRevision
 
                                                                         replacement <- Some prepared
                                                                         do! barrier "selected-revision-attributes-replacement-ready"
+                                                                        do! GitLfsService.applyAttributesReplacement prepared
+                                                                        do! barrier "selected-revision-attributes-installed"
                                                                         do! GitLfsService.completeAttributesReplacement prepared
                                                                         replacement <- None
                                                                         return Ok()
