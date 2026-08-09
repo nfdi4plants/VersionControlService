@@ -60,6 +60,15 @@ let private injectAttributesLinkFailure
 [<Emit("(async () => { const fsp = require('node:fs/promises'); const probe = await fsp.open($0, 'r'); const prototype = Object.getPrototypeOf(probe); await probe.close(); const original = prototype.sync; let injected = false; prototype.sync = function() { if (!injected) { injected = true; const error = new Error('injected exclusive attributes fsync failure'); error.code = 'EIO'; return Promise.reject(error); } return original.call(this); }; return () => { prototype.sync = original; }; })()")>]
 let private injectNextFileHandleSyncFailure (_probePath: string) : JS.Promise<unit -> unit> = jsNative
 
+[<Emit("(async () => { const fs = require('node:fs'); const fsp = require('node:fs/promises'); const probe = await fsp.open($0, 'r'); const prototype = Object.getPrototypeOf(probe); await probe.close(); const original = prototype.sync; let injected = false; prototype.sync = function() { if (!injected) { injected = true; fs.writeFileSync($1, $2, 'utf8'); $3(); const error = new Error('injected exclusive attributes fsync failure after consumer edit'); error.code = 'EIO'; return Promise.reject(error); } return original.call(this); }; return () => { prototype.sync = original; }; })()")>]
+let private injectNextFileHandleSyncFailureAfterAttributesEdit
+    (_probePath: string)
+    (_attributesPath: string)
+    (_consumerContent: string)
+    (_onInjection: unit -> unit)
+    : JS.Promise<unit -> unit> =
+    jsNative
+
 let private tryReadUtf8FileAsync (path: string) : JS.Promise<string option> = promise {
     try
         let! content = fsPromisesDynamic?readFile (path, "utf8") |> unbox<JS.Promise<string>>
@@ -1127,7 +1136,7 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "selected revision removes only its exclusive attributes file when fallback fsync fails",
+            "selected revision leaves its published exclusive attributes file when fallback fsync fails",
             TestOptions(timeout = 120000),
             fun () -> promise {
                 let! root, workPath, binding = createSelectedRevisionFixture ()
@@ -1174,7 +1183,9 @@ Vitest.describe (
 
                     Vitest.expect(linkAttempted).toBe true
                     let! attributesAfter = tryReadUtf8FileAsync attributesPath
-                    Vitest.expect(attributesAfter).toEqual None
+                    Vitest.expect(attributesAfter).toEqual (
+                        Some "\"/large.bin\" filter=lfs diff=lfs merge=lfs -text\n"
+                    )
 
                     let! worktreeNames = fsPromisesDynamic?readdir workPath |> unbox<JS.Promise<string[]>>
                     let attributesTemps =
@@ -1190,6 +1201,91 @@ Vitest.describe (
                         Vitest.expect(outcome.AffectedPaths |> Array.contains ".gitattributes").toBe true
                         Vitest.expect(outcome.ResultingRevision.IsSome).toBe true
                     | _ -> failwith "Expected fallback fsync failure to return partial success."
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "selected revision preserves consumer bytes when exclusive attributes fsync fails",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, binding = createSelectedRevisionFixture ()
+
+                try
+                    let attributesPath = join [| workPath; ".gitattributes" |]
+                    let consumerContent = "# consumer owns these published bytes\n"
+                    do!
+                        writeUtf8FileAsync
+                            (join [| workPath; "large.bin" |])
+                            (String.replicate (1024 * 1024) "u")
+
+                    let mutable linkAttempted = false
+                    let restoreLink =
+                        injectAttributesLinkFailure attributesPath (fun () -> linkAttempted <- true)
+
+                    let session =
+                        GitWorkspaceSession.createSession GitWorkspaceSession.GitSessionHooks.none binding
+
+                    let! statusResult = session.Core.GetStatus(ctx "attributes-consumer-fsync-status") |> Async.StartAsPromise
+                    let status =
+                        match statusResult with
+                        | Succeeded outcome -> outcome.Value
+                        | _ -> failwith "Expected selected-revision status."
+
+                    let mutable consumerEditInjected = false
+                    let! restoreSync =
+                        injectNextFileHandleSyncFailureAfterAttributesEdit
+                            (join [| workPath; "base.txt" |])
+                            attributesPath
+                            consumerContent
+                            (fun () -> consumerEditInjected <- true)
+
+                    let! revisionResult =
+                        promise {
+                            try
+                                return!
+                                    session.Core.CreateRevision
+                                        {
+                                            Message = "test: preserve consumer attributes after fsync failure"
+                                            Paths = [| repositoryPath "large.bin" |]
+                                            ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                        }
+                                        (ctx "attributes-consumer-fsync-revision")
+                                    |> Async.StartAsPromise
+                            finally
+                                restoreSync ()
+                                restoreLink ()
+                        }
+
+                    Vitest.expect(linkAttempted).toBe true
+                    Vitest.expect(consumerEditInjected).toBe true
+                    let! attributesAfter = tryReadUtf8FileAsync attributesPath
+                    Vitest.expect(attributesAfter).toEqual (Some consumerContent)
+
+                    let! worktreeNames = fsPromisesDynamic?readdir workPath |> unbox<JS.Promise<string[]>>
+                    let attributesTemps =
+                        worktreeNames
+                        |> Array.filter (fun name -> name.StartsWith(".gitattributes.vcs-", StringComparison.Ordinal))
+
+                    Vitest.expect(attributesTemps).toEqual [||]
+
+                    match revisionResult with
+                    | PartiallySucceeded(outcome, failure) ->
+                        Vitest.expect(failure.StateChanged).toBe true
+                        Vitest.expect(failure.Code).toBe "attributes_reconciliation_failed"
+                        Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "reconcile_index")
+                        Vitest.expect(failure.RecoveryAction |> Option.bind _.Instructions).toEqual (
+                            Some
+                                "Merge the generated literal Git LFS rules into the current .gitattributes without discarding concurrent edits, then reconcile the affected paths in the index (for example with git reset)."
+                        )
+                        Vitest.expect(outcome.AffectedPaths |> Array.contains "large.bin").toBe true
+                        Vitest.expect(outcome.AffectedPaths |> Array.contains ".gitattributes").toBe true
+                        Vitest.expect(outcome.ResultingRevision.IsSome).toBe true
+                    | _ -> failwith "Expected consumer edit after exclusive publication to return partial success."
 
                     do! removeDirectoryAsync root
                 with error ->

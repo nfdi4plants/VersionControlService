@@ -568,14 +568,7 @@ let applyAttributesReplacement (replacement: AttributesReplacement) =
                         createError <- Some error
 
                 match createError, createdIdentity with
-                | Some error, Some identity ->
-                    NodeFileSystem.removeFileIfIdentityMatchesSync
-                        replacement.AttributesPath
-                        identity
-                    |> ignore
-
-                    return raise error
-                | Some error, None -> return raise error
+                | Some error, _ -> return raise error
                 | None, Some identity ->
                     ensurePathHasNoLinks replacement.AttributesPath
                     let pathIdentity = NodeFileSystem.lstatSync replacement.AttributesPath
