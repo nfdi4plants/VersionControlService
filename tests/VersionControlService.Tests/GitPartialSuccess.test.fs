@@ -2273,6 +2273,282 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "clean push whose exact ref remains unchanged fails without claiming mutation",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable pushReportedSuccess = false
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request operationContext ->
+                            async {
+                                if request.Arguments |> Array.contains "push" then
+                                    pushReportedSuccess <- true
+
+                                    return
+                                        OperationResult.succeeded {
+                                            ExitCode = 0
+                                            StdOut = ""
+                                            StdErr = ""
+                                        }
+                                else
+                                    return! NodeProcess.run request operationContext
+                            })
+                    Barrier = None
+                }
+
+                let! root, workPath, barePath, session = createPublishFixture hooks
+
+                try
+                    let! previousTarget = runGitOk barePath [| "rev-parse"; "main" |]
+                    let! _, publishStatus =
+                        createTextPublishRevision
+                            session
+                            workPath
+                            "clean-push-not-observed.txt"
+                            "clean-push-not-observed"
+
+                    let! result =
+                        (synchronization session).Publish
+                            {
+                                ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                            }
+                            (ctx "clean-push-not-observed")
+                        |> Async.StartAsPromise
+
+                    Vitest.expect(pushReportedSuccess).toBe true
+
+                    match result with
+                    | Failed failure ->
+                        Vitest.expect(failure.Category).toEqual ProviderError
+                        Vitest.expect(failure.Code).toBe "publish_not_observed"
+                        Vitest.expect(failure.StateChanged).toBe false
+                        Vitest.expect(failure.Retryable).toBe true
+                        Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (
+                            Some "retry_publish_verification"
+                        )
+                        Vitest.expect(
+                            failure.RevisionEvidence
+                            |> Array.contains ("expected_target", previousTarget.Trim() |> RevisionId.tryCreate |> Result.defaultWith failwith)
+                        ).toBe true
+                        Vitest.expect(
+                            failure.RevisionEvidence
+                            |> Array.contains ("observed_target", previousTarget.Trim() |> RevisionId.tryCreate |> Result.defaultWith failwith)
+                        ).toBe true
+                    | PartiallySucceeded(outcome, _) ->
+                        failwith $"An unchanged remote ref falsely reported {outcome.Publication}."
+                    | Succeeded _ -> failwith "An unchanged remote ref cannot report a successful publication."
+
+                    let! targetHead = runGitOk barePath [| "rev-parse"; "main" |]
+                    Vitest.expect(targetHead.Trim()).toBe(previousTarget.Trim())
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "clean push whose exact ref races to a third revision reports concurrency",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable bareTarget = ""
+                let mutable pushReportedSuccess = false
+                let mutable racedRevision = ""
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request operationContext ->
+                            async {
+                                let! result = NodeProcess.run request operationContext
+
+                                if
+                                    request.Arguments |> Array.contains "push"
+                                    && match result with
+                                       | Succeeded outcome -> outcome.Value.ExitCode = 0
+                                       | _ -> false
+                                then
+                                    pushReportedSuccess <- true
+                                    let! parent = runGitOk bareTarget [| "rev-parse"; "main" |] |> Async.AwaitPromise
+                                    let! tree = runGitOk bareTarget [| "rev-parse"; "main^{tree}" |] |> Async.AwaitPromise
+                                    let! _ = runGitOk bareTarget [| "config"; "user.name"; "VCS Race Tests" |] |> Async.AwaitPromise
+                                    let! _ = runGitOk bareTarget [| "config"; "user.email"; "race@example.org" |] |> Async.AwaitPromise
+                                    let! concurrent =
+                                        runGitOk
+                                            bareTarget
+                                            [| "commit-tree"; tree.Trim(); "-p"; parent.Trim(); "-m"; "race: after clean push" |]
+                                        |> Async.AwaitPromise
+
+                                    racedRevision <- concurrent.Trim()
+                                    let! _ =
+                                        runGitOk
+                                            bareTarget
+                                            [| "update-ref"; "refs/heads/main"; racedRevision; parent.Trim() |]
+                                        |> Async.AwaitPromise
+
+                                    ()
+
+                                return result
+                            })
+                    Barrier = None
+                }
+
+                let! root, workPath, barePath, session = createPublishFixture hooks
+                bareTarget <- barePath
+
+                try
+                    let! previousTarget = runGitOk barePath [| "rev-parse"; "main" |]
+                    let! _, publishStatus =
+                        createTextPublishRevision
+                            session
+                            workPath
+                            "clean-push-raced.txt"
+                            "clean-push-raced"
+
+                    let! result =
+                        (synchronization session).Publish
+                            {
+                                ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                            }
+                            (ctx "clean-push-raced")
+                        |> Async.StartAsPromise
+
+                    Vitest.expect(pushReportedSuccess).toBe true
+
+                    match result with
+                    | Failed failure ->
+                        Vitest.expect(failure.Category).toEqual Concurrency
+                        Vitest.expect(failure.Code).toBe "precondition_failed"
+                        Vitest.expect(failure.StateChanged).toBe true
+                        Vitest.expect(failure.Retryable).toBe true
+                        Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (
+                            Some "retry_publish_verification"
+                        )
+                        Vitest.expect(
+                            failure.RevisionEvidence
+                            |> Array.contains ("expected_target", previousTarget.Trim() |> RevisionId.tryCreate |> Result.defaultWith failwith)
+                        ).toBe true
+                        Vitest.expect(
+                            failure.RevisionEvidence
+                            |> Array.contains ("observed_target", racedRevision |> RevisionId.tryCreate |> Result.defaultWith failwith)
+                        ).toBe true
+                    | PartiallySucceeded(outcome, _) ->
+                        failwith $"A raced remote ref falsely reported {outcome.Publication}."
+                    | Succeeded _ -> failwith "A raced remote ref cannot report a successful publication."
+
+                    let! targetHead = runGitOk barePath [| "rev-parse"; "main" |]
+                    Vitest.expect(targetHead.Trim()).toBe racedRevision
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "path evidence failure stops publication before the core push",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable failPathEvidence = false
+                let mutable pathEvidenceAttempted = false
+                let mutable corePushRan = false
+                let mutable evidencePrevious = ""
+                let mutable evidenceIntended = ""
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request operationContext ->
+                            async {
+                                if
+                                    failPathEvidence
+                                    && request.Arguments |> Array.contains "diff"
+                                    && request.Arguments |> Array.contains "--name-only"
+                                    && request.Arguments |> Array.contains evidencePrevious
+                                    && request.Arguments |> Array.contains evidenceIntended
+                                then
+                                    pathEvidenceAttempted <- true
+
+                                    return
+                                        OperationResult.failed {
+                                            OperationFailure.createRedacted
+                                                ProviderError
+                                                "injected_publish_evidence_failed"
+                                                "Exact publication path evidence could not be read." with
+                                                Retryable = true
+                                        }
+                                elif request.Arguments |> Array.contains "push" then
+                                    corePushRan <- true
+                                    let! result = NodeProcess.run request operationContext
+
+                                    match result with
+                                    | Succeeded outcome when outcome.Value.ExitCode = 0 ->
+                                        return
+                                            OperationResult.failed {
+                                                OperationFailure.createRedacted
+                                                    Network
+                                                    "injected_push_response_loss"
+                                                    "The response was lost after publication." with
+                                                    Retryable = true
+                                            }
+                                    | _ -> return result
+                                else
+                                    return! NodeProcess.run request operationContext
+                            })
+                    Barrier = None
+                }
+
+                let! root, workPath, barePath, session = createPublishFixture hooks
+
+                try
+                    let! previousTarget = runGitOk barePath [| "rev-parse"; "main" |]
+                    let! localHead, publishStatus =
+                        createTextPublishRevision
+                            session
+                            workPath
+                            "unavailable-path-evidence.txt"
+                            "unavailable-path-evidence"
+
+                    evidencePrevious <- previousTarget.Trim()
+                    evidenceIntended <- localHead.Trim()
+                    failPathEvidence <- true
+
+                    let! result =
+                        (synchronization session).Publish
+                            {
+                                ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                            }
+                            (ctx "unavailable-path-evidence")
+                        |> Async.StartAsPromise
+
+                    Vitest.expect(pathEvidenceAttempted).toBe true
+                    Vitest.expect(corePushRan).toBe false
+
+                    match result with
+                    | Failed failure ->
+                        Vitest.expect(failure.Category).toEqual ProviderError
+                        Vitest.expect(failure.Code).toBe "injected_publish_evidence_failed"
+                        Vitest.expect(failure.StateChanged).toBe false
+                        Vitest.expect(failure.Retryable).toBe true
+                    | PartiallySucceeded(outcome, _) ->
+                        failwith $"Missing path evidence was discovered only after {outcome.Publication}."
+                    | Succeeded _ -> failwith "Missing path evidence cannot report success."
+
+                    let! targetHead = runGitOk barePath [| "rev-parse"; "main" |]
+                    Vitest.expect(targetHead.Trim()).toBe(previousTarget.Trim())
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
             "successful push with inconclusive verification does not claim local-only state",
             TestOptions(timeout = 120000),
             fun () -> promise {
@@ -2529,6 +2805,7 @@ Vitest.describe (
                 let! root, workPath, barePath, session = createPublishFixture hooks
 
                 try
+                    let! previousTarget = runGitOk barePath [| "rev-parse"; "main" |]
                     do! writeUtf8FileAsync (join [| workPath; "published.txt" |]) "published\n"
                     let! status = sessionStatus session
 
@@ -2559,11 +2836,29 @@ Vitest.describe (
                         |> Async.StartAsPromise
 
                     match result with
-                    | PartiallySucceeded(_, failure) ->
+                    | PartiallySucceeded(outcome, failure) ->
+                        Vitest.expect(outcome.Publication).toEqual Published
+                        Vitest.expect(outcome.AffectedPaths).toEqual [| "published.txt" |]
+                        Vitest.expect(failure.AffectedPaths).toEqual [| "published.txt" |]
+                        Vitest.expect(outcome.ResultingRevision |> Option.map RevisionId.value).toEqual (
+                            Some(localHead.Trim())
+                        )
                         Vitest.expect(failure.StateChanged).toBe true
                         Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual(
                             Some "retry_publish_verification"
                         )
+                        Vitest.expect(
+                            failure.RevisionEvidence
+                            |> Array.contains ("previous_target", previousTarget.Trim() |> RevisionId.tryCreate |> Result.defaultWith failwith)
+                        ).toBe true
+                        Vitest.expect(
+                            failure.RevisionEvidence
+                            |> Array.contains ("published_revision", localHead.Trim() |> RevisionId.tryCreate |> Result.defaultWith failwith)
+                        ).toBe true
+                        Vitest.expect(
+                            failure.RevisionEvidence
+                            |> Array.contains ("observed_target", localHead.Trim() |> RevisionId.tryCreate |> Result.defaultWith failwith)
+                        ).toBe true
                     | _ -> failwith "Expected post-publication state failure to be partial success."
 
                     let! targetHead = runGitOk barePath [| "rev-parse"; "main" |]

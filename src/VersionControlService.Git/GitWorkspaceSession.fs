@@ -2187,8 +2187,25 @@ let private publish (state: SessionState) (request: PublishRequest) (context: Op
                             return
                                 OperationResult.noOp (Some "The target already has every local revision.") syncState
                     else
-                        do! barrier state.Hooks state.RepoPath "publish-precheck-done" context
-                        do! barrier state.Hooks state.RepoPath "transfer-start" context
+                        let! pathResult =
+                            match workspaceRevision with
+                            | Some publishedRevision ->
+                                publicationChangedPaths
+                                    state
+                                    observedTarget
+                                    publishedRevision
+                                    context
+                            | None ->
+                                async {
+                                    return
+                                        Error {
+                                            OperationFailure.create
+                                                ProviderError
+                                                "publish_evidence_failed"
+                                                "The intended publication revision could not be read." with
+                                                Retryable = true
+                                        }
+                                }
 
                         let reportLfsProgress (progress: GitProgressDto) =
                             context.ReportProgress {
@@ -2199,24 +2216,43 @@ let private publish (state: SessionState) (request: PublishRequest) (context: Op
                                 DisplayMessage = progress.Output |> Option.map Redaction.redact
                             }
 
-                        let! lfsPreparation =
-                            GitService.prepareExplicitLfsPush
-                                state.RepoPath
-                                "origin"
-                                branch
-                                authentication
-                                (Some reportLfsProgress)
-                                context.Cancellation.IsCancellationRequested
-                            |> Async.AwaitPromise
+                        let! publicationPreparation =
+                            async {
+                                match pathResult with
+                                | Error failure ->
+                                    return
+                                        Error {
+                                            failure with
+                                                StateChanged = false
+                                        }
+                                | Ok affectedPaths ->
+                                    do! barrier state.Hooks state.RepoPath "publish-precheck-done" context
+                                    do! barrier state.Hooks state.RepoPath "transfer-start" context
 
-                        match lfsPreparation with
-                        | Error failure ->
-                            return
-                                Failed {
-                                    toOperationFailure failure with
-                                        Retryable = true
-                                }
-                        | Ok explicitUploadCompleted ->
+                                    let! lfsPreparation =
+                                        GitService.prepareExplicitLfsPush
+                                            state.RepoPath
+                                            "origin"
+                                            branch
+                                            authentication
+                                            (Some reportLfsProgress)
+                                            context.Cancellation.IsCancellationRequested
+                                        |> Async.AwaitPromise
+
+                                    match lfsPreparation with
+                                    | Error failure ->
+                                        return
+                                            Error {
+                                                toOperationFailure failure with
+                                                    Retryable = true
+                                            }
+                                    | Ok explicitUploadCompleted ->
+                                        return Ok(affectedPaths, explicitUploadCompleted)
+                            }
+
+                        match publicationPreparation with
+                        | Error failure -> return Failed failure
+                        | Ok(affectedPaths, explicitUploadCompleted) ->
                             let pushEnvironment = [|
                                 "GIT_TERMINAL_PROMPT", "0"
 
@@ -2375,27 +2411,6 @@ let private publish (state: SessionState) (request: PublishRequest) (context: Op
 
                                 match pushFailure with
                                 | Some originalFailure when publicationVerified ->
-                                    let publishedRevision = workspaceRevision |> Option.defaultValue ""
-                                    let! pathResult =
-                                        publicationChangedPaths
-                                            state
-                                            observedTarget
-                                            publishedRevision
-                                            verificationContext
-
-                                    let affectedPaths, pathWarnings, pathDetails =
-                                        match pathResult with
-                                        | Ok paths -> paths, [||], [||]
-                                        | Error failure ->
-                                            [||],
-                                            [|
-                                                {
-                                                    Code = "publish_path_evidence_unavailable"
-                                                    Message = failure.Message
-                                                }
-                                            |],
-                                            [| $"Published path evidence failed ({failure.Code}): {failure.Message}" |]
-
                                     let! stateResult = synchronizationState state verificationContext
 
                                     let exactState, stateDetails =
@@ -2416,7 +2431,7 @@ let private publish (state: SessionState) (request: PublishRequest) (context: Op
 
                                     let failureWithEvidence =
                                         originalFailure
-                                        |> appendDetails (Array.append pathDetails stateDetails)
+                                        |> appendDetails stateDetails
 
                                     let failureAffectedPaths =
                                         Array.append originalFailure.AffectedPaths affectedPaths
@@ -2426,7 +2441,6 @@ let private publish (state: SessionState) (request: PublishRequest) (context: Op
                                         OperationResult.partiallySucceeded
                                             {
                                                 OperationOutcome.performed exactState with
-                                                    Warnings = pathWarnings
                                                     AffectedPaths = affectedPaths
                                                     Publication = Published
                                                     ResultingRevision = workspaceRevision |> Option.map mkRevisionId
@@ -2472,7 +2486,7 @@ let private publish (state: SessionState) (request: PublishRequest) (context: Op
                                                         originalFailure.RevisionEvidence
                                                         (targetEvidence verifiedRevision)
                                         }
-                                | None ->
+                                | None when publicationVerified ->
                                     let! stateResult = synchronizationState state verificationContext
 
                                     let syncState, stateFailure =
@@ -2481,90 +2495,63 @@ let private publish (state: SessionState) (request: PublishRequest) (context: Op
                                         | Error failure ->
                                             fallbackState verifiedRevision UnknownRelationship, Some failure
 
-                                    if publicationVerified then
-                                        let exactState = {
-                                            syncState with
-                                                BaseRevision = workspaceRevision |> Option.map mkRevisionId
-                                                WorkspaceRevision = workspaceRevision |> Option.map mkRevisionId
-                                                TargetRevision = verifiedRevision |> Option.map mkRevisionId
-                                                RemoteChangedPaths = None
-                                                Relationship = UpToDate
-                                        }
+                                    let exactState = {
+                                        syncState with
+                                            BaseRevision = workspaceRevision |> Option.map mkRevisionId
+                                            WorkspaceRevision = workspaceRevision |> Option.map mkRevisionId
+                                            TargetRevision = verifiedRevision |> Option.map mkRevisionId
+                                            RemoteChangedPaths = None
+                                            Relationship = UpToDate
+                                    }
 
-                                        let outcome = {
-                                            OperationOutcome.performed exactState with
-                                                Publication = Published
-                                                ResultingRevision = workspaceRevision |> Option.map mkRevisionId
-                                        }
+                                    let outcome = {
+                                        OperationOutcome.performed exactState with
+                                            AffectedPaths = affectedPaths
+                                            Publication = Published
+                                            ResultingRevision = workspaceRevision |> Option.map mkRevisionId
+                                    }
 
-                                        match stateFailure with
-                                        | None -> return Succeeded outcome
-                                        | Some failure ->
-                                            let publishedRevision = workspaceRevision |> Option.defaultValue ""
-                                            let! pathResult =
-                                                publicationChangedPaths
-                                                    state
-                                                    observedTarget
-                                                    publishedRevision
-                                                    verificationContext
-
-                                            let affectedPaths, pathWarnings =
-                                                match pathResult with
-                                                | Ok paths -> paths, [||]
-                                                | Error pathFailure ->
-                                                    [||],
-                                                    [|
-                                                        {
-                                                            Code = "publish_path_evidence_unavailable"
-                                                            Message = pathFailure.Message
-                                                        }
-                                                    |]
-
-                                            let partialOutcome = {
-                                                outcome with
-                                                    Warnings = pathWarnings
-                                                    AffectedPaths = affectedPaths
-                                            }
-
-                                            return
-                                                OperationResult.partiallySucceeded
-                                                    partialOutcome
-                                                    {
-                                                        failure with
-                                                            AffectedPaths =
-                                                                Array.append failure.AffectedPaths affectedPaths
-                                                                |> Array.distinct
-                                                            RevisionEvidence =
-                                                                combineEvidence
-                                                                    failure.RevisionEvidence
-                                                                    (publishedEvidence verifiedRevision)
-                                                    }
-                                                    reconcilePublished
-                                    else
-                                        let failure =
-                                            match stateFailure with
-                                            | Some value -> value
-                                            | None ->
-                                                OperationFailure.create
-                                                    ProviderError
-                                                    "publish_verification_failed"
-                                                    "The ref push completed, but the resulting remote ref could not be verified."
-
+                                    match stateFailure with
+                                    | None -> return Succeeded outcome
+                                    | Some failure ->
                                         return
                                             OperationResult.partiallySucceeded
-                                                {
-                                                    OperationOutcome.performed syncState with
-                                                        Publication = LocalOnly
-                                                        ResultingRevision = workspaceRevision |> Option.map mkRevisionId
-                                                }
+                                                outcome
                                                 {
                                                     failure with
+                                                        AffectedPaths =
+                                                            Array.append failure.AffectedPaths affectedPaths
+                                                            |> Array.distinct
                                                         RevisionEvidence =
                                                             combineEvidence
                                                                 failure.RevisionEvidence
-                                                                (targetEvidence verifiedRevision)
+                                                                (publishedEvidence verifiedRevision)
                                                 }
-                                                verifyBeforeRetry
+                                                reconcilePublished
+                                | None when verifiedRevision = observedTarget ->
+                                    return
+                                        Failed {
+                                            OperationFailure.create
+                                                ProviderError
+                                                "publish_not_observed"
+                                                "The ref push reported success, but the exact remote ref did not change." with
+                                                StateChanged = false
+                                                Retryable = true
+                                                RecoveryAction = Some verifyBeforeRetry
+                                                RevisionEvidence = targetEvidence verifiedRevision
+                                        }
+                                | None ->
+                                    return
+                                        Failed {
+                                            OperationFailure.create
+                                                Concurrency
+                                                "precondition_failed"
+                                                "The publication target advanced to a different revision during publish." with
+                                                StateChanged = true
+                                                Retryable = true
+                                                RecoveryAction = Some verifyBeforeRetry
+                                                RevisionEvidence = targetEvidence verifiedRevision
+                                        }
     }
 
 // ---------------------------------------------------------------------------
