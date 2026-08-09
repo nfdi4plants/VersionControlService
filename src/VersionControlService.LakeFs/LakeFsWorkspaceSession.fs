@@ -102,7 +102,7 @@ let private repositoryPathOfKey (state: SessionState) (key: string) =
         state.Binding.WorkspaceRoot
         state.Index.Prefix
         key
-    |> LakeFsPathSafety.require
+    |> LakeFsPathSafety.orRaise
 
 let private repositoryPath path =
     match RepositoryPath.tryCreate path with
@@ -117,7 +117,7 @@ let private repositoryPath path =
 
 let private tryLocalFilePath (state: SessionState) (path: string) : string option =
     LakeFsPathSafety.resolveWorkspacePath state.Binding.WorkspaceRoot (repositoryPath path)
-    |> LakeFsPathSafety.require
+    |> LakeFsPathSafety.orRaise
     |> fun absolute ->
         if NodeFileSystem.existsSync absolute then Some absolute else None
 
@@ -131,16 +131,16 @@ let private temporaryPath (state: SessionState) label =
 
 let private writeLocal (state: SessionState) (path: string) (content: string) =
     LakeFsPathSafety.writeUtf8File state.Binding.WorkspaceRoot (repositoryPath path) content
-    |> LakeFsPathSafety.require
+    |> LakeFsPathSafety.orRaise
 
 let private removeLocal (state: SessionState) (path: string) =
     LakeFsPathSafety.removeFile state.Binding.WorkspaceRoot (repositoryPath path)
-    |> LakeFsPathSafety.require
+    |> LakeFsPathSafety.orRaise
 
 /// All repo-relative files currently in the workspace directory.
 let private walkLocalFiles (state: SessionState) : string list =
     LakeFsPathSafety.walkFiles state.Binding.WorkspaceRoot
-    |> LakeFsPathSafety.require
+    |> LakeFsPathSafety.orRaise
     |> Array.map RepositoryPath.value
     |> Array.toList
 
@@ -961,6 +961,7 @@ let private materializeRef
     (state: SessionState)
     (resolved: LakeFsConnection)
     (reference: string)
+    (preserveExistingFiles: bool)
     (context: OperationContext)
     : Async<Result<unit, OperationFailure>> =
     async {
@@ -1002,21 +1003,48 @@ let private materializeRef
                         match downloaded with
                         | Error downloadFailure -> failure <- Some downloadFailure
                         | Ok transfer ->
-                            match
-                                LakeFsPathSafety.replaceFileFromTemporary
+                            let targetPath =
+                                LakeFsPathSafety.resolveWorkspacePath
                                     state.Binding.WorkspaceRoot
                                     repositoryPath
-                                    downloadedPath
-                            with
-                            | Error replaceFailure -> failure <- Some replaceFailure
-                            | Ok() ->
-                                entries.Add {
-                                    Path = path
-                                    BaseChecksum = stat.Checksum
-                                    LocalHash = transfer.Sha256
-                                    LocalSize = transfer.BytesCopied
-                                    LocalMtimeMs = stat.Mtime
-                                }
+
+                            match targetPath with
+                            | Error pathFailure -> failure <- Some pathFailure
+                            | Ok targetPath when preserveExistingFiles && NodeFileSystem.existsSync targetPath ->
+                                try
+                                    NodeFileSystem.unlinkSync downloadedPath
+
+                                    entries.Add {
+                                        Path = path
+                                        BaseChecksum = stat.Checksum
+                                        LocalHash = transfer.Sha256
+                                        LocalSize = transfer.BytesCopied
+                                        LocalMtimeMs = stat.Mtime
+                                    }
+                                with error ->
+                                    failure <-
+                                        Some(
+                                            OperationFailure.createRedacted
+                                                ProviderError
+                                                "provider_state_cleanup_failed"
+                                                $"Cleaning a prepared lakeFS object failed: {error.Message}"
+                                        )
+                            | Ok _ ->
+                                match
+                                    LakeFsPathSafety.replaceFileFromTemporary
+                                        state.Binding.WorkspaceRoot
+                                        repositoryPath
+                                        downloadedPath
+                                with
+                                | Error replaceFailure -> failure <- Some replaceFailure
+                                | Ok() ->
+                                    entries.Add {
+                                        Path = path
+                                        BaseChecksum = stat.Checksum
+                                        LocalHash = transfer.Sha256
+                                        LocalSize = transfer.BytesCopied
+                                        LocalMtimeMs = stat.Mtime
+                                    }
 
                 match failure with
                 | Some value -> return Error value
@@ -1143,7 +1171,7 @@ let private switchWorkspaceToRef
     (context: OperationContext)
     =
     async {
-        let! materialized = materializeRef state resolved targetRevision context
+        let! materialized = materializeRef state resolved targetRevision false context
 
         match materialized with
         | Error failure -> return Error failure
@@ -1689,7 +1717,7 @@ let private update (state: SessionState) (request: UpdateRequest) (context: Oper
                                                         state.Index.WorkspaceBranch
 
                                                 let! materialized =
-                                                    materializeRef state resolved materializationRef context
+                                                    materializeRef state resolved materializationRef false context
 
                                                 match materialized with
                                                 | Error failure ->
@@ -1937,7 +1965,7 @@ let private completeConflictFinalize
     =
     async {
         let! materialized =
-            materializeRef state resolved state.Index.WorkspaceBranch context
+            materializeRef state resolved state.Index.WorkspaceBranch false context
 
         match materialized with
         | Error failure -> return Failed { failure with StateChanged = true }
@@ -2370,7 +2398,7 @@ let private createSessionFromState (state: SessionState) : WorkspaceSession =
 /// branch (server-visible; filtered only from logical listings) and materializes
 /// the target into the workspace directory.
 let private openSessionFromStateDirectory
-    (stateDirectory: string)
+    (providerState: LakeFsStateStore.ResolvedState)
     (hooks: LakeFsSessionHooks)
     (credentials: LakeFsCredentials.LakeFsCredentialStrategy)
     (binding: WorkspaceBinding)
@@ -2415,7 +2443,7 @@ let private openSessionFromStateDirectory
 
                             let state = {
                                 Binding = binding
-                                StateDirectory = stateDirectory
+                                StateDirectory = providerState.StateDirectory
                                 Location = location
                                 Credentials = credentials
                                 Hooks = hooks
@@ -2436,17 +2464,29 @@ let private openSessionFromStateDirectory
                                 Busy = false
                             }
 
-                            let! materialized = materializeRef state resolved workspaceBranch context
+                            let preserveExistingFiles =
+                                providerState.ProvisioningMode <> LakeFsStateStore.CloneProvisioning
+
+                            let! materialized =
+                                materializeRef
+                                    state
+                                    resolved
+                                    workspaceBranch
+                                    preserveExistingFiles
+                                    context
 
                             match materialized with
                             | Error failure -> return Error failure
                             | Ok() ->
                                 match saveIndex state with
                                 | Error failure -> return Error failure
-                                | Ok() -> return Ok state
+                                | Ok() ->
+                                    match LakeFsStateStore.markReady providerState with
+                                    | Error failure -> return Error failure
+                                    | Ok _ -> return Ok state
                 }
 
-                match LakeFsIndex.load stateDirectory with
+                match LakeFsIndex.load providerState.StateDirectory with
                 | LakeFsIndex.Corrupt message ->
                     return Failed(OperationFailure.createRedacted ProviderError "index_corrupt" message)
                 | LakeFsIndex.Loaded index ->
@@ -2457,7 +2497,7 @@ let private openSessionFromStateDirectory
                     then
                         let state = {
                             Binding = binding
-                            StateDirectory = stateDirectory
+                            StateDirectory = providerState.StateDirectory
                             Location = location
                             Credentials = credentials
                             Hooks = hooks
@@ -2467,7 +2507,12 @@ let private openSessionFromStateDirectory
                             Busy = false
                         }
 
-                        return OperationResult.succeeded (createSessionFromState state)
+                        if providerState.IsReady then
+                            return OperationResult.succeeded (createSessionFromState state)
+                        else
+                            match LakeFsStateStore.markReady providerState with
+                            | Error failure -> return Failed failure
+                            | Ok _ -> return OperationResult.succeeded (createSessionFromState state)
                     else
                         return
                             Failed(
@@ -2477,11 +2522,20 @@ let private openSessionFromStateDirectory
                                     "The external lakeFS state does not match the workspace binding location."
                             )
                 | LakeFsIndex.Missing ->
-                    let! created = createOwnedState [||]
+                    if providerState.IsReady then
+                        return
+                            Failed(
+                                OperationFailure.create
+                                    ProviderError
+                                    "provider_state_index_missing"
+                                    "The ready external lakeFS provider state is missing its workspace index."
+                            )
+                    else
+                        let! created = createOwnedState [||]
 
-                    match created with
-                    | Error failure -> return Failed failure
-                    | Ok state -> return OperationResult.succeeded (createSessionFromState state)
+                        match created with
+                        | Error failure -> return Failed failure
+                        | Ok state -> return OperationResult.succeeded (createSessionFromState state)
     }
 
 let openSession
@@ -2497,7 +2551,7 @@ let openSession
         | Ok state ->
             return!
                 openSessionFromStateDirectory
-                    state.StateDirectory
+                    state
                     hooks
                     credentials
                     binding

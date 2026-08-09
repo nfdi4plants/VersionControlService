@@ -459,7 +459,7 @@ let walkFiles (workspaceRoot: string) : Result<RepositoryPath[], OperationFailur
     | Some value -> Error value
     | None -> Ok(files.ToArray())
 
-let require result =
+let orRaise result =
     match result with
     | Ok value -> value
     | Error failure -> raise (WorkspacePathFailure failure)

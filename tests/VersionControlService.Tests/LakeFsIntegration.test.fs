@@ -6,6 +6,9 @@ open VersionControlService.LakeFs
 open VersionControlService.Tests.LakeFsProviderContractTests
 open Vitest
 
+module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
+module NodePath = VersionControlService.Runtime.Node.Path
+
 let private expectValue operation = function
     | Succeeded outcome -> outcome.Value
     | PartiallySucceeded(_, failure)
@@ -22,6 +25,78 @@ let private repositoryPath value =
 Vitest.describe (
     "lakeFS integration",
     fun () ->
+        Vitest.test (
+            "lakeFS initialize preserves existing user bytes and reports ordinary changes",
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
+            fun () -> promise {
+                if not (integrationEnabled ()) then
+                    return failwith "lakeFS integration skipped: Docker not available"
+
+                let harness = createLakeFsHarness ()
+
+                try
+                    let! anchor = harness.CreateWorkspace()
+                    let! workspaceRoot = harness.CreateLocalPath()
+                    let collidingPath = NodePath.join [| workspaceRoot; "base.txt" |]
+                    let unrelatedPath = NodePath.join [| workspaceRoot; "consumer.bin" |]
+                    let collidingBytes = "consumer base\u0000bytes"
+                    let unrelatedBytes = "unrelated\u0000bytes"
+
+                    NodeFileSystem.writeFileSync collidingPath collidingBytes NodeFileSystem.TextEncoding.Utf8
+                    NodeFileSystem.writeFileSync unrelatedPath unrelatedBytes NodeFileSystem.TextEncoding.Utf8
+
+                    let! initialized =
+                        harness.Factory.Initialize
+                            {
+                                TargetPath = workspaceRoot
+                                Location = Some anchor.Binding.Location
+                            }
+                            (OperationContext.detached "integration-initialize-existing")
+                        |> Async.StartAsPromise
+
+                    let binding = expectValue "initialize existing workspace" initialized
+                    let! opened =
+                        harness.Factory.Open
+                            binding
+                            (OperationContext.detached "integration-open-existing")
+                        |> Async.StartAsPromise
+
+                    let session = expectValue "open initialized workspace" opened
+
+                    Vitest.expect(
+                        NodeFileSystem.readFileSync collidingPath NodeFileSystem.TextEncoding.Utf8
+                    ).toBe collidingBytes
+
+                    Vitest.expect(
+                        NodeFileSystem.readFileSync unrelatedPath NodeFileSystem.TextEncoding.Utf8
+                    ).toBe unrelatedBytes
+
+                    let! statusResult =
+                        session.Core.GetStatus(OperationContext.detached "integration-initialize-existing-status")
+                        |> Async.StartAsPromise
+
+                    let status = expectValue "initialized workspace status" statusResult
+
+                    let changes =
+                        status.Changes
+                        |> Array.map (fun change -> RepositoryPath.value change.Path, change.Kind)
+                        |> Map.ofArray
+
+                    Vitest.expect(changes.Count).toBe 2
+                    Vitest.expect(changes["base.txt"]).toEqual FileChangeKind.ModifiedChange
+                    Vitest.expect(changes["consumer.bin"]).toEqual FileChangeKind.AddedChange
+
+                    Vitest.expect(
+                        NodeFileSystem.readdirSync workspaceRoot |> Array.sort
+                    ).toEqual [| "base.txt"; "consumer.bin" |]
+
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
         Vitest.test (
             "lakeFS creates a unique owned server-visible workspace branch",
             TestOptions(timeout = 120000, skip = not (integrationEnabled ())),

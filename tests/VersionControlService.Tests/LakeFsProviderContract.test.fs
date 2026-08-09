@@ -627,16 +627,31 @@ Vitest.describe (
                     Vitest.expect(binding.ProviderStateRef.IsSome).toBe true
                     Vitest.expect(RuntimeNodePath.isAbsolute binding.ProviderStateRef.Value).toBe false
 
-                    let stateDirectory =
+                    let resolvedState =
                         match LakeFsStateStore.resolve options workspaceRoot binding.ProviderStateRef with
-                        | Ok state -> state.StateDirectory
+                        | Ok state -> state
                         | Error failure -> failwith $"State resolution failed: {failure.Code}"
 
+                    let stateDirectory = resolvedState.StateDirectory
+
                     Vitest.expect(stateDirectory.StartsWith(stateRoot)).toBe true
+                    Vitest.expect(resolvedState.ProvisioningMode).toBe LakeFsStateStore.InitializeProvisioning
                     let! workspaceFiles = fsPromisesDynamic?readdir (workspaceRoot) |> unbox<JS.Promise<string[]>>
                     Vitest.expect(workspaceFiles).toEqual [| "existing.bin" |]
                     let! existing = tryReadUtf8FileAsync existingPath
                     Vitest.expect(existing).toEqual(Some "existing user bytes\u0000remain")
+
+                    match LakeFsStateStore.markReady resolvedState with
+                    | Error failure -> failwith $"State readiness update failed: {failure.Code}"
+                    | Ok _ -> ()
+
+                    let! missingReadyIndex =
+                        factory.Open binding (context "external-state-ready-index-missing")
+                        |> Async.StartAsPromise
+
+                    match missingReadyIndex with
+                    | Failed failure -> Vitest.expect(failure.Code).toBe "provider_state_index_missing"
+                    | _ -> failwith "Expected ready provider state with a missing index to fail without recreation."
 
                     let! cloneIntoNonempty =
                         factory.Clone
@@ -652,6 +667,24 @@ Vitest.describe (
                     match cloneIntoNonempty with
                     | Failed failure -> Vitest.expect(failure.Code).toBe "target_not_empty"
                     | _ -> failwith "Expected clone to retain its strict nonempty-target rule."
+
+                    let cloneFileTarget = join [| root; "existing-file-target" |]
+                    do! writeUtf8FileAsync cloneFileTarget "consumer-owned file"
+
+                    let! cloneIntoFile =
+                        factory.Clone
+                            {
+                                Location = location
+                                TargetPath = cloneFileTarget
+                                TargetRef = None
+                                MaterializeAllObjects = true
+                            }
+                            (context "external-state-clone-file")
+                        |> Async.StartAsPromise
+
+                    match cloneIntoFile with
+                    | Failed failure -> Vitest.expect(failure.Code).toBe "target_not_empty"
+                    | _ -> failwith "Expected clone to reject an existing file target structurally."
 
                     let! missingReference =
                         factory.Open

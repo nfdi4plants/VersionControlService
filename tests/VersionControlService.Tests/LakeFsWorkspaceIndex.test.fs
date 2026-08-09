@@ -189,6 +189,15 @@ Vitest.describe (
 
                     Vitest.expect(resolved.StateDirectory).toBe allocated.StateDirectory
 
+                    let otherWorkspaceRoot = join [| root; "another-workspace" |]
+                    let! _ =
+                        fsPromisesDynamic?mkdir (otherWorkspaceRoot)
+                        |> unbox<JS.Promise<obj>>
+
+                    match LakeFsStateStore.resolve options otherWorkspaceRoot (Some allocated.StateId) with
+                    | Error failure -> Vitest.expect(failure.Code).toBe "provider_state_mismatch"
+                    | Ok _ -> failwith "Expected provider state to remain owned by its allocating workspace."
+
                     match LakeFsWorkspaceIndex.load resolved.StateDirectory with
                     | LakeFsWorkspaceIndex.Loaded loaded -> Vitest.expect(loaded.Generation).toBe 1
                     | _ -> failwith "Expected the externally stored index to load."
@@ -214,6 +223,46 @@ Vitest.describe (
                     match LakeFsStateStore.create unsafeOptions workspaceRoot with
                     | Error failure -> Vitest.expect(failure.Code).toBe "provider_state_inside_workspace"
                     | Ok _ -> failwith "Expected in-workspace provider state to be rejected."
+
+                    let linkedStateTarget = join [| workspaceRoot; "linked-provider-state" |]
+                    let linkedStateRoot = join [| root; "provider-state-link" |]
+                    let! _ = fsPromisesDynamic?mkdir (linkedStateTarget) |> unbox<JS.Promise<obj>>
+                    let! _ =
+                        fsPromisesDynamic?symlink (linkedStateTarget, linkedStateRoot, "junction")
+                        |> unbox<JS.Promise<obj>>
+
+                    let linkedOptions: LakeFsProviderOptions.LakeFsProviderOptions = {
+                        StateRoot = linkedStateRoot
+                    }
+
+                    match LakeFsStateStore.create linkedOptions workspaceRoot with
+                    | Error failure -> Vitest.expect(failure.Code).toBe "provider_state_link_not_supported"
+                    | Ok _ -> failwith "Expected a linked provider state root to be rejected."
+
+                    let childLinkStateRoot = join [| root; "child-link-state" |]
+                    let childLinkOptions: LakeFsProviderOptions.LakeFsProviderOptions = {
+                        StateRoot = childLinkStateRoot
+                    }
+
+                    let childLinkState =
+                        match LakeFsStateStore.create childLinkOptions workspaceRoot with
+                        | Ok value -> value
+                        | Error failure -> failwith $"Child-link state allocation failed: {failure.Code}"
+
+                    do! removeDirectoryAsync childLinkState.TemporaryDirectory
+                    let! _ =
+                        fsPromisesDynamic?symlink
+                            (workspaceRoot, childLinkState.TemporaryDirectory, "junction")
+                        |> unbox<JS.Promise<obj>>
+
+                    match
+                        LakeFsStateStore.resolve
+                            childLinkOptions
+                            workspaceRoot
+                            (Some childLinkState.StateId)
+                    with
+                    | Error failure -> Vitest.expect(failure.Code).toBe "provider_state_link_not_supported"
+                    | Ok _ -> failwith "Expected a linked provider state child directory to be rejected."
 
                     do! removeDirectoryAsync root
                 with error ->

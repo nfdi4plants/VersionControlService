@@ -50,8 +50,9 @@ let private bindingFor
     (options: LakeFsProviderOptions.LakeFsProviderOptions)
     (workspaceRoot: string)
     (location: RepositoryLocation)
+    (provisioningMode: string)
     : Result<WorkspaceBinding, OperationFailure> =
-    LakeFsStateStore.create options workspaceRoot
+    LakeFsStateStore.createForProvisioning options workspaceRoot provisioningMode
     |> Result.map (fun state -> {
         SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
         ProviderId = lakeFsProviderId
@@ -155,7 +156,13 @@ let createFactory
                         NodeFileSystem.mkdirSync request.TargetPath (NodeFileSystem.MkdirOptions(recursive = true))
 
                     return
-                        match bindingFor options request.TargetPath location with
+                        match
+                            bindingFor
+                                options
+                                request.TargetPath
+                                location
+                                LakeFsStateStore.InitializeProvisioning
+                        with
                         | Ok binding -> OperationResult.succeeded binding
                         | Error failure -> Failed failure
         }
@@ -170,7 +177,11 @@ let createFactory
 
                 let targetNonEmpty =
                     targetExists
-                    && (NodeFileSystem.readdirSync request.TargetPath).Length > 0
+                    && (let target = NodeFileSystem.lstatSync request.TargetPath
+
+                        not (target.isDirectory ())
+                        || target.isSymbolicLink ()
+                        || (NodeFileSystem.readdirSync request.TargetPath).Length > 0)
 
                 if targetNonEmpty then
                     return
@@ -185,7 +196,13 @@ let createFactory
                         NodeFileSystem.mkdirSync request.TargetPath (NodeFileSystem.MkdirOptions(recursive = true))
 
                     return
-                        match bindingFor options request.TargetPath request.Location with
+                        match
+                            bindingFor
+                                options
+                                request.TargetPath
+                                request.Location
+                                LakeFsStateStore.CloneProvisioning
+                        with
                         | Ok binding -> OperationResult.succeeded binding
                         | Error failure -> Failed failure
         }
@@ -195,7 +212,13 @@ let createFactory
             // Binding data comes exclusively from the request — provider markers
             // on disk are never read here.
             return
-                match bindingFor options request.WorkspaceRoot request.Location with
+                match
+                    bindingFor
+                        options
+                        request.WorkspaceRoot
+                        request.Location
+                        LakeFsStateStore.BindProvisioning
+                with
                 | Ok binding -> OperationResult.succeeded binding
                 | Error failure -> Failed failure
         }

@@ -2,6 +2,8 @@ module VersionControlService.LakeFs.LakeFsStateStore
 
 open System
 open System.Text.RegularExpressions
+open Fable.Core
+open Fable.Core.JsInterop
 open VersionControlService.Abstractions
 
 module LakeFsProviderOptions = VersionControlService.LakeFs.LakeFsProviderOptions
@@ -15,7 +17,39 @@ type ResolvedState = {
     TransactionsDirectory: string
     RecoveryDirectory: string
     TemporaryDirectory: string
+    WorkspaceRoot: string
+    ProvisioningMode: string
+    IsReady: bool
 }
+
+[<Literal>]
+let private ManifestSchemaVersion = 1
+
+[<Literal>]
+let private ManifestFileName = "state.json"
+
+[<Literal>]
+let InitializeProvisioning = "initialize"
+
+[<Literal>]
+let CloneProvisioning = "clone"
+
+[<Literal>]
+let BindProvisioning = "bind"
+
+type private StateManifest = {
+    SchemaVersion: int
+    StateId: string
+    WorkspaceRoot: string
+    ProvisioningMode: string
+    IsReady: bool
+}
+
+[<Emit("JSON.stringify($0, null, 2)")>]
+let private jsonStringify (_value: obj) : string = jsNative
+
+[<Emit("JSON.parse($0)")>]
+let private jsonParse (_text: string) : obj = jsNative
 
 let private pathComparison =
     if NodeInterop.processPlatform () = "win32" then
@@ -39,9 +73,54 @@ let private isWithin root candidate =
 let private failure code message =
     OperationFailure.create ProviderError code message
 
+let private tryLstat path =
+    try
+        Ok(Some(NodeFileSystem.lstatSync path))
+    with error ->
+        let code: string = error?code |> unbox
+
+        if code = "ENOENT" then
+            Ok None
+        else
+            Error(
+                OperationFailure.createRedacted
+                    ProviderError
+                    "provider_state_inspection_failed"
+                    $"Inspecting an external lakeFS state path failed: {error.Message}"
+            )
+
+let private pathChain path =
+    let rec collect current paths =
+        let parent = NodePath.dirname current
+
+        if String.Equals(parent, current, pathComparison) then
+            current :: paths
+        else
+            collect parent (current :: paths)
+
+    collect (normalize path) []
+
+let private rejectLinksInChain path =
+    pathChain path
+    |> List.fold
+        (fun result current ->
+            match result with
+            | Error _ -> result
+            | Ok() ->
+                match tryLstat current with
+                | Error inspectionFailure -> Error inspectionFailure
+                | Ok(Some stats) when stats.isSymbolicLink () ->
+                    Error(
+                        failure
+                            "provider_state_link_not_supported"
+                            "Symbolic links, junctions, and reparse-point paths are not supported for lakeFS provider state."
+                    )
+                | Ok _ -> Ok())
+        (Ok())
+
 let private stateIdPattern = Regex("^state-[a-f0-9]{32}$")
 
-let private resolvedState stateRoot stateId =
+let private resolvedState stateRoot stateId manifest =
     let stateDirectory = NodePath.resolve [| stateRoot; stateId |]
 
     {
@@ -50,7 +129,73 @@ let private resolvedState stateRoot stateId =
         TransactionsDirectory = NodePath.join [| stateDirectory; "transactions" |]
         RecoveryDirectory = NodePath.join [| stateDirectory; "recovery" |]
         TemporaryDirectory = NodePath.join [| stateDirectory; "temporary" |]
+        WorkspaceRoot = manifest.WorkspaceRoot
+        ProvisioningMode = manifest.ProvisioningMode
+        IsReady = manifest.IsReady
     }
+
+let private stateDirectory stateRoot stateId =
+    NodePath.resolve [| stateRoot; stateId |]
+
+let private manifestPath stateDirectory =
+    NodePath.join [| stateDirectory; ManifestFileName |]
+
+let private indexPath stateDirectory =
+    NodePath.join [| stateDirectory; "index.json" |]
+
+let private validateOwnedLayout (state: ResolvedState) =
+    [|
+        manifestPath state.StateDirectory
+        indexPath state.StateDirectory
+        state.TransactionsDirectory
+        state.RecoveryDirectory
+        state.TemporaryDirectory
+    |]
+    |> Array.fold
+        (fun result path ->
+            match result with
+            | Error _ -> result
+            | Ok() -> rejectLinksInChain path)
+        (Ok())
+
+let private writeManifest path manifest =
+    NodeFileSystem.writeUtf8FileExclusiveAndFlushSync path (jsonStringify manifest)
+
+let private loadManifest path =
+    if not (NodeFileSystem.existsSync path) then
+        Error(failure "provider_state_corrupt" "The external lakeFS state manifest is missing.")
+    else
+        try
+            let parsed = jsonParse (NodeFileSystem.readFileSync path NodeFileSystem.TextEncoding.Utf8)
+
+            let schemaVersion =
+                parsed?SchemaVersion
+                |> Option.ofObj
+                |> Option.map unbox<int>
+                |> Option.defaultValue 0
+
+            if schemaVersion <> ManifestSchemaVersion then
+                Error(
+                    failure
+                        "provider_state_corrupt"
+                        $"Unsupported lakeFS state manifest schema version {schemaVersion}."
+                )
+            elif
+                isNull parsed?StateId
+                || isNull parsed?WorkspaceRoot
+                || isNull parsed?ProvisioningMode
+                || isNull parsed?IsReady
+            then
+                Error(failure "provider_state_corrupt" "The external lakeFS state manifest is incomplete.")
+            else
+                Ok(unbox<StateManifest> parsed)
+        with error ->
+            Error(
+                OperationFailure.createRedacted
+                    ProviderError
+                    "provider_state_corrupt"
+                    $"The external lakeFS state manifest could not be parsed: {error.Message}"
+            )
 
 let private validateLocation
     (options: LakeFsProviderOptions.LakeFsProviderOptions)
@@ -68,11 +213,17 @@ let private validateLocation
                 "lakeFS provider state must be stored outside the managed workspace."
         )
     else
-        Ok state
+        match rejectLinksInChain stateRoot with
+        | Error linkFailure -> Error linkFailure
+        | Ok() ->
+            match rejectLinksInChain state.StateDirectory with
+            | Error linkFailure -> Error linkFailure
+            | Ok() -> Ok state
 
-let create
+let createForProvisioning
     (options: LakeFsProviderOptions.LakeFsProviderOptions)
     (workspaceRoot: string)
+    (provisioningMode: string)
     : Result<ResolvedState, OperationFailure> =
     try
         if String.IsNullOrWhiteSpace options.StateRoot then
@@ -87,23 +238,39 @@ let create
                         "lakeFS provider state must be stored outside the managed workspace."
                 )
             else
-                NodeFileSystem.mkdirSync stateRoot (NodeFileSystem.MkdirOptions(recursive = true))
-                let stateId = "state-" + NodeInterop.randomUuid().Replace("-", "").ToLowerInvariant()
-                let state = resolvedState stateRoot stateId
+                match rejectLinksInChain stateRoot with
+                | Error linkFailure -> Error linkFailure
+                | Ok() ->
+                    NodeFileSystem.mkdirSync stateRoot (NodeFileSystem.MkdirOptions(recursive = true))
 
-                match validateLocation options workspaceRoot state with
-                | Error invalid -> Error invalid
-                | Ok valid ->
-                    NodeFileSystem.mkdirSync valid.StateDirectory (NodeFileSystem.MkdirOptions(recursive = false))
+                    match rejectLinksInChain stateRoot with
+                    | Error linkFailure -> Error linkFailure
+                    | Ok() ->
+                        let stateId = "state-" + NodeInterop.randomUuid().Replace("-", "").ToLowerInvariant()
+                        let manifest = {
+                            SchemaVersion = ManifestSchemaVersion
+                            StateId = stateId
+                            WorkspaceRoot = normalize workspaceRoot
+                            ProvisioningMode = provisioningMode
+                            IsReady = false
+                        }
+                        let state = resolvedState stateRoot stateId manifest
 
-                    for child in [|
-                        valid.TransactionsDirectory
-                        valid.RecoveryDirectory
-                        valid.TemporaryDirectory
-                    |] do
-                        NodeFileSystem.mkdirSync child (NodeFileSystem.MkdirOptions(recursive = false))
+                        match validateLocation options workspaceRoot state with
+                        | Error invalid -> Error invalid
+                        | Ok valid ->
+                            NodeFileSystem.mkdirSync valid.StateDirectory (NodeFileSystem.MkdirOptions(recursive = false))
 
-                    Ok valid
+                            for child in [|
+                                valid.TransactionsDirectory
+                                valid.RecoveryDirectory
+                                valid.TemporaryDirectory
+                            |] do
+                                NodeFileSystem.mkdirSync child (NodeFileSystem.MkdirOptions(recursive = false))
+
+                            writeManifest (manifestPath valid.StateDirectory) manifest
+
+                            validateOwnedLayout valid |> Result.map (fun () -> valid)
     with error ->
         Error(
             OperationFailure.createRedacted
@@ -111,6 +278,12 @@ let create
                 "provider_state_create_failed"
                 $"Creating external lakeFS provider state failed: {error.Message}"
         )
+
+let create
+    (options: LakeFsProviderOptions.LakeFsProviderOptions)
+    (workspaceRoot: string)
+    : Result<ResolvedState, OperationFailure> =
+    createForProvisioning options workspaceRoot BindProvisioning
 
 let resolve
     (options: LakeFsProviderOptions.LakeFsProviderOptions)
@@ -131,26 +304,77 @@ let resolve
                 "The workspace binding contains an invalid lakeFS provider state reference."
         )
     | Some stateId ->
-        let state = resolvedState (normalize options.StateRoot) stateId
+        let directory = stateDirectory (normalize options.StateRoot) stateId
 
-        match validateLocation options workspaceRoot state with
-        | Error invalid -> Error invalid
-        | Ok valid when not (NodeFileSystem.existsSync valid.StateDirectory) ->
+        match rejectLinksInChain directory with
+        | Error linkFailure -> Error linkFailure
+        | Ok() when not (NodeFileSystem.existsSync directory) ->
             Error(failure "provider_state_missing" "The external lakeFS provider state directory is missing.")
-        | Ok valid ->
-            let missingLayout =
-                [|
-                    valid.TransactionsDirectory
-                    valid.RecoveryDirectory
-                    valid.TemporaryDirectory
-                |]
-                |> Array.exists (NodeFileSystem.existsSync >> not)
+        | Ok() ->
+            match rejectLinksInChain (manifestPath directory) with
+            | Error linkFailure -> Error linkFailure
+            | Ok() ->
+                match loadManifest (manifestPath directory) with
+                | Error invalid -> Error invalid
+                | Ok manifest when manifest.StateId <> stateId ->
+                    Error(failure "provider_state_corrupt" "The external lakeFS state manifest identity is invalid.")
+                | Ok manifest when not (String.Equals(normalize workspaceRoot, normalize manifest.WorkspaceRoot, pathComparison)) ->
+                    Error(
+                        failure
+                            "provider_state_mismatch"
+                            "The external lakeFS state belongs to a different workspace."
+                    )
+                | Ok manifest ->
+                    let state = resolvedState (normalize options.StateRoot) stateId manifest
 
-            if missingLayout then
-                Error(
-                    failure
-                        "provider_state_corrupt"
-                        "The external lakeFS provider state directory is incomplete."
-                )
-            else
-                Ok valid
+                    match validateLocation options workspaceRoot state with
+                    | Error invalid -> Error invalid
+                    | Ok valid ->
+                        match validateOwnedLayout valid with
+                        | Error linkFailure -> Error linkFailure
+                        | Ok() ->
+                            let missingLayout =
+                                [|
+                                    valid.TransactionsDirectory
+                                    valid.RecoveryDirectory
+                                    valid.TemporaryDirectory
+                                |]
+                                |> Array.exists (NodeFileSystem.existsSync >> not)
+
+                            if missingLayout then
+                                Error(
+                                    failure
+                                        "provider_state_corrupt"
+                                        "The external lakeFS provider state directory is incomplete."
+                                )
+                            else
+                                Ok valid
+
+let markReady (state: ResolvedState) : Result<ResolvedState, OperationFailure> =
+    let temporaryPath =
+        NodePath.join [| state.TemporaryDirectory; $"state-{NodeInterop.randomUuid()}.tmp" |]
+
+    let nextManifest = {
+        SchemaVersion = ManifestSchemaVersion
+        StateId = state.StateId
+        WorkspaceRoot = state.WorkspaceRoot
+        ProvisioningMode = state.ProvisioningMode
+        IsReady = true
+    }
+
+    try
+        writeManifest temporaryPath nextManifest
+        NodeFileSystem.renameSync temporaryPath (manifestPath state.StateDirectory)
+        Ok { state with IsReady = true }
+    with error ->
+        try
+            NodeFileSystem.unlinkSync temporaryPath
+        with _ ->
+            ()
+
+        Error(
+            OperationFailure.createRedacted
+                ProviderError
+                "provider_state_write_failed"
+                $"Updating the external lakeFS state manifest failed: {error.Message}"
+        )
