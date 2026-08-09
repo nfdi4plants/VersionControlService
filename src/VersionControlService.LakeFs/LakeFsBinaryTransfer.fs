@@ -176,6 +176,102 @@ let downloadObjectToFile
                     ()
     }
 
+let private uploadObjectFromFileCore
+    (connection: LakeFsConnection)
+    (repository: string)
+    (branch: string)
+    (key: string)
+    (sourcePath: string)
+    (validateSource: (NodeFileSystem.Stats -> Result<unit, OperationFailure>) option)
+    (context: OperationContext)
+    : Async<Result<StreamCopyResult, OperationFailure>> =
+    async {
+        let mutable source: obj option = None
+        let mutable descriptorToClose: int option = None
+
+        try
+            if context.Cancellation.IsCancellationRequested() then
+                return Error(canceledFailure ())
+            else
+                let descriptor, openedStats = NodeFileSystem.openReadOnlyNoFollowSync sourcePath
+                descriptorToClose <- Some descriptor
+
+                match validateSource |> Option.map (fun validate -> validate openedStats) with
+                | Some(Error failure) -> return Error failure
+                | None
+                | Some(Ok()) ->
+                    let readable: obj =
+                        fileSystemDynamic?createReadStream (
+                            sourcePath,
+                            createObj [
+                                "fd" ==> descriptor
+                                "autoClose" ==> true
+                            ]
+                        )
+
+                    descriptorToClose <- None
+                    source <- Some readable
+                    let hash = NodeInterop.createSha256Hash ()
+                    let mutable copied = 0.0
+                    let total = Some openedStats.size
+
+                    readable?on (
+                        "data",
+                        fun (chunk: obj) ->
+                            NodeInterop.updateHash hash chunk
+                            copied <- copied + float (NodeInterop.bufferLength chunk)
+                            reportBytes "lakefs-upload" key total context copied
+                    )
+                    |> ignore
+
+                    context.Cancellation.Register(fun () ->
+                        readable?destroy (NodeInterop.createError "canceled") |> ignore)
+
+                    let encodedCredentials =
+                        toBase64 $"{connection.AccessKeyId}:{connection.SecretAccessKey}"
+
+                    let options =
+                        createObj [
+                            "method" ==> "POST"
+                            "headers" ==>
+                                createObj [
+                                    "Authorization" ==> $"Basic {encodedCredentials}"
+                                    "Content-Type" ==> "application/octet-stream"
+                                ]
+                            "body" ==> readable
+                            "duplex" ==> "half"
+                            "signal" ==> NodeCancellation.toAbortSignal context.Cancellation
+                        ]
+
+                    try
+                        let! response =
+                            fetchJs (uploadUrl connection repository branch key) options
+                            |> Async.AwaitPromise
+
+                        let status = unbox<int> response?status
+
+                        if status >= 200 && status < 300 then
+                            if context.Cancellation.IsCancellationRequested() then
+                                return Error(canceledFailure ())
+                            else
+                                return
+                                    Ok {
+                                        BytesCopied = copied
+                                        Sha256 = NodeInterop.digestHashHex hash
+                                    }
+                        else
+                            let! body = response?text () |> unbox<JS.Promise<string>> |> Async.AwaitPromise
+                            return Error(classifyStatus status body)
+                    with error ->
+                        if context.Cancellation.IsCancellationRequested() then
+                            return Error(canceledFailure ())
+                        else
+                            return Error(networkFailure (NodeInterop.errorMessage error))
+        finally
+            source |> Option.iter (fun value -> value?destroy () |> ignore)
+            descriptorToClose |> Option.iter NodeFileSystem.closeFileDescriptorSync
+    }
+
 let uploadObjectFromFile
     (connection: LakeFsConnection)
     (repository: string)
@@ -183,72 +279,23 @@ let uploadObjectFromFile
     (key: string)
     (sourcePath: string)
     (context: OperationContext)
-    : Async<Result<StreamCopyResult, OperationFailure>> =
-    async {
-        let mutable source: obj option = None
+    =
+    uploadObjectFromFileCore connection repository branch key sourcePath None context
 
-        try
-            if context.Cancellation.IsCancellationRequested() then
-                return Error(canceledFailure ())
-            else
-                let readable: obj = fileSystemDynamic?createReadStream sourcePath
-                source <- Some readable
-                let hash = NodeInterop.createSha256Hash ()
-                let mutable copied = 0.0
-                let total = Some((NodeFileSystem.statSync sourcePath).size)
-
-                readable?on (
-                    "data",
-                    fun (chunk: obj) ->
-                        NodeInterop.updateHash hash chunk
-                        copied <- copied + float (NodeInterop.bufferLength chunk)
-                        reportBytes "lakefs-upload" key total context copied
-                )
-                |> ignore
-
-                context.Cancellation.Register(fun () ->
-                    readable?destroy (NodeInterop.createError "canceled") |> ignore)
-
-                let encodedCredentials =
-                    toBase64 $"{connection.AccessKeyId}:{connection.SecretAccessKey}"
-
-                let options =
-                    createObj [
-                        "method" ==> "POST"
-                        "headers" ==>
-                            createObj [
-                                "Authorization" ==> $"Basic {encodedCredentials}"
-                                "Content-Type" ==> "application/octet-stream"
-                            ]
-                        "body" ==> readable
-                        "duplex" ==> "half"
-                        "signal" ==> NodeCancellation.toAbortSignal context.Cancellation
-                    ]
-
-                try
-                    let! response =
-                        fetchJs (uploadUrl connection repository branch key) options
-                        |> Async.AwaitPromise
-
-                    let status = unbox<int> response?status
-
-                    if status >= 200 && status < 300 then
-                        if context.Cancellation.IsCancellationRequested() then
-                            return Error(canceledFailure ())
-                        else
-                            return
-                                Ok {
-                                    BytesCopied = copied
-                                    Sha256 = NodeInterop.digestHashHex hash
-                                }
-                    else
-                        let! body = response?text () |> unbox<JS.Promise<string>> |> Async.AwaitPromise
-                        return Error(classifyStatus status body)
-                with error ->
-                    if context.Cancellation.IsCancellationRequested() then
-                        return Error(canceledFailure ())
-                    else
-                        return Error(networkFailure (NodeInterop.errorMessage error))
-        finally
-            source |> Option.iter (fun value -> value?destroy () |> ignore)
-    }
+let uploadObjectFromFileChecked
+    (connection: LakeFsConnection)
+    (repository: string)
+    (branch: string)
+    (key: string)
+    (sourcePath: string)
+    (validateSource: NodeFileSystem.Stats -> Result<unit, OperationFailure>)
+    (context: OperationContext)
+    =
+    uploadObjectFromFileCore
+        connection
+        repository
+        branch
+        key
+        sourcePath
+        (Some validateSource)
+        context

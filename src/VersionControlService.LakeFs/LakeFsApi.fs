@@ -353,6 +353,24 @@ let uploadObjectFromFile
         sourcePath
         context
 
+let uploadObjectFromFileChecked
+    (connection: LakeFsConnection)
+    (repository: string)
+    (branch: string)
+    (path: string)
+    (sourcePath: string)
+    (validateSource: VersionControlService.Runtime.Node.FileSystem.Stats -> Result<unit, OperationFailure>)
+    (context: OperationContext)
+    =
+    LakeFsBinaryTransfer.uploadObjectFromFileChecked
+        connection
+        repository
+        branch
+        path
+        sourcePath
+        validateSource
+        context
+
 let deleteObject
     (connection: LakeFsConnection)
     (repository: string)

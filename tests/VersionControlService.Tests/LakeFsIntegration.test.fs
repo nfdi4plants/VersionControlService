@@ -1,6 +1,7 @@
 module VersionControlService.Tests.LakeFsIntegrationTests
 
 open Fable.Core
+open Fable.Core.JsInterop
 open VersionControlService.Abstractions
 open VersionControlService.LakeFs
 open VersionControlService.Tests.LakeFsProviderContractTests
@@ -8,6 +9,8 @@ open Vitest
 
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodePath = VersionControlService.Runtime.Node.Path
+
+let private fsPromisesDynamic: obj = importAll "fs/promises"
 
 let private expectValue operation = function
     | Succeeded outcome -> outcome.Value
@@ -92,6 +95,337 @@ Vitest.describe (
 
                     do! harness.Cleanup()
                 with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "lakeFS restore rejects colliding selected paths before workspace mutation",
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
+            fun () -> promise {
+                if not (integrationEnabled ()) then
+                    return failwith "lakeFS integration skipped: Docker not available"
+
+                let harness = createLakeFsHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+
+                    let index =
+                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        | LakeFsWorkspaceIndex.Loaded value -> value
+                        | _ -> failwith "Expected a persisted index before the restore collision."
+
+                    let parsed =
+                        LakeFsTypes.LakeFsLocation.tryParse workspace.Binding.Location.ProviderLocation
+                        |> Result.defaultWith failwith
+
+                    for path, content in [|
+                        "Case.txt", "upper restore content\n"
+                        "case.txt", "lower restore content\n"
+                    |] do
+                        let! uploaded =
+                            uploadTextObject
+                                (connection ())
+                                parsed.Repository
+                                index.WorkspaceBranch
+                                path
+                                content
+                                (OperationContext.detached "integration-restore-collision-upload")
+                            |> Async.StartAsPromise
+
+                        uploaded |> Result.defaultWith (fun failure -> failwith failure.Message) |> ignore
+
+                    let! committed =
+                        LakeFsApi.commit
+                            (connection ())
+                            parsed.Repository
+                            index.WorkspaceBranch
+                            "test: colliding restore objects"
+                            (OperationContext.detached "integration-restore-collision-commit")
+                        |> Async.StartAsPromise
+
+                    let commit = committed |> Result.defaultWith (fun failure -> failwith failure.Message)
+
+                    match
+                        LakeFsWorkspaceIndex.save
+                            (stateDirectoryForBinding workspace.Binding)
+                            { index with WorkspaceRevision = Some commit.Id }
+                    with
+                    | Error message -> failwith message
+                    | Ok _ -> ()
+
+                    let! reopened =
+                        harness.Factory.Open
+                            workspace.Binding
+                            (OperationContext.detached "integration-restore-collision-reopen")
+                        |> Async.StartAsPromise
+
+                    let session = expectValue "reopen for restore collision" reopened
+                    let! statusResult =
+                        session.Core.GetStatus
+                            (OperationContext.detached "integration-restore-collision-status")
+                        |> Async.StartAsPromise
+
+                    let status = expectValue "restore collision status" statusResult
+                    let! restoreResult =
+                        session.Core.RestorePaths
+                            {
+                                Paths = [| repositoryPath "Case.txt"; repositoryPath "case.txt" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (OperationContext.detached "integration-restore-collision")
+                        |> Async.StartAsPromise
+
+                    let failure = expectFailure "restore collision" restoreResult
+                    Vitest.expect(failure.Code).toBe "path_collision"
+                    Vitest.expect(failure.StateChanged).toBe false
+                    let! upper = workspace.ReadFile "Case.txt"
+                    let! lower = workspace.ReadFile "case.txt"
+                    Vitest.expect(upper).toEqual None
+                    Vitest.expect(lower).toEqual None
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "lakeFS selected revision rejects a parent junction swapped in after source classification",
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
+            fun () -> promise {
+                if not (integrationEnabled ()) then
+                    return failwith "lakeFS integration skipped: Docker not available"
+
+                let harness = createLakeFsHarness ()
+                let mutable barrierRan = false
+                let mutable linkedDirectory = ""
+                let mutable backupDirectory = ""
+                let mutable outsideDirectory = ""
+                let mutable raceCleaned = false
+
+                let cleanupRace () = promise {
+                    if barrierRan && not raceCleaned then
+                        let! _ =
+                            fsPromisesDynamic?rm
+                                (linkedDirectory, createObj [ "recursive" ==> true; "force" ==> true ])
+                            |> unbox<JS.Promise<obj>>
+
+                        NodeFileSystem.renameSync backupDirectory linkedDirectory
+
+                    if outsideDirectory <> "" && not raceCleaned then
+                        let! _ =
+                            fsPromisesDynamic?rm
+                                (outsideDirectory, createObj [ "recursive" ==> true; "force" ==> true ])
+                            |> unbox<JS.Promise<obj>>
+
+                        ()
+
+                    raceCleaned <- true
+                }
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    linkedDirectory <- NodePath.join [| workspace.Binding.WorkspaceRoot; "nested" |]
+                    backupDirectory <- NodePath.join [| workspace.Binding.WorkspaceRoot; "nested-safe" |]
+                    outsideDirectory <- workspace.Binding.WorkspaceRoot + "-outside"
+                    NodeFileSystem.mkdirSync outsideDirectory (NodeFileSystem.MkdirOptions(recursive = true))
+                    do! workspace.WriteFile "nested/selected.txt" "safe selected bytes\n"
+                    NodeFileSystem.writeFileSync
+                        (NodePath.join [| outsideDirectory; "selected.txt" |])
+                        "outside secret must not upload\n"
+                        NodeFileSystem.TextEncoding.Utf8
+
+                    let hooks: LakeFsWorkspaceSession.LakeFsSessionHooks = {
+                        Barrier =
+                            Some(fun _ point _ -> async {
+                                if point = "selected-revision-sources-classified" then
+                                    barrierRan <- true
+                                    NodeFileSystem.renameSync linkedDirectory backupDirectory
+
+                                    do!
+                                        fsPromisesDynamic?symlink
+                                            (outsideDirectory, linkedDirectory, "junction")
+                                        |> unbox<JS.Promise<obj>>
+                                        |> Async.AwaitPromise
+                                        |> Async.Ignore
+                            })
+                    }
+
+                    let factory =
+                        LakeFsWorkspaceSession.createFactoryWithHooks
+                            lakeFsProviderOptions
+                            hooks
+                            (LakeFsCredentials.fixedConnection (connection ()))
+
+                    let! opened =
+                        factory.Open
+                            workspace.Binding
+                            (OperationContext.detached "integration-source-swap-open")
+                        |> Async.StartAsPromise
+
+                    let session = expectValue "open source-swap session" opened
+                    let beforeIndex =
+                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        | LakeFsWorkspaceIndex.Loaded value -> value
+                        | _ -> failwith "Expected an index before the selected-source race."
+
+                    let! statusResult =
+                        session.Core.GetStatus(OperationContext.detached "integration-source-swap-status")
+                        |> Async.StartAsPromise
+
+                    let status = expectValue "source-swap status" statusResult
+                    let! revisionResult =
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: reject source swap"
+                                Paths = [| repositoryPath "nested/selected.txt" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (OperationContext.detached "integration-source-swap-revision")
+                        |> Async.StartAsPromise
+
+                    do! cleanupRace ()
+                    Vitest.expect(barrierRan).toBe true
+                    let parsed =
+                        LakeFsTypes.LakeFsLocation.tryParse workspace.Binding.Location.ProviderLocation
+                        |> Result.defaultWith failwith
+
+                    let! branchResult =
+                        LakeFsApi.getBranch
+                            (connection ())
+                            parsed.Repository
+                            beforeIndex.WorkspaceBranch
+                            (OperationContext.detached "integration-source-swap-branch")
+                        |> Async.StartAsPromise
+
+                    let branch = branchResult |> Result.defaultWith (fun failure -> failwith failure.Message)
+                    Vitest.expect(Some branch.CommitId).toEqual beforeIndex.WorkspaceRevision
+
+                    match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                    | LakeFsWorkspaceIndex.Loaded afterIndex ->
+                        Vitest.expect(afterIndex.WorkspaceRevision).toEqual beforeIndex.WorkspaceRevision
+                    | _ -> failwith "Expected the selected-source race to preserve the index."
+
+                    let failure = expectFailure "source-swap revision" revisionResult
+                    Vitest.expect(failure.Code).toBe "symlink_not_supported"
+                    Vitest.expect(failure.StateChanged).toBe false
+                    Vitest.expect(failure.AffectedPaths).toContain "nested/selected.txt"
+                    Vitest.expect(failure.Message.Contains "outside secret").toBe false
+                    do! harness.Cleanup()
+                with error ->
+                    do! cleanupRace ()
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "lakeFS selected revision rejects a selected file replaced after source classification",
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
+            fun () -> promise {
+                if not (integrationEnabled ()) then
+                    return failwith "lakeFS integration skipped: Docker not available"
+
+                let harness = createLakeFsHarness ()
+                let mutable barrierRan = false
+                let mutable selectedPath = ""
+                let mutable backupPath = ""
+                let mutable raceCleaned = false
+
+                let cleanupRace () =
+                    if barrierRan && not raceCleaned then
+                        if NodeFileSystem.existsSync selectedPath then
+                            NodeFileSystem.unlinkSync selectedPath
+
+                        NodeFileSystem.renameSync backupPath selectedPath
+
+                    raceCleaned <- true
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    selectedPath <- NodePath.join [| workspace.Binding.WorkspaceRoot; "selected.txt" |]
+                    backupPath <- NodePath.join [| workspace.Binding.WorkspaceRoot; "selected-original.txt" |]
+                    do! workspace.WriteFile "selected.txt" "classified selected bytes\n"
+
+                    let hooks: LakeFsWorkspaceSession.LakeFsSessionHooks = {
+                        Barrier =
+                            Some(fun _ point _ -> async {
+                                if point = "selected-revision-sources-classified" then
+                                    barrierRan <- true
+                                    NodeFileSystem.renameSync selectedPath backupPath
+
+                                    NodeFileSystem.writeFileSync
+                                        selectedPath
+                                        "replacement selected bytes\n"
+                                        NodeFileSystem.TextEncoding.Utf8
+                            })
+                    }
+
+                    let factory =
+                        LakeFsWorkspaceSession.createFactoryWithHooks
+                            lakeFsProviderOptions
+                            hooks
+                            (LakeFsCredentials.fixedConnection (connection ()))
+
+                    let! opened =
+                        factory.Open
+                            workspace.Binding
+                            (OperationContext.detached "integration-source-replace-open")
+                        |> Async.StartAsPromise
+
+                    let session = expectValue "open source-replace session" opened
+                    let beforeIndex =
+                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        | LakeFsWorkspaceIndex.Loaded value -> value
+                        | _ -> failwith "Expected an index before the selected-source replacement race."
+
+                    let! statusResult =
+                        session.Core.GetStatus(OperationContext.detached "integration-source-replace-status")
+                        |> Async.StartAsPromise
+
+                    let status = expectValue "source-replace status" statusResult
+                    let! revisionResult =
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: reject source replacement"
+                                Paths = [| repositoryPath "selected.txt" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (OperationContext.detached "integration-source-replace-revision")
+                        |> Async.StartAsPromise
+
+                    cleanupRace ()
+                    Vitest.expect(barrierRan).toBe true
+                    let parsed =
+                        LakeFsTypes.LakeFsLocation.tryParse workspace.Binding.Location.ProviderLocation
+                        |> Result.defaultWith failwith
+
+                    let! branchResult =
+                        LakeFsApi.getBranch
+                            (connection ())
+                            parsed.Repository
+                            beforeIndex.WorkspaceBranch
+                            (OperationContext.detached "integration-source-replace-branch")
+                        |> Async.StartAsPromise
+
+                    let branch = branchResult |> Result.defaultWith (fun failure -> failwith failure.Message)
+                    Vitest.expect(Some branch.CommitId).toEqual beforeIndex.WorkspaceRevision
+
+                    match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                    | LakeFsWorkspaceIndex.Loaded afterIndex ->
+                        Vitest.expect(afterIndex.WorkspaceRevision).toEqual beforeIndex.WorkspaceRevision
+                    | _ -> failwith "Expected the selected-source replacement race to preserve the index."
+
+                    let failure = expectFailure "source-replace revision" revisionResult
+                    Vitest.expect(failure.Code).toBe "workspace_path_changed"
+                    Vitest.expect(failure.StateChanged).toBe false
+                    Vitest.expect(failure.AffectedPaths).toContain "selected.txt"
+                    do! harness.Cleanup()
+                with error ->
+                    cleanupRace ()
                     do! harness.Cleanup()
                     return raise error
             }

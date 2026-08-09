@@ -828,6 +828,22 @@ Vitest.describe (
                     | Error failure -> Vitest.expect(failure.Code).toBe "symlink_not_supported"
                     | Ok _ -> failwith "Expected walking a workspace containing a link to fail."
 
+                    let danglingTarget = join [| outsideRoot; "missing-target" |]
+                    let danglingLink = join [| workspaceRoot; "dangling" |]
+                    let! _ =
+                        fsPromisesDynamic?symlink (danglingTarget, danglingLink, "junction")
+                        |> unbox<JS.Promise<obj>>
+
+                    match
+                        LakeFsPathSafety.resolveWorkspacePath
+                            workspaceRoot
+                            (repositoryPath "dangling/secret.txt")
+                    with
+                    | Error failure ->
+                        Vitest.expect(failure.Code).toBe "symlink_not_supported"
+                        Vitest.expect(failure.AffectedPaths).toContain "dangling/secret.txt"
+                    | Ok _ -> failwith "Expected a dangling link in the parent chain to be rejected."
+
                     let casePaths = [| repositoryPath "Data/File.txt"; repositoryPath "data/file.txt" |]
 
                     match LakeFsPathSafety.validateMaterializationPathsForPlatform "win32" casePaths with

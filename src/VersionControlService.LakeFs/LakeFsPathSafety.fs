@@ -11,6 +11,13 @@ module NodePath = VersionControlService.Runtime.Node.Path
 
 exception WorkspacePathFailure of OperationFailure
 
+type InspectedFile = {
+    AbsolutePath: string
+    Sha256: string
+    Size: float
+    Identity: NodeFileSystem.Stats
+}
+
 let private normalizeNfc (value: string) = value.Normalize NormalizationForm.FormC
 
 let private pathFailure code message path =
@@ -66,11 +73,10 @@ let rejectLinksInChain
         let mutable failure: OperationFailure option = None
 
         for current in candidates do
-            if failure.IsNone && NodeFileSystem.existsSync current then
+            if failure.IsNone then
                 try
-                    let stats = NodeFileSystem.lstatSync current
-
-                    if stats.isSymbolicLink() then
+                    match NodeFileSystem.tryLstatSync current with
+                    | Some stats when stats.isSymbolicLink() ->
                         failure <-
                             Some(
                                 pathFailure
@@ -78,6 +84,7 @@ let rejectLinksInChain
                                     "Symbolic links, junctions, and reparse-point paths are not supported in lakeFS workspaces."
                                     affectedPath
                             )
+                    | _ -> ()
                 with error ->
                     failure <-
                         Some(
@@ -205,6 +212,16 @@ let private changedPathFailure path =
         "The workspace path changed while it was being accessed. Refresh and retry."
         (RepositoryPath.value path)
 
+let private changedFileFailure path =
+    {
+        OperationFailure.create
+            Concurrency
+            "workspace_path_changed"
+            "The workspace file changed while the operation was preparing it. Refresh and retry." with
+            Retryable = true
+            AffectedPaths = [| RepositoryPath.value path |]
+    }
+
 let private attributeToRequestedPath
     (requestedPath: RepositoryPath)
     (failure: OperationFailure)
@@ -213,6 +230,84 @@ let private attributeToRequestedPath
         { failure with AffectedPaths = [| RepositoryPath.value requestedPath |] }
     else
         failure
+
+let inspectFile
+    (workspaceRoot: string)
+    (path: RepositoryPath)
+    : Result<InspectedFile option, OperationFailure> =
+    match resolveWorkspacePath workspaceRoot path with
+    | Error failure -> Error(attributeToRequestedPath path failure)
+    | Ok absolute ->
+        try
+            match NodeFileSystem.tryLstatSync absolute with
+            | None -> Ok None
+            | Some initialStats
+                when initialStats.isSymbolicLink() || not (initialStats.isFile()) ->
+                Error(changedPathFailure path)
+            | Some initialStats ->
+                let hashed = NodeFileSystem.hashFileNoFollowSync absolute
+
+                match resolveWorkspacePath workspaceRoot path with
+                | Error failure -> Error(attributeToRequestedPath path failure)
+                | Ok verifiedAbsolute ->
+                    let currentStats = NodeFileSystem.lstatSync verifiedAbsolute
+
+                    if
+                        not (hashed.Stats.isFile())
+                        || currentStats.isSymbolicLink()
+                        || not (currentStats.isFile())
+                        || not (identityMatches initialStats hashed.Stats)
+                        || not (identityMatches hashed.Stats currentStats)
+                    then
+                        Error(changedFileFailure path)
+                    else
+                        Ok(
+                            Some {
+                                AbsolutePath = verifiedAbsolute
+                                Sha256 = hashed.Sha256
+                                Size = hashed.Stats.size
+                                Identity = hashed.Stats
+                            }
+                        )
+        with error ->
+            Error {
+                OperationFailure.createRedacted
+                    ProviderError
+                    "workspace_inspection_failed"
+                    $"Inspecting a workspace file failed: {error.Message}" with
+                    AffectedPaths = [| RepositoryPath.value path |]
+            }
+
+let validateOpenedFile
+    (workspaceRoot: string)
+    (path: RepositoryPath)
+    (expectedStats: NodeFileSystem.Stats)
+    (openedStats: NodeFileSystem.Stats)
+    : Result<unit, OperationFailure> =
+    match resolveWorkspacePath workspaceRoot path with
+    | Error failure -> Error(attributeToRequestedPath path failure)
+    | Ok absolute ->
+        try
+            let currentStats = NodeFileSystem.lstatSync absolute
+
+            if
+                currentStats.isSymbolicLink()
+                || not (currentStats.isFile())
+                || not (expectedStats.isFile())
+                || not (openedStats.isFile())
+                || not (identityMatches expectedStats openedStats)
+                || not (identityMatches openedStats currentStats)
+            then
+                Error(changedFileFailure path)
+            else
+                Ok()
+        with error ->
+            Error(
+                OperationFailure.createRedacted
+                    ProviderError
+                    "path_inspection_failed"
+                    $"Inspecting an opened workspace file failed: {error.Message}"
+            )
 
 let readUtf8File
     (workspaceRoot: string)
@@ -224,12 +319,16 @@ let readUtf8File
     | Ok absolute ->
         try
             let content, openedStats = NodeFileSystem.readUtf8FileNoFollowSync absolute
-            let currentStats = NodeFileSystem.lstatSync absolute
 
-            if currentStats.isSymbolicLink() || not (identityMatches openedStats currentStats) then
-                Error(changedPathFailure path)
-            else
-                Ok(Some content)
+            match resolveWorkspacePath workspaceRoot path with
+            | Error failure -> Error(attributeToRequestedPath path failure)
+            | Ok verifiedAbsolute ->
+                let currentStats = NodeFileSystem.lstatSync verifiedAbsolute
+
+                if currentStats.isSymbolicLink() || not (identityMatches openedStats currentStats) then
+                    Error(changedFileFailure path)
+                else
+                    Ok(Some content)
         with error ->
             Error(
                 OperationFailure.createRedacted
@@ -248,12 +347,16 @@ let readBuffer
     | Ok absolute ->
         try
             let content, openedStats = NodeFileSystem.readBufferNoFollowSync absolute
-            let currentStats = NodeFileSystem.lstatSync absolute
 
-            if currentStats.isSymbolicLink() || not (identityMatches openedStats currentStats) then
-                Error(changedPathFailure path)
-            else
-                Ok(Some content)
+            match resolveWorkspacePath workspaceRoot path with
+            | Error failure -> Error(attributeToRequestedPath path failure)
+            | Ok verifiedAbsolute ->
+                let currentStats = NodeFileSystem.lstatSync verifiedAbsolute
+
+                if currentStats.isSymbolicLink() || not (identityMatches openedStats currentStats) then
+                    Error(changedFileFailure path)
+                else
+                    Ok(Some content)
         with error ->
             Error(
                 OperationFailure.createRedacted

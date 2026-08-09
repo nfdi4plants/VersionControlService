@@ -115,11 +115,9 @@ let private repositoryPath path =
             }
         )
 
-let private tryLocalFilePath (state: SessionState) (path: string) : string option =
-    LakeFsPathSafety.resolveWorkspacePath state.Binding.WorkspaceRoot (repositoryPath path)
+let private inspectLocalFile (state: SessionState) (path: string) =
+    LakeFsPathSafety.inspectFile state.Binding.WorkspaceRoot (repositoryPath path)
     |> LakeFsPathSafety.orRaise
-    |> fun absolute ->
-        if NodeFileSystem.existsSync absolute then Some absolute else None
 
 let private temporaryPath (state: SessionState) label =
     let directory = NodePath.join [| state.StateDirectory; "temporary" |]
@@ -163,8 +161,8 @@ let private classifyWorkspace (state: SessionState) : LocalChange list =
         |> List.map (fun path ->
             let entry = entriesByPath.TryFind path
             let localHash =
-                tryLocalFilePath state path
-                |> Option.map LakeFsIndex.hashFile
+                inspectLocalFile state path
+                |> Option.map _.Sha256
 
             {
                 ChangePath = path
@@ -575,7 +573,8 @@ let private recoverInterruptedSelectedRevision
 
 let private finishSelectedRevision
     (state: SessionState)
-    (changed: (string * string option * LakeFsIndex.LocalObjectState)[])
+    (changed: (string * LakeFsPathSafety.InspectedFile option * LakeFsIndex.LocalObjectState)[])
+    (completed: LakeFsObjectTransfer.CompletedObjectTransfer[])
     (expectedParent: string option)
     (commit: LakeFsCommit)
     (branchAfter: Result<LakeFsBranch, OperationFailure>)
@@ -596,6 +595,13 @@ let private finishSelectedRevision
 
         if verified then
             let updatedEntries =
+                let uploadedByPath =
+                    completed
+                    |> Array.choose (fun transferred ->
+                        transferred.Uploaded
+                        |> Option.map (fun uploaded -> transferred.Path, uploaded))
+                    |> Map.ofArray
+
                 let withoutSelected =
                     state.Index.Entries
                     |> Array.filter (fun entry ->
@@ -606,16 +612,16 @@ let private finishSelectedRevision
 
                 let newEntries =
                     changed
-                    |> Array.choose (fun (pathValue, content, objectState) ->
-                        match objectState, content with
+                    |> Array.choose (fun (pathValue, inspected, objectState) ->
+                        match objectState, inspected with
                         | LakeFsIndex.DeletedObject, _ -> None
-                        | _, Some sourcePath ->
-                            let stats = NodeFileSystem.statSync sourcePath
+                        | _, Some _ ->
+                            let uploaded = uploadedByPath.[pathValue]
                             Some {
                                 LakeFsIndex.Path = pathValue
                                 LakeFsIndex.BaseChecksum = ""
-                                LakeFsIndex.LocalHash = LakeFsIndex.hashFile sourcePath
-                                LakeFsIndex.LocalSize = stats.size
+                                LakeFsIndex.LocalHash = uploaded.Sha256
+                                LakeFsIndex.LocalSize = uploaded.BytesCopied
                                 LakeFsIndex.LocalMtimeMs = 0.0
                             }
                         | _, None -> None)
@@ -704,18 +710,18 @@ let private createRevision (state: SessionState) (request: CreateRevisionRequest
                         request.Paths
                         |> Array.map (fun path ->
                             let pathValue = RepositoryPath.value path
-                            let sourcePath = tryLocalFilePath state pathValue
+                            let inspected = inspectLocalFile state pathValue
 
                             pathValue,
-                            sourcePath,
+                            inspected,
                             LakeFsIndex.classifyLocalObject
                                 (entriesByPath.TryFind pathValue)
-                                (sourcePath |> Option.map LakeFsIndex.hashFile))
+                                (inspected |> Option.map _.Sha256))
 
                     let missing =
                         selections
-                        |> Array.filter (fun (pathValue, sourcePath, _) ->
-                            sourcePath.IsNone && not (entriesByPath.ContainsKey pathValue))
+                        |> Array.filter (fun (pathValue, inspected, _) ->
+                            inspected.IsNone && not (entriesByPath.ContainsKey pathValue))
                         |> Array.map (fun (pathValue, _, _) -> pathValue)
 
                     if missing.Length > 0 then
@@ -742,14 +748,23 @@ let private createRevision (state: SessionState) (request: CreateRevisionRequest
                                     (Some "The selected paths are unchanged.")
                                     (mkRevisionId currentRevision)
                         else
+                            do! barrier state "selected-revision-sources-classified" context
+
                             // Act: stream only the selected changes to the workspace branch.
                             let expectedParent = state.Index.WorkspaceRevision
                             let selectedTransfers: LakeFsObjectTransfer.SelectedObjectTransfer[] =
                                 changed
-                                |> Array.map (fun (pathValue, sourcePath, objectState) -> {
+                                |> Array.map (fun (pathValue, inspected, objectState) -> {
                                     Path = pathValue
                                     ObjectKey = objectKey state pathValue
-                                    SourcePath = sourcePath
+                                    SourcePath = inspected |> Option.map _.AbsolutePath
+                                    ValidateSource =
+                                        inspected
+                                        |> Option.map (fun source ->
+                                            LakeFsPathSafety.validateOpenedFile
+                                                state.Binding.WorkspaceRoot
+                                                (repositoryPath pathValue)
+                                                source.Identity)
                                     IsDeletion = objectState = LakeFsIndex.DeletedObject
                                 })
 
@@ -762,7 +777,7 @@ let private createRevision (state: SessionState) (request: CreateRevisionRequest
                                     context
 
                             match transferResult with
-                            | LakeFsObjectTransfer.TransferFailed(failure, completedPaths)
+                            | LakeFsObjectTransfer.TransferFailed(failure, completed)
                                 when failure.Category = Canceled ->
                                 let! interrupted =
                                     recoverInterruptedSelectedRevision
@@ -772,12 +787,17 @@ let private createRevision (state: SessionState) (request: CreateRevisionRequest
                                         context.OperationId
 
                                 return Failed interrupted
-                            | LakeFsObjectTransfer.TransferFailed(failure, completedPaths) ->
+                            | LakeFsObjectTransfer.TransferFailed(failure, completed) ->
+                                let completedPaths = completed |> Array.map _.Path
+                                let affectedPaths =
+                                    Array.append completedPaths failure.AffectedPaths
+                                    |> Array.distinct
+
                                 return
                                     Failed {
                                         failure with
                                             StateChanged = completedPaths.Length > 0
-                                            AffectedPaths = completedPaths
+                                            AffectedPaths = affectedPaths
                                             RecoveryAction =
                                                 if completedPaths.Length > 0 then
                                                     Some {
@@ -789,11 +809,11 @@ let private createRevision (state: SessionState) (request: CreateRevisionRequest
                                                 else
                                                     failure.RecoveryAction
                                     }
-                            | LakeFsObjectTransfer.TransferCompleted completedPaths ->
+                            | LakeFsObjectTransfer.TransferCompleted completed ->
                                 context.ReportProgress {
                                     PhaseCode = "selected-upload-complete"
                                     Item = None
-                                    Completed = Some(float completedPaths.Length)
+                                    Completed = Some(float completed.Length)
                                     Total = Some(float selectedTransfers.Length)
                                     DisplayMessage = Some "Selected lakeFS objects uploaded"
                                 }
@@ -875,6 +895,7 @@ let private createRevision (state: SessionState) (request: CreateRevisionRequest
                                                 finishSelectedRevision
                                                     state
                                                     changed
+                                                    completed
                                                     expectedParent
                                                     commit
                                                     branchAfter
@@ -886,46 +907,49 @@ let private restorePaths (state: SessionState) (request: RestoreRequest) (contex
         if request.Paths.Length = 0 then
             return OperationResult.validationFailed "no_paths_selected" "Select at least one path."
         else
-            let! connection = connect state
-
-            match connection with
+            match LakeFsPathSafety.validateMaterializationPaths request.Paths with
             | Error failure -> return Failed failure
-            | Ok resolved ->
-                let workspaceRef =
-                    state.Index.WorkspaceRevision |> Option.defaultValue state.Index.WorkspaceBranch
+            | Ok() ->
+                let! connection = connect state
 
-                let mutable failure: OperationFailure option = None
+                match connection with
+                | Error failure -> return Failed failure
+                | Ok resolved ->
+                    let workspaceRef =
+                        state.Index.WorkspaceRevision |> Option.defaultValue state.Index.WorkspaceBranch
 
-                for path in request.Paths do
-                    if failure.IsNone then
-                        let pathValue = RepositoryPath.value path
-                        let downloadedPath = temporaryPath state "restore"
+                    let mutable failure: OperationFailure option = None
 
-                        let! downloaded =
-                            LakeFsApi.downloadObjectToFile
-                                resolved
-                                state.Index.Repository
-                                workspaceRef
-                                (objectKey state pathValue)
-                                downloadedPath
-                                context
+                    for path in request.Paths do
+                        if failure.IsNone then
+                            let pathValue = RepositoryPath.value path
+                            let downloadedPath = temporaryPath state "restore"
 
-                        match downloaded with
-                        | Ok _ ->
-                            match
-                                LakeFsPathSafety.replaceFileFromTemporary
-                                    state.Binding.WorkspaceRoot
-                                    path
+                            let! downloaded =
+                                LakeFsApi.downloadObjectToFile
+                                    resolved
+                                    state.Index.Repository
+                                    workspaceRef
+                                    (objectKey state pathValue)
                                     downloadedPath
-                            with
-                            | Ok() -> ()
-                            | Error replaceFailure -> failure <- Some replaceFailure
-                        | Error notFound when notFound.Category = NotFound -> removeLocal state pathValue
-                        | Error other -> failure <- Some other
+                                    context
 
-                match failure with
-                | Some value -> return Failed value
-                | None -> return OperationResult.succeeded ()
+                            match downloaded with
+                            | Ok _ ->
+                                match
+                                    LakeFsPathSafety.replaceFileFromTemporary
+                                        state.Binding.WorkspaceRoot
+                                        path
+                                        downloadedPath
+                                with
+                                | Ok() -> ()
+                                | Error replaceFailure -> failure <- Some replaceFailure
+                            | Error notFound when notFound.Category = NotFound -> removeLocal state pathValue
+                            | Error other -> failure <- Some other
+
+                    match failure with
+                    | Some value -> return Failed value
+                    | None -> return OperationResult.succeeded ()
     }
 
 let private listRefs (state: SessionState) (context: OperationContext) =
@@ -1445,13 +1469,11 @@ let private buildConflictItems
     async {
         let items = ResizeArray<LakeFsConflictSession.ItemState>()
 
-        let candidateFromFile sourcePath : LakeFsConflictSession.CandidateContent =
+        let candidateFromBuffer sourcePath buffer : LakeFsConflictSession.CandidateContent =
             let preview =
-                if (NodeFileSystem.statSync sourcePath).size > float (1024 * 1024) then
+                if float (NodeInterop.bufferLength buffer) > float (1024 * 1024) then
                     UnsupportedPreview(Some "lakeFS object exceeds the text conflict preview limit.")
                 else
-                    let buffer, _ = NodeFileSystem.readBufferNoFollowSync sourcePath
-
                     if NodeInterop.bufferContainsNul buffer || not (NodeInterop.bufferIsValidUtf8 buffer) then
                         UnsupportedPreview(Some "Binary lakeFS object; select an original candidate or resolve it manually.")
                     else
@@ -1461,6 +1483,10 @@ let private buildConflictItems
                 SourcePath = sourcePath
                 Preview = preview
             }
+
+        let candidateFromFile sourcePath =
+            let buffer, _ = NodeFileSystem.readBufferNoFollowSync sourcePath
+            candidateFromBuffer sourcePath buffer
 
         for path in overlapping do
             let key = objectKey state path
@@ -1491,8 +1517,12 @@ let private buildConflictItems
             let! targetContent = readRef targetHead
 
             let workspaceContent =
-                tryLocalFilePath state path
-                |> Option.map candidateFromFile
+                match inspectLocalFile state path with
+                | None -> None
+                | Some inspected ->
+                    LakeFsPathSafety.readBuffer state.Binding.WorkspaceRoot (repositoryPath path)
+                    |> LakeFsPathSafety.orRaise
+                    |> Option.map (candidateFromBuffer inspected.AbsolutePath)
 
             items.Add {
                 ItemPath = path

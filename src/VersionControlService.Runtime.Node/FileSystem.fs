@@ -38,6 +38,11 @@ type FileHandle =
     abstract member stat: unit -> JS.Promise<Stats>
     abstract member close: unit -> JS.Promise<unit>
 
+type HashedFile = {
+    Sha256: string
+    Stats: Stats
+}
+
 type Dirent =
     abstract member name: string
     abstract member isDirectory: unit -> bool
@@ -55,6 +60,17 @@ let statSync (path: string) : Stats = jsNative
 
 [<Import("lstatSync", "fs")>]
 let lstatSync (path: string) : Stats = jsNative
+
+let tryLstatSync (path: string) : Stats option =
+    try
+        Some(lstatSync path)
+    with error ->
+        let code: string = error?code |> unbox
+
+        if code = "ENOENT" then
+            None
+        else
+            raise error
 
 [<Import("readFileSync", "fs")>]
 let readFileSync (path: string) (encoding: TextEncoding) : string = jsNative
@@ -106,38 +122,73 @@ let lstatAsync (path: string) : JS.Promise<Stats> = jsNative
 
 let private fileSystemDynamic: obj = importAll "node:fs"
 let private fileSystemPromisesDynamic: obj = importAll "node:fs/promises"
+let private cryptoDynamic: obj = importAll "node:crypto"
+let private bufferDynamic: obj = importAll "node:buffer"
 
 [<Emit("$0 == null")>]
 let private isNullish (_value: obj) : bool = jsNative
 
+let openReadOnlyNoFollowSync (path: string) : int * Stats =
+    let noFollow: obj = fileSystemDynamic?constants?O_NOFOLLOW
+    let readOnly: int = unbox fileSystemDynamic?constants?O_RDONLY
+    let flags = if isNullish noFollow then readOnly else readOnly ||| unbox<int> noFollow
+    let descriptor: int = fileSystemDynamic?openSync (path, flags) |> unbox
+
+    try
+        let stats: Stats = fileSystemDynamic?fstatSync descriptor |> unbox
+        descriptor, stats
+    with error ->
+        fileSystemDynamic?closeSync descriptor |> ignore
+        raise error
+
+let closeFileDescriptorSync (descriptor: int) =
+    fileSystemDynamic?closeSync descriptor |> ignore
+
+let hashFileNoFollowSync (path: string) : HashedFile =
+    let descriptor, stats = openReadOnlyNoFollowSync path
+
+    try
+        let chunk: obj = bufferDynamic?Buffer?allocUnsafe (1024 * 1024)
+        let hash: obj = cryptoDynamic?createHash "sha256"
+        let mutable reading = true
+
+        while reading do
+            let bytesRead: int =
+                fileSystemDynamic?readSync (descriptor, chunk, 0, 1024 * 1024, null)
+                |> unbox
+
+            if bytesRead = 0 then
+                reading <- false
+            else
+                hash?update (chunk?subarray (0, bytesRead)) |> ignore
+
+        {
+            Sha256 = hash?digest "hex" |> unbox
+            Stats = stats
+        }
+    finally
+        closeFileDescriptorSync descriptor
+
 /// Reads UTF-8 through a descriptor opened with O_NOFOLLOW where supported and
 /// returns the identity of the opened object for a caller-side lstat comparison.
 let readUtf8FileNoFollowSync (path: string) : string * Stats =
-    let noFollow: obj = fileSystemDynamic?constants?O_NOFOLLOW
-    let readOnly: int = unbox fileSystemDynamic?constants?O_RDONLY
-    let flags = if isNullish noFollow then readOnly else readOnly ||| unbox<int> noFollow
-    let descriptor: int = fileSystemDynamic?openSync (path, flags) |> unbox
+    let descriptor, stats = openReadOnlyNoFollowSync path
 
     try
-        let stats: Stats = fileSystemDynamic?fstatSync (descriptor) |> unbox
         let content: string = fileSystemDynamic?readFileSync (descriptor, "utf8") |> unbox
         content, stats
     finally
-        fileSystemDynamic?closeSync (descriptor) |> ignore
+        closeFileDescriptorSync descriptor
 
 /// Reads raw bytes through a descriptor opened with O_NOFOLLOW where supported.
 let readBufferNoFollowSync (path: string) : obj * Stats =
-    let noFollow: obj = fileSystemDynamic?constants?O_NOFOLLOW
-    let readOnly: int = unbox fileSystemDynamic?constants?O_RDONLY
-    let flags = if isNullish noFollow then readOnly else readOnly ||| unbox<int> noFollow
-    let descriptor: int = fileSystemDynamic?openSync (path, flags) |> unbox
+    let descriptor, stats = openReadOnlyNoFollowSync path
 
     try
-        let stats: Stats = fileSystemDynamic?fstatSync (descriptor) |> unbox
         let content: obj = fileSystemDynamic?readFileSync descriptor |> unbox
         content, stats
     finally
-        fileSystemDynamic?closeSync (descriptor) |> ignore
+        closeFileDescriptorSync descriptor
 
 let removeFileIfIdentityMatchesSync (path: string) (expected: Stats) : bool =
     try
