@@ -47,22 +47,18 @@ let private injectAttributesSymlinkIdentity
     : unit -> unit =
     jsNative
 
-[<Emit("(() => { const fs = require('node:fs'); const moduleApi = require('node:module'); const original = fs.renameSync; fs.renameSync = (fromPath, toPath) => { if (toPath === $0 && String(fromPath).startsWith($0 + '.vcs-') && !$1()) fs.writeFileSync($0, $2, 'utf8'); return original(fromPath, toPath); }; moduleApi.syncBuiltinESMExports(); return () => { fs.renameSync = original; moduleApi.syncBuiltinESMExports(); }; })()")>]
-let private injectLateAttributesEditBeforeRename
+[<Emit("(() => { const fs = require('node:fs'); const moduleApi = require('node:module'); const originalOpen = fs.openSync; const originalFsync = fs.fsyncSync; let targetDescriptor; fs.openSync = (path, ...args) => { const descriptor = originalOpen(path, ...args); if (String(path).startsWith($0 + '.vcs-') && String(path).endsWith('.tmp')) targetDescriptor = descriptor; return descriptor; }; fs.fsyncSync = descriptor => { if (descriptor === targetDescriptor) { targetDescriptor = undefined; const error = new Error('injected attributes temp fsync failure'); error.code = 'EIO'; throw error; } return originalFsync(descriptor); }; moduleApi.syncBuiltinESMExports(); return () => { fs.openSync = originalOpen; fs.fsyncSync = originalFsync; moduleApi.syncBuiltinESMExports(); }; })()")>]
+let private injectAttributesTempFsyncFailure (_attributesPath: string) : unit -> unit = jsNative
+
+[<Emit("(() => { const fs = require('node:fs'); const moduleApi = require('node:module'); const original = fs.linkSync; fs.linkSync = (existingPath, newPath) => { if (newPath === $0) { $1(); const error = new Error('injected hard-link restriction'); error.code = 'EPERM'; throw error; } return original(existingPath, newPath); }; moduleApi.syncBuiltinESMExports(); return () => { fs.linkSync = original; moduleApi.syncBuiltinESMExports(); }; })()")>]
+let private injectAttributesLinkFailure
     (_attributesPath: string)
-    (_barrierRan: unit -> bool)
-    (_content: string)
+    (_onAttempt: unit -> unit)
     : unit -> unit =
     jsNative
 
-[<Emit("(() => { const fs = require('node:fs'); const moduleApi = require('node:module'); const originalRename = fs.renameSync; let injected = false; fs.renameSync = (fromPath, toPath) => { const shouldInject = !injected && toPath === $0 && String(fromPath).startsWith($0 + '.vcs-') && !$1(); if (shouldInject) { injected = true; fs.writeFileSync($0, $2, 'utf8'); } const result = originalRename(fromPath, toPath); if (shouldInject) fs.writeFileSync($0, $3, 'utf8'); return result; }; moduleApi.syncBuiltinESMExports(); return () => { fs.renameSync = originalRename; moduleApi.syncBuiltinESMExports(); }; })()")>]
-let private injectInstalledAttributesEditAfterRename
-    (_attributesPath: string)
-    (_barrierRan: unit -> bool)
-    (_lateOldContent: string)
-    (_newestInstalledContent: string)
-    : unit -> unit =
-    jsNative
+[<Emit("(async () => { const fsp = require('node:fs/promises'); const probe = await fsp.open($0, 'r'); const prototype = Object.getPrototypeOf(probe); await probe.close(); const original = prototype.sync; let injected = false; prototype.sync = function() { if (!injected) { injected = true; const error = new Error('injected exclusive attributes fsync failure'); error.code = 'EIO'; return Promise.reject(error); } return original.call(this); }; return () => { prototype.sync = original; }; })()")>]
+let private injectNextFileHandleSyncFailure (_probePath: string) : JS.Promise<unit -> unit> = jsNative
 
 let private tryReadUtf8FileAsync (path: string) : JS.Promise<string option> = promise {
     try
@@ -985,6 +981,224 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "selected revision removes its attributes temp file when fsync fails",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, binding = createSelectedRevisionFixture ()
+
+                try
+                    let attributesPath = join [| workPath; ".gitattributes" |]
+                    do!
+                        writeUtf8FileAsync
+                            (join [| workPath; "large.bin" |])
+                            (String.replicate (1024 * 1024) "f")
+
+                    let restoreFsync = injectAttributesTempFsyncFailure attributesPath
+                    let session =
+                        GitWorkspaceSession.createSession GitWorkspaceSession.GitSessionHooks.none binding
+
+                    let! statusResult = session.Core.GetStatus(ctx "attributes-temp-fsync-status") |> Async.StartAsPromise
+                    let status =
+                        match statusResult with
+                        | Succeeded outcome -> outcome.Value
+                        | _ -> failwith "Expected selected-revision status."
+
+                    let! revisionResult =
+                        promise {
+                            try
+                                return!
+                                    session.Core.CreateRevision
+                                        {
+                                            Message = "test: clean attributes temp after fsync failure"
+                                            Paths = [| repositoryPath "large.bin" |]
+                                            ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                        }
+                                        (ctx "attributes-temp-fsync-revision")
+                                    |> Async.StartAsPromise
+                            finally
+                                restoreFsync ()
+                        }
+
+                    let! worktreeNames = fsPromisesDynamic?readdir workPath |> unbox<JS.Promise<string[]>>
+                    let attributesTemps =
+                        worktreeNames
+                        |> Array.filter (fun name ->
+                            name.StartsWith(".gitattributes.vcs-", StringComparison.Ordinal)
+                            && name.EndsWith(".tmp", StringComparison.Ordinal))
+
+                    Vitest.expect(attributesTemps).toEqual [||]
+                    let! attributesAfter = tryReadUtf8FileAsync attributesPath
+                    Vitest.expect(attributesAfter).toEqual None
+
+                    match revisionResult with
+                    | PartiallySucceeded(outcome, failure) ->
+                        Vitest.expect(failure.StateChanged).toBe true
+                        Vitest.expect(failure.Code).toBe "attributes_reconciliation_failed"
+                        Vitest.expect(outcome.AffectedPaths |> Array.contains ".gitattributes").toBe true
+                        Vitest.expect(outcome.ResultingRevision.IsSome).toBe true
+                    | _ -> failwith "Expected the temp fsync failure to return partial success."
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "selected revision falls back to exclusive attributes creation when hard links are restricted",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, binding = createSelectedRevisionFixture ()
+
+                try
+                    let attributesPath = join [| workPath; ".gitattributes" |]
+                    do!
+                        writeUtf8FileAsync
+                            (join [| workPath; "large.bin" |])
+                            (String.replicate (1024 * 1024) "h")
+
+                    let mutable linkAttempted = false
+                    let restoreLink =
+                        injectAttributesLinkFailure attributesPath (fun () -> linkAttempted <- true)
+
+                    let expectedAttributes =
+                        "\"/large.bin\" filter=lfs diff=lfs merge=lfs -text\n"
+
+                    let mutable exclusiveInstalled = false
+                    let hooks: GitWorkspaceSession.GitSessionHooks = {
+                        RunBytesProcess = None
+                        RunProcess = None
+                        Barrier =
+                            Some(fun _ point _ -> async {
+                                if point = "selected-revision-attributes-installed" then
+                                    let! installed = tryReadUtf8FileAsync attributesPath |> Async.AwaitPromise
+                                    exclusiveInstalled <- installed = Some expectedAttributes
+                            })
+                    }
+
+                    let session = GitWorkspaceSession.createSession hooks binding
+
+                    let! statusResult = session.Core.GetStatus(ctx "attributes-link-fallback-status") |> Async.StartAsPromise
+                    let status =
+                        match statusResult with
+                        | Succeeded outcome -> outcome.Value
+                        | _ -> failwith "Expected selected-revision status."
+
+                    let! revisionResult =
+                        promise {
+                            try
+                                return!
+                                    session.Core.CreateRevision
+                                        {
+                                            Message = "test: fall back from restricted hard links"
+                                            Paths = [| repositoryPath "large.bin" |]
+                                            ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                        }
+                                        (ctx "attributes-link-fallback-revision")
+                                    |> Async.StartAsPromise
+                            finally
+                                restoreLink ()
+                        }
+
+                    Vitest.expect(linkAttempted).toBe true
+                    Vitest.expect(exclusiveInstalled).toBe true
+                    let! attributesAfter = tryReadUtf8FileAsync attributesPath
+                    Vitest.expect(attributesAfter).toEqual (Some expectedAttributes)
+
+                    let! worktreeNames = fsPromisesDynamic?readdir workPath |> unbox<JS.Promise<string[]>>
+                    let attributesTemps =
+                        worktreeNames
+                        |> Array.filter (fun name -> name.StartsWith(".gitattributes.vcs-", StringComparison.Ordinal))
+
+                    Vitest.expect(attributesTemps).toEqual [||]
+
+                    match revisionResult with
+                    | Succeeded outcome ->
+                        Vitest.expect(outcome.AffectedPaths |> Array.contains ".gitattributes").toBe true
+                        Vitest.expect(outcome.ResultingRevision.IsSome).toBe true
+                    | _ -> failwith "Expected exclusive attributes creation to succeed."
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "selected revision removes only its exclusive attributes file when fallback fsync fails",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, binding = createSelectedRevisionFixture ()
+
+                try
+                    let attributesPath = join [| workPath; ".gitattributes" |]
+                    do!
+                        writeUtf8FileAsync
+                            (join [| workPath; "large.bin" |])
+                            (String.replicate (1024 * 1024) "e")
+
+                    let mutable linkAttempted = false
+                    let restoreLink =
+                        injectAttributesLinkFailure attributesPath (fun () -> linkAttempted <- true)
+
+                    let session =
+                        GitWorkspaceSession.createSession GitWorkspaceSession.GitSessionHooks.none binding
+
+                    let! statusResult = session.Core.GetStatus(ctx "attributes-fallback-fsync-status") |> Async.StartAsPromise
+                    let status =
+                        match statusResult with
+                        | Succeeded outcome -> outcome.Value
+                        | _ -> failwith "Expected selected-revision status."
+
+                    let! restoreSync =
+                        injectNextFileHandleSyncFailure (join [| workPath; "base.txt" |])
+
+                    let! revisionResult =
+                        promise {
+                            try
+                                return!
+                                    session.Core.CreateRevision
+                                        {
+                                            Message = "test: clean exclusive attributes after fsync failure"
+                                            Paths = [| repositoryPath "large.bin" |]
+                                            ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                        }
+                                        (ctx "attributes-fallback-fsync-revision")
+                                    |> Async.StartAsPromise
+                            finally
+                                restoreSync ()
+                                restoreLink ()
+                        }
+
+                    Vitest.expect(linkAttempted).toBe true
+                    let! attributesAfter = tryReadUtf8FileAsync attributesPath
+                    Vitest.expect(attributesAfter).toEqual None
+
+                    let! worktreeNames = fsPromisesDynamic?readdir workPath |> unbox<JS.Promise<string[]>>
+                    let attributesTemps =
+                        worktreeNames
+                        |> Array.filter (fun name -> name.StartsWith(".gitattributes.vcs-", StringComparison.Ordinal))
+
+                    Vitest.expect(attributesTemps).toEqual [||]
+
+                    match revisionResult with
+                    | PartiallySucceeded(outcome, failure) ->
+                        Vitest.expect(failure.StateChanged).toBe true
+                        Vitest.expect(failure.Code).toBe "attributes_reconciliation_failed"
+                        Vitest.expect(outcome.AffectedPaths |> Array.contains ".gitattributes").toBe true
+                        Vitest.expect(outcome.ResultingRevision.IsSome).toBe true
+                    | _ -> failwith "Expected fallback fsync failure to return partial success."
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
             "selected revision LFS reconciliation preserves an in-place attributes edit after ref movement",
             TestOptions(timeout = 120000),
             fun () -> promise {
@@ -1199,7 +1413,7 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "selected revision preserves an attributes edit in the final replacement window",
+            "selected revision preserves an attributes edit before append",
             TestOptions(timeout = 120000),
             fun () -> promise {
                 let! root, workPath, binding = createSelectedRevisionFixture ()
@@ -1217,12 +1431,6 @@ Vitest.describe (
                             (String.replicate (1024 * 1024) "w")
 
                     let mutable finalBarrierRan = false
-                    let restoreRename =
-                        injectLateAttributesEditBeforeRename
-                            attributesPath
-                            (fun () -> finalBarrierRan)
-                            attributesConcurrentEdit
-
                     let hooks: GitWorkspaceSession.GitSessionHooks = {
                         RunBytesProcess = None
                         RunProcess = None
@@ -1242,20 +1450,14 @@ Vitest.describe (
                         | _ -> failwith "Expected selected-revision status."
 
                     let! revisionResult =
-                        promise {
-                            try
-                                return!
-                                    session.Core.CreateRevision
-                                        {
-                                            Message = "test: preserve final-window attributes edit"
-                                            Paths = [| repositoryPath "large.bin" |]
-                                            ExpectedWorkspaceVersion = status.WorkspaceVersion
-                                        }
-                                        (ctx "final-attributes-race-revision")
-                                    |> Async.StartAsPromise
-                            finally
-                                restoreRename ()
-                        }
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: preserve pre-append attributes edit"
+                                Paths = [| repositoryPath "large.bin" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (ctx "final-attributes-race-revision")
+                        |> Async.StartAsPromise
 
                     let! attributesAfter = tryReadUtf8FileAsync attributesPath
                     Vitest.expect(attributesAfter).toEqual (Some attributesConcurrentEdit)
@@ -1283,14 +1485,14 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "selected revision preserves newer attributes bytes after generated content is installed",
+            "selected revision preserves newer attributes bytes after generated content is appended",
             TestOptions(timeout = 120000),
             fun () -> promise {
                 let! root, workPath, binding = createSelectedRevisionFixture ()
 
                 try
                     let attributesBefore = "# baseline\n"
-                    let lateOldContent = "# late old inode edit\n"
+                    let generatedRule = "\"/large.bin\" filter=lfs diff=lfs merge=lfs -text\n"
                     let newestInstalledContent = "# newest installed path edit\n"
                     let attributesPath = join [| workPath; ".gitattributes" |]
                     do! writeUtf8FileAsync attributesPath attributesBefore
@@ -1302,13 +1504,7 @@ Vitest.describe (
                             (String.replicate (1024 * 1024) "n")
 
                     let mutable installedBarrierRan = false
-                    let restoreRename =
-                        injectInstalledAttributesEditAfterRename
-                            attributesPath
-                            (fun () -> installedBarrierRan)
-                            lateOldContent
-                            newestInstalledContent
-
+                    let mutable appendInstalled = false
                     let hooks: GitWorkspaceSession.GitSessionHooks = {
                         RunBytesProcess = None
                         RunProcess = None
@@ -1316,6 +1512,8 @@ Vitest.describe (
                             Some(fun _ point _ -> async {
                                 if point = "selected-revision-attributes-installed" then
                                     installedBarrierRan <- true
+                                    let! installed = tryReadUtf8FileAsync attributesPath |> Async.AwaitPromise
+                                    appendInstalled <- installed = Some(attributesBefore + generatedRule)
                                     do! writeUtf8FileAsync attributesPath newestInstalledContent |> Async.AwaitPromise
                             })
                     }
@@ -1328,24 +1526,19 @@ Vitest.describe (
                         | _ -> failwith "Expected selected-revision status."
 
                     let! revisionResult =
-                        promise {
-                            try
-                                return!
-                                    session.Core.CreateRevision
-                                        {
-                                            Message = "test: preserve newest installed attributes"
-                                            Paths = [| repositoryPath "large.bin" |]
-                                            ExpectedWorkspaceVersion = status.WorkspaceVersion
-                                        }
-                                        (ctx "installed-attributes-race-revision")
-                                    |> Async.StartAsPromise
-                            finally
-                                restoreRename ()
-                        }
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: preserve newest installed attributes"
+                                Paths = [| repositoryPath "large.bin" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (ctx "installed-attributes-race-revision")
+                        |> Async.StartAsPromise
 
                     let! attributesAfter = tryReadUtf8FileAsync attributesPath
                     Vitest.expect(attributesAfter).toEqual (Some newestInstalledContent)
                     Vitest.expect(installedBarrierRan).toBe true
+                    Vitest.expect(appendInstalled).toBe true
 
                     match revisionResult with
                     | PartiallySucceeded(outcome, failure) ->
@@ -1417,6 +1610,9 @@ Vitest.describe (
                         Vitest.expect(failure.StateChanged).toBe true
                         Vitest.expect(failure.Code).toBe "index_reconciliation_failed"
                         Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "reconcile_index")
+                        Vitest.expect(failure.RecoveryAction |> Option.bind _.Instructions).toEqual (
+                            Some "Reconcile the affected paths in the index (for example with git reset)."
+                        )
                         Vitest.expect(outcome.AffectedPaths |> Array.contains "large.bin").toBe true
                         Vitest.expect(outcome.AffectedPaths |> Array.contains ".gitattributes").toBe true
                         Vitest.expect(outcome.ResultingRevision.IsSome).toBe true
@@ -1428,6 +1624,72 @@ Vitest.describe (
                     Vitest.expect(headAfter.Trim() = headBefore.Trim()).toBe false
                     Vitest.expect(attributesAfter |> Option.exists _.Contains("\"/large.bin\" filter=lfs")).toBe true
                     Vitest.expect(worktreeLarge).toEqual (Some largeContent)
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "selected revision without generated attributes gives index-only recovery",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, binding = createSelectedRevisionFixture ()
+
+                try
+                    do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) "changed\n"
+
+                    let hooks: GitWorkspaceSession.GitSessionHooks = {
+                        RunBytesProcess = None
+                        RunProcess =
+                            Some(fun request operationContext ->
+                                if request.Arguments |> Array.tryHead = Some "reset" then
+                                    async {
+                                        return
+                                            OperationResult.failed(
+                                                OperationFailure.create
+                                                    ProviderError
+                                                    "injected_reconciliation_failure"
+                                                    "The reconciliation command failed."
+                                            )
+                                    }
+                                else
+                                    NodeProcess.run request operationContext)
+                        Barrier = None
+                    }
+
+                    let session = GitWorkspaceSession.createSession hooks binding
+                    let! statusResult = session.Core.GetStatus(ctx "index-only-recovery-status") |> Async.StartAsPromise
+                    let status =
+                        match statusResult with
+                        | Succeeded outcome -> outcome.Value
+                        | _ -> failwith "Expected selected-revision status."
+
+                    let! revisionResult =
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: index-only recovery"
+                                Paths = [| repositoryPath "base.txt" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (ctx "index-only-recovery-revision")
+                        |> Async.StartAsPromise
+
+                    match revisionResult with
+                    | PartiallySucceeded(outcome, failure) ->
+                        Vitest.expect(failure.StateChanged).toBe true
+                        Vitest.expect(failure.Code).toBe "index_reconciliation_failed"
+                        Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "reconcile_index")
+                        Vitest.expect(failure.RecoveryAction |> Option.bind _.Instructions).toEqual (
+                            Some "Reconcile the affected paths in the index (for example with git reset)."
+                        )
+                        Vitest.expect(outcome.AffectedPaths).toEqual [| "base.txt" |]
+                        Vitest.expect(outcome.ResultingRevision.IsSome).toBe true
+                    | _ -> failwith "Expected index reconciliation to return partial success."
+
+                    let! attributesAfter = tryReadUtf8FileAsync (join [| workPath; ".gitattributes" |])
+                    Vitest.expect(attributesAfter).toEqual None
                     do! removeDirectoryAsync root
                 with error ->
                     do! removeDirectoryAsync root

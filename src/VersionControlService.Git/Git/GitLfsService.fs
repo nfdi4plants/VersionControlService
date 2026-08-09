@@ -217,6 +217,19 @@ let private removeExactAttributeRule (rule: string) (content: string) =
 let private sameFileIdentity (left: NodeFileSystem.Stats) (right: NodeFileSystem.Stats) =
     left.dev = right.dev && left.ino = right.ino
 
+[<Emit("$0?.code")>]
+let private nodeErrorCode (_error: exn) : string = jsNative
+
+let private isHardLinkUnavailable (error: exn) =
+    match nodeErrorCode error |> Option.ofObj with
+    | Some "EPERM"
+    | Some "EACCES"
+    | Some "ENOTSUP"
+    | Some "EOPNOTSUPP"
+    | Some "ENOSYS"
+    | Some "EXDEV" -> true
+    | _ -> false
+
 let private ensurePathHasNoLinks (path: string) =
     let rec check current =
         let parent = NodePath.dirname current
@@ -280,6 +293,7 @@ let replaceAttributesAtomically
 type AttributesReplacement = private {
     AttributesPath: string
     TempPath: string
+    TempIdentity: NodeFileSystem.Stats
     OriginalContent: string
     GeneratedContent: string
     AppendContent: string option
@@ -330,12 +344,21 @@ let private cleanupAttributesReplacement (replacement: AttributesReplacement) =
                 cleanupError <- Some error
         | None -> ()
 
-        try
-            if NodeFileSystem.existsSync replacement.TempPath then
-                NodeFileSystem.unlinkSync replacement.TempPath
-        with error ->
-            if cleanupError.IsNone then
-                cleanupError <- Some error
+        if
+            not (
+                NodeFileSystem.removeFileIfIdentityMatchesSync
+                    replacement.TempPath
+                    replacement.TempIdentity
+            )
+            && NodeFileSystem.existsSync replacement.TempPath
+            && cleanupError.IsNone
+        then
+            cleanupError <-
+                Some(
+                    InvalidOperationException(
+                        "The Git attributes transaction did not remove a temporary path it no longer owned."
+                    )
+                )
 
         match cleanupError with
         | Some error -> return raise error
@@ -363,10 +386,14 @@ let prepareAttributesReplacement
             | None -> None
 
         let tempPath = attributesPath + $".vcs-{Guid.NewGuid():N}.tmp"
-        NodeFileSystem.writeUtf8FileExclusiveAndFlushSync tempPath content
+        let mutable tempIdentity = None
 
         try
             ensurePathHasNoLinks (NodePath.dirname attributesPath)
+            let createdIdentity =
+                NodeFileSystem.writeUtf8FileExclusiveAndFlushWithIdentitySync tempPath content
+
+            tempIdentity <- Some createdIdentity
 
             match originalIdentity with
             | Some expected ->
@@ -391,6 +418,7 @@ let prepareAttributesReplacement
                     return {
                         AttributesPath = attributesPath
                         TempPath = tempPath
+                        TempIdentity = createdIdentity
                         OriginalContent = originalContent
                         GeneratedContent = content
                         AppendContent = appendContent
@@ -407,6 +435,7 @@ let prepareAttributesReplacement
                 return {
                     AttributesPath = attributesPath
                     TempPath = tempPath
+                    TempIdentity = createdIdentity
                     OriginalContent = originalContent
                     GeneratedContent = content
                     AppendContent = appendContent
@@ -415,8 +444,10 @@ let prepareAttributesReplacement
                     InstalledContent = None
                 }
         with error ->
-            if NodeFileSystem.existsSync tempPath then
-                NodeFileSystem.unlinkSync tempPath
+            match tempIdentity with
+            | Some createdIdentity ->
+                NodeFileSystem.removeFileIfIdentityMatchesSync tempPath createdIdentity |> ignore
+            | None -> ()
 
             return raise error
     }
@@ -502,16 +533,70 @@ let applyAttributesReplacement (replacement: AttributesReplacement) =
             if NodeFileSystem.existsSync replacement.AttributesPath then
                 invalidOp "The Git attributes file appeared before its policy could be created."
 
-            NodeFileSystem.linkSync replacement.TempPath replacement.AttributesPath
-            let installedContent, installedIdentity = readAttributesNoFollow replacement.AttributesPath
+            let mutable useExclusiveCreate = false
 
-            match installedIdentity with
-            | Some identity when installedContent = replacement.GeneratedContent ->
-                replacement.InstalledIdentity <- Some identity
-                replacement.InstalledContent <- Some installedContent
-            | _ ->
-                invalidOp
-                    "The Git attributes file changed while its policy was being created; concurrent bytes were preserved."
+            try
+                NodeFileSystem.linkSync replacement.TempPath replacement.AttributesPath
+            with error when isHardLinkUnavailable error ->
+                useExclusiveCreate <- true
+
+            if useExclusiveCreate then
+                let! createdHandle =
+                    NodeFileSystem.openAppendExclusiveAsync replacement.AttributesPath
+                    |> Async.AwaitPromise
+
+                let mutable createError: exn option = None
+                let mutable createdIdentity = None
+
+                try
+                    let! identity = createdHandle.stat () |> Async.AwaitPromise
+                    createdIdentity <- Some identity
+                    do! createdHandle.writeFile (box replacement.GeneratedContent) |> Async.AwaitPromise
+                    do! createdHandle.sync () |> Async.AwaitPromise
+                    let! createdContent = readHandleUtf8FromStart createdHandle
+
+                    if createdContent <> replacement.GeneratedContent then
+                        invalidOp
+                            "The Git attributes file changed while its policy was being created; concurrent bytes were preserved."
+                with error ->
+                    createError <- Some error
+
+                try
+                    do! createdHandle.close () |> Async.AwaitPromise
+                with error ->
+                    if createError.IsNone then
+                        createError <- Some error
+
+                match createError, createdIdentity with
+                | Some error, Some identity ->
+                    NodeFileSystem.removeFileIfIdentityMatchesSync
+                        replacement.AttributesPath
+                        identity
+                    |> ignore
+
+                    return raise error
+                | Some error, None -> return raise error
+                | None, Some identity ->
+                    ensurePathHasNoLinks replacement.AttributesPath
+                    let pathIdentity = NodeFileSystem.lstatSync replacement.AttributesPath
+
+                    if not (sameFileIdentity identity pathIdentity) then
+                        invalidOp
+                            "The Git attributes file changed while its policy was being created; concurrent bytes were preserved."
+
+                    replacement.InstalledIdentity <- Some identity
+                    replacement.InstalledContent <- Some replacement.GeneratedContent
+                | None, None -> invalidOp "The Git attributes file identity was unavailable after creation."
+            else
+                let installedContent, installedIdentity = readAttributesNoFollow replacement.AttributesPath
+
+                match installedIdentity with
+                | Some identity when installedContent = replacement.GeneratedContent ->
+                    replacement.InstalledIdentity <- Some identity
+                    replacement.InstalledContent <- Some installedContent
+                | _ ->
+                    invalidOp
+                        "The Git attributes file changed while its policy was being created; concurrent bytes were preserved."
         | _ -> invalidOp "The Git attributes replacement transaction was invalid."
     }
 

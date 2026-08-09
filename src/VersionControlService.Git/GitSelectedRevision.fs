@@ -821,7 +821,7 @@ let createRevision
                                                                 Publication = LocalOnly
                                                         }
 
-                                                        let partialReconciliation failure =
+                                                        let partialReconciliation recoveryInstructions failure =
                                                             OperationResult.partiallySucceeded
                                                                 outcome
                                                                 {
@@ -831,8 +831,7 @@ let createRevision
                                                                 {
                                                                     Code = "reconcile_index"
                                                                     Instructions =
-                                                                        Some
-                                                                            "Merge the generated literal Git LFS rules into the current .gitattributes without discarding concurrent edits, then reconcile the affected paths in the index (for example with git reset)."
+                                                                        Some recoveryInstructions
                                                                 }
 
                                                         let! attributesWriteResult =
@@ -881,7 +880,11 @@ let createRevision
                                                         // Reconcile only the committed paths in the
                                                         // real index (unrelated staged state untouched).
                                                         match attributesWriteResult with
-                                                        | Error failure -> return partialReconciliation failure
+                                                        | Error failure ->
+                                                            return
+                                                                partialReconciliation
+                                                                    "Merge the generated literal Git LFS rules into the current .gitattributes without discarding concurrent edits, then reconcile the affected paths in the index (for example with git reset)."
+                                                                    failure
                                                         | Ok() ->
                                                             let reconciliationPayload =
                                                                 GitPathTransport.nulDelimitedLiteralPathspecs reconciliationPaths
@@ -901,21 +904,21 @@ let createRevision
                                                                 return Succeeded outcome
                                                             | Error failure ->
                                                                 return
-                                                                    partialReconciliation (
-                                                                        OperationFailure.createRedacted
+                                                                    partialReconciliation
+                                                                        "Reconcile the affected paths in the index (for example with git reset)."
+                                                                        (OperationFailure.createRedacted
                                                                             ProviderError
                                                                             "index_reconciliation_failed"
-                                                                            failure.Message
-                                                                    )
+                                                                            failure.Message)
                                                             | Ok reconcileOutput ->
                                                                 // The revision exists; only reconciliation failed.
                                                                 return
-                                                                    partialReconciliation (
-                                                                        OperationFailure.createRedacted
+                                                                    partialReconciliation
+                                                                        "Reconcile the affected paths in the index (for example with git reset)."
+                                                                        (OperationFailure.createRedacted
                                                                             ProviderError
                                                                             "index_reconciliation_failed"
-                                                                            reconcileOutput.StdErr
-                                                                    )
+                                                                            reconcileOutput.StdErr)
                             finally
                                 cleanupTemporaryIndex ()
     }

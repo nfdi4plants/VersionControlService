@@ -139,21 +139,54 @@ let readBufferNoFollowSync (path: string) : obj * Stats =
     finally
         fileSystemDynamic?closeSync (descriptor) |> ignore
 
-/// Creates a new UTF-8 file exclusively, flushes its bytes, and closes it.
+let removeFileIfIdentityMatchesSync (path: string) (expected: Stats) : bool =
+    try
+        let current: Stats = fileSystemDynamic?lstatSync path |> unbox
+
+        if current.isFile () && current.dev = expected.dev && current.ino = expected.ino then
+            fileSystemDynamic?unlinkSync path |> ignore
+            true
+        else
+            false
+    with _ ->
+        false
+
+/// Creates a new UTF-8 file exclusively, flushes its bytes, closes it, and
+/// returns the identity of the exact inode created by this operation.
 /// O_EXCL prevents an existing link from being followed at the temporary path.
-let writeUtf8FileExclusiveAndFlushSync (path: string) (content: string) : unit =
+let writeUtf8FileExclusiveAndFlushWithIdentitySync (path: string) (content: string) : Stats =
     let flags: int =
         (unbox<int> fileSystemDynamic?constants?O_WRONLY)
         ||| (unbox<int> fileSystemDynamic?constants?O_CREAT)
         ||| (unbox<int> fileSystemDynamic?constants?O_EXCL)
 
     let descriptor: int = fileSystemDynamic?openSync (path, flags, 384) |> unbox
+    let mutable identity: Stats option = None
 
     try
-        fileSystemDynamic?writeFileSync (descriptor, content, "utf8") |> ignore
-        fileSystemDynamic?fsyncSync (descriptor) |> ignore
-    finally
-        fileSystemDynamic?closeSync (descriptor) |> ignore
+        let created: Stats = fileSystemDynamic?fstatSync descriptor |> unbox
+        identity <- Some created
+
+        try
+            fileSystemDynamic?writeFileSync (descriptor, content, "utf8") |> ignore
+            fileSystemDynamic?fsyncSync (descriptor) |> ignore
+        finally
+            fileSystemDynamic?closeSync (descriptor) |> ignore
+
+        created
+    with error ->
+        match identity with
+        | Some created -> removeFileIfIdentityMatchesSync path created |> ignore
+        | None ->
+            try
+                fileSystemDynamic?closeSync (descriptor) |> ignore
+            with _ ->
+                ()
+
+        raise error
+
+let writeUtf8FileExclusiveAndFlushSync (path: string) (content: string) : unit =
+    writeUtf8FileExclusiveAndFlushWithIdentitySync path content |> ignore
 
 /// Opens a read handle without following a leaf symlink on platforms where
 /// Node exposes O_NOFOLLOW. Windows does not expose that flag, so callers must
@@ -184,6 +217,11 @@ let openAppendNoFollowAsync (path: string) : JS.Promise<FileHandle> =
             writeOnly ||| append ||| unbox<int> noFollow
 
     fileSystemPromisesDynamic?``open`` (path, flags) |> unbox<JS.Promise<FileHandle>>
+
+/// Creates a new readable file exclusively and forces every write to append.
+/// The exclusive open never follows or replaces an appearing path.
+let openAppendExclusiveAsync (path: string) : JS.Promise<FileHandle> =
+    fileSystemPromisesDynamic?``open`` (path, "ax+", 384) |> unbox<JS.Promise<FileHandle>>
 
 /// Opens a new file exclusively so an existing path or link cannot be followed.
 let openWriteExclusiveAsync (path: string) : JS.Promise<FileHandle> =
