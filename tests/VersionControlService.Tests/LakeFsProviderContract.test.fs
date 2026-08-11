@@ -56,11 +56,11 @@ let connection () : LakeFsConnection = {
     AccessKeyId =
         getEnvironmentVariable "LAKEFS_INTEGRATION_ACCESS_KEY_ID"
         |> Option.ofObj
-        |> Option.defaultValue "task13-access"
+        |> Option.defaultValue "integration-access"
     SecretAccessKey =
         getEnvironmentVariable "LAKEFS_INTEGRATION_SECRET_ACCESS_KEY"
         |> Option.ofObj
-        |> Option.defaultValue "task13-secret"
+        |> Option.defaultValue "integration-secret"
 }
 
 let private createTempDirectoryAsync () : JS.Promise<string> =
@@ -194,7 +194,7 @@ let createLakeFsHarness () : ProviderTestHarness =
 
     let nextId () =
         counter <- counter + 1
-        $"task13-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}-{counter}"
+        $"task13-{RuntimeNodeInterop.randomUuid()}-{counter}"
 
     let credentials: LakeFsCredentials.LakeFsCredentialStrategy = {
         ResolveConnection =

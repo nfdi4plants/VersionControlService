@@ -1,0 +1,161 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  format-build-dotnet:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: dotnet tool restore
+      - run: dotnet restore VersionControlService.slnx
+      - run: npm ci
+      - run: dotnet format VersionControlService.slnx --verify-no-changes --no-restore
+      - run: dotnet build VersionControlService.slnx --no-restore -c Release
+      - run: dotnet test tests/VersionControlService.Abstractions.Tests/VersionControlService.Abstractions.Tests.fsproj --no-restore -c Release
+      - name: Check tracked names
+        shell: pwsh
+        run: |
+          $forbiddenPattern = @(
+              ('Swa' + 'te')
+              ('VersionControlProvider' + 'Registry')
+              ('VersionControlService' + '\.Contracts')
+          ) -join '|'
+          $forbidden = git grep -n -i -E $forbiddenPattern -- ':!docs/superpowers/**'
+          if ($LASTEXITCODE -eq 0) { throw "Forbidden legacy or consumer-specific tracked content:`n$forbidden" }
+
+          $qualified = git grep -n -i -E '\bv[0-9]+\b' -- src tests |
+              Where-Object { $_ -notmatch 'git-lfs\.github\.com/spec/v1|/api/v1|--porcelain=v2' }
+          if ($qualified) { throw "Version-qualified naming in library sources:`n$($qualified -join [System.Environment]::NewLine)" }
+
+  fable-vitest:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: dotnet tool restore
+      - run: dotnet restore VersionControlService.slnx
+      - run: npm ci
+      - run: git lfs install --skip-repo
+      - run: .\build.cmd test run
+
+  git-lfs-scenarios:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: git --version
+      - run: git lfs version
+      - run: git lfs install --skip-repo
+      - run: dotnet tool restore
+      - run: dotnet restore VersionControlService.slnx
+      - run: npm ci
+      - shell: pwsh
+        run: build/RunFocusedTest.ps1 -TestFile GitProviderContract.test.js -Filter '.*'
+      - shell: pwsh
+        run: build/RunFocusedTest.ps1 -TestFile GitSynchronization.test.js -Filter 'Git LFS transfer ordering'
+      - shell: pwsh
+        run: build/RunFocusedTest.ps1 -TestFile GitPartialSuccess.test.js -Filter 'selected revision|publish|push'
+
+  package-graph-consumer:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: dotnet tool restore
+      - run: dotnet restore VersionControlService.slnx
+      - run: npm ci
+      - name: Pack and compile the one-reference consumer
+        shell: pwsh
+        run: |
+          $version = "0.0.0-local.$(Get-Date -Format yyyyMMddHHmmss)"
+          $feed = Join-Path $env:RUNNER_TEMP 'version-control-service-feed'
+          $cache = Join-Path $env:RUNNER_TEMP 'version-control-service-cache'
+          $output = Join-Path $env:RUNNER_TEMP 'version-control-service-consumer-output'
+
+          powershell -NoProfile -File build/PackLocal.ps1 -Version $version -Output $feed
+          powershell -NoProfile -File build/VerifyPackageGraph.ps1 -Feed $feed -Version $version
+
+          dotnet restore tests/VersionControlService.PackageConsumer/VersionControlService.PackageConsumer.fsproj `
+              --source $feed `
+              --source 'https://api.nuget.org/v3/index.json' `
+              --packages $cache `
+              --no-cache `
+              -p:VersionControlServicePackageVersion=$version
+          if ($LASTEXITCODE -ne 0) { throw 'Package consumer restore failed.' }
+
+          $env:VersionControlServicePackageVersion = $version
+          dotnet fable tests/VersionControlService.PackageConsumer/VersionControlService.PackageConsumer.fsproj `
+              --noRestore `
+              --noCache `
+              -o $output `
+              -s
+          if ($LASTEXITCODE -ne 0) { throw 'Package consumer Fable compilation failed.' }
+
+  external-provider:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - run: dotnet restore samples/ExternalProvider/ExternalProvider.fsproj
+      - run: dotnet build samples/ExternalProvider/ExternalProvider.fsproj --no-restore -c Release
+
+  lakefs-live:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: docker --version
+      - run: git lfs version
+      - run: git lfs install --skip-repo
+      - run: dotnet tool restore
+      - run: dotnet restore VersionControlService.slnx
+      - run: npm ci
+      - shell: pwsh
+        run: build/RunLakeFsIntegration.ps1
