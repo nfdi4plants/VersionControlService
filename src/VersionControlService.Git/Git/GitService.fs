@@ -5,6 +5,7 @@ open System.IO
 open System.Text.RegularExpressions
 open Fable.Core
 open Fable.Core.JsInterop
+open VersionControlService.Abstractions
 open VersionControlService.Git.GitEngineTypes
 open VersionControlService.Runtime.Node.Interop
 open VersionControlService.Runtime.Node.FileSystem
@@ -344,6 +345,26 @@ let validatePathspecs (pathSpecs: string[]) =
                 | _, Error e -> Error e
                 | Ok acc, Ok value -> Ok(Array.append acc [| value |])
             )
+            (Ok [||])
+
+let private validateLiteralDiffPathspecs (pathSpecs: string[]) =
+    if isNull pathSpecs || pathSpecs.Length = 0 then
+        Error(exn "At least one pathspec is required.")
+    else
+        pathSpecs
+        |> Array.map (fun pathSpec ->
+            if String.IsNullOrWhiteSpace pathSpec then
+                Error(exn "Pathspec must not be empty.")
+            else
+                match RepositoryPath.tryCreate pathSpec with
+                | Ok path -> Ok path
+                | Error message -> Error(exn message))
+        |> Array.fold
+            (fun state next ->
+                match state, next with
+                | Error e, _ -> Error e
+                | _, Error e -> Error e
+                | Ok acc, Ok value -> Ok(Array.append acc [| value |]))
             (Ok [||])
 
 let private splitGitOutputLines (text: string) =
@@ -1546,14 +1567,19 @@ let getDiffSummary (arcPath: string) : JS.Promise<GitResult<GitDiffSummaryDto>> 
 
 /// Returns raw `git diff` text for validated pathspecs. Used by tests and lower-level consumers.
 let getDiff (arcPath: string) (pathSpecs: string[]) : JS.Promise<GitResult<string>> = promise {
-    match validatePathspecs pathSpecs with
+    match validateLiteralDiffPathspecs pathSpecs with
     | Error validationError -> return errorResult validationError
-    | Ok safePathSpecs ->
+    | Ok literalPaths ->
         return!
             withLocalGit
                 arcPath
                 (fun git -> promise {
-                    let diffArgs = [| "diff"; "--"; yield! safePathSpecs |]
+                    let diffArgs =
+                        [|
+                            "diff"
+                            "--"
+                            yield! literalPaths |> Array.map GitPathTransport.literalPathspec
+                        |]
                     let! diff = git.raw diffArgs
                     return diff
                 })
@@ -1561,9 +1587,9 @@ let getDiff (arcPath: string) (pathSpecs: string[]) : JS.Promise<GitResult<strin
 
 /// Returns porcelain word-diff text for validated pathspecs.
 let getWordDiff (arcPath: string) (pathSpecs: string[]) : JS.Promise<GitResult<string>> = promise {
-    match validatePathspecs pathSpecs with
+    match validateLiteralDiffPathspecs pathSpecs with
     | Error validationError -> return errorResult validationError
-    | Ok safePathSpecs ->
+    | Ok literalPaths ->
         return!
             withLocalGit
                 arcPath
@@ -1573,7 +1599,9 @@ let getWordDiff (arcPath: string) (pathSpecs: string[]) : JS.Promise<GitResult<s
                         "--word-diff=porcelain"
                         "-U0"
                         "--"
-                        yield! safePathSpecs
+                        yield!
+                            literalPaths
+                            |> Array.map GitPathTransport.literalPathspec
                     |]
 
                     let! diff = git.raw diffArgs

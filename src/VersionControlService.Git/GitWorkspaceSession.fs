@@ -2009,6 +2009,65 @@ let private refresh (state: SessionState) (context: OperationContext) =
             | Ok syncState -> return OperationResult.noOp (Some "No target is configured.") syncState
     }
 
+let private previewRefreshedState (state: SessionState) (context: OperationContext) (syncState: SynchronizationState) =
+    async {
+        let changed = syncState.RemoteChangedPaths |> Option.defaultValue [||]
+
+        let! statusResult = awaitGit (GitService.getStatus state.RepoPath)
+
+        match statusResult with
+        | Error failure -> return Failed failure
+        | Ok status ->
+            let dirtyPaths = status.Files |> Array.map _.Path |> Set.ofArray
+
+            let overlapping =
+                changed
+                |> Array.filter (fun path -> dirtyPaths.Contains(RepositoryPath.value path))
+
+            // Committed-side conflicts between diverged histories via
+            // `merge-tree --write-tree` (Git 2.38+): exit code 1 = conflicts.
+            let! committedConflicts =
+                match syncState.Relationship, syncState.TargetRevision with
+                | Diverged, Some target ->
+                    async {
+                        let! mergeTree =
+                            runGit
+                                state.Hooks
+                                state.RepoPath
+                                [|
+                                    "merge-tree"
+                                    "--write-tree"
+                                    "HEAD"
+                                    RevisionId.value target
+                                |]
+                                None
+                                context
+
+                        match mergeTree with
+                        | Ok output when output.ExitCode = 0 -> return Ok false
+                        | Ok output when output.ExitCode = 1 -> return Ok true
+                        | Ok output ->
+                            let detail =
+                                if String.IsNullOrWhiteSpace output.StdErr then output.StdOut else output.StdErr
+
+                            return Error(previewIndeterminate "committed conflicts" detail)
+                        | Error failure ->
+                            return Error(previewIndeterminate "committed conflicts" failure.Message)
+                    }
+                | _ -> async { return Ok false }
+
+            match committedConflicts with
+            | Error failure -> return Failed failure
+            | Ok hasCommittedConflicts ->
+                return
+                    OperationResult.succeeded {
+                        ChangedPaths = changed
+                        OverlappingPaths = overlapping
+                        HasDataLossRisk = overlapping.Length > 0
+                        WouldCreateConflictSession = overlapping.Length > 0 || hasCommittedConflicts
+                    }
+    }
+
 let private previewUpdate (state: SessionState) (context: OperationContext) =
     async {
         let! refreshResult = refresh state context
@@ -2019,61 +2078,15 @@ let private previewUpdate (state: SessionState) (context: OperationContext) =
         | Succeeded outcome ->
             let syncState = outcome.Value
 
-            let changed = syncState.RemoteChangedPaths |> Option.defaultValue [||]
-
-            let! statusResult = awaitGit (GitService.getStatus state.RepoPath)
-
-            match statusResult with
-            | Error failure -> return Failed failure
-            | Ok status ->
-                let dirtyPaths = status.Files |> Array.map _.Path |> Set.ofArray
-
-                let overlapping =
-                    changed
-                    |> Array.filter (fun path -> dirtyPaths.Contains(RepositoryPath.value path))
-
-                // Committed-side conflicts between diverged histories via
-                // `merge-tree --write-tree` (Git 2.38+): exit code 1 = conflicts.
-                let! committedConflicts =
-                    match syncState.Relationship, syncState.TargetRevision with
-                    | Diverged, Some target ->
-                        async {
-                            let! mergeTree =
-                                runGit
-                                    state.Hooks
-                                    state.RepoPath
-                                    [|
-                                        "merge-tree"
-                                        "--write-tree"
-                                        "HEAD"
-                                        RevisionId.value target
-                                    |]
-                                    None
-                                    context
-
-                            match mergeTree with
-                            | Ok output when output.ExitCode = 0 -> return Ok false
-                            | Ok output when output.ExitCode = 1 -> return Ok true
-                            | Ok output ->
-                                let detail =
-                                    if String.IsNullOrWhiteSpace output.StdErr then output.StdOut else output.StdErr
-
-                                return Error(previewIndeterminate "committed conflicts" detail)
-                            | Error failure ->
-                                return Error(previewIndeterminate "committed conflicts" failure.Message)
-                        }
-                    | _ -> async { return Ok false }
-
-                match committedConflicts with
-                | Error failure -> return Failed failure
-                | Ok hasCommittedConflicts ->
-                    return
-                        OperationResult.succeeded {
-                            ChangedPaths = changed
-                            OverlappingPaths = overlapping
-                            HasDataLossRisk = overlapping.Length > 0
-                            WouldCreateConflictSession = overlapping.Length > 0 || hasCommittedConflicts
-                        }
+            match syncState.Relationship, syncState.TargetRevision with
+            | UnknownRelationship, Some _ ->
+                return
+                    Failed(
+                        previewIndeterminate
+                            "synchronization state"
+                            "The workspace and target histories do not share a merge base."
+                    )
+            | _ -> return! previewRefreshedState state context syncState
     }
 
 let private update (state: SessionState) (request: UpdateRequest) (context: OperationContext) =
@@ -3366,18 +3379,34 @@ let private getBaseContent
     }
 
 let private createTextDiff (state: SessionState) : TextDiffService =
-    let mapDiff (operation: JS.Promise<GitService.GitResult<string>>) =
+    let mapDiff (context: OperationContext) (operation: unit -> JS.Promise<GitService.GitResult<string>>) =
         async {
-            let! result = awaitGit operation
+            try
+                if context.Cancellation.IsCancellationRequested() then
+                    return OperationResult.canceled "The Git text diff was canceled."
+                else
+                    let! result = awaitGit (operation ())
 
-            match result with
-            | Ok text -> return OperationResult.succeeded (TextContent text)
-            | Error failure -> return OperationResult.succeeded (UnsupportedContent(Some failure.Message))
+                    if context.Cancellation.IsCancellationRequested() then
+                        return OperationResult.canceled "The Git text diff was canceled."
+                    else
+                        match result with
+                        | Ok text -> return OperationResult.succeeded (TextContent text)
+                        | Error failure -> return Failed failure
+            with error ->
+                return
+                    Failed(
+                        OperationFailure.createRedacted ProviderError "git_failure" error.Message
+                    )
         }
 
     {
-        GetDiff = fun path _ -> mapDiff (GitService.getDiff state.RepoPath [| RepositoryPath.value path |])
-        GetWordDiff = fun path _ -> mapDiff (GitService.getWordDiff state.RepoPath [| RepositoryPath.value path |])
+        GetDiff =
+            fun path context ->
+                mapDiff context (fun () -> GitService.getDiff state.RepoPath [| RepositoryPath.value path |])
+        GetWordDiff =
+            fun path context ->
+                mapDiff context (fun () -> GitService.getWordDiff state.RepoPath [| RepositoryPath.value path |])
         GetBaseContent = fun path context -> getBaseContent state path context
     }
 

@@ -15,9 +15,9 @@
     <Compile Include="Git\GitLfsService.fs" />
     <Compile Include="Git\GitTokenProvider.fs" />
     <Compile Include="Git\GitInternals.fs" />
+    <Compile Include="GitPathTransport.fs" />
     <Compile Include="Git\GitService.fs" />
     <Compile Include="Git\GitProvisioningService.fs" />
-    <Compile Include="GitPathTransport.fs" />
     <Compile Include="GitCredentialStrategy.fs" />
     <Compile Include="GitRefs.fs" />
     <Compile Include="GitConflictSession.fs" />

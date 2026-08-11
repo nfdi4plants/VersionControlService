@@ -1827,6 +1827,194 @@ let private repositoryPath (value: string) =
     | Error message -> failwith message
 
 Vitest.describe (
+    "Git text diff",
+    fun () ->
+        Vitest.test (
+            "text diff is literal and truthful about failures",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, session = createBaseContentFixture ()
+
+                try
+                    let canceled = OperationCancellation.Source()
+                    canceled.Cancel()
+
+                    let! canceledResult =
+                        (textDiffService session).GetDiff
+                            (repositoryPath "base.txt")
+                            (OperationContext.create "diff-canceled" canceled.Cancellation ignore)
+                        |> Async.StartAsPromise
+
+                    let canceledFailure = expectProviderFailure "canceled text diff" canceledResult
+                    Vitest.expect(canceledFailure.Category).toEqual (Canceled)
+
+                    do! removeDirectoryAsync (join [| root; "work" |])
+
+                    let! deletedResult =
+                        (textDiffService session).GetDiff
+                            (repositoryPath "base.txt")
+                            (OperationContext.detached "diff-deleted-repository")
+                        |> Async.StartAsPromise
+
+                    let deletedFailure = expectProviderFailure "deleted-repository text diff" deletedResult
+                    Vitest.expect(deletedFailure.Category).toEqual (ProviderError)
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "text diff is literal and truthful for glob-metacharacter paths",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let files = [|
+                        "report[1].csv", "report1.csv", "literal report original", "decoy report original"
+                        "a*b.txt", "axb.txt", "literal star original", "decoy star original"
+                    |]
+
+                    for literalPath, decoyPath, literalContent, decoyContent in files do
+                        let! literalObject =
+                            runGitIn
+                                workspace.Binding.WorkspaceRoot
+                                [||]
+                                [| "hash-object"; "-w"; "--stdin" |]
+                                (Some literalContent)
+
+                        let! _ =
+                            runGitIn
+                                workspace.Binding.WorkspaceRoot
+                                [||]
+                                [|
+                                    "-c"
+                                    "core.protectNTFS=false"
+                                    "update-index"
+                                    "--add"
+                                    "--cacheinfo"
+                                    $"100644,{literalObject.Trim()},{literalPath}"
+                                |]
+                                None
+
+                        let! decoyObject =
+                            runGitIn
+                                workspace.Binding.WorkspaceRoot
+                                [||]
+                                [| "hash-object"; "-w"; "--stdin" |]
+                                (Some decoyContent)
+
+                        let! _ =
+                            runGitIn
+                                workspace.Binding.WorkspaceRoot
+                                [||]
+                                [|
+                                    "-c"
+                                    "core.protectNTFS=false"
+                                    "update-index"
+                                    "--add"
+                                    "--cacheinfo"
+                                    $"100644,{decoyObject.Trim()},{decoyPath}"
+                                |]
+                                None
+
+                        ()
+
+                    let! _ = runGitIn workspace.Binding.WorkspaceRoot [||] [| "commit"; "-m"; "test: literal diff paths" |] None
+
+                    for literalPath, decoyPath, literalContent, decoyContent in files do
+                        let! literalObject =
+                            runGitIn
+                                workspace.Binding.WorkspaceRoot
+                                [||]
+                                [| "hash-object"; "-w"; "--stdin" |]
+                                (Some $"{literalContent} changed")
+
+                        let! _ =
+                            runGitIn
+                                workspace.Binding.WorkspaceRoot
+                                [||]
+                                [|
+                                    "-c"
+                                    "core.protectNTFS=false"
+                                    "update-index"
+                                    "--add"
+                                    "--cacheinfo"
+                                    $"100644,{literalObject.Trim()},{literalPath}"
+                                |]
+                                None
+
+                        let! decoyObject =
+                            runGitIn
+                                workspace.Binding.WorkspaceRoot
+                                [||]
+                                [| "hash-object"; "-w"; "--stdin" |]
+                                (Some $"{decoyContent} changed")
+
+                        let! _ =
+                            runGitIn
+                                workspace.Binding.WorkspaceRoot
+                                [||]
+                                [|
+                                    "-c"
+                                    "core.protectNTFS=false"
+                                    "update-index"
+                                    "--add"
+                                    "--cacheinfo"
+                                    $"100644,{decoyObject.Trim()},{decoyPath}"
+                                |]
+                                None
+
+                        ()
+
+                    let diff = textDiffService workspace.Session
+
+                    for literalPathValue, decoyPathValue, literalContent, decoyContent in files do
+                        let literalPath = repositoryPath literalPathValue
+
+                        let! regularResult =
+                            diff.GetDiff literalPath (OperationContext.detached $"diff-literal-{literalPathValue}")
+                            |> Async.StartAsPromise
+
+                        let regularText =
+                            match expectProviderValue $"literal diff {literalPathValue}" regularResult with
+                            | TextContent text -> text
+                            | UnsupportedContent _ -> failwith "Expected a text diff."
+
+                        Vitest.expect(regularText.Contains($"a/{literalPathValue}")).toBe (true)
+                        Vitest.expect(regularText.Contains($"b/{literalPathValue}")).toBe (true)
+                        Vitest.expect(regularText.Contains($"{literalContent} changed")).toBe (true)
+                        Vitest.expect(regularText.Contains($"{decoyContent} changed")).toBe (false)
+                        Vitest.expect(regularText.Contains(decoyPathValue)).toBe (false)
+
+                        let! wordResult =
+                            diff.GetWordDiff literalPath (OperationContext.detached $"word-diff-literal-{literalPathValue}")
+                            |> Async.StartAsPromise
+
+                        let wordText =
+                            match expectProviderValue $"literal word diff {literalPathValue}" wordResult with
+                            | TextContent text -> text
+                            | UnsupportedContent _ -> failwith "Expected a text word diff."
+
+                        Vitest.expect(wordText.Contains($"a/{literalPathValue}")).toBe (true)
+                        Vitest.expect(wordText.Contains($"b/{literalPathValue}")).toBe (true)
+                        Vitest.expect(wordText.Contains($"{literalContent} changed")).toBe (true)
+                        Vitest.expect(wordText.Contains($"{decoyContent} changed")).toBe (false)
+                        Vitest.expect(wordText.Contains(decoyPathValue)).toBe (false)
+
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+)
+
+Vitest.describe (
     "Git workspace adoption",
     fun () ->
         Vitest.test (

@@ -1211,6 +1211,41 @@ Vitest.describe (
     "Git workspace synchronization",
     fun () ->
         Vitest.test (
+            "preview classifies unrelated histories as indeterminate",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, _, barePath, session = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+                let unrelatedPath = join [| root; "unrelated" |]
+
+                try
+                    let! _ = runGitIn root [| "init"; "-b"; "main"; unrelatedPath |]
+                    let! _ = runGitIn unrelatedPath [| "config"; "user.name"; "Unrelated Target" |]
+                    let! _ = runGitIn unrelatedPath [| "config"; "user.email"; "unrelated@example.org" |]
+                    do! writeUtf8FileAsync (join [| unrelatedPath; "unrelated.txt" |]) "unrelated target\n"
+                    let! _ = runGitIn unrelatedPath [| "add"; "-A" |]
+                    let! _ = runGitIn unrelatedPath [| "commit"; "-m"; "unrelated target" |]
+                    let! _ = runGitIn unrelatedPath [| "remote"; "add"; "origin"; barePath |]
+                    let! _ = runGitIn unrelatedPath [| "push"; "--force"; "origin"; "main" |]
+
+                    let! previewResult =
+                        Async.StartAsPromise((syncService session).PreviewUpdate(ctx "preview-unrelated-histories"))
+
+                    match previewResult with
+                    | Failed failure ->
+                        Vitest.expect(failure.Code).toBe ("preview_indeterminate")
+                        Vitest.expect(failure.Retryable).toBe (true)
+                    | Succeeded outcome ->
+                        failwith $"Expected an indeterminate preview, received {outcome.Value.ChangedPaths.Length} changed paths."
+                    | PartiallySucceeded _ -> failwith "Expected unrelated-history preview to fail, not partially succeed."
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
             "conflicting update opens a versioned conflict session and rejects stale tokens before verified finalize",
             TestOptions(timeout = 120000),
             fun () -> promise {
