@@ -32,6 +32,22 @@ let private writeUtf8FileAsync (path: string) (content: string) : JS.Promise<uni
     return ()
 }
 
+let private createDirectoryLinkAsync (targetPath: string) (linkPath: string) : JS.Promise<unit> = promise {
+    let! _ =
+        fsPromisesDynamic?symlink (targetPath, linkPath, "junction")
+        |> unbox<JS.Promise<obj>>
+
+    return ()
+}
+
+let private providerOptions
+    (stateRoot: string)
+    (pathCaseSensitivity: PathCaseSensitivity)
+    : LakeFsProviderOptions.LakeFsProviderOptions = {
+    StateRoot = stateRoot
+    PathCaseSensitivity = pathCaseSensitivity
+}
+
 let private sampleIndex: LakeFsWorkspaceIndex.WorkspaceIndex = {
     SchemaVersion = LakeFsWorkspaceIndex.CurrentSchemaVersion
     Repository = "repo"
@@ -202,7 +218,7 @@ Vitest.describe (
                 let! _ = fsPromisesDynamic?mkdir (workspaceRoot) |> unbox<JS.Promise<obj>>
 
                 try
-                    let options: LakeFsProviderOptions.LakeFsProviderOptions = { StateRoot = stateRoot }
+                    let options: LakeFsProviderOptions.LakeFsProviderOptions = providerOptions stateRoot CaseInsensitive
 
                     let allocated =
                         match LakeFsStateStore.create options workspaceRoot with
@@ -264,6 +280,7 @@ Vitest.describe (
 
                     let unsafeOptions: LakeFsProviderOptions.LakeFsProviderOptions = {
                         StateRoot = join [| workspaceRoot; "provider-state" |]
+                        PathCaseSensitivity = CaseInsensitive
                     }
 
                     match LakeFsStateStore.create unsafeOptions workspaceRoot with
@@ -279,15 +296,17 @@ Vitest.describe (
 
                     let linkedOptions: LakeFsProviderOptions.LakeFsProviderOptions = {
                         StateRoot = linkedStateRoot
+                        PathCaseSensitivity = CaseInsensitive
                     }
 
                     match LakeFsStateStore.create linkedOptions workspaceRoot with
-                    | Error failure -> Vitest.expect(failure.Code).toBe "provider_state_link_not_supported"
-                    | Ok _ -> failwith "Expected a linked provider state root to be rejected."
+                    | Error failure -> Vitest.expect(failure.Code).toBe "provider_state_inside_workspace"
+                    | Ok _ -> failwith "Expected linked provider state inside the workspace to be rejected."
 
                     let childLinkStateRoot = join [| root; "child-link-state" |]
                     let childLinkOptions: LakeFsProviderOptions.LakeFsProviderOptions = {
                         StateRoot = childLinkStateRoot
+                        PathCaseSensitivity = CaseInsensitive
                     }
 
                     let childLinkState =
@@ -314,6 +333,97 @@ Vitest.describe (
                 with error ->
                     do! removeDirectoryAsync root
                     return raise error
+            }
+        )
+)
+
+Vitest.describe (
+    "lakeFS state containment",
+    fun () ->
+        Vitest.test (
+            "lakeFS state containment rejects a state root physically inside a symlinked workspace",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root = createTempDirectoryAsync ()
+                let realWorkspace = join [| root; "real" |]
+                let workspaceRoot = join [| root; "link-ws" |]
+                let stateRoot = join [| realWorkspace; "provider-state" |]
+
+                try
+                    let! _ =
+                        fsPromisesDynamic?mkdir (realWorkspace, createObj [ "recursive" ==> true ])
+                        |> unbox<JS.Promise<obj>>
+
+                    do! createDirectoryLinkAsync realWorkspace workspaceRoot
+
+                    match LakeFsStateStore.create (providerOptions stateRoot CaseInsensitive) workspaceRoot with
+                    | Error failure -> Vitest.expect(failure.Code).toBe "provider_state_inside_workspace"
+                    | Ok _ -> failwith "Expected physical state containment to reject the state root."
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+
+                do! removeDirectoryAsync root
+            }
+        )
+
+        Vitest.test (
+            "lakeFS state containment honors host case sensitivity for workspace collisions",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root = createTempDirectoryAsync ()
+                let workspaceRoot = join [| root; "Workspace" |]
+                let stateRoot = join [| root; "workspace" |]
+
+                try
+                    let! _ =
+                        fsPromisesDynamic?mkdir (workspaceRoot, createObj [ "recursive" ==> true ])
+                        |> unbox<JS.Promise<obj>>
+
+                    match LakeFsStateStore.create (providerOptions stateRoot CaseInsensitive) workspaceRoot with
+                    | Error failure -> Vitest.expect(failure.Code).toBe "provider_state_inside_workspace"
+                    | Ok _ -> failwith "Expected case-insensitive state containment to reject the collision."
+
+                    match LakeFsStateStore.create (providerOptions stateRoot CaseSensitive) workspaceRoot with
+                    | Ok _ -> Vitest.expect(true).toBe true
+                    | Error failure -> failwith $"Expected case-sensitive paths to remain distinct: {failure.Code}"
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+
+                do! removeDirectoryAsync root
+            }
+        )
+
+        Vitest.test (
+            "lakeFS state containment allows an external state root beneath a symlink",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root = createTempDirectoryAsync ()
+                let workspaceRoot = join [| root; "workspace" |]
+                let externalTarget = join [| root; "external-state" |]
+                let linkedDirectory = join [| root; "linked-system-directory" |]
+                let stateRoot = join [| linkedDirectory; "provider-state" |]
+
+                try
+                    let! _ =
+                        fsPromisesDynamic?mkdir (workspaceRoot, createObj [ "recursive" ==> true ])
+                        |> unbox<JS.Promise<obj>>
+
+                    let! _ =
+                        fsPromisesDynamic?mkdir (externalTarget, createObj [ "recursive" ==> true ])
+                        |> unbox<JS.Promise<obj>>
+
+                    do! createDirectoryLinkAsync externalTarget linkedDirectory
+
+                    match LakeFsStateStore.create (providerOptions stateRoot CaseInsensitive) workspaceRoot with
+                    | Ok state -> Vitest.expect(state.StateDirectory.StartsWith(stateRoot)).toBe true
+                    | Error failure -> failwith $"Expected an external linked state root to remain usable: {failure.Code}"
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+
+                do! removeDirectoryAsync root
             }
         )
 )

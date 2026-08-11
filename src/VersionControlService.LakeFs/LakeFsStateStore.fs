@@ -88,24 +88,29 @@ let private jsonParse (_text: string) : obj = jsNative
 [<Emit("require('node:fs').rmSync($0, { recursive: true, force: true })")>]
 let private removeTreeSync (_path: string) : unit = jsNative
 
-let private pathComparison =
-    if NodeInterop.processPlatform () = "win32" then
-        StringComparison.OrdinalIgnoreCase
-    else
-        StringComparison.Ordinal
+let private pathComparison = function
+    | CaseSensitive -> StringComparison.Ordinal
+    | CaseInsensitive -> StringComparison.OrdinalIgnoreCase
 
 let private normalize path = NodePath.resolve [| path |]
 
-let private isWithin root candidate =
-    let normalizedRoot = normalize root
-    let normalizedCandidate = normalize candidate
-    let relative = NodePath.relative normalizedRoot normalizedCandidate
+let private physicalPath path =
+    NodeFileSystem.realpathSync path |> normalize
 
-    String.Equals(normalizedRoot, normalizedCandidate, pathComparison)
-    || (not (NodePath.isAbsolute relative)
-        && relative <> ".."
-        && not (relative.StartsWith("../", StringComparison.Ordinal))
-        && not (relative.StartsWith("..\\", StringComparison.Ordinal)))
+let private isWithin sensitivity root candidate =
+    let normalizedRoot = physicalPath root
+    let normalizedCandidate = physicalPath candidate
+    let comparison = pathComparison sensitivity
+    let descendantPrefix =
+        if normalizedRoot.EndsWith "/" || normalizedRoot.EndsWith "\\" then
+            normalizedRoot
+        elif normalizedRoot.Contains "\\" then
+            normalizedRoot + "\\"
+        else
+            normalizedRoot + "/"
+
+    String.Equals(normalizedRoot, normalizedCandidate, comparison)
+    || normalizedCandidate.StartsWith(descendantPrefix, comparison)
 
 let private failure code message =
     OperationFailure.create ProviderError code message
@@ -143,34 +148,16 @@ let private tryLstat path =
                     $"Inspecting an external lakeFS state path failed: {error.Message}"
             )
 
-let private pathChain path =
-    let rec collect current paths =
-        let parent = NodePath.dirname current
-
-        if String.Equals(parent, current, pathComparison) then
-            current :: paths
-        else
-            collect parent (current :: paths)
-
-    collect (normalize path) []
-
-let private rejectLinksInChain path =
-    pathChain path
-    |> List.fold
-        (fun result current ->
-            match result with
-            | Error _ -> result
-            | Ok() ->
-                match tryLstat current with
-                | Error inspectionFailure -> Error inspectionFailure
-                | Ok(Some stats) when stats.isSymbolicLink () ->
-                    Error(
-                        failure
-                            "provider_state_link_not_supported"
-                            "Symbolic links, junctions, and reparse-point paths are not supported for lakeFS provider state."
-                    )
-                | Ok _ -> Ok())
-        (Ok())
+let private rejectLeafLink path =
+    match tryLstat path with
+    | Error inspectionFailure -> Error inspectionFailure
+    | Ok(Some stats) when stats.isSymbolicLink () ->
+        Error(
+            failure
+                "provider_state_link_not_supported"
+                "Symbolic links, junctions, and reparse-point paths are not supported for lakeFS provider state."
+        )
+    | Ok _ -> Ok()
 
 let private stateIdPattern = Regex("^state-[a-f0-9]{32}$")
 
@@ -209,7 +196,7 @@ let private validateOwnedLayout (state: ResolvedState) =
         (fun result path ->
             match result with
             | Error _ -> result
-            | Ok() -> rejectLinksInChain path)
+            | Ok() -> rejectLeafLink path)
         (Ok())
 
 let private recoveryFailure path message =
@@ -361,21 +348,16 @@ let private validateLocation
     =
     let stateRoot = normalize options.StateRoot
 
-    if not (isWithin stateRoot state.StateDirectory) then
+    if not (isWithin options.PathCaseSensitivity stateRoot state.StateDirectory) then
         Error(failure "provider_state_ref_invalid" "The provider state reference escapes the configured state root.")
-    elif isWithin workspaceRoot state.StateDirectory then
+    elif isWithin options.PathCaseSensitivity workspaceRoot state.StateDirectory then
         Error(
             failure
                 "provider_state_inside_workspace"
                 "lakeFS provider state must be stored outside the managed workspace."
         )
     else
-        match rejectLinksInChain stateRoot with
-        | Error linkFailure -> Error linkFailure
-        | Ok() ->
-            match rejectLinksInChain state.StateDirectory with
-            | Error linkFailure -> Error linkFailure
-            | Ok() -> Ok state
+        Ok state
 
 let createForProvisioning
     (options: LakeFsProviderOptions.LakeFsProviderOptions)
@@ -388,46 +370,40 @@ let createForProvisioning
         else
             let stateRoot = normalize options.StateRoot
 
-            if isWithin workspaceRoot stateRoot then
+            if isWithin options.PathCaseSensitivity workspaceRoot stateRoot then
                 Error(
                     failure
                         "provider_state_inside_workspace"
                         "lakeFS provider state must be stored outside the managed workspace."
                 )
             else
-                match rejectLinksInChain stateRoot with
-                | Error linkFailure -> Error linkFailure
-                | Ok() ->
-                    NodeFileSystem.mkdirSync stateRoot (NodeFileSystem.MkdirOptions(recursive = true))
+                NodeFileSystem.mkdirSync stateRoot (NodeFileSystem.MkdirOptions(recursive = true))
 
-                    match rejectLinksInChain stateRoot with
-                    | Error linkFailure -> Error linkFailure
-                    | Ok() ->
-                        let stateId = "state-" + NodeInterop.randomUuid().Replace("-", "").ToLowerInvariant()
-                        let manifest = {
-                            SchemaVersion = ManifestSchemaVersion
-                            StateId = stateId
-                            WorkspaceRoot = normalize workspaceRoot
-                            ProvisioningMode = provisioningMode
-                            IsReady = false
-                        }
-                        let state = resolvedState stateRoot stateId manifest
+                let stateId = "state-" + NodeInterop.randomUuid().Replace("-", "").ToLowerInvariant()
+                let manifest = {
+                    SchemaVersion = ManifestSchemaVersion
+                    StateId = stateId
+                    WorkspaceRoot = normalize workspaceRoot
+                    ProvisioningMode = provisioningMode
+                    IsReady = false
+                }
+                let state = resolvedState stateRoot stateId manifest
 
-                        match validateLocation options workspaceRoot state with
-                        | Error invalid -> Error invalid
-                        | Ok valid ->
-                            NodeFileSystem.mkdirSync valid.StateDirectory (NodeFileSystem.MkdirOptions(recursive = false))
+                match validateLocation options workspaceRoot state with
+                | Error invalid -> Error invalid
+                | Ok valid ->
+                    NodeFileSystem.mkdirSync valid.StateDirectory (NodeFileSystem.MkdirOptions(recursive = false))
 
-                            for child in [|
-                                valid.TransactionsDirectory
-                                valid.RecoveryDirectory
-                                valid.TemporaryDirectory
-                            |] do
-                                NodeFileSystem.mkdirSync child (NodeFileSystem.MkdirOptions(recursive = false))
+                    for child in [|
+                        valid.TransactionsDirectory
+                        valid.RecoveryDirectory
+                        valid.TemporaryDirectory
+                    |] do
+                        NodeFileSystem.mkdirSync child (NodeFileSystem.MkdirOptions(recursive = false))
 
-                            writeManifest (manifestPath valid.StateDirectory) manifest
+                    writeManifest (manifestPath valid.StateDirectory) manifest
 
-                            validateOwnedLayout valid |> Result.map (fun () -> valid)
+                    validateOwnedLayout valid |> Result.map (fun () -> valid)
     with error ->
         Error(
             OperationFailure.createRedacted
@@ -447,42 +423,48 @@ let resolve
     (workspaceRoot: string)
     (providerStateRef: string option)
     : Result<ResolvedState, OperationFailure> =
-    match providerStateRef with
-    | None ->
-        Error(
-            failure
-                "provider_state_ref_missing"
-                "The workspace binding does not contain a lakeFS provider state reference."
-        )
-    | Some stateId when not (stateIdPattern.IsMatch stateId) ->
-        Error(
-            failure
-                "provider_state_ref_invalid"
-                "The workspace binding contains an invalid lakeFS provider state reference."
-        )
-    | Some stateId ->
-        let directory = stateDirectory (normalize options.StateRoot) stateId
+    if String.IsNullOrWhiteSpace options.StateRoot then
+        Error(failure "provider_state_root_invalid" "The lakeFS provider state root is required.")
+    else
+        match providerStateRef with
+        | None ->
+            Error(
+                failure
+                    "provider_state_ref_missing"
+                    "The workspace binding does not contain a lakeFS provider state reference."
+            )
+        | Some stateId when not (stateIdPattern.IsMatch stateId) ->
+            Error(
+                failure
+                    "provider_state_ref_invalid"
+                    "The workspace binding contains an invalid lakeFS provider state reference."
+            )
+        | Some stateId ->
+            let stateRoot = normalize options.StateRoot
+            let directory = stateDirectory stateRoot stateId
 
-        match rejectLinksInChain directory with
-        | Error linkFailure -> Error linkFailure
-        | Ok() when not (NodeFileSystem.existsSync directory) ->
-            Error(failure "provider_state_missing" "The external lakeFS provider state directory is missing.")
-        | Ok() ->
-            match rejectLinksInChain (manifestPath directory) with
-            | Error linkFailure -> Error linkFailure
-            | Ok() ->
+            if not (NodeFileSystem.existsSync directory) then
+                Error(failure "provider_state_missing" "The external lakeFS provider state directory is missing.")
+            else
                 match loadManifest (manifestPath directory) with
                 | Error invalid -> Error invalid
                 | Ok manifest when manifest.StateId <> stateId ->
                     Error(failure "provider_state_corrupt" "The external lakeFS state manifest identity is invalid.")
-                | Ok manifest when not (String.Equals(normalize workspaceRoot, normalize manifest.WorkspaceRoot, pathComparison)) ->
+                | Ok manifest when
+                    not (
+                        String.Equals(
+                            physicalPath workspaceRoot,
+                            physicalPath manifest.WorkspaceRoot,
+                            pathComparison options.PathCaseSensitivity
+                        )
+                    ) ->
                     Error(
                         failure
                             "provider_state_mismatch"
                             "The external lakeFS state belongs to a different workspace."
                     )
                 | Ok manifest ->
-                    let state = resolvedState (normalize options.StateRoot) stateId manifest
+                    let state = resolvedState stateRoot stateId manifest
 
                     match validateLocation options workspaceRoot state with
                     | Error invalid -> Error invalid

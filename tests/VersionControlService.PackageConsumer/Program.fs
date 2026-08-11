@@ -15,6 +15,7 @@ let main _ =
 
     let lakeFsOptions: LakeFsProviderOptions.LakeFsProviderOptions = {
         StateRoot = ".version-control-service-package-consumer-state"
+        PathCaseSensitivity = CaseInsensitive
     }
 
     let lakeFsFactory =

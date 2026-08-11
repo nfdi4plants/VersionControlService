@@ -122,11 +122,43 @@ let lstatAsync (path: string) : JS.Promise<Stats> = jsNative
 
 let private fileSystemDynamic: obj = importAll "node:fs"
 let private fileSystemPromisesDynamic: obj = importAll "node:fs/promises"
+let private pathDynamic: obj = importAll "node:path"
 let private cryptoDynamic: obj = importAll "node:crypto"
 let private bufferDynamic: obj = importAll "node:buffer"
 
 [<Emit("$0 == null")>]
 let private isNullish (_value: obj) : bool = jsNative
+
+let realpathSync (path: string) : string =
+    let absolutePath: string = pathDynamic?resolve path |> unbox
+
+    let rec resolveExisting current suffix =
+        try
+            let resolved: string = fileSystemDynamic?realpathSync current |> unbox
+
+            suffix
+            |> List.fold
+                (fun current segment -> pathDynamic?join (current, segment) |> unbox<string>)
+                resolved
+        with error ->
+            let code =
+                try
+                    error?code |> unbox<string>
+                with _ ->
+                    ""
+
+            if code <> "ENOENT" then
+                raise error
+
+            let parent: string = pathDynamic?dirname current |> unbox
+
+            if parent = current then
+                raise error
+
+            let name: string = pathDynamic?basename current |> unbox
+            resolveExisting parent (name :: suffix)
+
+    resolveExisting absolutePath []
 
 let openReadOnlyNoFollowSync (path: string) : int * Stats =
     let noFollow: obj = fileSystemDynamic?constants?O_NOFOLLOW

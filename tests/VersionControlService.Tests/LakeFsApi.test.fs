@@ -453,7 +453,10 @@ Vitest.describe (
                     }
 
                     let factory =
-                        LakeFsProviderFactory.createFactory { StateRoot = stateRoot } strategy
+                        LakeFsProviderFactory.createFactory {
+                            StateRoot = stateRoot
+                            PathCaseSensitivity = CaseInsensitive
+                        } strategy
 
                     let location: RepositoryLocation = {
                         ProviderId = LakeFsProviderFactory.lakeFsProviderId

@@ -59,6 +59,7 @@ let private injectNextTransactionCleanupFailure () : (unit -> unit) = jsNative
 
 let lakeFsProviderOptions: LakeFsProviderOptions.LakeFsProviderOptions = {
     StateRoot = join [| osDynamic?tmpdir () |> unbox<string>; "vcs-lakefs-provider-state" |]
+    PathCaseSensitivity = CaseInsensitive
 }
 
 let stateDirectoryForBinding (binding: WorkspaceBinding) =
@@ -149,7 +150,10 @@ let private createMaterializationRecoveryScenario () = promise {
     let stateRoot = join [| root; "provider-state" |]
     do! ensureDirectoryAsync workspaceRoot
 
-    let options: LakeFsProviderOptions.LakeFsProviderOptions = { StateRoot = stateRoot }
+    let options: LakeFsProviderOptions.LakeFsProviderOptions = {
+        StateRoot = stateRoot
+        PathCaseSensitivity = CaseInsensitive
+    }
 
     let state =
         LakeFsStateStore.create options workspaceRoot
@@ -1142,7 +1146,10 @@ Vitest.describe (
                             SecretAccessKey = "unused"
                         }
 
-                    let options: LakeFsProviderOptions.LakeFsProviderOptions = { StateRoot = stateRoot }
+                    let options: LakeFsProviderOptions.LakeFsProviderOptions = {
+                        StateRoot = stateRoot
+                        PathCaseSensitivity = CaseInsensitive
+                    }
                     let factory = LakeFsWorkspaceSession.createFactory options credentials
                     let location: RepositoryLocation = {
                         ProviderId = ProviderId.tryCreate "lakefs" |> Result.defaultWith failwith
@@ -1283,7 +1290,10 @@ Vitest.describe (
                 let! root = createTempDirectoryAsync ()
                 let workspaceRoot = join [| root; "workspace" |]
                 let stateRoot = join [| root; "provider-state" |]
-                let options: LakeFsProviderOptions.LakeFsProviderOptions = { StateRoot = stateRoot }
+                let options: LakeFsProviderOptions.LakeFsProviderOptions = {
+                    StateRoot = stateRoot
+                    PathCaseSensitivity = CaseInsensitive
+                }
                 let restoreCleanupFailure = injectNextTransactionCleanupFailure ()
 
                 try
