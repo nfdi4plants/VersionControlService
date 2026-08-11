@@ -135,7 +135,7 @@ module FakeProvider =
     let createCore () : CoreVersionControl =
         let mutable version = 1
         let mutable revisionCounter = 0
-        let currentToken () = $"fake-v{version}"
+        let currentToken () = $"fake-token-{version}"
 
         let status () = {
             CurrentRef = None
@@ -417,7 +417,7 @@ let contractShapeTests =
             let! statusResult = session.Core.GetStatus context
             let status = expectSucceeded "core status" statusResult
 
-            Expect.equal status.WorkspaceVersion "fake-v1" "The core works without any optional service."
+            Expect.equal status.WorkspaceVersion "fake-token-1" "The core works without any optional service."
         }
 
         testCaseAsync "a synchronization provider needs no object-storage extension"
