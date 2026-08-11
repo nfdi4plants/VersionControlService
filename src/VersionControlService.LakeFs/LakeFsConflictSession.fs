@@ -13,6 +13,7 @@ type CandidateContent = {
 
 type ResolvedContent =
     | ExistingFile of sourcePath: string
+    | WorkspaceFile of path: RepositoryPath
     | SuppliedText of content: string
 
 type ItemState = {
@@ -159,7 +160,7 @@ let resolve (conflict: State) (path: RepositoryPath) (resolution: ConflictResolu
             | SupplyResolvedContent content when supportsResolvedContent -> Some(Some(SuppliedText content))
             | SupplyResolvedContent _ -> None
             | PickCandidate "workspace" ->
-                Some(item.WorkspaceContent |> Option.map (fun value -> ExistingFile value.SourcePath))
+                Some(item.WorkspaceContent |> Option.map (fun _ -> WorkspaceFile path))
             | PickCandidate "target" ->
                 Some(item.TargetContent |> Option.map (fun value -> ExistingFile value.SourcePath))
             | PickCandidate "base" ->

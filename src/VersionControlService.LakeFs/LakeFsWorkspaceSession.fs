@@ -145,6 +145,7 @@ let private walkLocalFiles (state: SessionState) : string list =
 type private LocalChange = {
     ChangePath: string
     State: LakeFsIndex.LocalObjectState
+    ContentHash: string option
 }
 
 /// Classifies every local file and indexed entry (content-hash authority).
@@ -167,6 +168,7 @@ let private classifyWorkspace (state: SessionState) : LocalChange list =
             {
                 ChangePath = path
                 State = LakeFsIndex.classifyLocalObject entry localHash
+                ContentHash = localHash
             })
 
     let deletions =
@@ -176,6 +178,7 @@ let private classifyWorkspace (state: SessionState) : LocalChange list =
         |> List.map (fun entry -> {
             ChangePath = entry.Path
             State = LakeFsIndex.DeletedObject
+            ContentHash = None
         })
 
     (localChanges @ deletions)
@@ -184,7 +187,9 @@ let private classifyWorkspace (state: SessionState) : LocalChange list =
 let private workspaceVersion (state: SessionState) =
     let changesIdentity =
         classifyWorkspace state
-        |> List.map (fun change -> $"{change.ChangePath}:{change.State}")
+        |> List.map (fun change ->
+            let contentHash = change.ContentHash |> Option.defaultValue "none"
+            $"{change.ChangePath}:{change.State}:{contentHash}")
         |> String.concat ";"
 
     let conflictPart =
@@ -2484,26 +2489,79 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                 if resolutionFailure.IsNone then
                                                     match item.ResolvedContent with
                                                     | Some(Some content) ->
-                                                        let sourcePath =
+                                                        let sourceAndValidation =
                                                             match content with
-                                                            | LakeFsConflictSession.ExistingFile path -> path
+                                                            | LakeFsConflictSession.WorkspaceFile path ->
+                                                                match
+                                                                    LakeFsPathSafety.resolveWorkspacePath
+                                                                        state.Binding.WorkspaceRoot
+                                                                        path
+                                                                with
+                                                                | Error failure -> Error failure
+                                                                | Ok _ ->
+                                                                    match
+                                                                        LakeFsPathSafety.inspectFile
+                                                                            state.Binding.WorkspaceRoot
+                                                                            path
+                                                                    with
+                                                                    | Error failure -> Error failure
+                                                                    | Ok None ->
+                                                                        Error {
+                                                                            OperationFailure.create
+                                                                                NotFound
+                                                                                "workspace_file_missing"
+                                                                                "The selected workspace conflict candidate is no longer present." with
+                                                                                AffectedPaths = [| RepositoryPath.value path |]
+                                                                        }
+                                                                    | Ok(Some inspected) ->
+                                                                        Ok(
+                                                                            inspected.AbsolutePath,
+                                                                            LakeFsPathSafety.validateOpenedFile
+                                                                                state.Binding.WorkspaceRoot
+                                                                                path
+                                                                                inspected.Identity
+                                                                        )
+                                                            | LakeFsConflictSession.ExistingFile path ->
+                                                                Ok(path, fun stats ->
+                                                                    if stats.isSymbolicLink() || not (stats.isFile()) then
+                                                                        Error(
+                                                                            OperationFailure.create
+                                                                                Validation
+                                                                                "symlink_not_supported"
+                                                                                "The conflict candidate is not a regular file."
+                                                                        )
+                                                                    else
+                                                                        Ok())
                                                             | LakeFsConflictSession.SuppliedText text ->
                                                                 let path = temporaryPath state "conflict-resolution"
                                                                 NodeFileSystem.writeUtf8FileExclusiveAndFlushSync path text
-                                                                path
+                                                                Ok(path, fun stats ->
+                                                                    if stats.isSymbolicLink() || not (stats.isFile()) then
+                                                                        Error(
+                                                                            OperationFailure.create
+                                                                                Validation
+                                                                                "symlink_not_supported"
+                                                                                "The conflict candidate is not a regular file."
+                                                                        )
+                                                                    else
+                                                                        Ok())
 
-                                                        let! upload =
-                                                            LakeFsApi.uploadObjectFromFile
-                                                                resolved
-                                                                state.Index.Repository
-                                                                state.Index.WorkspaceBranch
-                                                                (objectKey state item.ItemPath)
-                                                                sourcePath
-                                                                context
-
-                                                        match upload with
+                                                        match sourceAndValidation with
                                                         | Error failure -> resolutionFailure <- Some failure
-                                                        | Ok _ -> ()
+                                                        | Ok(sourcePath, validateSource) ->
+                                                            let! upload =
+                                                                LakeFsApi.uploadObjectFromFileChecked
+                                                                    resolved
+                                                                    state.Index.Repository
+                                                                    state.Index.WorkspaceBranch
+                                                                    (objectKey state item.ItemPath)
+                                                                    sourcePath
+                                                                    validateSource
+                                                                    context
+
+                                                            match upload with
+                                                            | Error failure -> resolutionFailure <- Some failure
+                                                            | Ok _ -> ()
                                                     | Some None ->
                                                         let! deletion =
                                                             LakeFsApi.deleteObject

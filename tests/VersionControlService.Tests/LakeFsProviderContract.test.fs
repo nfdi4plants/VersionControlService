@@ -30,6 +30,21 @@ let private getEnvironmentVariable (_name: string) : string = jsNative
 let private fsPromisesDynamic: obj = importAll "fs/promises"
 let private osDynamic: obj = importAll "os"
 
+[<Emit("""(() => {
+    const original = globalThis.fetch;
+    let uploads = 0;
+    globalThis.fetch = (url, options) => {
+        const method = String(options?.method ?? 'GET').toUpperCase();
+        if (method === 'POST' && String(url).includes('/objects?path=')) uploads++;
+        return original(url, options);
+    };
+    return {
+        count: () => uploads,
+        restore: () => { globalThis.fetch = original; }
+    };
+})()""")>]
+let private beginUploadRequestTracking () : obj = jsNative
+
 [<Emit("(() => { const fs = require('node:fs'); const moduleApi = require('node:module'); const original = fs.renameSync; let pending = true; fs.renameSync = (...args) => { if (pending) { pending = false; const error = new Error('injected cross-volume rename'); error.code = 'EXDEV'; throw error; } return original(...args); }; moduleApi.syncBuiltinESMExports(); return () => { fs.renameSync = original; moduleApi.syncBuiltinESMExports(); }; })()")>]
 let private injectNextCrossVolumeRename () : (unit -> unit) = jsNative
 
@@ -183,6 +198,11 @@ type private WorkspaceControl = {
     mutable SlowTransfer: bool
 }
 
+let private finalizePathMutations = Collections.Generic.Dictionary<string, unit -> JS.Promise<unit>>()
+
+let private armFinalizePathMutation workspaceRoot mutation =
+    finalizePathMutations[workspaceRoot] <- mutation
+
 let createLakeFsHarness () : ProviderTestHarness =
     let tempRoots = ResizeArray<string>()
     let repositories = ResizeArray<string>()
@@ -311,6 +331,13 @@ let createLakeFsHarness () : ProviderTestHarness =
                             | LakeFsWorkspaceIndex.Corrupt _ ->
                                 failwith "Expected a persisted workspace index for the destination race."
                         | None -> ()
+
+                    if point = "finalize-precheck-done" then
+                        match finalizePathMutations.TryGetValue root with
+                        | true, mutation ->
+                            finalizePathMutations.Remove root |> ignore
+                            do! Async.AwaitPromise(mutation ())
+                        | false, _ -> ()
 
                     if point = "selected-revision-commit-done" then
                         match control.RaceMutations with
@@ -553,6 +580,7 @@ let createLakeFsHarness () : ProviderTestHarness =
                 tempRoots.Clear()
                 controls.Clear()
                 stateDirectories.Clear()
+                finalizePathMutations.Clear()
                 return ()
             }
     }
@@ -589,6 +617,72 @@ let private expectOperationValue operation = function
 
 let private repositoryPath value =
     RepositoryPath.tryCreate value |> Result.defaultWith failwith
+
+let private createSingleFileConflict harness = promise {
+    let! workspace = harness.CreateWorkspace()
+
+    do!
+        harness.AdvanceTarget workspace [|
+            { Path = "base.txt"; Content = Some "target base\n" }
+        |]
+
+    do! workspace.WriteFile "base.txt" "workspace base\n"
+
+    let! saveStatusResult =
+        workspace.Session.Core.GetStatus(context "conflict-staleness-save-status")
+        |> Async.StartAsPromise
+
+    let saveStatus = expectOperationValue "conflict staleness save status" saveStatusResult
+    let! saveResult =
+        workspace.Session.Core.CreateRevision
+            {
+                Message = "create conflict staleness workspace revision"
+                Paths = [| repositoryPath "base.txt" |]
+                ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+            }
+            (context "conflict-staleness-save")
+        |> Async.StartAsPromise
+
+    expectOperationValue "conflict staleness workspace revision" saveResult |> ignore
+
+    let! updateStatusResult =
+        workspace.Session.Core.GetStatus(context "conflict-staleness-update-status")
+        |> Async.StartAsPromise
+
+    let updateStatus = expectOperationValue "conflict staleness update status" updateStatusResult
+    let synchronization =
+        workspace.Session.Synchronization
+        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization services.")
+
+    let! updateResult =
+        synchronization.Update
+            { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
+            (context "conflict-staleness-update")
+        |> Async.StartAsPromise
+
+    let updateFailure =
+        match updateResult with
+        | Succeeded _ -> failwith "The conflict staleness update unexpectedly succeeded."
+        | PartiallySucceeded(_, failure)
+        | Failed failure -> failure
+
+    Vitest.expect(updateFailure.Category).toEqual FailureCategory.Conflict
+    Vitest.expect(updateFailure.Code).toBe "conflicts_detected"
+
+    let conflicts =
+        workspace.Session.ConflictResolution
+        |> Option.defaultWith (fun () -> failwith "Expected lakeFS conflict-resolution services.")
+
+    let! sessionResult =
+        conflicts.GetActiveSession(context "conflict-staleness-session")
+        |> Async.StartAsPromise
+
+    let summary =
+        expectOperationValue "conflict staleness session" sessionResult
+        |> Option.defaultWith (fun () -> failwith "Expected an active conflict session.")
+
+    return workspace, conflicts, summary
+}
 
 Vitest.describe (
     "lakeFS provisioning profile external state",
@@ -1926,6 +2020,174 @@ Vitest.describe (
                     do! harness.Cleanup()
                 with error ->
                     do! harness.Cleanup()
+                    return raise error
+            }
+        )
+)
+
+Vitest.describe (
+    "lakeFS conflict staleness",
+    fun () ->
+        Vitest.test (
+            "lakeFS conflict staleness rotates the workspace token for same-path content changes",
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
+            fun () -> promise {
+                if not (integrationEnabled ()) then
+                    return failwith "lakeFS integration skipped: Docker not available"
+
+                let harness = createLakeFsHarness ()
+
+                try
+                    let! (workspace, conflicts, summary) = createSingleFileConflict harness
+                    let item = summary.Items[0]
+                    do! workspace.WriteFile "base.txt" "workspace base changed first\n"
+
+                    let! firstStatusResult =
+                        workspace.Session.Core.GetStatus(context "conflict-staleness-first-status")
+                        |> Async.StartAsPromise
+
+                    let firstStatus = expectOperationValue "conflict staleness first status" firstStatusResult
+                    let tracker = beginUploadRequestTracking ()
+
+                    try
+                        do! workspace.WriteFile "base.txt" "workspace base changed out of band\n"
+
+                        let! secondStatusResult =
+                            workspace.Session.Core.GetStatus(context "conflict-staleness-second-status")
+                            |> Async.StartAsPromise
+
+                        let secondStatus = expectOperationValue "conflict staleness second status" secondStatusResult
+                        Vitest.expect(secondStatus.WorkspaceVersion).not.toBe firstStatus.WorkspaceVersion
+
+                        let! resolutionResult =
+                            conflicts.Resolve
+                                {
+                                    Handle = summary.Handle
+                                    ExpectedWorkspaceVersion = firstStatus.WorkspaceVersion
+                                    Path = item.Path
+                                    Resolution = PickCandidate "workspace"
+                                }
+                                (context "conflict-staleness-stale-resolution")
+                            |> Async.StartAsPromise
+
+                        let resolutionFailure =
+                            match resolutionResult with
+                            | Succeeded _
+                            | PartiallySucceeded _ ->
+                                failwith "A stale content-sensitive conflict resolution unexpectedly succeeded."
+                            | Failed failure -> failure
+
+                        Vitest.expect(resolutionFailure.Category).toEqual FailureCategory.Concurrency
+                        Vitest.expect(resolutionFailure.Code).toBe "precondition_failed"
+                        Vitest.expect(resolutionFailure.RecoveryAction |> Option.map _.Code).toEqual (Some ConflictRecovery.RefreshConflictSession)
+                        Vitest.expect(tracker?count () |> unbox<int>).toBe 0
+                    finally
+                        tracker?restore () |> ignore
+
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "lakeFS conflict staleness rejects an outside symlink during finalize before upload",
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
+            fun () -> promise {
+                if not (integrationEnabled ()) then
+                    return failwith "lakeFS integration skipped: Docker not available"
+
+                let harness = createLakeFsHarness ()
+                let mutable candidatePath = ""
+                let mutable outsideDirectory = ""
+
+                try
+                    let! (workspace, conflicts, summary) = createSingleFileConflict harness
+                    let item = summary.Items[0]
+
+                    let! resolutionStatusResult =
+                        workspace.Session.Core.GetStatus(context "conflict-staleness-resolution-status")
+                        |> Async.StartAsPromise
+
+                    let resolutionStatus = expectOperationValue "conflict staleness resolution status" resolutionStatusResult
+                    let! resolutionResult =
+                        conflicts.Resolve
+                            {
+                                Handle = summary.Handle
+                                ExpectedWorkspaceVersion = resolutionStatus.WorkspaceVersion
+                                Path = item.Path
+                                Resolution = PickCandidate "workspace"
+                            }
+                            (context "conflict-staleness-workspace-resolution")
+                        |> Async.StartAsPromise
+
+                    let resolution = expectOperationValue "conflict staleness workspace resolution" resolutionResult
+
+                    let! finalizeStatusResult =
+                        workspace.Session.Core.GetStatus(context "conflict-staleness-finalize-status")
+                        |> Async.StartAsPromise
+
+                    let finalizeStatus = expectOperationValue "conflict staleness finalize status" finalizeStatusResult
+                    candidatePath <- join [| workspace.Binding.WorkspaceRoot; "base.txt" |]
+                    outsideDirectory <- workspace.Binding.WorkspaceRoot + "-outside"
+                    let outsideFile = join [| outsideDirectory; "base.txt" |]
+                    let tracker = beginUploadRequestTracking ()
+
+                    try
+                        armFinalizePathMutation
+                            workspace.Binding.WorkspaceRoot
+                            (fun () -> promise {
+                                RuntimeNodeFileSystem.mkdirSync outsideDirectory (RuntimeNodeFileSystem.MkdirOptions(recursive = true))
+                                RuntimeNodeFileSystem.writeFileSync
+                                    outsideFile
+                                    "outside conflict content\n"
+                                    RuntimeNodeFileSystem.TextEncoding.Utf8
+                                let! _ =
+                                    fsPromisesDynamic?rm
+                                        (candidatePath, createObj [ "force" ==> true ])
+                                    |> unbox<JS.Promise<obj>>
+                                let! _ =
+                                    fsPromisesDynamic?symlink
+                                        (outsideDirectory, candidatePath, "junction")
+                                    |> unbox<JS.Promise<obj>>
+                                return ()
+                            })
+
+                        let! finalizeResult =
+                            conflicts.Finalize
+                                {
+                                    Handle = resolution.RefreshedHandle
+                                    ExpectedWorkspaceVersion = finalizeStatus.WorkspaceVersion
+                                    Message = Some "finalize symlink conflict"
+                                }
+                                (context "conflict-staleness-symlink-finalize")
+                            |> Async.StartAsPromise
+
+                        let finalizeFailure =
+                            match finalizeResult with
+                            | Succeeded _
+                            | PartiallySucceeded _ -> failwith "Symlinked conflict finalization unexpectedly succeeded."
+                            | Failed failure -> failure
+
+                        Vitest.expect(finalizeFailure.Code).toBe "symlink_not_supported"
+                        Vitest.expect(finalizeFailure.AffectedPaths).toContain "base.txt"
+                        Vitest.expect(tracker?count () |> unbox<int>).toBe 0
+                    finally
+                        tracker?restore () |> ignore
+
+                    if RuntimeNodeFileSystem.existsSync candidatePath then
+                        RuntimeNodeFileSystem.unlinkSync candidatePath
+
+                    do! harness.Cleanup()
+                    do! removeDirectoryAsync outsideDirectory
+                with error ->
+                    if candidatePath <> "" && RuntimeNodeFileSystem.existsSync candidatePath then
+                        RuntimeNodeFileSystem.unlinkSync candidatePath
+
+                    do! harness.Cleanup()
+                    if outsideDirectory <> "" then
+                        do! removeDirectoryAsync outsideDirectory
                     return raise error
             }
         )
