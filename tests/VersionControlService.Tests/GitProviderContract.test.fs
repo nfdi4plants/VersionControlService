@@ -797,10 +797,318 @@ Vitest.describe (
                     |> Async.StartAsPromise
 
                 let failure = expectProviderFailure "option-like remote rejection" result
-                Vitest.expect(failure.Code).toBe "location_unreachable"
+                Vitest.expect(failure.Category).toEqual (Validation)
+                Vitest.expect(failure.Code).toBe "location_not_allowed"
                 Vitest.expect(failure.StateChanged).toBe false
-                Vitest.expect(observedArguments |> Array.contains providerLocation).toBe true
-                Vitest.expect(observedArguments |> Array.contains "protocol.file.allow=always").toBe false
+                Vitest.expect(observedArguments.Length).toBe 0
+            }
+        )
+
+        Vitest.test (
+            "provider locations are validated before VerifyLocation, Clone, and Bind run Git",
+            fun () -> promise {
+                for providerLocation in [|
+                    "--upload-pack=doesnotexist"
+                    "ext::sh -c whatever"
+                    "file:///some/path"
+                |] do
+                    let observed = ResizeArray<NodeProcess.ProcessRequest>()
+
+                    let hooks = {
+                        GitWorkspaceSession.GitSessionHooks.none with
+                            RunProcess =
+                                Some(fun request _ ->
+                                    async {
+                                        observed.Add request
+                                        return OperationResult.succeeded (processOutput 0 "" "")
+                                    })
+                    }
+
+                    let factory = GitWorkspaceSession.createFactory hooks
+                    let location = {
+                        ProviderId = gitProviderId
+                        DisplayName = None
+                        ProviderLocation = providerLocation
+                        ConnectionProfileId = None
+                    }
+
+                    let! verifyResult =
+                        Async.StartAsPromise(
+                            factory.VerifyLocation
+                                {
+                                    Location = location
+                                    Intents = [| ReadIntent |]
+                                }
+                                (OperationContext.detached "validate-provider-location")
+                        )
+
+                    let verifyFailure = expectProviderFailure "validated VerifyLocation" verifyResult
+
+                    let! cloneResult =
+                        Async.StartAsPromise(
+                            factory.Clone
+                                {
+                                    Location = location
+                                    TargetPath = "C:/provider-location-clone-target"
+                                    TargetRef = None
+                                    MaterializeAllObjects = false
+                                }
+                                (OperationContext.detached "validate-provider-location-clone")
+                        )
+
+                    let cloneFailure = expectProviderFailure "validated Clone" cloneResult
+
+                    let! bindResult =
+                        Async.StartAsPromise(
+                            factory.Bind
+                                {
+                                    WorkspaceRoot = "C:/provider-location-bind-workspace"
+                                    Location = location
+                                }
+                                (OperationContext.detached "validate-provider-location-bind")
+                        )
+
+                    let bindFailure = expectProviderFailure "validated Bind" bindResult
+
+                    for failure in [| verifyFailure; cloneFailure; bindFailure |] do
+                        Vitest.expect(failure.Category).toEqual (Validation)
+                        Vitest.expect(failure.Code).toBe ("location_not_allowed")
+
+                    Vitest.expect(observed.Count).toBe 0
+            }
+        )
+
+        Vitest.test (
+            "provider locations are validated with exact remote-name matching during Bind",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root = createTempDirectoryAsync ()
+
+                try
+                    let originalPath = join [| root; "myorigin.git" |]
+                    let boundPath = join [| root; "bound.git" |]
+                    let workspacePath = join [| root; "workspace" |]
+
+                    let! _ = runGitIn root [||] [| "init"; "--bare"; "-b"; "main"; originalPath |] None
+                    let! _ = runGitIn root [||] [| "init"; "--bare"; "-b"; "main"; boundPath |] None
+                    let! _ = runGitIn root [||] [| "init"; "-b"; "main"; workspacePath |] None
+                    let! _ = runGitIn workspacePath [||] [| "remote"; "add"; "myorigin"; originalPath |] None
+                    let! originalLocation =
+                        runGitIn workspacePath [||] [| "remote"; "get-url"; "myorigin" |] None
+
+                    let location = {
+                        ProviderId = gitProviderId
+                        DisplayName = None
+                        ProviderLocation = boundPath
+                        ConnectionProfileId = None
+                    }
+
+                    let factory = GitWorkspaceSession.createFactory GitWorkspaceSession.GitSessionHooks.none
+
+                    let! bindResult =
+                        Async.StartAsPromise(
+                            factory.Bind
+                                {
+                                    WorkspaceRoot = workspacePath
+                                    Location = location
+                                }
+                                (OperationContext.detached "bind-exact-remote-name")
+                        )
+
+                    expectProviderValue "bind with myorigin" bindResult |> ignore
+
+                    let! originLocation =
+                        runGitIn workspacePath [||] [| "remote"; "get-url"; "origin" |] None
+
+                    let! unchangedLocation =
+                        runGitIn workspacePath [||] [| "remote"; "get-url"; "myorigin" |] None
+
+                    Vitest.expect(originLocation.Trim()).toBe (boundPath.Trim())
+                    Vitest.expect(unchangedLocation.Trim()).toBe (originalLocation.Trim())
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "provider locations are validated when Initialize configures and omits remotes",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root = createTempDirectoryAsync ()
+
+                try
+                    let initializedPath = join [| root; "initialized" |]
+                    let localOnlyPath = join [| root; "local-only" |]
+                    let localLocationPath = join [| root; "local-location" |]
+                    let remoteLocation = {
+                        ProviderId = gitProviderId
+                        DisplayName = None
+                        ProviderLocation = "https://example.invalid/repository.git"
+                        ConnectionProfileId = None
+                    }
+
+                    let factory = GitWorkspaceSession.createFactory GitWorkspaceSession.GitSessionHooks.none
+
+                    let! initializedResult =
+                        Async.StartAsPromise(
+                            factory.Initialize
+                                {
+                                    TargetPath = initializedPath
+                                    Location = Some remoteLocation
+                                }
+                                (OperationContext.detached "initialize-with-location")
+                        )
+
+                    let initializedBinding = expectProviderValue "initialize with remote location" initializedResult
+                    let! configuredRemotes = runGitIn initializedPath [||] [| "remote" |] None
+                    let! configuredOrigin =
+                        runGitIn initializedPath [||] [| "config"; "--get"; "remote.origin.url" |] None
+
+                    Vitest.expect(initializedBinding.Location).toEqual (remoteLocation)
+                    Vitest.expect(configuredRemotes.Trim()).toBe ("origin")
+                    Vitest.expect(configuredOrigin.Trim()).toBe (remoteLocation.ProviderLocation)
+
+                    let! localOnlyResult =
+                        Async.StartAsPromise(
+                            factory.Initialize
+                                {
+                                    TargetPath = localOnlyPath
+                                    Location = None
+                                }
+                                (OperationContext.detached "initialize-without-location")
+                        )
+
+                    let localOnlyBinding = expectProviderValue "initialize without remote location" localOnlyResult
+                    let! configuredRemotes =
+                        runGitIn localOnlyPath [||] [| "remote" |] None
+
+                    Vitest.expect(configuredRemotes.Trim()).toBe ""
+
+                    let! openedResult =
+                        Async.StartAsPromise(
+                            factory.Open localOnlyBinding (OperationContext.detached "open-local-only-initialize")
+                        )
+
+                    let session = expectProviderValue "open local-only initialized workspace" openedResult
+                    let! statusResult =
+                        Async.StartAsPromise(session.Core.GetStatus(OperationContext.detached "local-only-status"))
+
+                    let status = expectProviderValue "local-only initialized status" statusResult
+                    let synchronization =
+                        status.Synchronization
+                        |> Option.defaultWith (fun () -> failwith "Expected local-only synchronization state.")
+
+                    Vitest.expect(synchronization.Relationship).toEqual (NoTarget)
+
+                    let localLocation = {
+                        ProviderId = gitProviderId
+                        DisplayName = None
+                        ProviderLocation = localLocationPath
+                        ConnectionProfileId = None
+                    }
+
+                    let! localLocationResult =
+                        Async.StartAsPromise(
+                            factory.Initialize
+                                {
+                                    TargetPath = localLocationPath
+                                    Location = Some localLocation
+                                }
+                                (OperationContext.detached "initialize-with-local-location")
+                        )
+
+                    let localLocationBinding =
+                        expectProviderValue "initialize with local self location" localLocationResult
+
+                    let! localLocationRemotes = runGitIn localLocationPath [||] [| "remote" |] None
+                    Vitest.expect(localLocationRemotes.Trim()).toBe ""
+
+                    let! localLocationOpenResult =
+                        Async.StartAsPromise(
+                            factory.Open
+                                localLocationBinding
+                                (OperationContext.detached "open-local-location-initialize")
+                        )
+
+                    let localLocationSession =
+                        expectProviderValue "open local self initialized workspace" localLocationOpenResult
+
+                    let! localLocationStatusResult =
+                        Async.StartAsPromise(
+                            localLocationSession.Core.GetStatus(
+                                OperationContext.detached "local-location-initialize-status"
+                            )
+                        )
+
+                    let localLocationStatus =
+                        expectProviderValue "local self initialized status" localLocationStatusResult
+
+                    let localLocationSynchronization =
+                        localLocationStatus.Synchronization
+                        |> Option.defaultWith (fun () -> failwith "Expected local-location synchronization state.")
+
+                    Vitest.expect(localLocationSynchronization.Relationship).toEqual (NoTarget)
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "provider locations are validated when Initialize reports repository creation after remote failure",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root = createTempDirectoryAsync ()
+
+                try
+                    let targetPath = join [| root; "remote-add-failure" |]
+                    let hooks = {
+                        GitWorkspaceSession.GitSessionHooks.none with
+                            RunProcess =
+                                Some(fun request processContext ->
+                                    if request.Arguments |> Array.contains "remote" then
+                                        async {
+                                            return
+                                                OperationResult.succeeded(
+                                                    processOutput 128 "" "fatal: injected remote add failure"
+                                                )
+                                        }
+                                    else
+                                        NodeProcess.run request processContext)
+                    }
+
+                    let factory = GitWorkspaceSession.createFactory hooks
+
+                    let! result =
+                        Async.StartAsPromise(
+                            factory.Initialize
+                                {
+                                    TargetPath = targetPath
+                                    Location =
+                                        Some {
+                                            ProviderId = gitProviderId
+                                            DisplayName = None
+                                            ProviderLocation = "https://example.invalid/repository.git"
+                                            ConnectionProfileId = None
+                                        }
+                                }
+                                (OperationContext.detached "initialize-remote-add-failure")
+                        )
+
+                    let failure = expectProviderFailure "initialize remote add failure" result
+                    Vitest.expect(failure.StateChanged).toBe true
+                    let! gitDirectory = runGitIn targetPath [||] [| "rev-parse"; "--git-dir" |] None
+                    Vitest.expect(gitDirectory.Trim()).toBe ".git"
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
             }
         )
 
@@ -2218,6 +2526,126 @@ Vitest.describe (
 
                 Vitest.expect(unexpectedOutputFailure.Category).toEqual (ProviderError)
                 Vitest.expect(unexpectedOutputFailure.Code).toBe ("origin_lookup_failed")
+            }
+        )
+
+        Vitest.test (
+            "provider locations are validated before corrupt adoption guesses a binding",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root = createTempDirectoryAsync ()
+
+                try
+                    let workspacePath = join [| root; "corrupt-repository" |]
+                    let gitPath = join [| workspacePath; ".git" |]
+                    do! ensureDirectoryAsync gitPath
+                    do! writeBinaryFileAsync (join [| gitPath; "HEAD" |]) [| 0; 255; 1; 254 |]
+                    do! writeBinaryFileAsync (join [| gitPath; "objects" |]) [| 9; 8; 7; 6 |]
+                    let mutable revParseDetail = ""
+
+                    let hooks = {
+                        GitWorkspaceSession.GitSessionHooks.none with
+                            RunProcess =
+                                Some(fun request processContext ->
+                                    async {
+                                        let! result =
+                                            NodeProcess.run
+                                                {
+                                                    request with
+                                                        Environment =
+                                                            Array.append
+                                                                request.Environment
+                                                                [| "GIT_CEILING_DIRECTORIES", root |]
+                                                }
+                                                processContext
+
+                                        match request.Arguments, result with
+                                        | [| "rev-parse"; "--show-toplevel" |], Succeeded outcome ->
+                                            revParseDetail <- outcome.Value.StdErr + outcome.Value.StdOut
+                                        | _ -> ()
+
+                                        return result
+                                    })
+                    }
+
+                    let factory = GitWorkspaceSession.createFactory hooks
+
+                    let! adoptionResult =
+                        Async.StartAsPromise(
+                            factory.Adopt
+                                {
+                                    WorkspaceRoot = workspacePath
+                                    ConnectionProfileId = None
+                                }
+                                (OperationContext.detached "adopt-corrupt-repository")
+                        )
+
+                    let failure = expectProviderFailure "adopt corrupt repository" adoptionResult
+                    Vitest.expect(failure.Category).toEqual (Unsupported)
+                    Vitest.expect(failure.Code).toBe ("adoption_unsupported")
+                    Vitest.expect(failure.Message.Contains("without guessing")).toBe true
+                    Vitest.expect(String.IsNullOrWhiteSpace revParseDetail).toBe false
+                    Vitest.expect(failure.Message.Contains(revParseDetail.Trim())).toBe true
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "provider locations are validated without hiding dubious-ownership adoption remediation",
+            fun () -> promise {
+                let! root = createTempDirectoryAsync ()
+
+                try
+                    let workspacePath = join [| root; "dubious-repository" |]
+                    do! ensureDirectoryAsync (join [| workspacePath; ".git" |])
+                    let detail =
+                        "fatal: detected dubious ownership in repository at 'dubious-repository'\nTo add an exception, call git config --global --add safe.directory dubious-repository"
+
+                    let hooks = {
+                        GitWorkspaceSession.GitSessionHooks.none with
+                            RunProcess =
+                                Some(fun request _ ->
+                                    async {
+                                        match request.Arguments with
+                                        | [| "rev-parse"; "--show-toplevel" |] ->
+                                            return OperationResult.succeeded (processOutput 128 "" detail)
+                                        | _ ->
+                                            return
+                                                OperationResult.failed(
+                                                    OperationFailure.create
+                                                        ProviderError
+                                                        "unexpected_command"
+                                                        "Unexpected Git command."
+                                                )
+                                    })
+                    }
+
+                    let factory = GitWorkspaceSession.createFactory hooks
+
+                    let! result =
+                        Async.StartAsPromise(
+                            factory.Adopt
+                                {
+                                    WorkspaceRoot = workspacePath
+                                    ConnectionProfileId = None
+                                }
+                                (OperationContext.detached "adopt-dubious-repository")
+                        )
+
+                    let failure = expectProviderFailure "adopt dubious repository" result
+                    Vitest.expect(failure.Category).toEqual (ProviderError)
+                    Vitest.expect(failure.Code).toBe ("git_failure")
+                    Vitest.expect(failure.Message.Contains("dubious ownership")).toBe true
+                    Vitest.expect(failure.Message.Contains("safe.directory")).toBe true
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
             }
         )
 )

@@ -45,6 +45,7 @@ let private protocolOverridePattern =
     Regex("protocol\\.[^\\s=]+\\.(allow|deny)|(^|\\s)-c\\s+protocol\\.", RegexOptions.IgnoreCase)
 
 let private remoteNamePattern = Regex("^[A-Za-z0-9._/-]+$")
+let private scpRemotePattern = Regex(@"^[^\s@/:]+@[^\s/:]+:.+$")
 let private invalidBranchCharactersPattern = Regex(@"[~^:?*\[\\\s]")
 [<Literal>]
 let AutoTrackThresholdKey = "versioncontrolservice.lfs.autotrackthresholdmb"
@@ -395,11 +396,18 @@ let validateRemoteName (remoteName: string) =
 /// Enforces the service remote URL policy before clone/add-remote/auth lookup.
 let ensureAllowedRemoteUrl (remoteUrl: string) =
     let normalized = remoteUrl.Trim()
+    let isWindowsDrivePath =
+        normalized.Length >= 3
+        && Char.IsLetter normalized[0]
+        && normalized[1] = ':'
+        && (normalized[2] = '/' || normalized[2] = '\\')
 
     if String.IsNullOrWhiteSpace normalized then
         Error(exn "Remote URL is empty.")
     elif protocolOverridePattern.IsMatch normalized then
         Error(exn "Remote URL contains a protocol override attempt.")
+    elif normalized.StartsWith("-", StringComparison.Ordinal) then
+        Error(exn "Remote URL starts with an unsupported option.")
     elif
         disallowedRemotePrefixes
         |> Array.exists (fun prefix -> normalized.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
@@ -409,8 +417,24 @@ let ensureAllowedRemoteUrl (remoteUrl: string) =
         Ok normalized
     elif normalized.StartsWith("ssh://", StringComparison.OrdinalIgnoreCase) then
         Ok normalized
+    elif scpRemotePattern.IsMatch normalized then
+        Ok normalized
+    elif isWindowsDrivePath then
+        Ok normalized
+    elif normalized.Contains ':' then
+        Error(exn "Remote URL contains an unsupported transport.")
     else
-        Error(exn "Only https:// and ssh:// remotes are allowed.")
+        Ok normalized
+
+let private isLocalPathRemote (remoteUrl: string) =
+    let normalized = remoteUrl.Trim()
+    let isWindowsDrivePath =
+        normalized.Length >= 3
+        && Char.IsLetter normalized[0]
+        && normalized[1] = ':'
+        && (normalized[2] = '/' || normalized[2] = '\\')
+
+    isAbsolute normalized || isWindowsDrivePath || not (normalized.Contains ':')
 
 let private trimTrailingGitSuffix (path: string) =
     if path.EndsWith(".git", StringComparison.OrdinalIgnoreCase) && path.Length > 4 then
@@ -1264,6 +1288,8 @@ let private createOriginLfsRemoteSession
         | Error failure -> return Error failure
         | Ok remoteUrl ->
             match ensureAllowedRemoteUrl remoteUrl with
+            | Ok _ when isLocalPathRemote remoteUrl ->
+                return Ok(createLocalGitSession arcPath progressCallback)
             | Ok _ ->
                 let! sessionResult = createAuthenticatedGitSession arcPath remoteName progressCallback
                 return sessionResult

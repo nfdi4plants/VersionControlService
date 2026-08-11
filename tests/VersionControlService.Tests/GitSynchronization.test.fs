@@ -8,6 +8,7 @@ open VersionControlService.Tests.NodePath
 open Vitest
 
 module GitWorkspaceSession = VersionControlService.Git.GitWorkspaceSession
+module GitCredentialStrategy = VersionControlService.Git.GitCredentialStrategy
 module NodeProcess = VersionControlService.Runtime.Node.Process
 
 let private fsPromisesDynamic: obj = importAll "fs/promises"
@@ -110,8 +111,22 @@ let private expectValue (operationName: string) (result: OperationResult<'T>) : 
         failwith $"{operationName} unexpectedly returned partial success ({failure.Code})."
     | Failed failure -> failwith $"{operationName} failed ({failure.Category}/{failure.Code}): {failure.Message}"
 
+let private expectProviderFailure (operationName: string) (result: OperationResult<'T>) : OperationFailure =
+    match result with
+    | Failed failure -> failure
+    | Succeeded _
+    | PartiallySucceeded _ -> failwith $"Expected {operationName} to fail."
+
 let private expectSucceeded operationName result =
     expectValue operationName result
+
+let private toFileRemoteUrl (path: string) =
+    let normalized = path.Replace("\\", "/")
+
+    if normalized.StartsWith("/", StringComparison.Ordinal) then
+        $"file://{normalized}"
+    else
+        $"file:///{normalized}"
 
 let private isConflictedChange (change: FileChange) =
     change.Kind = ConflictedChange
@@ -420,6 +435,374 @@ Vitest.describe (
                     Vitest
                         .expect(failure.RecoveryAction |> Option.map _.Code)
                         .toEqual (Some "refresh_conflict_session")
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+)
+
+Vitest.describe (
+    "Git publish target identity",
+    fun () ->
+        Vitest.test (
+            "publish target identity reports a missing remote before ls-remote or push",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let observed = ResizeArray<NodeProcess.ProcessRequest>()
+
+                let hooks = {
+                    GitWorkspaceSession.GitSessionHooks.none with
+                        RunProcess =
+                            Some(fun request processContext ->
+                                async {
+                                    observed.Add request
+                                    return! NodeProcess.run request processContext
+                                })
+                }
+
+                let! root, workPath, _, session = createSyncFixture hooks
+
+                try
+                    let! status = sessionStatus session
+                    let! _ = runGitIn workPath [| "branch"; "--unset-upstream" |]
+                    let! _ = runGitIn workPath [| "remote"; "remove"; "origin" |]
+                    let credentialCalls = ResizeArray<string * string option>()
+                    let strategy: GitCredentialStrategy.GitCredentialStrategy = {
+                        ResolveCredential =
+                            fun host profileId ->
+                                async {
+                                    credentialCalls.Add(host, profileId)
+                                    return
+                                        Some {
+                                            Username = "missing-target"
+                                            Secret = "must-not-be-resolved"
+                                        }
+                                }
+                    }
+
+                    let binding: WorkspaceBinding = {
+                        SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
+                        ProviderId = gitProviderId
+                        WorkspaceRoot = workPath
+                        ProviderStateRef = None
+                        Location = {
+                            ProviderId = gitProviderId
+                            DisplayName = None
+                            ProviderLocation = "https://origin.local.test/origin.git"
+                            ConnectionProfileId = Some "missing-target-profile"
+                        }
+                        ConnectionProfileId = Some "missing-target-profile"
+                    }
+
+                    let credentialSession =
+                        GitWorkspaceSession.createSessionWithCredentials hooks strategy binding
+
+                    observed.Clear()
+
+                    let! publishResult =
+                        (syncService credentialSession).Publish
+                            {
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                            }
+                            (ctx "publish-without-remote")
+                        |> Async.StartAsPromise
+
+                    let failure = expectProviderFailure "publish without configured remote" publishResult
+                    Vitest.expect(failure.Category).toEqual (Validation)
+                    Vitest.expect(failure.Code).toBe ("publish_target_missing")
+
+                    Vitest
+                        .expect(
+                            observed
+                            |> Seq.exists (fun request ->
+                                request.Arguments
+                                |> Array.exists (fun argument -> argument = "ls-remote" || argument = "push"))
+                        )
+                        .toBe false
+
+                    Vitest.expect(credentialCalls.Count).toBe 0
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    let! _ = removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "publish target identity follows the configured upstream remote",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let observed = ResizeArray<NodeProcess.ProcessRequest>()
+
+                let hooks = {
+                    GitWorkspaceSession.GitSessionHooks.none with
+                        RunProcess =
+                            Some(fun request processContext ->
+                                async {
+                                    observed.Add request
+                                    return! NodeProcess.run request processContext
+                                })
+                }
+
+                let! root, workPath, originPath, session = createSyncFixture hooks
+
+                try
+                    let upstreamPath = join [| root; "upstream.git" |]
+                    let! _ = runGitIn root [| "init"; "--bare"; "-b"; "main"; upstreamPath |]
+                    let! _ = runGitIn workPath [| "remote"; "add"; "upstream"; upstreamPath |]
+                    let! _ = runGitIn workPath [| "push"; "-u"; "upstream"; "main" |]
+                    let! _ = runGitIn workPath [| "branch"; "--set-upstream-to=upstream/main"; "main" |]
+
+                    do! writeUtf8FileAsync (join [| workPath; "upstream-target.txt" |]) "upstream target\n"
+                    let! beforeRevisionStatus = sessionStatus session
+
+                    let! revisionResult =
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: publish to configured upstream"
+                                Paths = [| mkPath "upstream-target.txt" |]
+                                ExpectedWorkspaceVersion = beforeRevisionStatus.WorkspaceVersion
+                            }
+                            (ctx "publish-upstream-revision")
+                        |> Async.StartAsPromise
+
+                    expectValue "configured upstream revision" revisionResult |> ignore
+                    let! localRevision = runGitIn workPath [| "rev-parse"; "HEAD" |]
+                    let! publishStatus = sessionStatus session
+                    observed.Clear()
+
+                    let! publishResult =
+                        (syncService session).Publish
+                            {
+                                ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                            }
+                            (ctx "publish-to-configured-upstream")
+                        |> Async.StartAsPromise
+
+                    expectValue "publish to configured upstream" publishResult |> ignore
+
+                    let! upstreamRevision = runGitIn upstreamPath [| "rev-parse"; "main" |]
+                    let! originRevision = runGitIn originPath [| "rev-parse"; "main" |]
+
+                    Vitest.expect(upstreamRevision.Trim()).toBe (localRevision.Trim())
+                    Vitest.expect(originRevision.Trim()).not.toBe (localRevision.Trim())
+
+                    let pushRequest =
+                        observed
+                        |> Seq.find (fun request -> request.Arguments |> Array.contains "push")
+
+                    Vitest.expect(pushRequest.Arguments |> Array.contains "upstream").toBe true
+                    Vitest.expect(pushRequest.Arguments |> Array.contains "origin").toBe false
+
+                    let lsRemoteRequests =
+                        observed
+                        |> Seq.filter (fun request -> request.Arguments |> Array.contains "ls-remote")
+                        |> Seq.toArray
+
+                    Vitest.expect(lsRemoteRequests.Length > 0).toBe true
+                    Vitest
+                        .expect(lsRemoteRequests |> Array.forall (fun request -> request.Arguments |> Array.contains "upstream"))
+                        .toBe true
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "publish target identity rejects a configured upstream whose remote was deleted",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let observed = ResizeArray<NodeProcess.ProcessRequest>()
+                let hooks = {
+                    GitWorkspaceSession.GitSessionHooks.none with
+                        RunProcess =
+                            Some(fun request processContext ->
+                                async {
+                                    observed.Add request
+                                    return! NodeProcess.run request processContext
+                                })
+                }
+
+                let! root, workPath, originPath, session = createSyncFixture hooks
+
+                try
+                    let upstreamPath = join [| root; "deleted-upstream.git" |]
+                    let! _ = runGitIn root [| "init"; "--bare"; "-b"; "main"; upstreamPath |]
+                    let! _ = runGitIn workPath [| "remote"; "add"; "upstream"; upstreamPath |]
+                    let! _ = runGitIn workPath [| "push"; "-u"; "upstream"; "main" |]
+                    let! _ = runGitIn workPath [| "remote"; "remove"; "upstream" |]
+                    let! _ = runGitIn workPath [| "config"; "branch.main.remote"; "upstream" |]
+                    let! _ = runGitIn workPath [| "config"; "branch.main.merge"; "refs/heads/main" |]
+                    do! writeUtf8FileAsync (join [| workPath; "deleted-upstream.txt" |]) "local only\n"
+                    let! _ = runGitIn workPath [| "add"; "deleted-upstream.txt" |]
+                    let! _ = runGitIn workPath [| "commit"; "-m"; "test: deleted upstream" |]
+                    let! originBefore = runGitIn originPath [| "rev-parse"; "main" |]
+                    let! status = sessionStatus session
+                    observed.Clear()
+
+                    let! publishResult =
+                        (syncService session).Publish
+                            {
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                            }
+                            (ctx "publish-deleted-upstream")
+                        |> Async.StartAsPromise
+
+                    let failure = expectProviderFailure "publish with deleted upstream" publishResult
+                    Vitest.expect(failure.Category).toEqual (Validation)
+                    Vitest.expect(failure.Code).toBe ("configured_target_invalid")
+
+                    Vitest
+                        .expect(
+                            observed
+                            |> Seq.exists (fun request ->
+                                request.Arguments
+                                |> Array.exists (fun argument -> argument = "ls-remote" || argument = "push"))
+                        )
+                        .toBe false
+
+                    let! originAfter = runGitIn originPath [| "rev-parse"; "main" |]
+                    Vitest.expect(originAfter.Trim()).toBe (originBefore.Trim())
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "publish target identity scopes credentials and LFS URLs to the configured upstream URL",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let observed = ResizeArray<NodeProcess.ProcessRequest>()
+                let hooks = {
+                    GitWorkspaceSession.GitSessionHooks.none with
+                        RunProcess =
+                            Some(fun request processContext ->
+                                async {
+                                    observed.Add request
+                                    return! NodeProcess.run request processContext
+                                })
+                }
+
+                let! root, workPath, originPath, _ = createSyncFixture hooks
+
+                try
+                    let originHost = "origin.local.test"
+                    let upstreamHost = "upstream.local.test"
+                    let originUrl = $"https://{originHost}/origin.git"
+                    let upstreamUrl = $"https://{upstreamHost}/upstream.git"
+                    let upstreamPath = join [| root; "credential-upstream.git" |]
+                    let! _ = runGitIn root [| "init"; "--bare"; "-b"; "main"; upstreamPath |]
+                    let! _ =
+                        runGitIn workPath [|
+                            "config"
+                            "--add"
+                            $"url.{toFileRemoteUrl originPath}.insteadOf"
+                            originUrl
+                        |]
+
+                    let! _ = runGitIn workPath [| "remote"; "set-url"; "origin"; originUrl |]
+                    let! _ =
+                        runGitIn workPath [|
+                            "config"
+                            "--add"
+                            $"url.{toFileRemoteUrl upstreamPath}.insteadOf"
+                            upstreamUrl
+                        |]
+
+                    let! _ = runGitIn workPath [| "remote"; "add"; "upstream"; upstreamUrl |]
+                    let! _ = runGitIn workPath [| "push"; "-u"; "upstream"; "main" |]
+                    let! _ = runGitIn workPath [| "branch"; "--set-upstream-to=upstream/main"; "main" |]
+                    do! writeUtf8FileAsync (join [| workPath; "credential-upstream.txt" |]) "upstream credentials\n"
+                    let! _ = runGitIn workPath [| "add"; "credential-upstream.txt" |]
+                    let! _ = runGitIn workPath [| "commit"; "-m"; "test: upstream credentials" |]
+
+                    let credentialCalls = ResizeArray<string * string option>()
+                    let strategy: GitCredentialStrategy.GitCredentialStrategy = {
+                        ResolveCredential =
+                            fun host profileId ->
+                                async {
+                                    credentialCalls.Add(host, profileId)
+
+                                    if host = upstreamHost then
+                                        return
+                                            Some {
+                                                Username = "upstream-user"
+                                                Secret = "upstream-secret"
+                                            }
+                                    else
+                                        return
+                                            Some {
+                                                Username = "origin-user"
+                                                Secret = "origin-secret"
+                                            }
+                                }
+                    }
+
+                    let binding: WorkspaceBinding = {
+                        SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
+                        ProviderId = gitProviderId
+                        WorkspaceRoot = workPath
+                        ProviderStateRef = None
+                        Location = {
+                            ProviderId = gitProviderId
+                            DisplayName = None
+                            ProviderLocation = originUrl
+                            ConnectionProfileId = Some "publish-profile"
+                        }
+                        ConnectionProfileId = Some "publish-profile"
+                    }
+
+                    let session = GitWorkspaceSession.createSessionWithCredentials hooks strategy binding
+                    let! status = sessionStatus session
+                    observed.Clear()
+                    credentialCalls.Clear()
+
+                    let! publishResult =
+                        (syncService session).Publish
+                            {
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                            }
+                            (ctx "publish-upstream-credentials")
+                        |> Async.StartAsPromise
+
+                    expectValue "publish with upstream credentials" publishResult |> ignore
+                    Vitest.expect(credentialCalls.ToArray()).toEqual [| upstreamHost, Some "publish-profile" |]
+
+                    let pushRequest =
+                        observed
+                        |> Seq.find (fun request -> request.Arguments |> Array.contains "push")
+
+                    let expectedHeader = $"http.https://{upstreamHost}/.extraHeader=Authorization: Basic "
+                    let expectedLfsUrl =
+                        $"lfs.url=https://upstream-user:upstream-secret@{upstreamHost}/upstream.git/info/lfs"
+
+                    Vitest
+                        .expect(pushRequest.Arguments |> Array.exists (fun argument -> argument.StartsWith expectedHeader))
+                        .toBe true
+
+                    Vitest.expect(pushRequest.Arguments |> Array.contains expectedLfsUrl).toBe true
+
+                    Vitest
+                        .expect(
+                            pushRequest.Arguments
+                            |> Array.exists (fun argument ->
+                                argument.Contains(originHost) || argument.Contains("origin-secret"))
+                        )
+                        .toBe false
 
                     do! removeDirectoryAsync root
                 with error ->

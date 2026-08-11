@@ -232,6 +232,17 @@ let private credentialAuthentication (state: SessionState) (remoteName: string) 
         state.ConnectionProfileId
         remoteName
 
+let private credentialAuthenticationForRemote
+    (state: SessionState)
+    (remoteName: string)
+    (remoteUrl: string)
+    =
+    GitCredentialStrategy.resolveCommandAuthentication
+        state.Credentials
+        remoteUrl
+        state.ConnectionProfileId
+        remoteName
+
 // ---------------------------------------------------------------------------
 // Status and workspace version
 // ---------------------------------------------------------------------------
@@ -827,24 +838,52 @@ let private previewIndeterminate (classification: string) (detail: string) =
             Retryable = true
     }
 
+let private remoteNames (output: string) =
+    output.Replace("\r\n", "\n").Split('\n', StringSplitOptions.RemoveEmptyEntries)
+    |> Array.map _.Trim()
+    |> Array.filter (String.IsNullOrWhiteSpace >> not)
+
+let private configuredRemoteNames (state: SessionState) (context: OperationContext) =
+    async {
+        let! remotes = runGitChecked state.Hooks state.RepoPath [| "remote" |] None context
+
+        match remotes with
+        | Error failure -> return Error failure
+        | Ok output -> return Ok(remoteNames output.StdOut)
+    }
+
 let private configuredUpstreamRemote
     (state: SessionState)
     (upstreamName: string)
     (context: OperationContext)
     =
     async {
-        let! remotes = runGitChecked state.Hooks state.RepoPath [| "remote" |] None context
+        let! remotes = configuredRemoteNames state context
 
         match remotes with
         | Error failure -> return Error failure
-        | Ok output ->
+        | Ok names ->
             let remote =
-                output.StdOut.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
+                names
                 |> Array.filter (fun candidate -> upstreamName.StartsWith(candidate + "/", StringComparison.Ordinal))
                 |> Array.sortByDescending _.Length
                 |> Array.tryHead
 
             return Ok remote
+    }
+
+let private configuredRemoteExists (state: SessionState) (remoteName: string) (context: OperationContext) =
+    async {
+        let! remotes = configuredRemoteNames state context
+
+        match remotes with
+        | Error failure -> return Error failure
+        | Ok names ->
+            return
+                Ok(
+                    names
+                    |> Array.exists (fun candidate -> String.Equals(candidate, remoteName, StringComparison.Ordinal))
+                )
     }
 
 let private toWorkspaceStatus (state: SessionState) (status: GitStatusDto) (context: OperationContext) =
@@ -1734,6 +1773,135 @@ let private currentBranchName (state: SessionState) (context: OperationContext) 
                 return Ok name
     }
 
+type private PublishRemote = {
+    Name: string
+    Url: string
+}
+
+let private configuredTargetInvalidFailure () =
+    OperationFailure.create
+        Validation
+        "configured_target_invalid"
+        "The configured Git upstream does not identify a remote."
+
+let private resolvePublishRemoteUrl
+    (state: SessionState)
+    (remoteName: string)
+    (context: OperationContext)
+    =
+    async {
+        let! result =
+            runGit
+                state.Hooks
+                state.RepoPath
+                [| "config"; "--get"; $"remote.{remoteName}.url" |]
+                None
+                context
+
+        match result with
+        | Error failure -> return Error failure
+        | Ok output when output.ExitCode = 0 && not (String.IsNullOrWhiteSpace output.StdOut) ->
+            return
+                Ok {
+                    Name = remoteName
+                    Url = output.StdOut.Trim()
+                }
+        | Ok _ -> return Error(configuredTargetInvalidFailure ())
+    }
+
+let private readOptionalConfigValue
+    (state: SessionState)
+    (key: string)
+    (context: OperationContext)
+    =
+    async {
+        let! result = runGit state.Hooks state.RepoPath [| "config"; "--get"; key |] None context
+
+        match result with
+        | Error failure -> return Error failure
+        | Ok output when output.ExitCode = 0 && not (String.IsNullOrWhiteSpace output.StdOut) ->
+            return Ok(Some(output.StdOut.Trim()))
+        | Ok output
+            when output.ExitCode = 1
+                 && String.IsNullOrWhiteSpace output.StdOut
+                 && String.IsNullOrWhiteSpace output.StdErr ->
+            return Ok None
+        | Ok output ->
+            return
+                Error(
+                    OperationFailure.createRedacted
+                        ProviderError
+                        "git_failure"
+                        $"git config --get {key} failed: {output.StdErr + output.StdOut}"
+                )
+    }
+
+let private configuredBranchRemote
+    (state: SessionState)
+    (branch: string)
+    (context: OperationContext)
+    =
+    async {
+        let! remoteResult = readOptionalConfigValue state $"branch.{branch}.remote" context
+
+        match remoteResult with
+        | Error failure -> return Error failure
+        | Ok remote ->
+            let! mergeResult = readOptionalConfigValue state $"branch.{branch}.merge" context
+
+            match remote, mergeResult with
+            | _, Error failure -> return Error failure
+            | None, Ok None -> return Ok None
+            | Some remoteName, Ok(Some _) -> return Ok(Some remoteName)
+            | _ -> return Error(configuredTargetInvalidFailure ())
+    }
+
+let private resolvePublishRemote
+    (state: SessionState)
+    (branch: string)
+    (context: OperationContext)
+    =
+    async {
+        let! upstreamResult = tryConfiguredUpstream state context
+
+        match upstreamResult with
+        | Error failure -> return Error failure
+        | Ok(Some upstream) when upstream.LogicalRef.Kind = RemoteRef ->
+            let! remoteResult = configuredUpstreamRemote state upstream.LogicalRef.Name context
+
+            match remoteResult with
+            | Ok(Some remote) ->
+                let! remoteUrlResult = resolvePublishRemoteUrl state remote context
+                return remoteUrlResult |> Result.map Some
+            | Ok None -> return Error(configuredTargetInvalidFailure ())
+            | Error failure -> return Error failure
+        | Ok(Some _) -> return Error(configuredTargetInvalidFailure ())
+        | Ok None ->
+            let! branchRemoteResult = configuredBranchRemote state branch context
+
+            match branchRemoteResult with
+            | Error failure -> return Error failure
+            | Ok(Some ".") -> return Error(configuredTargetInvalidFailure ())
+            | Ok(Some remoteName) ->
+                let! existsResult = configuredRemoteExists state remoteName context
+
+                match existsResult with
+                | Error failure -> return Error failure
+                | Ok false -> return Error(configuredTargetInvalidFailure ())
+                | Ok true ->
+                    let! remoteUrlResult = resolvePublishRemoteUrl state remoteName context
+                    return remoteUrlResult |> Result.map Some
+            | Ok None ->
+                let! originResult = configuredRemoteExists state "origin" context
+
+                match originResult with
+                | Error failure -> return Error failure
+                | Ok false -> return Ok None
+                | Ok true ->
+                    let! remoteUrlResult = resolvePublishRemoteUrl state "origin" context
+                    return remoteUrlResult |> Result.map Some
+    }
+
 let private revParse (state: SessionState) (reference: string) (context: OperationContext) =
     async {
         let! result =
@@ -1849,6 +2017,7 @@ let private synchronizationState (state: SessionState) (context: OperationContex
 
 let private readRemoteBranchRevision
     (state: SessionState)
+    (remoteName: string)
     (authentication: VersionControlService.Git.GitAuthAdapter.GitCommandAuthentication)
     (branch: string)
     (context: OperationContext)
@@ -1862,7 +2031,8 @@ let private readRemoteBranchRevision
                     yield! authentication.ConfigArgs
                     "ls-remote"
                     "--refs"
-                    "origin"
+                    "--"
+                    remoteName
                     $"refs/heads/{branch}"
                 |]
                 None
@@ -1877,7 +2047,7 @@ let private readRemoteBranchRevision
                     OperationFailure.createRedacted
                         Network
                         "target_unreachable"
-                        $"Reading the publication target from origin failed: {output.StdErr + output.StdOut}" with
+                        $"Reading the publication target from {remoteName} failed: {output.StdErr + output.StdOut}" with
                         Retryable = true
                 }
         | Ok output ->
@@ -2267,17 +2437,44 @@ let private publish (state: SessionState) (request: PublishRequest) (context: Op
         match branchResult with
         | Error failure -> return Failed failure
         | Ok branch ->
-            let! authentication = credentialAuthentication state "origin"
+            let! targetRemoteResult = resolvePublishRemote state branch context
+            let mutable resolvedTarget = None
 
             // Validate against remote truth. The local remote-tracking ref can be
             // stale between refresh and publish, and explicit LFS planning must
             // never mask a target-revision precondition failure.
             let! observedTargetResult =
-                readRemoteBranchRevision state authentication branch context
+                match targetRemoteResult with
+                | Error failure -> async { return Error failure }
+                | Ok None ->
+                    async {
+                        return
+                            Error(
+                                OperationFailure.create
+                                    Validation
+                                    "publish_target_missing"
+                                    "The workspace has no configured Git publication target."
+                            )
+                    }
+                | Ok(Some remote) ->
+                    async {
+                        let! authentication =
+                            credentialAuthenticationForRemote state remote.Name remote.Url
+
+                        resolvedTarget <- Some(remote, authentication)
+
+                        return!
+                            readRemoteBranchRevision state remote.Name authentication branch context
+                    }
 
             match observedTargetResult with
             | Error failure -> return Failed failure
             | Ok observedTarget ->
+                let targetRemote, authentication =
+                    resolvedTarget
+                    |> Option.defaultWith (fun () -> failwith "The publication target was not resolved.")
+
+                let remoteName = targetRemote.Name
 
                 let expectedMatches =
                     match request.ExpectedTargetRevision, observedTarget with
@@ -2360,7 +2557,7 @@ let private publish (state: SessionState) (request: PublishRequest) (context: Op
                                     let! lfsPreparation =
                                         GitService.prepareExplicitLfsPush
                                             state.RepoPath
-                                            "origin"
+                                            remoteName
                                             branch
                                             authentication
                                             (Some reportLfsProgress)
@@ -2395,7 +2592,7 @@ let private publish (state: SessionState) (request: PublishRequest) (context: Op
                                     [|
                                         yield! authentication.ConfigArgs
                                         "push"
-                                        "origin"
+                                        remoteName
                                         branch
                                     |]
                                     None
@@ -2421,7 +2618,7 @@ let private publish (state: SessionState) (request: PublishRequest) (context: Op
                                             OperationFailure.createRedacted
                                                 Network
                                                 "target_unreachable"
-                                                $"Publishing to origin failed: {combined}" with
+                                                $"Publishing to {remoteName} failed: {combined}" with
                                                 Retryable = true
                                         }
                                 | Ok _ -> None
@@ -2449,7 +2646,12 @@ let private publish (state: SessionState) (request: PublishRequest) (context: Op
                             }
 
                             let! verificationResult =
-                                readRemoteBranchRevision state authentication branch verificationContext
+                                readRemoteBranchRevision
+                                    state
+                                    remoteName
+                                    authentication
+                                    branch
+                                    verificationContext
 
                             verificationCompleted <- true
 
@@ -3529,6 +3731,34 @@ let private localLocation (providerLocation: string) : RepositoryLocation = {
     ConnectionProfileId = None
 }
 
+let private validateFactoryLocation (location: RepositoryLocation) =
+    match GitService.ensureAllowedRemoteUrl location.ProviderLocation with
+    | Ok providerLocation -> Ok { location with ProviderLocation = providerLocation }
+    | Error failure ->
+        Error(OperationFailure.createRedacted Validation "location_not_allowed" failure.Message)
+
+let private resolvesToSamePath (firstPath: string) (secondPath: string) =
+    try
+        String.Equals(
+            NodePath.resolve [| firstPath |],
+            NodePath.resolve [| secondPath |],
+            StringComparison.OrdinalIgnoreCase
+        )
+    with _ ->
+        false
+
+let private hasGitEntry (workspaceRoot: string) =
+    try
+        NodeFileSystem.tryLstatSync (NodePath.join [| workspaceRoot; ".git" |]) |> Option.isSome
+    with _ ->
+        false
+
+let private adoptionUnsupportedFailure (detail: string) =
+    OperationFailure.createRedacted
+        Unsupported
+        "adoption_unsupported"
+        $"The workspace cannot be adopted without guessing because Git cannot parse its repository metadata: {detail}"
+
 let createFactoryWithCredentials
     (hooks: GitSessionHooks)
     (credentials: GitCredentialStrategy.GitCredentialStrategy)
@@ -3647,184 +3877,212 @@ let createFactoryWithCredentials
     Probe = probe
     VerifyLocation =
         fun request context -> async {
-            let! authArguments =
-                GitCredentialStrategy.resolveAuthArguments
-                    credentials
-                    request.Location.ProviderLocation
-                    request.Location.ConnectionProfileId
-
-            let! result =
-                runGit
-                    hooks
-                    "."
-                    [|
-                        yield! authArguments
-                        "ls-remote"
-                        request.Location.ProviderLocation
-                    |]
-                    None
-                    context
-
-            match result with
-            | Ok output when output.ExitCode = 0 ->
-                return
-                    OperationResult.succeeded {
-                        Location = request.Location
-                        GrantedIntents = request.Intents
-                        DeniedIntents = [||]
-                    }
-            | Ok output ->
-                // Classify the failure so consumers can recover: authentication
-                // and authorization problems keep their categories instead of
-                // collapsing into a generic network error.
-                let category =
-                    match GitService.classifyFailureKind output.StdErr with
-                    | GitFailureKind.Unauthorized -> Authentication
-                    | GitFailureKind.Forbidden -> Authorization
-                    | GitFailureKind.Network -> Network
-                    | GitFailureKind.Timeout -> Timeout
-                    | _ -> NotFound
-
-                return
-                    Failed(
-                        OperationFailure.createRedacted
-                            category
-                            "location_unreachable"
-                            $"The repository location is not reachable: {output.StdErr}"
-                    )
+            match validateFactoryLocation request.Location with
             | Error failure -> return Failed failure
+            | Ok location ->
+                let! authArguments =
+                    GitCredentialStrategy.resolveAuthArguments
+                        credentials
+                        location.ProviderLocation
+                        location.ConnectionProfileId
+
+                let! result =
+                    runGit
+                        hooks
+                        "."
+                        [|
+                            yield! authArguments
+                            "ls-remote"
+                            "--"
+                            location.ProviderLocation
+                        |]
+                        None
+                        context
+
+                match result with
+                | Ok output when output.ExitCode = 0 ->
+                    return
+                        OperationResult.succeeded {
+                            Location = location
+                            GrantedIntents = request.Intents
+                            DeniedIntents = [||]
+                        }
+                | Ok output ->
+                    // Classify the failure so consumers can recover: authentication
+                    // and authorization problems keep their categories instead of
+                    // collapsing into a generic network error.
+                    let category =
+                        match GitService.classifyFailureKind output.StdErr with
+                        | GitFailureKind.Unauthorized -> Authentication
+                        | GitFailureKind.Forbidden -> Authorization
+                        | GitFailureKind.Network -> Network
+                        | GitFailureKind.Timeout -> Timeout
+                        | _ -> NotFound
+
+                    return
+                        Failed(
+                            OperationFailure.createRedacted
+                                category
+                                "location_unreachable"
+                                $"The repository location is not reachable: {output.StdErr}"
+                        )
+                | Error failure -> return Failed failure
         }
     Initialize =
         fun request context -> async {
-            let! result = Async.AwaitPromise(GitProvisioningService.initRepository request.TargetPath)
+            let validatedLocationResult =
+                match request.Location with
+                | None -> Ok None
+                | Some location -> validateFactoryLocation location |> Result.map Some
 
-            match result with
-            | Error failure when failure.Message.Contains("already a git repository", StringComparison.OrdinalIgnoreCase) ->
-                return
-                    Failed(
-                        OperationFailure.create
-                            Validation
-                            "already_initialized"
-                            "The target path is already initialized as a Git repository."
-                    )
-            | Error failure -> return Failed(toOperationFailure failure)
-            | Ok normalizedPath ->
-                let location =
-                    request.Location |> Option.defaultValue (localLocation normalizedPath)
-
-                return OperationResult.succeeded (bindingFor normalizedPath location)
-        }
-    Clone =
-        fun request context -> async {
-            let! authentication =
-                GitCredentialStrategy.resolveCommandAuthentication
-                    credentials
-                    request.Location.ProviderLocation
-                    request.Location.ConnectionProfileId
-                    "origin"
-
-            // Large objects stay as pointers during the Git transfer; hydration is a
-            // separate step so its failure can be reported as partial success.
-            let! result =
-                runGitEnv
-                    hooks
-                    "."
-                    [|
-                        yield! authentication.ConfigArgs
-                        "clone"
-                        request.Location.ProviderLocation
-                        request.TargetPath
-                    |]
-                    None
-                    [|
-                        "GIT_TERMINAL_PROMPT", "0"
-                        "GIT_LFS_SKIP_SMUDGE", "1"
-                    |]
-                    context
-
-            match result with
+            match validatedLocationResult with
             | Error failure -> return Failed failure
-            | Ok output when output.ExitCode <> 0 ->
-                let combined = output.StdErr + output.StdOut
+            | Ok requestedLocation ->
+                let! result = Async.AwaitPromise(GitProvisioningService.initRepository request.TargetPath)
 
-                if combined.Contains "already exists and is not an empty directory" then
+                match result with
+                | Error failure when failure.Message.Contains("already a git repository", StringComparison.OrdinalIgnoreCase) ->
                     return
                         Failed(
                             OperationFailure.create
                                 Validation
-                                "target_not_empty"
-                                "The clone target directory is not empty."
+                                "already_initialized"
+                                "The target path is already initialized as a Git repository."
                         )
-                else
-                    return
-                        Failed(
-                            OperationFailure.createRedacted ProviderError "clone_failed" $"Clone failed: {combined}"
-                        )
-            | Ok _ ->
-                let binding = bindingFor request.TargetPath request.Location
+                | Error failure -> return Failed(toOperationFailure failure)
+                | Ok normalizedPath ->
+                    match requestedLocation with
+                    | None -> return OperationResult.succeeded (bindingFor normalizedPath (localLocation normalizedPath))
+                    | Some location when resolvesToSamePath location.ProviderLocation normalizedPath ->
+                        return OperationResult.succeeded (bindingFor normalizedPath location)
+                    | Some location ->
+                        let! remoteResult =
+                            runGitChecked
+                                hooks
+                                normalizedPath
+                                [|
+                                    "remote"
+                                    "add"
+                                    "origin"
+                                    "--"
+                                    location.ProviderLocation
+                                |]
+                                None
+                                context
 
-                if not request.MaterializeAllObjects then
-                    return OperationResult.succeeded binding
-                else
-                    // Git transfer succeeded; object hydration failing afterwards is
-                    // partial success with a retry action, never an overall error
-                    // that hides the changed workspace.
-                    let! hydration =
-                        runGitEnv
-                            hooks
+                        match remoteResult with
+                        | Error failure -> return Failed { failure with StateChanged = true }
+                        | Ok _ -> return OperationResult.succeeded (bindingFor normalizedPath location)
+        }
+    Clone =
+        fun request context -> async {
+            match validateFactoryLocation request.Location with
+            | Error failure -> return Failed failure
+            | Ok location ->
+                let! authentication =
+                    GitCredentialStrategy.resolveCommandAuthentication
+                        credentials
+                        location.ProviderLocation
+                        location.ConnectionProfileId
+                        "origin"
+
+                // Large objects stay as pointers during the Git transfer; hydration is a
+                // separate step so its failure can be reported as partial success.
+                let! result =
+                    runGitEnv
+                        hooks
+                        "."
+                        [|
+                            yield! authentication.ConfigArgs
+                            "clone"
+                            "--"
+                            location.ProviderLocation
                             request.TargetPath
-                            [|
-                                yield! authentication.ConfigArgs
-                                "lfs"
-                                "pull"
-                                "origin"
-                            |]
-                            None
-                            [| "GIT_TERMINAL_PROMPT", "0" |]
-                            context
+                        |]
+                        None
+                        [|
+                            "GIT_TERMINAL_PROMPT", "0"
+                            "GIT_LFS_SKIP_SMUDGE", "1"
+                        |]
+                        context
 
-                    match hydration with
-                    | Ok hydrationOutput when hydrationOutput.ExitCode = 0 ->
+                match result with
+                | Error failure -> return Failed failure
+                | Ok output when output.ExitCode <> 0 ->
+                    let combined = output.StdErr + output.StdOut
+
+                    if combined.Contains "already exists and is not an empty directory" then
+                        return
+                            Failed(
+                                OperationFailure.create
+                                    Validation
+                                    "target_not_empty"
+                                    "The clone target directory is not empty."
+                            )
+                    else
+                        return
+                            Failed(
+                                OperationFailure.createRedacted ProviderError "clone_failed" $"Clone failed: {combined}"
+                            )
+                | Ok _ ->
+                    let binding = bindingFor request.TargetPath location
+
+                    if not request.MaterializeAllObjects then
                         return OperationResult.succeeded binding
-                    | Ok hydrationOutput ->
-                        let detail =
-                            if String.IsNullOrWhiteSpace hydrationOutput.StdErr then
-                                hydrationOutput.StdOut
-                            else
-                                hydrationOutput.StdErr
+                    else
+                        // Git transfer succeeded; object hydration failing afterwards is
+                        // partial success with a retry action, never an overall error
+                        // that hides the changed workspace.
+                        let! hydration =
+                            runGitEnv
+                                hooks
+                                request.TargetPath
+                                [|
+                                    yield! authentication.ConfigArgs
+                                    "lfs"
+                                    "pull"
+                                    "origin"
+                                |]
+                                None
+                                [| "GIT_TERMINAL_PROMPT", "0" |]
+                                context
 
-                        return
-                            OperationResult.partiallySucceeded
-                                (OperationOutcome.performed binding)
-                                (hydrationFailure "clone" detail)
-                                {
-                                    Code = "retry_materialization"
-                                    Instructions =
-                                        Some
-                                            "Retry downloading large objects once the object store is reachable."
-                                }
-                    | Error hydrationFailure ->
-                        return
-                            OperationResult.partiallySucceeded
-                                (OperationOutcome.performed binding)
-                                hydrationFailure
-                                {
-                                    Code = "retry_materialization"
-                                    Instructions =
-                                        Some
-                                            "Retry downloading large objects once the object store is reachable."
-                                }
+                        match hydration with
+                        | Ok hydrationOutput when hydrationOutput.ExitCode = 0 ->
+                            return OperationResult.succeeded binding
+                        | Ok hydrationOutput ->
+                            let detail =
+                                if String.IsNullOrWhiteSpace hydrationOutput.StdErr then
+                                    hydrationOutput.StdOut
+                                else
+                                    hydrationOutput.StdErr
+
+                            return
+                                OperationResult.partiallySucceeded
+                                    (OperationOutcome.performed binding)
+                                    (hydrationFailure "clone" detail)
+                                    {
+                                        Code = "retry_materialization"
+                                        Instructions =
+                                            Some
+                                                "Retry downloading large objects once the object store is reachable."
+                                    }
+                        | Error hydrationFailure ->
+                            return
+                                OperationResult.partiallySucceeded
+                                    (OperationOutcome.performed binding)
+                                    hydrationFailure
+                                    {
+                                        Code = "retry_materialization"
+                                        Instructions =
+                                            Some
+                                                "Retry downloading large objects once the object store is reachable."
+                                    }
         }
     Adopt =
         fun request context ->
             async {
-                let! rootResult =
-                    runGitChecked hooks request.WorkspaceRoot [| "rev-parse"; "--show-toplevel" |] None context
-
-                match rootResult with
-                | Error failure -> return Failed failure
-                | Ok rootOutput ->
-                    let workspaceRoot = rootOutput.StdOut.Trim()
+                let adoptParsedRoot workspaceRoot = async {
                     let! remoteResult =
                         runGit hooks workspaceRoot [| "config"; "--get"; "remote.origin.url" |] None context
 
@@ -3855,44 +4113,92 @@ let createFactoryWithCredentials
                                     "origin_lookup_failed"
                                     $"Git could not read remote.origin.url: {output.StdErr}"
                             )
+                }
+
+                let! rootResult =
+                    runGit hooks request.WorkspaceRoot [| "rev-parse"; "--show-toplevel" |] None context
+
+                match rootResult with
+                | Error failure -> return Failed failure
+                | Ok rootOutput when rootOutput.ExitCode = 0 ->
+                    return! adoptParsedRoot (rootOutput.StdOut.Trim())
+                | Ok output when hasGitEntry request.WorkspaceRoot ->
+                    let detail = output.StdErr + output.StdOut
+
+                    if detail.Contains("dubious ownership", StringComparison.OrdinalIgnoreCase) then
+                        return
+                            Failed(
+                                OperationFailure.createRedacted
+                                    ProviderError
+                                    "git_failure"
+                                    $"git rev-parse --show-toplevel failed: {detail}"
+                            )
+                    else
+                        let reportedDetail =
+                            if String.IsNullOrWhiteSpace detail then
+                                "Git exited without diagnostic output."
+                            else
+                                detail
+
+                        return Failed(adoptionUnsupportedFailure reportedDetail)
+                | Ok output ->
+                    return
+                        Failed(
+                            OperationFailure.createRedacted
+                                ProviderError
+                                "git_failure"
+                                $"git rev-parse --show-toplevel failed: {output.StdErr + output.StdOut}"
+                        )
             }
     Bind =
         fun request context -> async {
-            // Attach or re-target: set the origin remote of the existing workspace.
-            let! existing = runGit hooks request.WorkspaceRoot [| "remote" |] None context
-
-            let! result =
-                match existing with
-                | Ok output when output.StdOut.Contains "origin" ->
-                    runGitChecked
-                        hooks
-                        request.WorkspaceRoot
-                        [|
-                            "remote"
-                            "set-url"
-                            "origin"
-                            request.Location.ProviderLocation
-                        |]
-                        None
-                        context
-                | _ ->
-                    runGitChecked
-                        hooks
-                        request.WorkspaceRoot
-                        [|
-                            "remote"
-                            "add"
-                            "origin"
-                            request.Location.ProviderLocation
-                        |]
-                        None
-                        context
-
-            match result with
+            match validateFactoryLocation request.Location with
             | Error failure -> return Failed failure
-            | Ok _ ->
-                let! _ = runGit hooks request.WorkspaceRoot [| "fetch"; "origin" |] None context
-                return OperationResult.succeeded (bindingFor request.WorkspaceRoot request.Location)
+            | Ok location ->
+                // Attach or re-target: set the origin remote of the existing workspace.
+                let! existing = runGit hooks request.WorkspaceRoot [| "remote" |] None context
+
+                let hasOrigin =
+                    match existing with
+                    | Ok output ->
+                        remoteNames output.StdOut
+                        |> Array.exists (fun candidate ->
+                            String.Equals(candidate, "origin", StringComparison.Ordinal))
+                    | _ -> false
+
+                let! result =
+                    if hasOrigin then
+                        runGitChecked
+                            hooks
+                            request.WorkspaceRoot
+                            [|
+                                "remote"
+                                "set-url"
+                                "origin"
+                                "--"
+                                location.ProviderLocation
+                            |]
+                            None
+                            context
+                    else
+                        runGitChecked
+                            hooks
+                            request.WorkspaceRoot
+                            [|
+                                "remote"
+                                "add"
+                                "origin"
+                                "--"
+                                location.ProviderLocation
+                            |]
+                            None
+                            context
+
+                match result with
+                | Error failure -> return Failed failure
+                | Ok _ ->
+                    let! _ = runGit hooks request.WorkspaceRoot [| "fetch"; "origin" |] None context
+                    return OperationResult.succeeded (bindingFor request.WorkspaceRoot location)
         }
     Open =
         fun binding _ -> async {
