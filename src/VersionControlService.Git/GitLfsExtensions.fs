@@ -9,6 +9,7 @@ open VersionControlService.Git.GitEngineTypes
 
 module GitService = VersionControlService.Git.GitService
 module GitLfsService = VersionControlService.Git.GitLfsService
+module GitCredentialStrategy = VersionControlService.Git.GitCredentialStrategy
 
 let private categoryOfKind (kind: GitFailureKind) =
     match kind with
@@ -24,53 +25,140 @@ let private categoryOfKind (kind: GitFailureKind) =
 let private toOperationFailure (failure: GitService.GitFailure) : OperationFailure =
     OperationFailure.createRedacted (categoryOfKind failure.Kind) "lfs_operation_failed" failure.Message
 
-let private wrapUnit (operation: JS.Promise<GitService.GitResult<unit>>) : Async<OperationResult<unit>> =
-    async {
-        let! result = Async.AwaitPromise operation
+let private toOperationResult (failure: GitService.GitFailure) : OperationResult<unit> =
+    if failure.Kind = GitFailureKind.Canceled then
+        OperationResult.canceled failure.Message
+    else
+        Failed(toOperationFailure failure)
 
-        match result with
-        | Ok() -> return OperationResult.succeeded ()
-        | Error failure -> return Failed(toOperationFailure failure)
+let private wrapUnit
+    (context: OperationContext)
+    (beginOperation: unit -> unit)
+    (operation: unit -> JS.Promise<GitService.GitResult<unit>>)
+    : Async<OperationResult<unit>> =
+    async {
+        if context.Cancellation.IsCancellationRequested() then
+            return OperationResult.canceled "Git LFS operation canceled."
+        else
+            beginOperation ()
+
+            if context.Cancellation.IsCancellationRequested() then
+                return OperationResult.canceled "Git LFS operation canceled."
+            else
+                let! result = Async.AwaitPromise(operation ())
+
+                match result with
+                | Ok() when context.Cancellation.IsCancellationRequested() ->
+                    return OperationResult.canceled "Git LFS operation canceled."
+                | Ok() -> return OperationResult.succeeded ()
+                | Error failure -> return toOperationResult failure
     }
 
-let createObjectMaterialization (repoPath: string) : ObjectMaterializationService = {
+let createObjectMaterialization
+    (repoPath: string)
+    (credentials: GitCredentialStrategy.GitCredentialStrategy)
+    (connectionProfileId: string option)
+    : ObjectMaterializationService = {
     ListObjects =
-        fun _ -> async {
-            // Operational failures stay classified failures — never an empty
-            // successful list that hides them (GIT-014).
-            let! listingResult = Async.AwaitPromise(GitLfsService.readLsFilesByRelativePath repoPath)
+        fun context -> async {
+            if context.Cancellation.IsCancellationRequested() then
+                return OperationResult.canceled "Git LFS listing was canceled."
+            else
+                context.ReportProgress {
+                    PhaseCode = "lfs-list"
+                    Item = None
+                    Completed = None
+                    Total = None
+                    DisplayMessage = None
+                }
 
-            match listingResult with
-            | Error message ->
-                let category = categoryOfKind (GitService.classifyFailureKind message)
+                let! listingResult =
+                    Async.AwaitPromise(GitLfsService.readLsFilesByRelativePath repoPath context)
 
-                return
-                    Failed(
-                        OperationFailure.createRedacted
-                            category
-                            "lfs_listing_failed"
-                            $"Listing large objects failed: {message}"
-                    )
-            | Ok filesByPath ->
-                let objects =
-                    filesByPath.Values
-                    |> Seq.choose (fun file ->
-                        match RepositoryPath.tryCreate file.name with
-                        | Ok path ->
-                            Some {
-                                Path = path
-                                IsMaterialized = file.checkout
-                                IsLocallyAvailable = file.downloaded
-                                SizeBytes = Some file.size
-                                ObjectId = Some file.oid
-                            }
-                        | Error _ -> None)
-                    |> Seq.toArray
+                match listingResult with
+                | Error message when context.Cancellation.IsCancellationRequested() ->
+                    return OperationResult.canceled "Git LFS listing was canceled."
+                | Error message ->
+                    let category = categoryOfKind (GitService.classifyFailureKind message)
 
-                return OperationResult.succeeded objects
+                    return
+                        Failed(
+                            OperationFailure.createRedacted
+                                category
+                                "lfs_listing_failed"
+                                $"Listing large objects failed: {message}"
+                        )
+                | Ok filesByPath ->
+                    let objects =
+                        filesByPath.Values
+                        |> Seq.choose (fun file ->
+                            match RepositoryPath.tryCreate file.name with
+                            | Ok path ->
+                                Some {
+                                    Path = path
+                                    IsMaterialized = file.checkout
+                                    IsLocallyAvailable = file.downloaded
+                                    SizeBytes = Some file.size
+                                    ObjectId = Some file.oid
+                                }
+                            | Error _ -> None)
+                        |> Seq.toArray
+
+                    let totalBytes =
+                        objects
+                        |> Array.sumBy (fun item -> item.SizeBytes |> Option.defaultValue 0.0)
+
+                    context.ReportProgress {
+                        PhaseCode = "lfs-list"
+                        Item = None
+                        Completed = Some totalBytes
+                        Total = Some totalBytes
+                        DisplayMessage = None
+                    }
+
+                    if context.Cancellation.IsCancellationRequested() then
+                        return OperationResult.canceled "Git LFS listing was canceled."
+                    else
+                        return OperationResult.succeeded objects
         }
-    Materialize = fun path _ -> wrapUnit (GitService.downloadLfsFile repoPath (RepositoryPath.value path))
-    Dematerialize = fun path _ -> wrapUnit (GitService.freeLocalLfsCopy repoPath (RepositoryPath.value path))
+    Materialize =
+        fun path context ->
+            wrapUnit
+                context
+                (fun () ->
+                    context.ReportProgress {
+                        PhaseCode = "lfs-materialize"
+                        Item = Some(RepositoryPath.value path)
+                        Completed = None
+                        Total = None
+                        DisplayMessage = None
+                    })
+                (fun () ->
+                    GitService.downloadLfsFile
+                        repoPath
+                        (RepositoryPath.value path)
+                        credentials
+                        connectionProfileId
+                        context)
+    Dematerialize =
+        fun path context ->
+            wrapUnit
+                context
+                (fun () ->
+                    context.ReportProgress {
+                        PhaseCode = "lfs-dematerialize"
+                        Item = Some(RepositoryPath.value path)
+                        Completed = None
+                        Total = None
+                        DisplayMessage = None
+                    })
+                (fun () ->
+                    GitService.freeLocalLfsCopy
+                        repoPath
+                        (RepositoryPath.value path)
+                        credentials
+                        connectionProfileId
+                        context)
 }
 
 let createStoragePolicy (repoPath: string) : StoragePolicyService = {
@@ -105,7 +193,7 @@ let createStoragePolicy (repoPath: string) : StoragePolicyService = {
             | Error failure -> return Failed(toOperationFailure failure)
         }
     SetSettings =
-        fun settings _ -> async {
+        fun settings context -> async {
             if settings.AutoPolicyThresholdMb |> Option.exists (fun value -> value <= 0) then
                 return
                     Failed(
@@ -127,7 +215,7 @@ let createStoragePolicy (repoPath: string) : StoragePolicyService = {
                         DownloadLargeFiles = settings.MaterializeLargeObjects
                     }
 
-                    return! wrapUnit (GitService.setLfsSettings repoPath next)
+                    return! wrapUnit context ignore (fun () -> GitService.setLfsSettings repoPath next)
         }
 }
 
@@ -179,12 +267,19 @@ let private runMaintenance
             | Error failure -> return Failed(toOperationFailure failure)
     }
 
-let createMaintenance (repoPath: string) : StorageMaintenanceService = {
+let createMaintenance
+    (repoPath: string)
+    (credentials: GitCredentialStrategy.GitCredentialStrategy)
+    (connectionProfileId: string option)
+    : StorageMaintenanceService = {
     Prune =
         runMaintenance
             "maintenance-prune"
             "Git LFS cache pruning was canceled."
-            (GitService.pruneLfsCacheWithProgressAndCancellation repoPath)
+            (GitService.pruneLfsCacheWithProgressAndCancellation
+                repoPath
+                credentials
+                connectionProfileId)
     Deduplicate =
         runMaintenance
             "maintenance-deduplicate"

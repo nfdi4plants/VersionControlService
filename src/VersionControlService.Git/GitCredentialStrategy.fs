@@ -6,7 +6,6 @@ module VersionControlService.Git.GitCredentialStrategy
 
 open Fable.Core
 
-module GitTokenProvider = VersionControlService.Git.GitTokenProvider
 module GitAuthAdapter = VersionControlService.Git.GitAuthAdapter
 
 /// Resolved credential material for one host. Never serialized.
@@ -53,7 +52,7 @@ let internal buildScopedAuthArguments (remoteUrl: string) (credential: GitCreden
     match credential with
     | None -> [||]
     | Some resolved ->
-        match GitTokenProvider.tryExtractHostFromRemoteUrl remoteUrl with
+        match GitAuthAdapter.tryExtractHostFromRemoteUrl remoteUrl with
         | Ok host when remoteUrl.StartsWith "https://" ->
             let basicValue = toBase64 $"{resolved.Username}:{resolved.Secret}"
 
@@ -97,6 +96,15 @@ let internal buildScopedCommandAuthentication
         Environment = GitAuthAdapter.createNonInteractiveEnv ()
     }
 
+let internal buildScopedHeaderAuthentication
+    (remoteUrl: string)
+    (credential: GitCredential option)
+    : GitAuthAdapter.GitCommandAuthentication =
+    {
+        ConfigArgs = buildScopedAuthArguments remoteUrl credential
+        Environment = GitAuthAdapter.createNonInteractiveEnv ()
+    }
+
 /// Resolves the scoped auth arguments for a repository location.
 let internal resolveAuthArguments
     (strategy: GitCredentialStrategy)
@@ -104,7 +112,7 @@ let internal resolveAuthArguments
     (connectionProfileId: string option)
     : Async<string[]> =
     async {
-        match GitTokenProvider.tryExtractHostFromRemoteUrl providerLocation with
+        match GitAuthAdapter.tryExtractHostFromRemoteUrl providerLocation with
         | Ok host ->
             let! credential = strategy.ResolveCredential host connectionProfileId
             return buildScopedAuthArguments providerLocation credential
@@ -123,7 +131,7 @@ let internal resolveCommandAuthentication
     (remoteName: string)
     : Async<GitAuthAdapter.GitCommandAuthentication> =
     async {
-        match GitTokenProvider.tryExtractHostFromRemoteUrl providerLocation with
+        match GitAuthAdapter.tryExtractHostFromRemoteUrl providerLocation with
         | Ok host ->
             let! credential = strategy.ResolveCredential host connectionProfileId
             return buildScopedCommandAuthentication remoteName providerLocation credential

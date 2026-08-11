@@ -768,18 +768,28 @@ let private extractLsFilesFailureMessage (result: GitSpawnResult) =
 
 let readLsFilesByRelativePath
     (repoRoot: string)
+    (context: OperationContext)
     : JS.Promise<Result<Dictionary<string, GitLfsLsFileInfo>, string>> =
     promise {
         let normalizedRepoRoot = PathHelpers.normalizePath repoRoot
 
         try
             let! commandResult =
-                runGitCaptured {
+                runGitCapturedWithOutput
+                    (fun _ ->
+                        context.ReportProgress {
+                            PhaseCode = "lfs-list-transfer"
+                            Item = None
+                            Completed = Some 0.0
+                            Total = None
+                            DisplayMessage = None
+                        })
+                    {
                     WorkingDirectory = Some normalizedRepoRoot
                     Arguments = buildLsFilesJsonArgs ()
                     Environment = None
                     StandardInput = None
-                    CancelCheck = None
+                    CancelCheck = Some context.Cancellation.IsCancellationRequested
                     TimeoutMs = Some lfsLsFilesTimeoutMs
                 }
 
@@ -818,17 +828,24 @@ let readLsFilesByRelativePath
 
 /// Tries to read `git lfs ls-files -j` metadata keyed by repository-relative path.
 /// Fail-open behavior: command or parse failures yield an empty dictionary.
-let tryGetLsFilesByRelativePath (repoRoot: string) : JS.Promise<Dictionary<string, GitLfsLsFileInfo>> = promise {
-    match! readLsFilesByRelativePath repoRoot with
+let tryGetLsFilesByRelativePath
+    (repoRoot: string)
+    (context: OperationContext)
+    : JS.Promise<Dictionary<string, GitLfsLsFileInfo>> = promise {
+    match! readLsFilesByRelativePath repoRoot context with
     | Ok filesByRelativePath -> return filesByRelativePath
     | Error message ->
         warn $"Git LFS ls-files warning: {message}"
         return Dictionary<string, GitLfsLsFileInfo>()
 }
 
-let tryFindListingForPath (repoRoot: string) (relativePath: string) : JS.Promise<Result<GitLfsLsFileInfo, string>> = promise {
+let tryFindListingForPath
+    (repoRoot: string)
+    (relativePath: string)
+    (context: OperationContext)
+    : JS.Promise<Result<GitLfsLsFileInfo, string>> = promise {
     try
-        match! readLsFilesByRelativePath repoRoot with
+        match! readLsFilesByRelativePath repoRoot context with
         | Error message -> return Error $"Could not read Git LFS file metadata: {message}"
         | Ok filesByRelativePath ->
             return
@@ -870,71 +887,6 @@ let private buildSmudgePointerArgs (relativePath: string) = [|
 |]
 
 let buildCheckoutArgs (relativePath: string) = [| "lfs"; "checkout"; "--"; relativePath |]
-
-let private formatDiagnosticsSection (title: string) (content: string option) =
-    match content |> Option.map _.Trim() with
-    | Some value when not (String.IsNullOrWhiteSpace value) -> Some $"{title}:\n{redactDiagnosticText value}"
-    | _ -> None
-
-let private tryRunRawDiagnosticCommand
-    (runSimpleGitRaw: (ISimpleGit -> JS.Promise<string>) -> ISimpleGit -> JS.Promise<Result<string, 'Failure>>)
-    (getFailureMessage: 'Failure -> string option)
-    (git: ISimpleGit)
-    (args: string[])
-    : JS.Promise<string option> =
-    promise {
-        let! result = runSimpleGitRaw (fun currentGit -> currentGit.raw args) git
-
-        return
-            match result with
-            | Ok output when not (String.IsNullOrWhiteSpace output) -> Some output
-            | Ok _ -> None
-            | Error failure ->
-                getFailureMessage failure
-                |> Option.filter (fun message -> not (String.IsNullOrWhiteSpace message))
-                |> Option.map (fun message -> $"Unavailable: {message}")
-    }
-
-/// Collects redacted Git LFS diagnostics after an LFS upload failure so push errors are actionable.
-let collectPushDiagnostics
-    (runSimpleGitRaw: (ISimpleGit -> JS.Promise<string>) -> ISimpleGit -> JS.Promise<Result<string, 'Failure>>)
-    (getFailureMessage: 'Failure -> string option)
-    (remoteName: string)
-    (git: ISimpleGit)
-    : JS.Promise<string option> =
-    promise {
-        let! pushRemoteUrl =
-            tryRunRawDiagnosticCommand runSimpleGitRaw getFailureMessage git [|
-                "remote"
-                "get-url"
-                "--push"
-                remoteName
-            |]
-
-        let! lfsVersion = tryRunRawDiagnosticCommand runSimpleGitRaw getFailureMessage git [| "lfs"; "version" |]
-
-        let! lfsEnv = tryRunRawDiagnosticCommand runSimpleGitRaw getFailureMessage git [| "lfs"; "env" |]
-
-        let! lfsLogsLast = tryRunRawDiagnosticCommand runSimpleGitRaw getFailureMessage git [| "lfs"; "logs"; "last" |]
-
-        return
-            [
-                formatDiagnosticsSection "Git Push Remote" pushRemoteUrl
-                formatDiagnosticsSection "Git LFS Version" lfsVersion
-                formatDiagnosticsSection "Git LFS Env" lfsEnv
-                formatDiagnosticsSection "Git LFS Logs Last" lfsLogsLast
-            ]
-            |> List.choose id
-            |> function
-                | [] -> None
-                | sections -> Some(String.concat "\n\n" sections)
-    }
-
-/// Appends optional LFS diagnostic sections to the original push failure message.
-let appendPushDiagnostics (message: string) (diagnostics: string option) =
-    match diagnostics |> Option.map _.Trim() with
-    | Some value when not (String.IsNullOrWhiteSpace value) -> $"{message}\n\nLFS diagnostics:\n{value}"
-    | _ -> message
 
 let private resolvePushRefSpec
     (runStatus: ISimpleGit -> JS.Promise<Result<StatusResult, 'Failure>>)
@@ -1186,67 +1138,6 @@ let private extractSpawnFailureMessage (result: GitSpawnResult) =
 
 let private spawnFailure (result: GitSpawnResult) = exn (extractSpawnFailureMessage result)
 
-let private isHttpExtraHeaderConfigArg (configArg: string) =
-    let trimmed = configArg.Trim()
-    let equalsIndex = trimmed.IndexOf("=")
-
-    let key =
-        if equalsIndex >= 0 then
-            trimmed.Substring(0, equalsIndex)
-        else
-            trimmed
-
-    let normalizedKey = key.Trim().ToLowerInvariant()
-
-    normalizedKey.Equals("http.extraheader", StringComparison.Ordinal)
-    || (normalizedKey.StartsWith("http.", StringComparison.Ordinal)
-        && normalizedKey.EndsWith(".extraheader", StringComparison.Ordinal))
-
-let private lfsTransferConfigArgs (configArgs: string[]) =
-    let filtered = ResizeArray<string>()
-    let mutable index = 0
-
-    while index < configArgs.Length do
-        if
-            configArgs.[index] = "-c"
-            && index + 1 < configArgs.Length
-            && isHttpExtraHeaderConfigArg configArgs.[index + 1]
-        then
-            index <- index + 2
-        else
-            filtered.Add configArgs.[index]
-            index <- index + 1
-
-    filtered.ToArray()
-
-let runAuthenticatedTransferWith
-    (runSpawnedGit: GitSpawnRequest -> JS.Promise<GitSpawnResult>)
-    (commandAuth: GitCommandAuthentication)
-    (repoPath: string)
-    (arguments: string[])
-    (cancelCheck: (unit -> bool) option)
-    : JS.Promise<Result<unit, exn>> =
-    promise {
-        let! result =
-            runSpawnedGit {
-                WorkingDirectory = Some repoPath
-                Arguments = [|
-                    yield! lfsTransferConfigArgs commandAuth.ConfigArgs
-                    yield! arguments
-                |]
-                Environment = Some commandAuth.Environment
-                StandardInput = None
-                CancelCheck = cancelCheck
-                TimeoutMs = None
-            }
-
-        return
-            if result.ExitCode = 0 && not result.TimedOut then
-                Ok()
-            else
-                Error(exn (extractSpawnFailureMessage result))
-    }
-
 let private maintenanceProgressPattern =
     Regex(@"(?<progress>\d+(?:\.\d+)?)%\s+\((?<processed>\d+(?:\.\d+)?)/(?<total>\d+(?:\.\d+)?)(?:\s+bytes)?\)")
 
@@ -1320,7 +1211,7 @@ let internal runAuthenticatedMaintenance
                 {
                     WorkingDirectory = Some repoPath
                     Arguments = [|
-                        yield! lfsTransferConfigArgs commandAuth.ConfigArgs
+                        yield! commandAuth.ConfigArgs
                         yield! arguments
                     |]
                     Environment = Some commandAuth.Environment
@@ -1338,25 +1229,35 @@ let internal runAuthenticatedMaintenance
                 Error(exn (extractSpawnFailureMessage result))
     }
 
-let pullAll
-    (repoPath: string)
-    (commandAuth: GitCommandAuthentication)
-    (cancelCheck: (unit -> bool) option)
-    : JS.Promise<Result<unit, exn>> =
-    runAuthenticatedTransferWith runGitDiscardingStdout commandAuth repoPath [| "lfs"; "pull" |] cancelCheck
-
 let fetchRefetchForPath
     (repoPath: string)
     (commandAuth: GitCommandAuthentication)
     (relativePath: string)
     (cancelCheck: (unit -> bool) option)
+    (onStarted: unit -> unit)
     : JS.Promise<Result<unit, exn>> =
-    runAuthenticatedTransferWith
-        runGitDiscardingStdout
-        commandAuth
-        repoPath
-        (buildFetchRefetchArgs relativePath)
-        cancelCheck
+    promise {
+        let! result =
+            runGitDiscardingStdoutWithStarted
+                onStarted
+                {
+                    WorkingDirectory = Some repoPath
+                    Arguments = [|
+                        yield! commandAuth.ConfigArgs
+                        yield! buildFetchRefetchArgs relativePath
+                    |]
+                    Environment = Some commandAuth.Environment
+                    StandardInput = None
+                    CancelCheck = cancelCheck
+                    TimeoutMs = None
+                }
+
+        return
+            if result.ExitCode = 0 && not result.TimedOut then
+                Ok()
+            else
+                Error(exn (extractSpawnFailureMessage result))
+    }
 
 let private buildPointerInput (listing: GitLfsLsFileInfo) =
     let sizeText = listing.size |> int64 |> string
@@ -1370,18 +1271,20 @@ let downloadObjectFromListing
     (commandAuth: GitCommandAuthentication)
     (relativePath: string)
     (listing: GitLfsLsFileInfo)
+    (cancelCheck: (unit -> bool) option)
+    (onStarted: unit -> unit)
     : JS.Promise<Result<unit, exn>> =
     promise {
         let! result =
-            runGitDiscardingStdout {
+            runGitDiscardingStdoutWithStarted onStarted {
                 WorkingDirectory = Some repoPath
                 Arguments = [|
-                    yield! lfsTransferConfigArgs commandAuth.ConfigArgs
+                    yield! commandAuth.ConfigArgs
                     yield! buildSmudgePointerArgs relativePath
                 |]
                 Environment = Some commandAuth.Environment
                 StandardInput = Some(buildPointerInput listing)
-                CancelCheck = None
+                CancelCheck = cancelCheck
                 TimeoutMs = None
             }
 
@@ -1709,7 +1612,7 @@ let uploadObjects
                 runSpawnedGit {
                     WorkingDirectory = Some repoPath
                     Arguments = [|
-                        yield! lfsTransferConfigArgs commandAuth.ConfigArgs
+                        yield! commandAuth.ConfigArgs
                         "lfs"
                         "push"
                         "--object-id"
@@ -1732,7 +1635,7 @@ let uploadObjects
                         runSpawnedGit {
                             WorkingDirectory = Some repoPath
                             Arguments = [|
-                                yield! lfsTransferConfigArgs commandAuth.ConfigArgs
+                                yield! commandAuth.ConfigArgs
                                 "lfs"
                                 "push"
                                 remoteName

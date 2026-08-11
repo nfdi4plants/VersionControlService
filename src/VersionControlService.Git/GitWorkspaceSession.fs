@@ -3797,9 +3797,21 @@ let createSessionWithCredentialsAndIdentity
             // Git LFS is optional: the services exist because the Git provider
             // supports them; their operations report their own dependency status
             // when git-lfs is not installed. Core Git never requires LFS.
-            ObjectMaterialization = Some(GitLfsExtensions.createObjectMaterialization state.RepoPath)
+            ObjectMaterialization =
+                Some(
+                    GitLfsExtensions.createObjectMaterialization
+                        state.RepoPath
+                        state.Credentials
+                        state.ConnectionProfileId
+                )
             StoragePolicy = Some(GitLfsExtensions.createStoragePolicy state.RepoPath)
-            Maintenance = Some(GitLfsExtensions.createMaintenance state.RepoPath)
+            Maintenance =
+                Some(
+                    GitLfsExtensions.createMaintenance
+                        state.RepoPath
+                        state.Credentials
+                        state.ConnectionProfileId
+                )
             RepositoryBrowser = Some(createBrowser state)
     }
 

@@ -28,7 +28,6 @@ let private baseConfigEntries (options: SimpleGitOptions) =
     options.config |> Option.defaultValue [||]
 
 /// Converts command-line `-c key=value` pairs into simple-git config entries.
-/// Used by applyAuth so credentials stay scoped to the in-memory git instance.
 let toConfigEntries (args: string[]) =
     args
     |> Array.mapi (fun index value ->
@@ -84,116 +83,31 @@ let createNonInteractiveEnv () : obj =
 
     GitCommandResolver.ensureGitToolPath safeEnv
 
-/// Applies the non-interactive environment to a simple-git instance.
 let applyNonInteractiveEnv (git: ISimpleGit) = git.env (createNonInteractiveEnv ())
 
-[<Emit("Buffer.from($0, 'utf8').toString('base64')")>]
-let private toBase64 (value: string) : string = jsNative
-
-[<Emit("encodeURIComponent($0)")>]
-let private encodeUriComponent (value: string) : string = jsNative
-
-let private gitLabBasicAuthUsername = "oauth2"
-
-let private buildBasicAuthorizationValue (username: string) (token: string) =
-    let credentials = $"{username}:{token}"
-    let base64Credentials = toBase64 credentials
-    $"Basic {base64Credentials}"
-
-let private buildAuthenticatedRemoteUrl (remoteUrl: string) (token: string) =
-    if remoteUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase) then
-        let remoteUrlWithoutScheme = remoteUrl.Substring("https://".Length)
-        let encodedToken = encodeUriComponent token
-        $"https://{gitLabBasicAuthUsername}:{encodedToken}@{remoteUrlWithoutScheme}"
-    else
-        remoteUrl
-
-let private buildLfsEndpointUrl (remoteUrl: string) =
-    let trimmedRemoteUrl = remoteUrl.TrimEnd('/')
-    $"{trimmedRemoteUrl}/info/lfs"
-
-let private tryBuildScopedAuthUrl (remoteUrl: string) =
+let private tryExtractHostFromAbsoluteUri (remoteUrl: string) =
     let mutable uri = Unchecked.defaultof<Uri>
 
     if
         Uri.TryCreate(remoteUrl, UriKind.Absolute, &uri)
-        && uri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase)
+        && not (String.IsNullOrWhiteSpace uri.Host)
     then
-        let authority =
-            if uri.IsDefaultPort then
-                uri.Host
-            else
-                $"{uri.Host}:{uri.Port}"
-
-        Some($"{uri.Scheme}://{authority}/")
+        Ok(uri.Host.Trim().ToLowerInvariant())
     else
-        None
+        Error(exn $"Remote URL '{remoteUrl}' is not a valid absolute URI.")
 
-/// Builds per-command auth config for HTTPS Git and Git LFS operations.
-/// The token is injected as scoped config and optional authenticated remote URLs; nothing is persisted to repository config.
-let buildAuthArgs (_host: string) (token: string) (remoteName: string option) (remoteUrl: string option) : string[] = [|
-    let authorizationValue = buildBasicAuthorizationValue gitLabBasicAuthUsername token
+/// Extracts hosts from HTTPS and SSH URLs. Other remote forms, including scp-style SSH, are anonymous to credential lookup.
+let tryExtractHostFromRemoteUrl (remoteUrl: string) : Result<string, exn> =
+    let normalized = remoteUrl.Trim()
 
-    match remoteUrl |> Option.bind tryBuildScopedAuthUrl with
-    | Some scopeUrl ->
-        yield "-c"
-        yield $"http.{scopeUrl}.extraHeader=Authorization: {authorizationValue}"
-    | _ -> ()
-
-    match remoteName, remoteUrl with
-    | Some name, Some url when url.StartsWith("https://", StringComparison.OrdinalIgnoreCase) ->
-        let authenticatedRemoteUrl = buildAuthenticatedRemoteUrl url token
-        let plainLfsUrl = buildLfsEndpointUrl url
-        let authenticatedLfsUrl = buildLfsEndpointUrl authenticatedRemoteUrl
-        yield "-c"
-        yield $"remote.{name}.url={authenticatedRemoteUrl}"
-        yield "-c"
-        yield $"remote.{name}.pushurl={authenticatedRemoteUrl}"
-        yield "-c"
-        yield $"remote.{name}.lfsurl={authenticatedLfsUrl}"
-        yield "-c"
-        yield $"lfs.url={authenticatedLfsUrl}"
-        yield "-c"
-        yield $"lfs.{plainLfsUrl}.access=basic"
-        yield "-c"
-        yield $"lfs.{authenticatedLfsUrl}.access=basic"
-    | _ -> ()
-|]
-
-/// Creates auth data for lower-level spawned commands such as `git lfs push`.
-let createCommandAuthentication
-    (host: string)
-    (token: string)
-    (remoteName: string option)
-    (remoteUrl: string option)
-    : GitCommandAuthentication =
-    {
-        ConfigArgs = buildAuthArgs host token remoteName remoteUrl
-        Environment = createNonInteractiveEnv ()
-    }
-
-/// Returns a simple-git instance with authentication config merged into the supplied base options.
-/// Use this instead of writing credentials to `.git/config`.
-let applyAuth
-    (gitFactory: GitFactory)
-    (baseOptions: SimpleGitOptions)
-    (host: string)
-    (token: string)
-    (remoteName: string option)
-    (remoteUrl: string option)
-    : ISimpleGit =
-    let commandAuth = createCommandAuthentication host token remoteName remoteUrl
-    let authConfig = toConfigEntries commandAuth.ConfigArgs
-
-    let mergedConfig = [|
-        yield! baseConfigEntries baseOptions
-        yield! authConfig
-    |]
-
-    let scopedOptions: SimpleGitOptions =
-        emitJsExpr (baseOptions, mergedConfig) "{ ...$0, config: $1 }"
-
-    gitFactory scopedOptions
+    if String.IsNullOrWhiteSpace normalized then
+        Error(exn "Remote URL is empty.")
+    elif normalized.StartsWith("https://", StringComparison.OrdinalIgnoreCase) then
+        tryExtractHostFromAbsoluteUri normalized
+    elif normalized.StartsWith("ssh://", StringComparison.OrdinalIgnoreCase) then
+        tryExtractHostFromAbsoluteUri normalized
+    else
+        Error(exn "Remote URL must use https:// or ssh://.")
 
 /// Applies already-resolved command authentication to a simple-git instance.
 /// This lets provider sessions resolve an injected strategy once and reuse the

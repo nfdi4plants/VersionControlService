@@ -101,8 +101,44 @@ let private currentProcessPath () : string = jsNative
 [<Emit("process.env.PATH = $0")>]
 let private setCurrentProcessPath (_value: string) : unit = jsNative
 
+[<Emit("process.cwd()")>]
+let private currentProcessWorkingDirectory () : string = jsNative
+
+[<Emit("process.chdir($0)")>]
+let private setCurrentProcessWorkingDirectory (_value: string) : unit = jsNative
+
 [<Emit("require('node:path').delimiter")>]
 let private pathDelimiter: string = jsNative
+
+[<Emit("Object.prototype.hasOwnProperty.call(process.env, $0) ? process.env[$0] : null")>]
+let private tryGetProcessEnvironment (_name: string) : string = jsNative
+
+[<Emit("process.env[$0] = $1")>]
+let private setProcessEnvironment (_name: string) (_value: string) : unit = jsNative
+
+[<Emit("delete process.env[$0]")>]
+let private clearProcessEnvironment (_name: string) : unit = jsNative
+
+[<Emit("""
+(() => {
+    const childProcess = require('node:child_process');
+    const moduleApi = require('node:module');
+    const originalSpawn = childProcess.spawn;
+    childProcess.spawn = function(command, args, options) {
+        if (String(command).toLowerCase() === 'taskkill') {
+            setTimeout(() => originalSpawn.call(childProcess, command, args, options), 1500);
+            return { on() { return this; }, unref() {} };
+        }
+        return originalSpawn.call(childProcess, command, args, options);
+    };
+    moduleApi.syncBuiltinESMExports();
+    return () => {
+        childProcess.spawn = originalSpawn;
+        moduleApi.syncBuiltinESMExports();
+    };
+})()
+""")>]
+let private injectDelayedTaskkillSpawn () : (unit -> unit) = jsNative
 
 /// Direct git invocation for harness fixture work (never through the session).
 let private runGitIn
@@ -2099,6 +2135,345 @@ Vitest.describe (
                     Vitest.expect(changedPathFailure.Code).toBe "preview_indeterminate"
                     Vitest.expect(changedPathFailure.Retryable).toBe true
                     Vitest.expect(changedPathFailure.StateChanged).toBe false
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+)
+
+Vitest.describe (
+    "Git / materialization honors context",
+    fun () ->
+        Vitest.test (
+            "materialization honors context for ListObjects",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    do! workspace.WriteFile ".gitattributes" "materialized.bin filter=lfs diff=lfs merge=lfs -text\n"
+                    do! workspace.WriteFile "materialized.bin" "materialization context content\n"
+                    let! _ = runGitIn workspace.Binding.WorkspaceRoot [||] [| "add"; "-A" |] None
+                    let! _ = runGitIn workspace.Binding.WorkspaceRoot [||] [| "commit"; "-m"; "test: materialization context" |] None
+                    let! _ = runGitIn workspace.Binding.WorkspaceRoot [||] [| "push"; "origin"; "main" |] None
+
+                    let materialization =
+                        workspace.Session.ObjectMaterialization
+                        |> Option.defaultWith (fun () -> failwith "Expected Git object materialization.")
+
+                    let cancellation = OperationCancellation.Source()
+                    let mutable transferStarted = false
+                    let context =
+                        OperationContext.create
+                            "materialization-list-cancel"
+                            cancellation.Cancellation
+                            (fun progress ->
+                                if progress.PhaseCode = "lfs-list-transfer" then
+                                    transferStarted <- true
+                                    cancellation.Cancel())
+
+                    let! result = materialization.ListObjects context |> Async.StartAsPromise
+                    Vitest.expect(transferStarted).toBe true
+                    let failure = expectProviderFailure "canceled LFS listing" result
+                    Vitest.expect(failure.Category).toEqual Canceled
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "materialization honors context after a spawned transfer and immediate retry rejects delayed taskkill lock races",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+                let! fakeRoot = createTempDirectoryAsync ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    do! workspace.WriteFile ".gitattributes" "materialized.bin filter=lfs diff=lfs merge=lfs -text\n"
+                    do! workspace.WriteFile "materialized.bin" "materialization context content\n"
+                    let! _ = runGitIn workspace.Binding.WorkspaceRoot [||] [| "add"; "-A" |] None
+                    let! _ = runGitIn workspace.Binding.WorkspaceRoot [||] [| "commit"; "-m"; "test: materialization context" |] None
+                    let! _ = runGitIn workspace.Binding.WorkspaceRoot [||] [| "push"; "origin"; "main" |] None
+
+                    let materialization =
+                        workspace.Session.ObjectMaterialization
+                        |> Option.defaultWith (fun () -> failwith "Expected Git object materialization.")
+
+                    let path = RepositoryPath.tryCreate "materialized.bin" |> Result.defaultWith failwith
+
+                    let! initialDematerialize =
+                        materialization.Dematerialize path (OperationContext.detached "materialization-prepare")
+                        |> Async.StartAsPromise
+
+                    expectProviderValue "prepare materialization context" initialDematerialize |> ignore
+
+                    let materializeCancellation = OperationCancellation.Source()
+                    let mutable materializeTransferStarted = false
+                    let materializeContext =
+                        OperationContext.create
+                            "materialization-cancel"
+                            materializeCancellation.Cancellation
+                            (fun progress ->
+                                if progress.PhaseCode = "lfs-materialize-transfer" then
+                                    materializeTransferStarted <- true
+                                    materializeCancellation.Cancel())
+
+                    let! materializeResult =
+                        materialization.Materialize path materializeContext |> Async.StartAsPromise
+
+                    Vitest.expect(materializeTransferStarted).toBe true
+                    let materializeFailure = expectProviderFailure "canceled materialization" materializeResult
+                    Vitest.expect(materializeFailure.Category).toEqual Canceled
+
+                    let! restoredMaterialization =
+                        materialization.Materialize path (OperationContext.detached "materialization-restore")
+                        |> Async.StartAsPromise
+
+                    expectProviderValue "restore materialization" restoredMaterialization |> ignore
+
+                    let! listingJson =
+                        runGitIn
+                            workspace.Binding.WorkspaceRoot
+                            [||]
+                            [| "lfs"; "ls-files"; "-j" |]
+                            None
+
+                    let! pointerText =
+                        runGitIn
+                            workspace.Binding.WorkspaceRoot
+                            [||]
+                            [|
+                                "lfs"
+                                "pointer"
+                                "--file"
+                                join [| workspace.Binding.WorkspaceRoot; "materialized.bin" |]
+                            |]
+                            None
+
+                    let fakeGitPath = join [| fakeRoot; if isWindowsProcess () then "git.exe" else "git" |]
+                    let listingPath = join [| fakeRoot; "listing.json" |]
+                    let pointerPath = join [| fakeRoot; "pointer.txt" |]
+                    let markerPath = join [| fakeRoot; "slow-transfer" |]
+
+                    do! writeUtf8FileAsync listingPath listingJson
+                    do! writeUtf8FileAsync pointerPath pointerText
+
+                    if isWindowsProcess () then
+                        let! _ = fsPromisesDynamic?copyFile (nodeExecutablePath, fakeGitPath) |> unbox<JS.Promise<obj>>
+                        ()
+                    else
+                        do!
+                            writeUtf8FileAsync
+                                fakeGitPath
+                                $"#!/bin/sh\nscript=\"$1\"\nshift\nexec '{nodeExecutablePath}' \"$VCS_TEST_LFS_DISPATCH_ROOT/$script\" \"$@\"\n"
+
+                        let! _ = fsPromisesDynamic?chmod (fakeGitPath, 493) |> unbox<JS.Promise<obj>>
+                        ()
+
+                    do! writeUtf8FileAsync (join [| workspace.Binding.WorkspaceRoot; "status" |]) ""
+                    do! writeUtf8FileAsync (join [| workspace.Binding.WorkspaceRoot; "checkout" |]) ""
+                    do! writeUtf8FileAsync (join [| workspace.Binding.WorkspaceRoot; "rev-parse" |]) "console.log('true');\n"
+
+                    do!
+                        writeUtf8FileAsync
+                            (join [| workspace.Binding.WorkspaceRoot; "config" |])
+                            "process.stdout.write(process.env.VCS_TEST_LFS_REMOTE + '\\n');\n"
+
+                    do!
+                        writeUtf8FileAsync
+                            (join [| workspace.Binding.WorkspaceRoot; "check-attr" |])
+                            "process.stdout.write('materialized.bin: filter: lfs\\n');\n"
+
+                    do!
+                        writeUtf8FileAsync
+                            (join [| workspace.Binding.WorkspaceRoot; "lfs" |])
+                            """
+const fs = require('node:fs');
+const net = require('node:net');
+const command = process.argv[2] || '';
+const markerPath = process.env.VCS_TEST_LFS_MARKER;
+const port = Number(process.env.VCS_TEST_LFS_LOCK_PORT);
+if (command === 'ls-files') {
+    process.stdout.write(fs.readFileSync(process.env.VCS_TEST_LFS_LISTING, 'utf8'));
+} else if (command === 'pointer') {
+    process.stdout.write(fs.readFileSync(process.env.VCS_TEST_LFS_POINTER, 'utf8'));
+} else if (command === 'fetch' || command === 'smudge') {
+    if (fs.existsSync(markerPath) && fs.readFileSync(markerPath, 'utf8').trim() === command) {
+        fs.rmSync(markerPath, { force: true });
+        const lock = net.createServer();
+        lock.listen(port, '127.0.0.1', () => {
+            process.stderr.write('controlled LFS transfer running\n');
+            setTimeout(() => lock.close(() => process.exit(0)), 10000);
+        });
+    } else {
+        const probe = net.createServer();
+        probe.once('error', error => {
+            if (error.code === 'EADDRINUSE') {
+                process.stderr.write("fatal: Unable to create '.git/index.lock': File exists.\n");
+                process.exit(2);
+            } else {
+                throw error;
+            }
+        });
+        probe.listen(port, '127.0.0.1', () => probe.close(() => process.exit(0)));
+    }
+} else {
+    process.exit(0);
+}
+"""
+
+                    do! writeUtf8FileAsync markerPath "fetch"
+
+                    let originalPath = currentProcessPath ()
+                    let originalWorkingDirectory = currentProcessWorkingDirectory ()
+                    let environmentNames = [|
+                        "VCS_TEST_LFS_LISTING"
+                        "VCS_TEST_LFS_POINTER"
+                        "VCS_TEST_LFS_MARKER"
+                        "VCS_TEST_LFS_LOCK_PORT"
+                        "VCS_TEST_LFS_REMOTE"
+                        "VCS_TEST_LFS_DISPATCH_ROOT"
+                    |]
+                    let originalEnvironment =
+                        environmentNames
+                        |> Array.map (fun name -> name, (tryGetProcessEnvironment name |> Option.ofObj))
+
+                    let restoreTaskkill =
+                        if isWindowsProcess () then Some(injectDelayedTaskkillSpawn ()) else None
+
+                    let! dematerializeResult, retryResult, dematerializeTransferStarted =
+                        promise {
+                            try
+                                setCurrentProcessPath (fakeRoot + pathDelimiter + originalPath)
+                                setCurrentProcessWorkingDirectory workspace.Binding.WorkspaceRoot
+                                setProcessEnvironment "VCS_TEST_LFS_LISTING" listingPath
+                                setProcessEnvironment "VCS_TEST_LFS_POINTER" pointerPath
+                                setProcessEnvironment "VCS_TEST_LFS_MARKER" markerPath
+                                setProcessEnvironment "VCS_TEST_LFS_LOCK_PORT" "43871"
+                                setProcessEnvironment "VCS_TEST_LFS_REMOTE" workspace.Binding.Location.ProviderLocation
+                                setProcessEnvironment "VCS_TEST_LFS_DISPATCH_ROOT" workspace.Binding.WorkspaceRoot
+
+                                let dematerializeCancellation = OperationCancellation.Source()
+                                let mutable transferStarted = false
+                                let dematerializeContext =
+                                    OperationContext.create
+                                        "dematerialization-cancel"
+                                        dematerializeCancellation.Cancellation
+                                        (fun progress ->
+                                            if progress.PhaseCode = "lfs-dematerialize-transfer" && not transferStarted then
+                                                transferStarted <- true
+
+                                                Fable.Core.JS.setTimeout
+                                                    (fun () -> dematerializeCancellation.Cancel())
+                                                    50
+                                                |> ignore)
+
+                                let! canceledResult =
+                                    materialization.Dematerialize path dematerializeContext |> Async.StartAsPromise
+
+                                let! immediateRetry =
+                                    materialization.Dematerialize
+                                        path
+                                        (OperationContext.detached "dematerialization-immediate-retry")
+                                    |> Async.StartAsPromise
+
+                                if isWindowsProcess () then
+                                    do! Async.Sleep 750 |> Async.StartAsPromise
+
+                                return canceledResult, immediateRetry, transferStarted
+                            finally
+                                setCurrentProcessWorkingDirectory originalWorkingDirectory
+                                setCurrentProcessPath originalPath
+                                restoreTaskkill |> Option.iter (fun restore -> restore ())
+
+                                for name, originalValue in originalEnvironment do
+                                    match originalValue with
+                                    | Some value -> setProcessEnvironment name value
+                                    | None -> clearProcessEnvironment name
+                        }
+
+                    Vitest.expect(dematerializeTransferStarted).toBe true
+                    let dematerializeFailure = expectProviderFailure "canceled dematerialization" dematerializeResult
+                    Vitest.expect(dematerializeFailure.Category).toEqual Canceled
+                    expectProviderValue "dematerialization immediate retry" retryResult |> ignore
+                    do! harness.Cleanup()
+                    do! removeDirectoryAsync fakeRoot
+                with error ->
+                    do! harness.Cleanup()
+                    do! removeDirectoryAsync fakeRoot
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "materialization honors context with byte progress",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let content = "materialization progress content\n"
+                    let expectedSize = float content.Length
+                    do! workspace.WriteFile ".gitattributes" "materialized.bin filter=lfs diff=lfs merge=lfs -text\n"
+                    do! workspace.WriteFile "materialized.bin" content
+                    let! _ = runGitIn workspace.Binding.WorkspaceRoot [||] [| "add"; "-A" |] None
+                    let! _ = runGitIn workspace.Binding.WorkspaceRoot [||] [| "commit"; "-m"; "test: materialization progress" |] None
+                    let! _ = runGitIn workspace.Binding.WorkspaceRoot [||] [| "push"; "origin"; "main" |] None
+
+                    let materialization =
+                        workspace.Session.ObjectMaterialization
+                        |> Option.defaultWith (fun () -> failwith "Expected Git object materialization.")
+
+                    let path = RepositoryPath.tryCreate "materialized.bin" |> Result.defaultWith failwith
+                    let listReports = ResizeArray<OperationProgress>()
+                    let listContext =
+                        OperationContext.create "listing-progress" OperationCancellation.none listReports.Add
+
+                    let! listResult = materialization.ListObjects listContext |> Async.StartAsPromise
+                    expectProviderValue "listing progress" listResult |> ignore
+
+                    let! _ = materialization.Dematerialize path (OperationContext.detached "progress-prepare") |> Async.StartAsPromise
+
+                    let materializeReports = ResizeArray<OperationProgress>()
+                    let materializeContext =
+                        OperationContext.create
+                            "materialization-progress"
+                            OperationCancellation.none
+                            materializeReports.Add
+
+                    let! materializeResult = materialization.Materialize path materializeContext |> Async.StartAsPromise
+                    expectProviderValue "materialization progress" materializeResult |> ignore
+
+                    let! _ = materialization.Dematerialize path (OperationContext.detached "progress-reset") |> Async.StartAsPromise
+                    let dematerializeReports = ResizeArray<OperationProgress>()
+                    let dematerializeContext =
+                        OperationContext.create
+                            "dematerialization-progress"
+                            OperationCancellation.none
+                            dematerializeReports.Add
+
+                    let! dematerializeResult =
+                        materialization.Dematerialize path dematerializeContext |> Async.StartAsPromise
+
+                    expectProviderValue "dematerialization progress" dematerializeResult |> ignore
+
+                    let hasByteProgress expectedPhase (reports: ResizeArray<OperationProgress>) =
+                        reports
+                        |> Seq.exists (fun report ->
+                            report.PhaseCode = expectedPhase
+                            && report.Completed.IsSome
+                            && report.Total = Some expectedSize)
+
+                    Vitest.expect(hasByteProgress "lfs-list" listReports).toBe true
+                    Vitest.expect(hasByteProgress "lfs-materialize" materializeReports).toBe true
+                    Vitest.expect(hasByteProgress "lfs-dematerialize" dematerializeReports).toBe true
                     do! harness.Cleanup()
                 with error ->
                     do! harness.Cleanup()

@@ -13,21 +13,37 @@ let private repoValidationTimeoutMs = 5000
 [<Literal>]
 let private terminationGraceMs = 250
 
-[<Literal>]
-let private terminationSettlementMs = 1000
-
 let private isWindows () = processPlatform () = "win32"
+
+let private tryKillProcess (proc: obj) (signal: string) =
+    try
+        proc?kill (signal) |> unbox<bool>
+    with _ ->
+        false
 
 let private signalProcessTree (proc: obj) (signal: string) =
     let pid: int = proc?pid |> unbox
 
     if isWindows () then
-        childProcessDynamic?spawn (
-            "taskkill",
-            [| "/pid"; string pid; "/T"; "/F" |],
-            createObj [ "windowsHide" ==> true; "stdio" ==> "ignore" ]
-        )
-        |> ignore
+        try
+            let result: obj =
+                childProcessDynamic?spawnSync (
+                    "taskkill",
+                    [| "/pid"; string pid; "/T"; "/F" |],
+                    createObj [ "windowsHide" ==> true; "stdio" ==> "ignore" ]
+                )
+
+            let error: obj = result?error
+            let status: obj = result?status
+            let succeeded = isNull error && (isNull status || int (unbox<float> status) = 0)
+
+            if not succeeded then
+                tryKillProcess proc signal |> ignore
+
+            succeeded
+        with _ ->
+            tryKillProcess proc signal |> ignore
+            false
     else
         try
             let signalName = signal.Replace("SIG", "")
@@ -38,11 +54,9 @@ let private signalProcessTree (proc: obj) (signal: string) =
                 createObj [ "stdio" ==> "ignore" ]
             )
             |> ignore
+            true
         with _ ->
-            try
-                proc?kill (signal) |> ignore
-            with _ ->
-                ()
+            tryKillProcess proc signal
 
 /// Low-level spawned `git` request used when simple-git cannot stream or feed stdin in the shape needed by LFS planning.
 type GitSpawnRequest = {
@@ -136,6 +150,25 @@ let private runGitProcess
                         TimedOut = timedOut
                     }
 
+            let scheduleWindowsFallbackSettlement () =
+                escalationId <-
+                    Some(
+                        Fable.Core.JS.setTimeout
+                            (fun () ->
+                                if not finished then
+                                    tryKillProcess proc "SIGKILL" |> ignore
+
+                                    settlementId <-
+                                        Some(
+                                            Fable.Core.JS.setTimeout
+                                                (fun () ->
+                                                    if not finished then
+                                                        finish -1)
+                                                terminationGraceMs
+                                        ))
+                            terminationGraceMs
+                    )
+
             let resetIdleTimer () =
                 clearIdleTimer ()
 
@@ -148,20 +181,21 @@ let private runGitProcess
                                     if not finished then
                                         timedOut <- true
                                         stderrChunks.Add $"Git command timed out after no output for {timeoutMs} ms."
-                                        signalProcessTree proc "SIGTERM"
+                                        let treeTerminationSucceeded = signalProcessTree proc "SIGTERM"
 
-                                        if not (isWindows ()) then
+                                        if isWindows () then
+                                            if not treeTerminationSucceeded then
+                                                scheduleWindowsFallbackSettlement ()
+                                        else
                                             escalationId <-
                                                 Some(
                                                     Fable.Core.JS.setTimeout
                                                         (fun () ->
                                                             if not finished then
-                                                                signalProcessTree proc "SIGKILL")
+                                                                signalProcessTree proc "SIGKILL" |> ignore)
                                                         terminationGraceMs
                                                 )
 
-                                        settlementId <-
-                                            Some(Fable.Core.JS.setTimeout (fun () -> finish -1) terminationSettlementMs)
                                 )
                                 timeoutMs
                         )
@@ -195,20 +229,20 @@ let private runGitProcess
                 if not finished && not cancelRequested then
                     cancelRequested <- true
                     stderrChunks.Add "Git command cancelled."
-                    signalProcessTree proc "SIGTERM"
+                    let treeTerminationSucceeded = signalProcessTree proc "SIGTERM"
 
-                    if not (isWindows ()) then
+                    if isWindows () then
+                        if not treeTerminationSucceeded then
+                            scheduleWindowsFallbackSettlement ()
+                    else
                         escalationId <-
                             Some(
                                 Fable.Core.JS.setTimeout
                                     (fun () ->
                                         if not finished then
-                                            signalProcessTree proc "SIGKILL")
+                                            signalProcessTree proc "SIGKILL" |> ignore)
                                     terminationGraceMs
                             )
-
-                    settlementId <-
-                        Some(Fable.Core.JS.setTimeout (fun () -> finish -1) terminationSettlementMs)
 
             cancelInterval <-
                 request.CancelCheck
@@ -242,17 +276,19 @@ let private runGitProcess
             )
             |> ignore
 
-            onStarted ()
-
-            match request.CancelCheck with
-            | Some cancelCheck when cancelCheck () -> requestCancellation ()
-            | _ -> ()
+            proc?stdin?on ("error", fun _ -> ()) |> ignore
 
             match request.StandardInput with
             | Some input ->
                 proc?stdin?setDefaultEncoding ("utf8") |> ignore
                 proc?stdin?``end`` (input) |> ignore
             | None -> proc?stdin?``end`` () |> ignore
+
+            onStarted ()
+
+            match request.CancelCheck with
+            | Some cancelCheck when cancelCheck () -> requestCancellation ()
+            | _ -> ()
         )
 
     return result
@@ -288,6 +324,12 @@ let internal runGitCapturedWithStartedAndOutput
 /// Runs `git` while draining and discarding stdout.
 /// This is used for commands such as `git lfs smudge`, whose stdout may contain a large file.
 let runGitDiscardingStdout (request: GitSpawnRequest) : Promise<GitSpawnResult> = runGitProcess false ignore ignore request
+
+let runGitDiscardingStdoutWithStarted
+    (onStarted: unit -> unit)
+    (request: GitSpawnRequest)
+    : Promise<GitSpawnResult> =
+    runGitProcess false onStarted ignore request
 
 /// Runs a small git command and returns stdout text, or None on command failure.
 /// Used for feature probes where failure should not surface as a user-facing Git error.

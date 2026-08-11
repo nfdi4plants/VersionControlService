@@ -13,11 +13,11 @@ open VersionControlService.Runtime.Node.Path
 open VersionControlService.Bindings.SimpleGit
 open VersionControlService.Git.GitLfsAdapter
 open VersionControlService.Git.GitLfsService
-open VersionControlService.Git.GitTokenProvider
 open VersionControlService.Git.GitAuthAdapter
 open VersionControlService.Git.GitInternals
 
 module FileSystem = VersionControlService.Runtime.Node.FileSystem
+module GitCredentialStrategy = VersionControlService.Git.GitCredentialStrategy
 
 type GitFailure = {
     Kind: GitFailureKind
@@ -26,16 +26,6 @@ type GitFailure = {
 
 /// Internal result type returned by Git services before adapters map it to DTOs.
 type GitResult<'T> = Result<'T, GitFailure>
-
-/// Resolved push target used by push workflow and tests to decide refspec/upstream behavior.
-type GitPushTarget = {
-    RefSpec: string
-    PushBranch: string
-    SetUpstream: bool
-}
-
-/// Pull result payload. Warning is reserved for recoverable follow-up issues such as LFS hydration failures.
-type GitPullResult = { Warning: GitFailure option }
 
 type GitProgressCallback = GitInternals.GitProgressCallback
 
@@ -58,45 +48,11 @@ let DefaultAutoTrackThresholdMb = 1
 
 let private gitLfsDefaultDownloadLargeFiles = false
 
-let private pushCancellationRequests =
-    System.Collections.Generic.Dictionary<string, bool>()
-
 let private normalizeOptionalGitRef (value: string option) =
     value
     |> Option.bind Option.ofObj
     |> Option.map _.Trim()
     |> Option.filter (fun item -> not (String.IsNullOrWhiteSpace item))
-
-let private pushCancellationKey (arcPath: string) =
-    let raw =
-        try
-            resolve [| arcPath |]
-        with _ ->
-            arcPath
-
-    raw.Trim().TrimEnd([| '/'; '\\' |]).ToLowerInvariant()
-
-let private startPushCancellationScope (arcPath: string) =
-    let key = pushCancellationKey arcPath
-    pushCancellationRequests.[key] <- false
-
-    let cancelCheck () =
-        match pushCancellationRequests.TryGetValue key with
-        | true, value -> value
-        | _ -> false
-
-    key, cancelCheck
-
-let private clearPushCancellationScope key =
-    pushCancellationRequests.Remove key |> ignore
-
-let cancelPush (arcPath: string) : GitResult<unit> =
-    let key = pushCancellationKey arcPath
-
-    if pushCancellationRequests.ContainsKey key then
-        pushCancellationRequests.[key] <- true
-
-    Ok()
 
 let private lfsInstallRequiredTokens = [|
     "git lfs is required for files larger than"
@@ -461,11 +417,6 @@ let tryGetRepositoryWebUrlFromRemoteUrl (remoteUrl: string) : Result<string, exn
             else
                 Ok($"https://{uri.Host}{normalizedPath}".TrimEnd('/'))
 
-let private validateOptionalBranchName (branchName: string option) =
-    match branchName with
-    | None -> Ok None
-    | Some branchName -> ensureValidBranchLikeName "Branch name" branchName |> Result.map Some
-
 let private unsupportedGitContentMessage (path: string) =
     $"Unsupported git content for '{path}'."
 
@@ -732,72 +683,6 @@ let private buildSyntheticWordDiffText (previousPath: string option) (currentPat
         yield $"+++ {currentToken}"
     ]
     |> String.concat "\n"
-
-let private ensureDefaultTrackingBranchForPull (remoteName: string) (git: ISimpleGit) : JS.Promise<unit> = promise {
-    let! remoteBranchText = git.raw [| "branch"; "-r"; "--no-color" |]
-    let! status = git.status ()
-
-    let currentBranch = normalizeOptionalGitRef status.current
-    let currentTracking = normalizeOptionalGitRef status.tracking
-
-    let remoteRefs =
-        remoteBranchText.Replace("\r\n", "\n").Split('\n', StringSplitOptions.RemoveEmptyEntries)
-        |> Array.map _.Trim()
-        |> Array.filter (fun branchName ->
-            not (String.IsNullOrWhiteSpace branchName) && not (branchName.Contains " -> ")
-        )
-
-    match status.detached, currentBranch with
-    | true, _
-    | _, None -> return ()
-    | false, Some branchName ->
-        let desiredUpstreamRef = $"{remoteName}/{branchName}"
-
-        let desiredTracking =
-            remoteRefs
-            |> Array.tryFind (fun branchRef -> String.Equals(branchRef, desiredUpstreamRef, StringComparison.Ordinal))
-
-        match desiredTracking, currentTracking with
-        | None, _ -> return ()
-        | Some desired, Some current when String.Equals(current, desired, StringComparison.Ordinal) -> return ()
-        | Some desired, _ ->
-            let! _ = git.raw [| "branch"; $"--set-upstream-to={desired}"; branchName |]
-            return ()
-}
-
-/// Resolves the branch/refspec to push and whether `--set-upstream` should be used.
-/// Exposed for tests because this policy affects new-branch publishing behavior.
-let resolvePushTarget
-    (requestedBranchName: string option)
-    (currentBranch: string option)
-    (trackingBranch: string option)
-    (isDetached: bool)
-    : GitPushTarget =
-    let normalizedCurrentBranch = normalizeOptionalGitRef currentBranch
-    let normalizedTrackingBranch = normalizeOptionalGitRef trackingBranch
-
-    match requestedBranchName with
-    | Some branchName -> {
-        RefSpec = branchName
-        PushBranch = branchName
-        SetUpstream =
-            not isDetached
-            && normalizedCurrentBranch = Some branchName
-            && normalizedTrackingBranch.IsNone
-      }
-    | None ->
-        match isDetached, normalizedCurrentBranch with
-        | true, _
-        | _, None -> {
-            RefSpec = "HEAD"
-            PushBranch = "HEAD"
-            SetUpstream = false
-          }
-        | false, Some branchName -> {
-            RefSpec = branchName
-            PushBranch = branchName
-            SetUpstream = normalizedTrackingBranch.IsNone
-          }
 
 let private reconcileTrackingBranchForCheckout
     (remoteName: string)
@@ -1176,25 +1061,6 @@ let private validateCommitLfsPolicy (git: ISimpleGit) : JS.Promise<GitResult<uni
 // Worktree-populating commands skip implicit LFS downloads; explicit LFS hydration uses authenticated transfers.
 let private applyLfsSkipSmudge (git: ISimpleGit) = git.env (GitLfsSkipSmudgeEnvKey, "1")
 
-// GitService keeps explicit post-pull hydration here because it must reuse the authenticated git instance created for the pull workflow.
-let private hydratePulledLfsContent
-    (progressCallback: GitProgressCallback option)
-    (repoPath: string)
-    (commandAuth: GitCommandAuthentication)
-    : JS.Promise<GitResult<unit>> =
-    promise {
-        reportPhase progressCallback "lfs" "Downloading Git LFS files"
-
-        match! GitLfsService.pullAll repoPath commandAuth None with
-        | Ok() -> return Ok()
-        | Error error -> return errorResult error
-    }
-
-let private createPullHydrationFailure (failure: GitFailure) = {
-    failure with
-        Message = $"Git pull completed, but Git LFS download failed: {failure.Message}"
-}
-
 type private AuthenticatedGitSession = {
     Git: ISimpleGit
     CommandAuth: GitAuthAdapter.GitCommandAuthentication
@@ -1214,6 +1080,8 @@ let private createLocalGitSession arcPath progressCallback =
 let private createAuthenticatedGitSession
     (arcPath: string)
     (remoteName: string)
+    (credentials: GitCredentialStrategy.GitCredentialStrategy)
+    (connectionProfileId: string option)
     (progressCallback: GitProgressCallback option)
     : JS.Promise<GitResult<AuthenticatedGitSession>> =
     promise {
@@ -1237,24 +1105,22 @@ let private createAuthenticatedGitSession
                 match tryExtractHostFromRemoteUrl allowedRemoteUrl with
                 | Error hostError -> return errorResult hostError
                 | Ok host ->
-                    let! tokenOption = tryGetAccessToken host
+                    let! credential = credentials.ResolveCredential host connectionProfileId |> Async.StartAsPromise
 
-                    match tokenOption with
-                    | Some token when not (String.IsNullOrWhiteSpace token) ->
+                    match credential with
+                    | Some resolved when not (String.IsNullOrWhiteSpace resolved.Secret) ->
                         try
                             let operationOptions = createOptions arcPath syncTimeout progressCallback
+                            let commandAuth =
+                                GitCredentialStrategy.buildScopedHeaderAuthentication
+                                    allowedRemoteUrl
+                                    (Some resolved)
 
                             let git =
-                                applyAuth
+                                applyCommandAuthentication
                                     (fun options -> createGit options |> withGitOutputProgress progressCallback)
                                     operationOptions
-                                    host
-                                    token
-                                    (Some remoteName)
-                                    (Some allowedRemoteUrl)
-
-                            let commandAuth =
-                                createCommandAuthentication host token (Some remoteName) (Some allowedRemoteUrl)
+                                    commandAuth
 
                             return Ok { Git = git; CommandAuth = commandAuth }
                         with error ->
@@ -1269,6 +1135,8 @@ let private createAuthenticatedGitSession
 
 let private createOriginLfsRemoteSession
     (arcPath: string)
+    (credentials: GitCredentialStrategy.GitCredentialStrategy)
+    (connectionProfileId: string option)
     (progressCallback: GitProgressCallback option)
     : JS.Promise<GitResult<AuthenticatedGitSession>> =
     promise {
@@ -1291,7 +1159,13 @@ let private createOriginLfsRemoteSession
             | Ok _ when isLocalPathRemote remoteUrl ->
                 return Ok(createLocalGitSession arcPath progressCallback)
             | Ok _ ->
-                let! sessionResult = createAuthenticatedGitSession arcPath remoteName progressCallback
+                let! sessionResult =
+                    createAuthenticatedGitSession
+                        arcPath
+                        remoteName
+                        credentials
+                        connectionProfileId
+                        progressCallback
                 return sessionResult
             | Error _ when
                 remoteUrl.StartsWith("file://", StringComparison.OrdinalIgnoreCase)
@@ -1299,15 +1173,6 @@ let private createOriginLfsRemoteSession
                 ->
                 return Ok(createLocalGitSession arcPath progressCallback)
             | Error validationError -> return errorResult validationError
-    }
-
-let private createOriginLfsRemoteGit
-    (arcPath: string)
-    (progressCallback: GitProgressCallback option)
-    : JS.Promise<GitResult<ISimpleGit>> =
-    promise {
-        let! sessionResult = createOriginLfsRemoteSession arcPath progressCallback
-        return sessionResult |> Result.map _.Git
     }
 
 let private ensureRepo (git: ISimpleGit) = promise {
@@ -1337,147 +1202,6 @@ let private withLocalGitAndProgress
 
 let private withLocalGit (arcPath: string) (operation: ISimpleGit -> JS.Promise<'T>) : JS.Promise<GitResult<'T>> =
     withLocalGitAndProgress arcPath None operation
-
-type private RemoteUrlState =
-    | RemoteMissing
-    | RemoteConfiguredWithoutUrl
-    | RemoteConfigured of string
-
-let private tryGetNonEmptyRemoteUrl (remote: RemoteWithRefs) =
-    [| remote.refs.push; remote.refs.fetch |]
-    |> Array.tryPick (fun url ->
-        url
-        |> Option.ofObj
-        |> Option.map _.Trim()
-        |> Option.filter (String.IsNullOrWhiteSpace >> not)
-    )
-
-let private getRemoteUrlState (remoteName: string) (git: ISimpleGit) : JS.Promise<RemoteUrlState> = promise {
-    let! remoteList = git.getRemotes true
-
-    let remoteUrl =
-        match remoteList with
-        | U2.Case1 remotes ->
-            remotes
-            |> Array.tryFind (fun remote -> String.Equals(remote.name, remoteName, StringComparison.Ordinal))
-            |> Option.map (fun _ -> RemoteConfiguredWithoutUrl)
-        | U2.Case2 remotes ->
-            remotes
-            |> Array.tryFind (fun remote -> String.Equals(remote.name, remoteName, StringComparison.Ordinal))
-            |> Option.map (fun remote ->
-                match tryGetNonEmptyRemoteUrl remote with
-                | Some url -> RemoteConfigured url
-                | None -> RemoteConfiguredWithoutUrl
-            )
-
-    return remoteUrl |> Option.defaultValue RemoteMissing
-}
-
-let private tryGetPublishRepositoryName (arcPath: string) =
-    let projectName =
-        arcPath
-        |> Option.ofObj
-        |> Option.map basename
-        |> Option.map _.Trim()
-        |> Option.filter (String.IsNullOrWhiteSpace >> not)
-
-    match projectName with
-    | Some name -> Ok name
-    | None -> Error(exn "Cannot derive a remote repository name from the local repository path.")
-
-let private createPublishFailure (projectName: string) (message: string) =
-    let details =
-        message
-        |> Option.ofObj
-        |> Option.map _.Trim()
-        |> Option.filter (String.IsNullOrWhiteSpace >> not)
-        |> Option.defaultValue "Remote repository creation failed without details."
-
-    {
-        Kind = classifyFailureKind details
-        Message = $"Could not publish local repository '{projectName}' through the active remote provisioning provider: {details}"
-    }
-
-let private configurePublishedOriginRemote
-    (arcPath: string)
-    (remoteState: RemoteUrlState)
-    (remoteUrl: string)
-    : JS.Promise<GitResult<unit>> =
-    withLocalGit
-        arcPath
-        (fun git -> promise {
-            match remoteState with
-            | RemoteMissing ->
-                let! _ = git.addRemote ("origin", remoteUrl)
-                return ()
-            | RemoteConfiguredWithoutUrl ->
-                let! _ = git.raw [| "remote"; "set-url"; "origin"; remoteUrl |]
-                return ()
-            | RemoteConfigured _ -> return ()
-        })
-
-let private publishOriginRemoteIfMissing
-    (arcPath: string)
-    (remoteName: string)
-    (remoteState: RemoteUrlState)
-    : JS.Promise<GitResult<unit>> =
-    promise {
-        if not (String.Equals(remoteName, "origin", StringComparison.Ordinal)) then
-            return
-                Error {
-                    Kind = GitFailureKind.Unknown
-                    Message = $"Remote '{remoteName}' is not configured. Configure the remote before pushing."
-                }
-        else
-            match tryGetPublishRepositoryName arcPath with
-            | Error nameError -> return errorResult nameError
-            | Ok projectName ->
-                let! projectResult = RemoteProvisioning.createProject projectName
-
-                match projectResult with
-                | Error message -> return Error(createPublishFailure projectName message)
-                | Ok remoteUrl ->
-                    match ensureAllowedRemoteUrl remoteUrl with
-                    | Error remoteUrlError ->
-                        return
-                            errorResult (
-                                exn
-                                    $"Remote provisioning created repository '{projectName}', but returned an unusable Git remote URL: {remoteUrlError.Message}"
-                            )
-                    | Ok safeRemoteUrl -> return! configurePublishedOriginRemote arcPath remoteState safeRemoteUrl
-    }
-
-let private ensurePushRemoteConfigured (arcPath: string) (remoteName: string) : JS.Promise<GitResult<unit>> = promise {
-    let! remoteStateResult = withLocalGit arcPath (getRemoteUrlState remoteName)
-
-    match remoteStateResult with
-    | Error failure -> return Error failure
-    | Ok(RemoteConfigured remoteUrl) ->
-        match ensureAllowedRemoteUrl remoteUrl with
-        | Ok _ -> return Ok()
-        | Error validationError ->
-            return
-                errorResult (
-                    exn
-                        $"Remote '{remoteName}' is configured but cannot be used for authenticated push: {validationError.Message}"
-                )
-    | Ok((RemoteMissing | RemoteConfiguredWithoutUrl) as remoteState) ->
-        return! publishOriginRemoteIfMissing arcPath remoteName remoteState
-}
-
-let private withAuthenticatedGit
-    (arcPath: string)
-    (remoteName: string)
-    (progressCallback: GitProgressCallback option)
-    (operation: ISimpleGit -> JS.Promise<'T>)
-    =
-    promise {
-        let! gitResult = createAuthenticatedGitSession arcPath remoteName progressCallback
-
-        match gitResult with
-        | Error failure -> return Error failure
-        | Ok session -> return! runSimpleGit operation session.Git
-    }
 
 let private requireCleanWorkingTreeForLfsStorageAction (actionLabel: string) (git: ISimpleGit) = promise {
     let! status = git.status ()
@@ -1768,246 +1492,6 @@ let getMergeConflictViewData
                         })
     }
 
-/// Fetches from a validated remote using the configured token provider and optional progress callback.
-let fetch
-    (arcPath: string)
-    (remoteName: string option)
-    (branchName: string option)
-    (progressCallback: GitProgressCallback option)
-    : JS.Promise<GitResult<unit>> =
-    promise {
-        match validateRemoteName (remoteName |> Option.defaultValue "origin") with
-        | Error remoteError -> return errorResult remoteError
-        | Ok safeRemoteName ->
-            match validateOptionalBranchName branchName with
-            | Error branchError -> return errorResult branchError
-            | Ok safeBranchName ->
-                let! result =
-                    withAuthenticatedGit
-                        arcPath
-                        safeRemoteName
-                        progressCallback
-                        (fun git -> promise {
-                            match safeBranchName with
-                            | None ->
-                                let! _ = git.fetch (safeRemoteName)
-                                return ()
-                            | Some safeBranch ->
-                                let! _ = git.fetch (safeRemoteName, safeBranch)
-                                return ()
-                        })
-
-                return result
-    }
-
-/// Verifies that the configured remote is reachable with the current credentials
-/// without transferring repository content. Uses the same auth path as fetch/pull/push
-/// so failures are classified and redacted identically.
-let verifyRemoteAccess (arcPath: string) (remoteName: string option) : JS.Promise<GitResult<unit>> =
-    promise {
-        match validateRemoteName (remoteName |> Option.defaultValue "origin") with
-        | Error remoteError -> return errorResult remoteError
-        | Ok safeRemoteName ->
-            return!
-                withAuthenticatedGit
-                    arcPath
-                    safeRemoteName
-                    None
-                    (fun git -> promise {
-                        let! _ = git.raw [| "ls-remote"; "--heads"; safeRemoteName |]
-                        return ()
-                    })
-    }
-
-/// Fetches and runs a merge-tree preflight to classify whether pull is likely safe or requires merge resolution.
-/// Renderer workflow uses this before "update from online" actions.
-let previewPull
-    (arcPath: string)
-    (remoteName: string option)
-    (branchName: string option)
-    (progressCallback: GitProgressCallback option)
-    : JS.Promise<GitResult<GitPullPreflightResult>> =
-    promise {
-        match validateRemoteName (remoteName |> Option.defaultValue "origin") with
-        | Error remoteError -> return errorResult remoteError
-        | Ok safeRemoteName ->
-            match validateOptionalBranchName branchName with
-            | Error branchError -> return errorResult branchError
-            | Ok safeBranchName ->
-                let! statusResult = withLocalGit arcPath (fun git -> git.status ())
-
-                match statusResult with
-                | Error failure -> return Error failure
-                | Ok status ->
-                    let currentBranch = normalizeOptionalGitRef status.current
-
-                    match status.detached, currentBranch with
-                    | true, _
-                    | _, None ->
-                        return
-                            Ok {
-                                Status = GitPullPreflightStatus.Indeterminate
-                                Message = Some "Cannot preview pull for a detached HEAD."
-                            }
-                    | false, Some _ ->
-                        let upstreamRef =
-                            safeBranchName
-                            |> Option.map (fun safeBranch -> $"{safeRemoteName}/{safeBranch}")
-                            |> Option.orElseWith (fun () -> normalizeOptionalGitRef status.tracking)
-
-                        match upstreamRef with
-                        | None ->
-                            return
-                                Ok {
-                                    Status = GitPullPreflightStatus.Indeterminate
-                                    Message = Some "No upstream tracking branch is configured for the current branch."
-                                }
-                        | Some resolvedUpstreamRef ->
-                            return!
-                                withAuthenticatedGit
-                                    arcPath
-                                    safeRemoteName
-                                    progressCallback
-                                    (fun git -> promise {
-                                        match safeBranchName with
-                                        | None ->
-                                            let! _ = git.fetch safeRemoteName
-                                            ()
-                                        | Some safeBranch ->
-                                            let! _ = git.fetch (safeRemoteName, safeBranch)
-                                            ()
-
-                                        let! mergeTreeResult =
-                                            runGitCapturedWithOutput progressCallback {
-                                                WorkingDirectory = Some arcPath
-                                                Arguments = [|
-                                                    "merge-tree"
-                                                    "--write-tree"
-                                                    "HEAD"
-                                                    resolvedUpstreamRef
-                                                |]
-                                                Environment = None
-                                                StandardInput = None
-                                                CancelCheck = None
-                                                TimeoutMs = Some 30000
-                                            }
-
-                                        if mergeTreeResult.ExitCode = 0 then
-                                            return {
-                                                Status = GitPullPreflightStatus.SafeToPull
-                                                Message = None
-                                            }
-                                        else
-                                            let diagnosticText =
-                                                $"{mergeTreeResult.StdoutText}\n{mergeTreeResult.StderrText}"
-
-                                            let normalizedDiagnostic = diagnosticText.ToLowerInvariant()
-
-                                            if
-                                                normalizedDiagnostic.Contains("conflict")
-                                                || normalizedDiagnostic.Contains("merge conflict")
-                                            then
-                                                return {
-                                                    Status = GitPullPreflightStatus.WouldRequireMergeResolution
-                                                    Message = Some "Pulling would require merge resolution."
-                                                }
-                                            else
-                                                let trimmedDiagnostic = diagnosticText.Trim()
-
-                                                return {
-                                                    Status = GitPullPreflightStatus.Indeterminate
-                                                    Message =
-                                                        if String.IsNullOrWhiteSpace trimmedDiagnostic then
-                                                            Some "Git pull preflight could not be classified safely."
-                                                        else
-                                                            Some
-                                                                $"Git pull preflight could not be classified safely: {trimmedDiagnostic}"
-                                                }
-                                    })
-    }
-
-/// Pulls from a validated remote using token-backed auth and the repository LFS download preference.
-/// When large-file download is enabled, LFS content is hydrated after the git pull.
-let pull
-    (arcPath: string)
-    (remoteName: string option)
-    (branchName: string option)
-    (progressCallback: GitProgressCallback option)
-    : JS.Promise<GitResult<GitPullResult>> =
-    promise {
-        match validateRemoteName (remoteName |> Option.defaultValue "origin") with
-        | Error remoteError -> return errorResult remoteError
-        | Ok safeRemoteName ->
-            match validateOptionalBranchName branchName with
-            | Error branchError -> return errorResult branchError
-            | Ok safeBranchName ->
-                let! sessionResult = createAuthenticatedGitSession arcPath safeRemoteName progressCallback
-
-                match sessionResult with
-                | Error failure -> return Error failure
-                | Ok session ->
-                    let! result =
-                        runSimpleGit
-                            (fun git -> promise {
-                                let! downloadLargeFiles = getConfiguredLfsDownloadLargeFiles git
-                                let effectiveGit = applyLfsSkipSmudge git
-
-                                match safeBranchName with
-                                | None ->
-                                    do! ensureDefaultTrackingBranchForPull safeRemoteName effectiveGit
-                                    let! _ = effectiveGit.pull (safeRemoteName)
-                                    ()
-                                | Some safeBranch ->
-                                    let! _ = effectiveGit.pull (safeRemoteName, safeBranch)
-                                    ()
-
-                                if downloadLargeFiles then
-                                    let! lfsPullResult =
-                                        hydratePulledLfsContent progressCallback arcPath session.CommandAuth
-
-                                    match lfsPullResult with
-                                    | Ok() -> return { Warning = None }
-                                    | Error failure ->
-                                        let hydrationFailure = createPullHydrationFailure failure
-                                        return abortGitPromise hydrationFailure.Message
-                                else
-                                    return { Warning = None }
-                            })
-                            session.Git
-
-                    return result
-    }
-
-/// Coordinates LFS upload planning, optional LFS upload, and the final git push.
-/// Kept separately testable because it controls when git hooks are skipped after an explicit LFS upload.
-let executePushWorkflow
-    (pushTarget: GitPushTarget)
-    (buildOutboundPlan: unit -> JS.Promise<Result<OutboundPushPlan, GitFailure>>)
-    (uploadLfsObjects: string[] -> JS.Promise<GitResult<unit>>)
-    (pushToRemote: bool -> GitPushTarget -> JS.Promise<GitResult<unit>>)
-    (collectLfsDiagnostics: GitFailure -> JS.Promise<string option>)
-    : JS.Promise<GitResult<unit>> =
-    promise {
-        let! lfsPlanResult = buildOutboundPlan ()
-
-        match lfsPlanResult with
-        | Error failure -> return Error failure
-        | Ok OutboundPushPlan.SkipLfsUpload -> return! pushToRemote false pushTarget
-        | Ok(OutboundPushPlan.UploadLfsObjects lfsObjectIds) ->
-            let! lfsUploadResult = uploadLfsObjects lfsObjectIds
-
-            match lfsUploadResult with
-            | Ok() -> return! pushToRemote true pushTarget
-            | Error failure ->
-                let! diagnostics = collectLfsDiagnostics failure
-
-                return
-                    Error {
-                        failure with
-                            Message = appendPushDiagnostics failure.Message diagnostics
-                    }
-    }
-
 /// Plans and performs only the explicit LFS portion of a provider publish.
 /// The caller owns the subsequent ref mutation and must set
 /// `GIT_LFS_SKIP_PUSH=1` when this function returns `Ok true`.
@@ -2081,122 +1565,6 @@ let prepareExplicitLfsPush
                         | Error error -> Error(toFailure error)
     }
 
-/// Pushes the current or requested branch, uploading referenced LFS objects first when needed.
-let push
-    (arcPath: string)
-    (remoteName: string option)
-    (branchName: string option)
-    (progressCallback: GitProgressCallback option)
-    : JS.Promise<GitResult<unit>> =
-    promise {
-        match validateRemoteName (remoteName |> Option.defaultValue "origin") with
-        | Error remoteError -> return errorResult remoteError
-        | Ok safeRemoteName ->
-            match validateOptionalBranchName branchName with
-            | Error branchError -> return errorResult branchError
-            | Ok safeBranchName ->
-                let! remoteConfigResult = ensurePushRemoteConfigured arcPath safeRemoteName
-
-                match remoteConfigResult with
-                | Error failure -> return Error failure
-                | Ok() ->
-                    let! gitResult = createAuthenticatedGitSession arcPath safeRemoteName progressCallback
-
-                    match gitResult with
-                    | Error failure -> return Error failure
-                    | Ok session ->
-                        let git = session.Git
-                        let runGitCapturedForProgress = runGitCapturedWithOutput progressCallback
-                        let cancellationKey, cancelCheck = startPushCancellationScope arcPath
-
-                        try
-                            let! pushStatusResult = runSimpleGit (fun currentGit -> currentGit.status ()) git
-
-                            match pushStatusResult with
-                            | Error failure -> return Error failure
-                            | Ok pushStatus ->
-                                let pushTarget =
-                                    resolvePushTarget
-                                        safeBranchName
-                                        pushStatus.current
-                                        pushStatus.tracking
-                                        pushStatus.detached
-
-                                return!
-                                    executePushWorkflow
-                                        pushTarget
-                                        (fun () ->
-                                            reportPhase progressCallback "lfs" "Checking Git LFS objects"
-
-                                            planOutboundPush
-                                                runSimpleGit
-                                                runGitCapturedForProgress
-                                                toFailure
-                                                (fun currentGit ->
-                                                    runSimpleGit (fun gitInstance -> gitInstance.status ()) currentGit
-                                                )
-                                                arcPath
-                                                safeRemoteName
-                                                (Some pushTarget.RefSpec)
-                                                git
-                                        )
-                                        (fun objectIds -> promise {
-                                            reportPhase progressCallback "lfs" "Uploading Git LFS objects"
-
-                                            let! uploadResult =
-                                                GitLfsService.uploadObjects
-                                                    runGitCapturedForProgress
-                                                    session.CommandAuth
-                                                    cancelCheck
-                                                    arcPath
-                                                    safeRemoteName
-                                                    pushTarget.RefSpec
-                                                    objectIds
-
-                                            return uploadResult |> Result.mapError toFailure
-                                        })
-                                        (fun skipLfsHook currentPushTarget ->
-                                            reportPhase progressCallback "push" "Pushing refs"
-
-                                            runSimpleGit
-                                                (fun currentGit -> promise {
-                                                    let pushGit =
-                                                        if skipLfsHook then
-                                                            currentGit.env ("GIT_LFS_SKIP_PUSH", "1")
-                                                        else
-                                                            currentGit
-
-                                                    if currentPushTarget.SetUpstream then
-                                                        let! _ =
-                                                            pushGit.push (
-                                                                safeRemoteName,
-                                                                currentPushTarget.PushBranch,
-                                                                !^[| "--set-upstream" |]
-                                                            )
-
-                                                        return ()
-                                                    else
-                                                        let! _ =
-                                                            pushGit.push (
-                                                                safeRemoteName,
-                                                                currentPushTarget.PushBranch
-                                                            )
-
-                                                        return ()
-                                                })
-                                                git
-                                        )
-                                        (fun _failure ->
-                                            collectPushDiagnostics
-                                                runSimpleGit
-                                                (fun currentFailure -> Some currentFailure.Message)
-                                                safeRemoteName
-                                                git
-                                        )
-                        finally
-                            clearPushCancellationScope cancellationKey
-    }
-
 /// Persists Git workflow LFS settings in local repository config.
 let setLfsSettings (arcPath: string) (settings: GitLfsSettingsDto) : JS.Promise<GitResult<unit>> = promise {
     match validateLfsThresholdMb settings.AutoTrackThresholdMb with
@@ -2228,6 +1596,8 @@ let setLfsSettings (arcPath: string) (settings: GitLfsSettingsDto) : JS.Promise<
 
 let pruneLfsCacheWithProgressAndCancellation
     (arcPath: string)
+    (credentials: GitCredentialStrategy.GitCredentialStrategy)
+    (connectionProfileId: string option)
     (progressCallback: GitProgressCallback option)
     (cancelCheck: unit -> bool)
     (onStarted: unit -> unit)
@@ -2249,7 +1619,12 @@ let pruneLfsCacheWithProgressAndCancellation
         match localValidationResult with
         | Error failure -> return Error failure
         | Ok() ->
-            let! sessionResult = createOriginLfsRemoteSession arcPath progressCallback
+            let! sessionResult =
+                createOriginLfsRemoteSession
+                    arcPath
+                    credentials
+                    connectionProfileId
+                    progressCallback
 
             match sessionResult with
             | Error failure -> return Error failure
@@ -2271,7 +1646,13 @@ let pruneLfsCacheWithProgress
     (arcPath: string)
     (progressCallback: GitProgressCallback option)
     : JS.Promise<GitResult<string>> =
-    pruneLfsCacheWithProgressAndCancellation arcPath progressCallback (fun () -> false) ignore
+    pruneLfsCacheWithProgressAndCancellation
+        arcPath
+        GitCredentialStrategy.anonymous
+        None
+        progressCallback
+        (fun () -> false)
+        ignore
 
 let pruneLfsCache (arcPath: string) : JS.Promise<GitResult<string>> = pruneLfsCacheWithProgress arcPath None
 
@@ -2382,44 +1763,69 @@ let private discardPathspecsWithOriginals (arcPath: string) (status: StatusResul
 
     Array.append safePathSpecs originalPaths |> Array.distinct
 
-let private requireLfsListingForPath (arcPath: string) (safePath: string) : JS.Promise<GitLfsLsFileInfo> = promise {
-    match! GitLfsService.tryFindListingForPath arcPath safePath with
-    | Ok listing -> return listing
-    | Error message -> return abortGitPromise $"'{safePath}' {message}"
-}
+let private canceledLfsResult<'T> () : GitResult<'T> =
+    Error(createFailure GitFailureKind.Canceled "Git LFS operation canceled.")
 
 let private runLfsRaw (args: string[]) git =
     runSimpleGit (fun currentGit -> currentGit.raw args) git
+
+let private requireLfsListingForPath
+    (arcPath: string)
+    (safePath: string)
+    (context: OperationContext)
+    : JS.Promise<GitLfsLsFileInfo> = promise {
+    if context.Cancellation.IsCancellationRequested() then
+        return abortGitPromise "Git LFS operation canceled."
+    else
+        match! GitLfsService.tryFindListingForPath arcPath safePath context with
+        | Ok listing -> return listing
+        | Error message -> return abortGitPromise $"'{safePath}' {message}"
+}
 
 let private getCleanLfsListingForPath
     (arcPath: string)
     (safePath: string)
     (dirtyMessage: string)
+    (context: OperationContext)
     : JS.Promise<GitResult<GitLfsLsFileInfo>> =
-    withLocalGit
-        arcPath
-        (fun git -> promise {
-            let! status = git.status ()
+    if context.Cancellation.IsCancellationRequested() then
+        promise { return canceledLfsResult () }
+    else
+        withLocalGit
+            arcPath
+            (fun git -> promise {
+                let! status = git.status ()
 
-            if not (isPathCleanInStatus status safePath) then
-                return abortGitPromise dirtyMessage
-            else
-                return! requireLfsListingForPath arcPath safePath
-        })
+                if context.Cancellation.IsCancellationRequested() then
+                    return abortGitPromise "Git LFS operation canceled."
+                elif not (isPathCleanInStatus status safePath) then
+                    return abortGitPromise dirtyMessage
+                else
+                    return! requireLfsListingForPath arcPath safePath context
+            })
 
 let private getCleanLfsFileForAction
     (arcPath: string)
     (requestedPath: string)
     (dirtyMessageForSafePath: string -> string)
-    : JS.Promise<GitResult<string * string * GitLfsLsFileInfo>> =
-    promise {
+    (context: OperationContext)
+    : JS.Promise<GitResult<string * string * GitLfsLsFileInfo>> = promise {
+    if context.Cancellation.IsCancellationRequested() then
+        return canceledLfsResult ()
+    else
         match tryResolveArcRelativePath arcPath requestedPath with
         | Error validationError -> return errorResult validationError
         | Ok(safePath, absolutePath) ->
-            match! getCleanLfsListingForPath arcPath safePath (dirtyMessageForSafePath safePath) with
+            match!
+                getCleanLfsListingForPath
+                    arcPath
+                    safePath
+                    (dirtyMessageForSafePath safePath)
+                    context
+            with
             | Error failure -> return Error failure
             | Ok listing -> return Ok(safePath, absolutePath, listing)
-    }
+}
 
 let private createMissingLfsAttributesFailure safePath actionDescription =
     exn
@@ -2436,12 +1842,15 @@ let private requireDownloadedLfsFile
     safePath
     absolutePath
     (expectedListing: GitLfsLsFileInfo)
+    (context: OperationContext)
     (git: ISimpleGit)
     =
     promise {
-        let! finalListing = requireLfsListingForPath arcPath safePath
+        let! finalListing = requireLfsListingForPath arcPath safePath context
 
-        if not finalListing.checkout then
+        if context.Cancellation.IsCancellationRequested() then
+            return abortGitPromise "Git LFS operation canceled."
+        elif not finalListing.checkout then
             return abortGitPromiseWith (createLfsCheckoutFailure arcPath safePath)
         else
             let! finalStats = statAsync absolutePath
@@ -2453,114 +1862,257 @@ let private requireDownloadedLfsFile
             else
                 let! finalStatus = git.status ()
 
-                if not (isPathCleanInStatus finalStatus safePath) then
+                if context.Cancellation.IsCancellationRequested() then
+                    return abortGitPromise "Git LFS operation canceled."
+                elif not (isPathCleanInStatus finalStatus safePath) then
                     return abortGitPromiseWith (createLfsCheckoutFailure arcPath safePath)
                 else
                     return ()
     }
 
-let private downloadMissingLfsFile arcPath safePath absolutePath listing : JS.Promise<GitResult<unit>> = promise {
-    match! createOriginLfsRemoteSession arcPath None with
-    | Error failure -> return Error failure
-    | Ok session ->
-        match! GitLfsService.downloadObjectFromListing arcPath session.CommandAuth safePath listing with
-        | Error error -> return errorResult error
-        | Ok() ->
-            let! checkoutResult = runLfsRaw (GitLfsService.buildCheckoutArgs safePath) session.Git
+let private downloadMissingLfsFile
+    arcPath
+    safePath
+    absolutePath
+    listing
+    credentials
+    connectionProfileId
+    context
+    : JS.Promise<GitResult<unit>> = promise {
+    if context.Cancellation.IsCancellationRequested() then
+        return canceledLfsResult ()
+    else
+        match! createOriginLfsRemoteSession arcPath credentials connectionProfileId None with
+        | Error failure -> return Error failure
+        | Ok session ->
+            match!
+                GitLfsService.downloadObjectFromListing
+                    arcPath
+                    session.CommandAuth
+                    safePath
+                    listing
+                    (Some context.Cancellation.IsCancellationRequested)
+                    (fun () ->
+                        context.ReportProgress {
+                            PhaseCode = "lfs-materialize-transfer"
+                            Item = Some safePath
+                            Completed = Some 0.0
+                            Total = Some listing.size
+                            DisplayMessage = None
+                        })
+            with
+            | Error _ when context.Cancellation.IsCancellationRequested() -> return canceledLfsResult ()
+            | Error error -> return errorResult error
+            | Ok() when context.Cancellation.IsCancellationRequested() -> return canceledLfsResult ()
+            | Ok() ->
+                let! checkoutResult = runLfsRaw (GitLfsService.buildCheckoutArgs safePath) session.Git
 
-            match checkoutResult with
-            | Error failure -> return Error failure
-            | Ok _ ->
-                return!
-                    runSimpleGit
-                        (fun currentGit -> requireDownloadedLfsFile arcPath safePath absolutePath listing currentGit)
-                        session.Git
+                match checkoutResult with
+                | Error failure -> return Error failure
+                | Ok _ when context.Cancellation.IsCancellationRequested() -> return canceledLfsResult ()
+                | Ok _ ->
+                    return!
+                        runSimpleGit
+                            (fun currentGit ->
+                                requireDownloadedLfsFile
+                                    arcPath
+                                    safePath
+                                    absolutePath
+                                    listing
+                                    context
+                                    currentGit)
+                            session.Git
 }
 
-let freeLocalLfsCopy (arcPath: string) (requestedPath: string) : JS.Promise<GitResult<unit>> = promise {
+let freeLocalLfsCopy
+    (arcPath: string)
+    (requestedPath: string)
+    (credentials: GitCredentialStrategy.GitCredentialStrategy)
+    (connectionProfileId: string option)
+    (context: OperationContext)
+    : JS.Promise<GitResult<unit>> = promise {
     let! lfsFileResult =
         getCleanLfsFileForAction
             arcPath
             requestedPath
             (fun safePath ->
-                $"'{safePath}' has local changes. Save, discard, or commit them before freeing the local LFS copy."
-            )
+                $"'{safePath}' has local changes. Save, discard, or commit them before freeing the local LFS copy.")
+            context
 
     match lfsFileResult with
     | Error failure -> return Error failure
-    | Ok(_, _, listing) when not listing.checkout -> return Ok()
+    | Ok(safePath, _, listing) when not listing.checkout ->
+        context.ReportProgress {
+            PhaseCode = "lfs-dematerialize"
+            Item = Some safePath
+            Completed = Some 0.0
+            Total = Some listing.size
+            DisplayMessage = Some "Git LFS file is already dematerialized"
+        }
+
+        return Ok()
     | Ok(safePath, _, _) when not (isTrackedByAttributes arcPath safePath) ->
         return errorResult (createMissingLfsAttributesFailure safePath "freeing the local LFS copy")
     | Ok(safePath, absolutePath, listing) ->
-        match! createOriginLfsRemoteSession arcPath None with
-        | Error failure -> return Error failure
-        | Ok session ->
-            match! GitLfsService.fetchRefetchForPath arcPath session.CommandAuth safePath None with
-            | Error error -> return errorResult error
-            | Ok() ->
-                let git = session.Git
-                let backupPath = createTemporaryLfsBackupPath absolutePath
+        context.ReportProgress {
+            PhaseCode = "lfs-dematerialize"
+            Item = Some safePath
+            Completed = Some 0.0
+            Total = Some listing.size
+            DisplayMessage = Some "Preparing Git LFS dematerialization"
+        }
 
-                try
-                    renameSync absolutePath backupPath
+        if context.Cancellation.IsCancellationRequested() then
+            return canceledLfsResult ()
+        else
+            match! createOriginLfsRemoteSession arcPath credentials connectionProfileId None with
+            | Error failure -> return Error failure
+            | Ok session ->
+                match!
+                    GitLfsService.fetchRefetchForPath
+                        arcPath
+                        session.CommandAuth
+                        safePath
+                        (Some context.Cancellation.IsCancellationRequested)
+                        (fun () ->
+                            context.ReportProgress {
+                                PhaseCode = "lfs-dematerialize-transfer"
+                                Item = Some safePath
+                                Completed = Some 0.0
+                                Total = Some listing.size
+                                DisplayMessage = None
+                            })
+                with
+                | Error _ when context.Cancellation.IsCancellationRequested() -> return canceledLfsResult ()
+                | Error error -> return errorResult error
+                | Ok() when context.Cancellation.IsCancellationRequested() -> return canceledLfsResult ()
+                | Ok() ->
+                    let git = session.Git
+                    let backupPath = createTemporaryLfsBackupPath absolutePath
 
-                    match! ensureBackupMatchesLfsOid backupPath listing with
-                    | Error validationError ->
+                    try
+                        renameSync absolutePath backupPath
+
+                        if context.Cancellation.IsCancellationRequested() then
+                            restoreTemporaryLfsBackup backupPath absolutePath
+                            return canceledLfsResult ()
+                        else
+                            match! ensureBackupMatchesLfsOid backupPath listing with
+                            | Error validationError ->
+                                restoreTemporaryLfsBackup backupPath absolutePath
+
+                                return errorResult validationError
+                            | Ok() ->
+                                let pointerGit = applyLfsSkipSmudge git
+
+                                let! checkoutResult =
+                                    runSimpleGit
+                                        (fun currentGit -> currentGit.raw [| "checkout"; "HEAD"; "--"; safePath |])
+                                        pointerGit
+
+                                match checkoutResult with
+                                | Error failure ->
+                                    restoreTemporaryLfsBackup backupPath absolutePath
+
+                                    return Error failure
+                                | Ok _ when context.Cancellation.IsCancellationRequested() ->
+                                    restoreTemporaryLfsBackup backupPath absolutePath
+                                    return canceledLfsResult ()
+                                | Ok _ ->
+                                    let! finalStatusResult = runSimpleGit (fun currentGit -> currentGit.status ()) git
+
+                                    match finalStatusResult with
+                                    | Error failure ->
+                                        restoreTemporaryLfsBackup backupPath absolutePath
+
+                                        return Error failure
+                                    | Ok finalStatus when not (isPathCleanInStatus finalStatus safePath) ->
+                                        restoreTemporaryLfsBackup backupPath absolutePath
+
+                                        return
+                                            errorResult (
+                                                exn
+                                                    $"Could not replace '{safePath}' with an LFS pointer without changing Git status."
+                                            )
+                                    | Ok _ ->
+                                        removeTemporaryLfsBackup backupPath
+
+                                        context.ReportProgress {
+                                            PhaseCode = "lfs-dematerialize"
+                                            Item = Some safePath
+                                            Completed = Some listing.size
+                                            Total = Some listing.size
+                                            DisplayMessage = Some "Git LFS file dematerialized"
+                                        }
+
+                                        return Ok()
+                    with ex ->
                         restoreTemporaryLfsBackup backupPath absolutePath
 
-                        return errorResult validationError
-                    | Ok() ->
-                        let pointerGit = applyLfsSkipSmudge git
-
-                        let! checkoutResult =
-                            runSimpleGit
-                                (fun currentGit -> currentGit.raw [| "checkout"; "HEAD"; "--"; safePath |])
-                                pointerGit
-
-                        match checkoutResult with
-                        | Error failure ->
-                            restoreTemporaryLfsBackup backupPath absolutePath
-
-                            return Error failure
-                        | Ok _ ->
-                            let! finalStatusResult = runSimpleGit (fun currentGit -> currentGit.status ()) git
-
-                            match finalStatusResult with
-                            | Error failure ->
-                                restoreTemporaryLfsBackup backupPath absolutePath
-
-                                return Error failure
-                            | Ok finalStatus when not (isPathCleanInStatus finalStatus safePath) ->
-                                restoreTemporaryLfsBackup backupPath absolutePath
-
-                                return
-                                    errorResult (
-                                        exn
-                                            $"Could not replace '{safePath}' with an LFS pointer without changing Git status."
-                                    )
-                            | Ok _ ->
-                                removeTemporaryLfsBackup backupPath
-
-                                return Ok()
-                with ex ->
-                    restoreTemporaryLfsBackup backupPath absolutePath
-
-                    return errorResult ex
+                        return errorResult ex
 }
 
-let downloadLfsFile (arcPath: string) (requestedPath: string) : JS.Promise<GitResult<unit>> = promise {
+let downloadLfsFile
+    (arcPath: string)
+    (requestedPath: string)
+    (credentials: GitCredentialStrategy.GitCredentialStrategy)
+    (connectionProfileId: string option)
+    (context: OperationContext)
+    : JS.Promise<GitResult<unit>> = promise {
     let! lfsFileResult =
         getCleanLfsFileForAction
             arcPath
             requestedPath
             (fun safePath ->
-                $"'{safePath}' has local changes. Save, discard, or commit them before downloading the Git LFS file."
-            )
+                $"'{safePath}' has local changes. Save, discard, or commit them before downloading the Git LFS file.")
+            context
 
     match lfsFileResult with
     | Error failure -> return Error failure
-    | Ok(_, _, listing) when listing.checkout -> return Ok()
-    | Ok(safePath, absolutePath, listing) -> return! downloadMissingLfsFile arcPath safePath absolutePath listing
+    | Ok(safePath, _, listing) when listing.checkout ->
+        context.ReportProgress {
+            PhaseCode = "lfs-materialize"
+            Item = Some safePath
+            Completed = Some listing.size
+            Total = Some listing.size
+            DisplayMessage = Some "Git LFS file is already materialized"
+        }
+
+        return Ok()
+    | Ok(safePath, absolutePath, listing) ->
+        context.ReportProgress {
+            PhaseCode = "lfs-materialize"
+            Item = Some safePath
+            Completed = Some 0.0
+            Total = Some listing.size
+            DisplayMessage = Some "Preparing Git LFS materialization"
+        }
+
+        if context.Cancellation.IsCancellationRequested() then
+            return canceledLfsResult ()
+        else
+            let! result =
+                downloadMissingLfsFile
+                    arcPath
+                    safePath
+                    absolutePath
+                    listing
+                    credentials
+                    connectionProfileId
+                    context
+
+            match result with
+            | Ok() ->
+                context.ReportProgress {
+                    PhaseCode = "lfs-materialize"
+                    Item = Some safePath
+                    Completed = Some listing.size
+                    Total = Some listing.size
+                    DisplayMessage = Some "Git LFS file materialized"
+                }
+
+                return Ok()
+            | Error failure -> return Error failure
 }
 
 /// Discards validated pathspecs by restoring tracked paths from HEAD and cleaning selected untracked files.

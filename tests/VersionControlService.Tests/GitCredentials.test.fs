@@ -113,7 +113,7 @@ Vitest.describe (
     "Git workspace credential strategies",
     fun () ->
         Vitest.test (
-            "credential strategies support anonymous token SSH and local remotes",
+            "lfs materialization credentials use the injected strategy like publish",
             TestOptions(timeout = 120000),
             fun () -> promise {
                 let! root = createTempDirectoryAsync ()
@@ -274,6 +274,54 @@ Vitest.describe (
                         testHost, Some "token-profile"
                         testHost, Some "token-profile"
                     |]
+
+                    let! _ = runGitIn workPath [| "lfs"; "track"; "materialized.bin" |]
+                    do! writeUtf8FileAsync (join [| workPath; "materialized.bin" |]) "materialized LFS content\n"
+                    let! _ = runGitIn workPath [| "add"; "-A" |]
+                    let! _ = runGitIn workPath [| "commit"; "-m"; "test: add materialized lfs file" |]
+                    let! _ = runGitIn workPath [| "push"; "origin"; "main" |]
+
+                    let materialization =
+                        session.ObjectMaterialization
+                        |> Option.defaultWith (fun () -> failwith "Expected Git object materialization.")
+
+                    strategyCalls.Clear()
+                    observedCommands.Clear()
+
+                    let! dematerializeResult =
+                        materialization.Dematerialize
+                            (RepositoryPath.tryCreate "materialized.bin" |> Result.defaultWith failwith)
+                            (ctx "credential-dematerialize")
+                        |> Async.StartAsPromise
+
+                    expectValue "credential dematerialization" dematerializeResult |> ignore
+
+                    let! materializeResult =
+                        materialization.Materialize
+                            (RepositoryPath.tryCreate "materialized.bin" |> Result.defaultWith failwith)
+                            (ctx "credential-materialize")
+                        |> Async.StartAsPromise
+
+                    expectValue "credential materialization" materializeResult |> ignore
+
+                    Vitest.expect(strategyCalls.ToArray()).toEqual [|
+                        testHost, Some "token-profile"
+                        testHost, Some "token-profile"
+                    |]
+
+                    for arguments in observedCommands do
+                        for argument in arguments do
+                            Vitest.expect(argument.Contains testSecret).toBe false
+
+                    strategyCalls.Clear()
+
+                    let maintenance =
+                        session.Maintenance
+                        |> Option.defaultWith (fun () -> failwith "Expected Git maintenance.")
+
+                    let! pruneResult = maintenance.Prune(ctx "credential-prune") |> Async.StartAsPromise
+                    expectValue "credential prune" pruneResult |> ignore
+                    Vitest.expect(strategyCalls.ToArray()).toEqual [| testHost, Some "token-profile" |]
 
                     // Anonymous local-path remote: a session with the anonymous strategy
                     // and no global token machinery synchronizes fine.
