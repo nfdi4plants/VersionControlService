@@ -19,11 +19,15 @@ let private categoryOfKind (kind: GitFailureKind) =
     | GitFailureKind.Timeout -> Timeout
     | GitFailureKind.Canceled -> Canceled
     | GitFailureKind.LfsInstallRequired -> DependencyMissing
+    | GitFailureKind.InvalidLfsThreshold -> Validation
     | GitFailureKind.RemoteProjectAlreadyExists -> ProviderError
     | GitFailureKind.Unknown -> ProviderError
 
 let private toOperationFailure (failure: GitService.GitFailure) : OperationFailure =
-    OperationFailure.createRedacted (categoryOfKind failure.Kind) "lfs_operation_failed" failure.Message
+    if failure.Kind = GitFailureKind.InvalidLfsThreshold then
+        OperationFailure.create Validation "invalid_lfs_threshold" failure.Message
+    else
+        OperationFailure.createRedacted (categoryOfKind failure.Kind) "lfs_operation_failed" failure.Message
 
 let private toOperationResult (failure: GitService.GitFailure) : OperationResult<unit> =
     if failure.Kind = GitFailureKind.Canceled then
@@ -176,8 +180,15 @@ let createStoragePolicy (repoPath: string) : StoragePolicyService = {
             match result with
             | Ok() -> return OperationResult.succeeded ()
             | Error error ->
+                let kind = GitService.classifyFailureKind error
+
                 return
-                    Failed(OperationFailure.createRedacted DependencyMissing "lfs_operation_failed" (string error))
+                    Failed(
+                        OperationFailure.createRedacted
+                            (categoryOfKind kind)
+                            "lfs_operation_failed"
+                            error
+                    )
         }
     GetSettings =
         fun _ -> async {
@@ -200,7 +211,7 @@ let createStoragePolicy (repoPath: string) : StoragePolicyService = {
                         OperationFailure.create
                             Validation
                             "invalid_lfs_threshold"
-                            "The automatic LFS threshold must be a positive whole MiB value."
+                            GitService.InvalidLfsThresholdMessage
                     )
             else
                 let! currentResult = Async.AwaitPromise(GitService.getLfsSettings repoPath)

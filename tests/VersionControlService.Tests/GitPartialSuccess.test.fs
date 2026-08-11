@@ -141,6 +141,17 @@ let private createSelectedRevisionFixture () = promise {
     return root, workPath, binding
 }
 
+let private pathExistsAsync (path: string) : JS.Promise<bool> = promise {
+    try
+        let! _ = fsPromisesDynamic?access (path) |> unbox<JS.Promise<obj>>
+        return true
+    with _ ->
+        return false
+}
+
+[<Emit("require('node:crypto').createHash('sha256').update($0, 'utf8').digest('hex')")>]
+let private sha256Utf8 (_value: string) : string = jsNative
+
 let private repositoryPath value =
     RepositoryPath.tryCreate value |> Result.defaultWith failwith
 
@@ -557,7 +568,7 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "selected revision validates every staged descendant of a selected directory",
+            "selected revision LFS tracks every staged descendant of a selected directory",
             TestOptions(timeout = 120000),
             fun () -> promise {
                 let! root, workPath, binding = createSelectedRevisionFixture ()
@@ -568,8 +579,6 @@ Vitest.describe (
                     do! writeUtf8FileAsync (join [| directoryPath; "a-small.bin" |]) "small\n"
                     let largeContent = String.replicate (1024 * 1024) "d"
                     do! writeUtf8FileAsync (join [| directoryPath; "z-large.bin" |]) largeContent
-                    let! headBefore = runGitOk workPath [| "rev-parse"; "HEAD" |]
-                    let! stagedBefore = runGitOk workPath [| "diff"; "--cached"; "--name-only" |]
                     let session =
                         GitWorkspaceSession.createSession GitWorkspaceSession.GitSessionHooks.none binding
 
@@ -590,21 +599,205 @@ Vitest.describe (
                         |> Async.StartAsPromise
 
                     match revisionResult with
+                    | Succeeded _ -> ()
+                    | _ -> failwith "Expected every staged directory descendant to be LFS-tracked."
+
+                    let! largeCommitted = runGitOk workPath [| "show"; "HEAD:selected/z-large.bin" |]
+                    let! committedAttributes = runGitOk workPath [| "show"; "HEAD:.gitattributes" |]
+                    let! attributesAfter = tryReadUtf8FileAsync (join [| workPath; ".gitattributes" |])
+                    Vitest.expect(largeCommitted.Contains "git-lfs").toBe true
+                    Vitest.expect(committedAttributes.Contains "\"/selected/z-large.bin\" filter=lfs").toBe true
+                    Vitest.expect(attributesAfter |> Option.exists _.Contains("\"/selected/z-large.bin\" filter=lfs")).toBe true
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "selected revision LFS skips ignored directory descendants without creating orphan objects",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, binding = createSelectedRevisionFixture ()
+
+                try
+                    let directoryPath = join [| workPath; "selected" |]
+                    let! _ = fsPromisesDynamic?mkdir (directoryPath) |> unbox<JS.Promise<obj>>
+                    do! writeUtf8FileAsync (join [| workPath; ".gitignore" |]) "selected/ignored.bin\n"
+                    do! writeUtf8FileAsync (join [| directoryPath; "tracked.bin" |]) "tracked before growth\n"
+                    let! _ = runGitOk workPath [| "add"; ".gitignore"; "selected/tracked.bin" |]
+                    let! _ = runGitOk workPath [| "commit"; "-m"; "test: tracked selected directory fixture" |]
+
+                    let trackedContent = String.replicate (1024 * 1024) "t"
+                    let ignoredContent = String.replicate (1024 * 1024) "i"
+                    do! writeUtf8FileAsync (join [| directoryPath; "tracked.bin" |]) trackedContent
+                    do! writeUtf8FileAsync (join [| directoryPath; "ignored.bin" |]) ignoredContent
+
+                    let ignoredOid = sha256Utf8 ignoredContent
+                    let ignoredObjectPath =
+                        join
+                            [|
+                                workPath
+                                ".git"
+                                "lfs"
+                                "objects"
+                                ignoredOid.Substring(0, 2)
+                                ignoredOid.Substring(2, 2)
+                                ignoredOid
+                            |]
+
+                    let! ignoredObjectBefore = pathExistsAsync ignoredObjectPath
+                    Vitest.expect(ignoredObjectBefore).toBe false
+                    let session =
+                        GitWorkspaceSession.createSession GitWorkspaceSession.GitSessionHooks.none binding
+
+                    let! statusResult = session.Core.GetStatus(ctx "ignored-directory-lfs-status") |> Async.StartAsPromise
+                    let status =
+                        match statusResult with
+                        | Succeeded outcome -> outcome.Value
+                        | _ -> failwith "Expected selected-revision status."
+
+                    let! revisionResult =
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: skip ignored selected directory descendants"
+                                Paths = [| repositoryPath "selected" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (ctx "ignored-directory-lfs-revision")
+                        |> Async.StartAsPromise
+
+                    match revisionResult with
+                    | Succeeded _ -> ()
                     | Failed failure ->
-                        Vitest.expect(failure.Category).toEqual Concurrency
-                        Vitest.expect(failure.Code).toBe "selected_content_changed"
+                        let! ignoredObjectAfterFailure = pathExistsAsync ignoredObjectPath
+                        failwith
+                            $"Expected ignored descendants to be skipped; got {failure.Code}; orphaned object: {ignoredObjectAfterFailure}."
+                    | PartiallySucceeded(_, failure) ->
+                        failwith $"Expected ignored descendants to be skipped; got partial success {failure.Code}."
+
+                    let! trackedCommitted = runGitOk workPath [| "show"; "HEAD:selected/tracked.bin" |]
+                    let! ignoredCommitted = runGit workPath [| "show"; "HEAD:selected/ignored.bin" |]
+                    let! committedAttributes = runGitOk workPath [| "show"; "HEAD:.gitattributes" |]
+                    let! ignoredObjectAfter = pathExistsAsync ignoredObjectPath
+                    Vitest.expect(trackedCommitted.Contains "git-lfs").toBe true
+                    Vitest.expect(ignoredCommitted |> Result.isError).toBe true
+                    Vitest.expect(committedAttributes.Contains "\"/selected/tracked.bin\" filter=lfs").toBe true
+                    Vitest.expect(committedAttributes.Contains "ignored.bin").toBe false
+                    Vitest.expect(ignoredObjectAfter).toBe false
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "selected revision LFS ignores working-tree-only attribute coverage",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, binding = createSelectedRevisionFixture ()
+
+                try
+                    let attributesContent = "*.bin filter=lfs diff=lfs merge=lfs -text\n"
+                    do! writeUtf8FileAsync (join [| workPath; ".gitattributes" |]) attributesContent
+                    do!
+                        writeUtf8FileAsync
+                            (join [| workPath; "large.bin" |])
+                            (String.replicate (1024 * 1024) "w")
+
+                    let! headBefore = runGitOk workPath [| "rev-parse"; "HEAD" |]
+                    let session =
+                        GitWorkspaceSession.createSession GitWorkspaceSession.GitSessionHooks.none binding
+
+                    let! statusResult = session.Core.GetStatus(ctx "working-attributes-lfs-status") |> Async.StartAsPromise
+                    let status =
+                        match statusResult with
+                        | Succeeded outcome -> outcome.Value
+                        | _ -> failwith "Expected selected-revision status."
+
+                    let! revisionResult =
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: reject working-tree-only LFS coverage"
+                                Paths = [| repositoryPath "large.bin" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (ctx "working-attributes-lfs-revision")
+                        |> Async.StartAsPromise
+
+                    match revisionResult with
+                    | Failed failure ->
+                        Vitest.expect(failure.Category).toEqual Validation
+                        Vitest.expect(failure.Code).toBe "precondition_failed"
                         Vitest.expect(failure.StateChanged).toBe false
-                        Vitest.expect(failure.AffectedPaths).toEqual [| "selected/z-large.bin" |]
-                    | _ -> failwith "Expected every staged directory descendant to be LFS-validated."
+                    | _ -> failwith "Expected working-tree-only attributes to be excluded from commit coverage."
 
                     let! headAfter = runGitOk workPath [| "rev-parse"; "HEAD" |]
-                    let! stagedAfter = runGitOk workPath [| "diff"; "--cached"; "--name-only" |]
-                    let! attributesAfter = tryReadUtf8FileAsync (join [| workPath; ".gitattributes" |])
-                    let! largeAfter = tryReadUtf8FileAsync (join [| directoryPath; "z-large.bin" |])
+                    let! committedAttributes = runGit workPath [| "show"; "HEAD:.gitattributes" |]
                     Vitest.expect(headAfter.Trim()).toBe (headBefore.Trim())
-                    Vitest.expect(stagedAfter).toBe stagedBefore
-                    Vitest.expect(attributesAfter).toEqual None
-                    Vitest.expect(largeAfter).toEqual (Some largeContent)
+                    Vitest.expect(committedAttributes |> Result.isError).toBe true
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "selected revision LFS surfaces a candidate stat failure before staging validation",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, binding = createSelectedRevisionFixture ()
+
+                try
+                    let selectedPath = join [| workPath; "stat-failure.bin" |]
+                    do! writeUtf8FileAsync selectedPath (String.replicate (1024 * 1024) "s")
+                    let mutable barrierRan = false
+
+                    let hooks: GitWorkspaceSession.GitSessionHooks = {
+                        RunBytesProcess = None
+                        RunProcess = None
+                        Barrier =
+                            Some(fun _ point _ -> async {
+                                if point = "selected-revision-lfs-candidates-listed" then
+                                    barrierRan <- true
+                                    let! _ =
+                                        fsPromisesDynamic?rm (selectedPath, createObj [ "force" ==> true ])
+                                        |> unbox<JS.Promise<obj>>
+                                        |> Async.AwaitPromise
+
+                                    ()
+                            })
+                    }
+
+                    let session = GitWorkspaceSession.createSession hooks binding
+                    let! statusResult = session.Core.GetStatus(ctx "stat-failure-lfs-status") |> Async.StartAsPromise
+                    let status =
+                        match statusResult with
+                        | Succeeded outcome -> outcome.Value
+                        | _ -> failwith "Expected selected-revision status."
+
+                    let! revisionResult =
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: surface selected LFS stat failure"
+                                Paths = [| repositoryPath "stat-failure.bin" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (ctx "stat-failure-lfs-revision")
+                        |> Async.StartAsPromise
+
+                    Vitest.expect(barrierRan).toBe true
+
+                    match revisionResult with
+                    | Failed failure ->
+                        Vitest.expect(failure.Category).toEqual ProviderError
+                        Vitest.expect(failure.Code).toBe "lfs_file_stat_failed"
+                        Vitest.expect(failure.AffectedPaths).toEqual [| "stat-failure.bin" |]
+                    | _ -> failwith "Expected the selected LFS candidate stat failure to surface."
+
                     do! removeDirectoryAsync root
                 with error ->
                     do! removeDirectoryAsync root

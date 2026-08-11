@@ -47,6 +47,7 @@ type GitFailureKind =
     | Timeout
     | Canceled
     | LfsInstallRequired
+    | InvalidLfsThreshold
     | RemoteProjectAlreadyExists
     | Unknown
 

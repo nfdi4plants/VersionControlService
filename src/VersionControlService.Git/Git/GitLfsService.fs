@@ -212,6 +212,9 @@ let private literalAttributePattern (relativePath: string) =
 let literalTrackingRule relativePath =
     $"{literalAttributePattern relativePath} filter=lfs diff=lfs merge=lfs -text"
 
+let private literalUntrackingRule relativePath =
+    $"{literalAttributePattern relativePath} -filter -diff -merge"
+
 let private removeExactAttributeRule (rule: string) (content: string) =
     let rulePattern = $"^{Regex.Escape(rule)}(?:\\r?\\n|$)"
     Regex(rulePattern, RegexOptions.Multiline).Replace(content, String.Empty)
@@ -647,30 +650,100 @@ let addLiteralTrackingRules (content: string) (relativePaths: string[]) =
 
     updated, added
 
-let private rewriteLiteralTrackingRule repoPath relativePath enabled =
-    try
-        let attributesPath = NodePath.resolve [| repoPath; ".gitattributes" |]
-        let content, originalIdentity = readAttributesNoFollow attributesPath
-        let canonicalRule = literalTrackingRule relativePath
+let private addLiteralUntrackingRules (content: string) (relativePaths: string[]) =
+    let lineEnding = if content.Contains("\r\n") then "\r\n" else "\n"
+    let mutable updated = content
+    let mutable added = false
 
-        let updated =
+    for relativePath in relativePaths |> Array.distinct do
+        let rule = literalUntrackingRule relativePath
+        let rulePattern = $"^{Regex.Escape(rule)}(?:\r?$)"
+
+        if not (Regex.IsMatch(updated, rulePattern, RegexOptions.Multiline)) then
+            updated <-
+                if String.IsNullOrEmpty updated then
+                    rule + lineEnding
+                elif updated.EndsWith("\n") then
+                    updated + rule + lineEnding
+                else
+                    updated + lineEnding + rule + lineEnding
+
+            added <- true
+
+    updated, added
+
+let private checkFilterAttribute repoPath relativePath : JS.Promise<Result<string, string>> = promise {
+    let! result = GitLfsAdapter.checkFilterAttributes repoPath [| relativePath |]
+
+    return
+        match result with
+        | Error error -> Error error
+        | Ok attributes ->
+            attributes
+            |> Array.tryFind (fun (path, _) -> path = relativePath)
+            |> Option.map snd
+            |> Option.defaultValue "unspecified"
+            |> Ok
+}
+
+let private rewriteLiteralTrackingRule repoPath relativePath enabled : JS.Promise<Result<unit, string>> =
+    promise {
+        try
+            let attributesPath = NodePath.resolve [| repoPath; ".gitattributes" |]
+            let content, originalIdentity = readAttributesNoFollow attributesPath
+            let canonicalRule = literalTrackingRule relativePath
+            let canonicalUnsetRule = literalUntrackingRule relativePath
+
             if enabled then
-                addLiteralTrackingRules content [| relativePath |] |> fst
+                let withoutUnset = removeExactAttributeRule canonicalUnsetRule content
+                let updated, _ = addLiteralTrackingRules withoutUnset [| relativePath |]
+
+                if updated <> content then
+                    replaceAttributesAtomically attributesPath originalIdentity content updated
+
+                let! verifiedFilterResult = checkFilterAttribute repoPath relativePath
+
+                match verifiedFilterResult with
+                | Ok "lfs" -> return Ok()
+                | Ok _ -> return Error "The Git LFS path policy does not resolve to lfs after tracking."
+                | Error error -> return Error $"Could not verify the Git LFS path policy: {error}"
             else
-                removeExactAttributeRule canonicalRule content
+                let withoutTracking = removeExactAttributeRule canonicalRule content
 
-        if updated <> content then
-            replaceAttributesAtomically attributesPath originalIdentity content updated
+                if withoutTracking <> content then
+                    replaceAttributesAtomically attributesPath originalIdentity content withoutTracking
 
-        Ok()
-    with error ->
-        Error $"Could not update the literal Git LFS path policy: {error.Message}"
+                let! verifiedFilterResult = checkFilterAttribute repoPath relativePath
+
+                match verifiedFilterResult with
+                | Error error -> return Error $"Could not verify the Git LFS path policy: {error}"
+                | Ok "lfs" ->
+                    let currentContent, currentIdentity = readAttributesNoFollow attributesPath
+                    let unsetContent, unsetAdded = addLiteralUntrackingRules currentContent [| relativePath |]
+
+                    if unsetAdded then
+                        replaceAttributesAtomically
+                            attributesPath
+                            currentIdentity
+                            currentContent
+                            unsetContent
+
+                    let! finalFilterResult = checkFilterAttribute repoPath relativePath
+
+                    match finalFilterResult with
+                    | Ok "lfs" -> return Error "The Git LFS path policy still resolves to lfs after untracking."
+                    | Ok _ -> return Ok()
+                    | Error error -> return Error $"Could not verify the Git LFS path policy: {error}"
+                | Ok _ -> return Ok()
+        with error ->
+            return Error $"Could not update the literal Git LFS path policy: {error.Message}"
+    }
 
 /// Tracks one exact repository-relative path and anchors the generated rule at the repository root.
 let trackLiteral (repoPath: string) (relativePath: string) : JS.Promise<Result<unit, string>> = promise {
     match! requireGitLfsForLiteralPolicy repoPath with
     | Error error -> return Error error
-    | Ok() -> return rewriteLiteralTrackingRule repoPath relativePath true
+    | Ok() -> return! rewriteLiteralTrackingRule repoPath relativePath true
 }
 
 /// Tracks a repository-relative path through git-lfs's literal filename mode.
@@ -690,7 +763,7 @@ let track (repoPath: string) (relativePath: string) : JS.Promise<Result<unit, st
 let untrackLiteral (repoPath: string) (relativePath: string) : JS.Promise<Result<unit, string>> = promise {
     match! requireGitLfsForLiteralPolicy repoPath with
     | Error error -> return Error error
-    | Ok() -> return rewriteLiteralTrackingRule repoPath relativePath false
+    | Ok() -> return! rewriteLiteralTrackingRule repoPath relativePath false
 }
 
 /// Runs `git lfs install` for a specific repository.
@@ -733,10 +806,6 @@ let isSystemInstalled () : JS.Promise<bool> = promise {
 
         return isInstalled
 }
-
-/// Checks whether `.gitattributes` marks a path for Git LFS.
-let isTrackedByAttributes (repoRoot: string) (relativePath: string) =
-    gitLfs.IsTrackedByAttributes repoRoot relativePath
 
 let private extractLsFilesFailureMessage (result: GitSpawnResult) =
     let stderrText =

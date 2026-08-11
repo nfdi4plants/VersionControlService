@@ -350,6 +350,56 @@ let tryExecGitText (workingDirectory: string option) (timeoutMs: int) (args: str
         return None
 }
 
+/// Parses NUL-delimited `git check-attr -z` triples into path/value pairs.
+let parseFilterAttributes (output: string) : Result<(string * string)[], string> =
+    let fields = output.Split '\000'
+    let fields =
+        if fields.Length > 0 && fields.[fields.Length - 1] = "" then
+            fields.[0 .. fields.Length - 2]
+        else
+            fields
+
+    if fields.Length % 3 <> 0 then
+        Error "Git returned malformed check-attr output."
+    else
+        Microsoft.FSharp.Collections.Array.init
+            (fields.Length / 3)
+            (fun index -> fields.[index * 3], fields.[index * 3 + 2])
+        |> Ok
+
+/// Resolves effective filter attributes for raw repository-relative paths in one stdin batch.
+let checkFilterAttributes
+    (repoRoot: string)
+    (relativePaths: string[])
+    : Promise<Result<(string * string)[], string>> =
+    promise {
+        if String.IsNullOrWhiteSpace repoRoot then
+            return Error "The Git repository path is invalid."
+        elif relativePaths.Length = 0 then
+            return Ok [||]
+        else
+            let! result =
+                runGitCaptured {
+                    WorkingDirectory = Some repoRoot
+                    Arguments = [| "check-attr"; "filter"; "--stdin"; "-z" |]
+                    Environment = None
+                    StandardInput = Some(String.concat "\000" (relativePaths |> Seq.distinct |> Seq.toArray))
+                    CancelCheck = None
+                    TimeoutMs = Some repoValidationTimeoutMs
+                }
+
+            if result.ExitCode <> 0 || result.TimedOut then
+                let detail =
+                    if not (String.IsNullOrWhiteSpace result.StderrText) then
+                        result.StderrText
+                    else
+                        result.StdoutText
+
+                return Error detail
+            else
+                return parseFilterAttributes result.StdoutText
+    }
+
 
 /// Adapter contract for Git LFS commands. Services depend on this shape instead of direct child-process calls.
 type IGitLfs =
@@ -358,9 +408,6 @@ type IGitLfs =
 
     abstract Install:
         timeoutMs: int option -> onProgress: (string -> unit) -> cancel: (unit -> bool) -> Promise<GitLfsResult>
-
-    abstract IsTrackedByAttributes: repoRoot: string -> relativePath: string -> bool
-
 
 type NodeGitLfsAdapter() =
     let activeLockKeys = System.Collections.Generic.HashSet<string>()
@@ -392,26 +439,6 @@ type NodeGitLfsAdapter() =
             output
             |> Option.exists (fun text -> text.Trim().Equals("true", System.StringComparison.OrdinalIgnoreCase))
     }
-
-    let validateRepoPathSync (repoPath: string) =
-        try
-            let output: string =
-                childProcessDynamic?execFileSync (
-                    "git",
-                    [| "rev-parse"; "--is-inside-work-tree" |],
-                    createObj [
-                        "cwd" ==> repoPath
-                        "encoding" ==> "utf8"
-                        "stdio" ==> "pipe"
-                        "shell" ==> false
-                        "env" ==> createNonInteractiveEnv ()
-                    ]
-                )
-                |> unbox<string>
-
-            output.Trim().Equals("true", System.StringComparison.OrdinalIgnoreCase)
-        with _ ->
-            false
 
     let runProcess
         (args: string list)
@@ -505,42 +532,11 @@ type NodeGitLfsAdapter() =
         : Promise<GitLfsResult> =
         promise { return! runProcess [ "lfs"; "install" ] None timeoutMs onProgress cancelCheck }
 
-    let isTrackedByAttributes (repoRoot: string) (relativePath: string) =
-        if
-            not (validateRepoPathSync repoRoot)
-            || System.String.IsNullOrWhiteSpace relativePath
-        then
-            false
-        else
-            try
-                let output: string =
-                    childProcessDynamic?execFileSync (
-                        "git",
-                        [| "check-attr"; "filter"; "--"; relativePath |],
-                        createObj [
-                            "cwd" ==> repoRoot
-                            "encoding" ==> "utf8"
-                            "stdio" ==> "pipe"
-                            "shell" ==> false
-                            "env" ==> createNonInteractiveEnv ()
-                        ]
-                    )
-                    |> unbox<string>
-
-                output.Contains(": filter: lfs")
-            with _ ->
-                false
-
     interface IGitLfs with
         member _.Run request onProgress cancel = runGitLfs request onProgress cancel
 
         member _.Install timeoutMs onProgress cancel =
             installGitLfs timeoutMs onProgress cancel
-
-        member _.IsTrackedByAttributes repoRoot relativePath =
-            isTrackedByAttributes repoRoot relativePath
-
-
 
 /// Factory for the default Node-backed Git LFS adapter.
 let gitLfsAdapter () : IGitLfs = NodeGitLfsAdapter() :> IGitLfs

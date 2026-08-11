@@ -68,6 +68,9 @@ let private readFileBase64Async (path: string) : JS.Promise<string> = promise {
     return bytes?toString("base64") |> unbox<string>
 }
 
+[<Emit("Buffer.from($0, 'utf8').toString('base64')")>]
+let private utf8Base64 (_value: string) : string = jsNative
+
 let private removeFileAsync (path: string) : JS.Promise<unit> = promise {
     let! _ =
         fsPromisesDynamic?rm (path, createObj [ "force" ==> true ])
@@ -1781,6 +1784,7 @@ Vitest.describe (
                         }
 
                     let failure = expectProviderFailure "atomic attributes replacement" result
+                    Vitest.expect(failure.Category).toEqual ProviderError
                     Vitest.expect(failure.StateChanged).toBe false
                     let! before = before
                     let! after = readFileBase64Async attributesPath
@@ -1793,7 +1797,7 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "untracking an exact path preserves legacy unanchored and glob rules byte-for-byte",
+            "untracking a path preserves legacy unanchored and glob rules byte-for-byte while appending literal unsets",
             TestOptions(timeout = 120000),
             fun () -> promise {
                 let harness = createGitHarness ()
@@ -1805,8 +1809,6 @@ Vitest.describe (
                         "file.bin filter=lfs diff=lfs merge=lfs -text\r\n*.dat filter=lfs diff=lfs merge=lfs -text\r\n"
 
                     do! writeUtf8FileAsync attributesPath legacyRules
-                    let before = readFileBase64Async attributesPath
-
                     let storagePolicy =
                         workspace.Session.StoragePolicy
                         |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
@@ -1822,9 +1824,18 @@ Vitest.describe (
 
                         expectProviderValue $"untrack {value}" result |> ignore
 
-                    let! before = before
-                    let! after = readFileBase64Async attributesPath
-                    Vitest.expect(after).toBe before
+                    let expectedAfter =
+                        legacyRules
+                        + "\"/nested/file.bin\" -filter -diff -merge\r\n"
+                        + "\"/nested/report.dat\" -filter -diff -merge\r\n"
+
+                    let! afterBase64 = readFileBase64Async attributesPath
+                    Vitest.expect(afterBase64).toBe (utf8Base64 expectedAfter)
+                    let! after = tryReadUtf8FileAsync attributesPath
+                    let after = after |> Option.defaultValue ""
+                    Vitest.expect(after.StartsWith legacyRules).toBe true
+                    Vitest.expect(after.Contains("\"/nested/file.bin\" -filter -diff -merge")).toBe true
+                    Vitest.expect(after.Contains("\"/nested/report.dat\" -filter -diff -merge")).toBe true
 
                     let! attributeOutput =
                         runGitIn
@@ -1833,8 +1844,41 @@ Vitest.describe (
                             [| "check-attr"; "-z"; "filter"; "--"; "nested/file.bin"; "nested/report.dat" |]
                             None
 
-                    Vitest.expect(attributeOutput.Contains("nested/file.bin\000filter\000lfs\000")).toBe true
-                    Vitest.expect(attributeOutput.Contains("nested/report.dat\000filter\000lfs\000")).toBe true
+                    Vitest.expect(attributeOutput.Contains("nested/file.bin\000filter\000lfs\000")).toBe false
+                    Vitest.expect(attributeOutput.Contains("nested/report.dat\000filter\000lfs\000")).toBe false
+                    Vitest.expect(attributeOutput.Contains("nested/file.bin\000filter\000unset\000")).toBe true
+                    Vitest.expect(attributeOutput.Contains("nested/report.dat\000filter\000unset\000")).toBe true
+
+                    for value in [| "nested/file.bin"; "nested/report.dat" |] do
+                        let path = RepositoryPath.tryCreate value |> Result.defaultWith failwith
+                        let! enableResult =
+                            storagePolicy.SetPathPolicy
+                                path
+                                true
+                                (OperationContext.detached $"cycle-enable-{value}")
+                            |> Async.StartAsPromise
+
+                        expectProviderValue $"cycle enable {value}" enableResult |> ignore
+                        let! disableResult =
+                            storagePolicy.SetPathPolicy
+                                path
+                                false
+                                (OperationContext.detached $"cycle-disable-{value}")
+                            |> Async.StartAsPromise
+
+                        expectProviderValue $"cycle disable {value}" disableResult |> ignore
+
+                    let! cycledAttributes = tryReadUtf8FileAsync attributesPath
+                    let cycledAttributes = cycledAttributes |> Option.defaultValue ""
+
+                    for value in [| "nested/file.bin"; "nested/report.dat" |] do
+                        let escaped = $"\"/{value}\""
+                        let literalLines =
+                            cycledAttributes.Replace("\r\n", "\n").Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                            |> Array.filter _.StartsWith(escaped)
+
+                        Vitest.expect(literalLines).toEqual [| $"{escaped} -filter -diff -merge" |]
+
                     do! harness.Cleanup()
                 with error ->
                     do! harness.Cleanup()
@@ -2288,7 +2332,7 @@ Vitest.describe (
                     do!
                         writeUtf8FileAsync
                             (join [| workspace.Binding.WorkspaceRoot; "check-attr" |])
-                            "process.stdout.write('materialized.bin: filter: lfs\\n');\n"
+                            "process.stdout.write('materialized.bin\\0filter\\0lfs\\0');\n"
 
                     do!
                         writeUtf8FileAsync
@@ -2701,6 +2745,612 @@ Vitest.describe (
                     Vitest.expect(fractionalFailure.StateChanged).toBe false
                     do! harness.Cleanup()
                 with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "automatic Git LFS policy reuses committed wildcard attributes without appending rules",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let attributesContent = "# committed policy\n*.bin filter=lfs diff=lfs merge=lfs -text\n"
+                    let attributesPath = join [| workspace.Binding.WorkspaceRoot; ".gitattributes" |]
+                    do! workspace.WriteFile ".gitattributes" attributesContent
+                    let! _ = runGitIn workspace.Binding.WorkspaceRoot [||] [| "add"; ".gitattributes" |] None
+                    let! _ =
+                        runGitIn
+                            workspace.Binding.WorkspaceRoot
+                            [||]
+                            [| "commit"; "-m"; "test: commit wildcard LFS policy" |]
+                            None
+
+                    let! attributesBefore = readFileBase64Async attributesPath
+                    let oneMiB = 1024 * 1024
+
+                    for index, marker in [| 1, "a"; 2, "b"; 3, "c" |] do
+                        do! workspace.WriteFile "data/big.bin" (String.replicate oneMiB marker)
+
+                        let! statusResult =
+                            workspace.Session.Core.GetStatus(OperationContext.detached $"automatic-policy-covered-status-{index}")
+                            |> Async.StartAsPromise
+
+                        let status = expectProviderValue "automatic policy covered status" statusResult
+                        let! revisionResult =
+                            workspace.Session.Core.CreateRevision
+                                {
+                                    Message = $"test: automatic policy covered commit {index}"
+                                    Paths = [| mkRepositoryPath "data/big.bin" |]
+                                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                }
+                                (OperationContext.detached $"automatic-policy-covered-revision-{index}")
+                            |> Async.StartAsPromise
+
+                        expectProviderValue "automatic policy covered revision" revisionResult |> ignore
+                        let! committed = runGitIn workspace.Binding.WorkspaceRoot [||] [| "show"; "HEAD:data/big.bin" |] None
+                        let! attributesAfter = readFileBase64Async attributesPath
+                        Vitest.expect(committed.Contains "git-lfs").toBe true
+                        Vitest.expect(attributesAfter).toBe attributesBefore
+
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "automatic Git LFS policy ignores dirty irrelevant attributes",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let committedAttributes = "*.bin filter=lfs diff=lfs merge=lfs -text\n"
+                    let dirtyAttributes = committedAttributes + "# unrelated consumer edit\n"
+                    do! workspace.WriteFile ".gitattributes" committedAttributes
+                    let! _ = runGitIn workspace.Binding.WorkspaceRoot [||] [| "add"; ".gitattributes" |] None
+                    let! _ =
+                        runGitIn
+                            workspace.Binding.WorkspaceRoot
+                            [||]
+                            [| "commit"; "-m"; "test: commit wildcard policy" |]
+                            None
+
+                    do! workspace.WriteFile ".gitattributes" dirtyAttributes
+                    do! workspace.WriteFile "data/big.bin" (String.replicate (1024 * 1024) "d")
+
+                    let! statusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "automatic-policy-dirty-status")
+                        |> Async.StartAsPromise
+
+                    let status = expectProviderValue "automatic policy dirty status" statusResult
+                    let! revisionResult =
+                        workspace.Session.Core.CreateRevision
+                            {
+                                Message = "test: automatic policy ignores dirty attributes"
+                                Paths = [| mkRepositoryPath "data/big.bin" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (OperationContext.detached "automatic-policy-dirty-revision")
+                        |> Async.StartAsPromise
+
+                    expectProviderValue "automatic policy dirty revision" revisionResult |> ignore
+                    let! committed = runGitIn workspace.Binding.WorkspaceRoot [||] [| "show"; "HEAD:data/big.bin" |] None
+                    let! attributesAfter = tryReadUtf8FileAsync (join [| workspace.Binding.WorkspaceRoot; ".gitattributes" |])
+                    Vitest.expect(committed.Contains "git-lfs").toBe true
+                    Vitest.expect(attributesAfter).toEqual (Some dirtyAttributes)
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "automatic Git LFS policy disables a wildcard-covered path with a literal unset",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    do! workspace.WriteFile ".gitattributes" "*.bin filter=lfs diff=lfs merge=lfs -text\n"
+                    let! _ = runGitIn workspace.Binding.WorkspaceRoot [||] [| "add"; ".gitattributes" |] None
+                    let! _ =
+                        runGitIn
+                            workspace.Binding.WorkspaceRoot
+                            [||]
+                            [| "commit"; "-m"; "test: commit wildcard disable policy" |]
+                            None
+
+                    let storagePolicy =
+                        workspace.Session.StoragePolicy
+                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
+
+                    let! result =
+                        storagePolicy.SetPathPolicy
+                            (mkRepositoryPath "data/big.bin")
+                            false
+                            (OperationContext.detached "automatic-policy-disable-wildcard")
+                        |> Async.StartAsPromise
+
+                    expectProviderValue "automatic policy disable wildcard" result |> ignore
+                    let! attributes =
+                        runGitIn
+                            workspace.Binding.WorkspaceRoot
+                            [||]
+                            [| "check-attr"; "-z"; "filter"; "--"; "data/big.bin" |]
+                            None
+
+                    Vitest.expect(attributes.Contains("data/big.bin\000filter\000lfs\000")).toBe false
+                    Vitest.expect(attributes.Contains("data/big.bin\000filter\000unset\000")).toBe true
+                    let! attributeFile = tryReadUtf8FileAsync (join [| workspace.Binding.WorkspaceRoot; ".gitattributes" |])
+                    Vitest.expect(attributeFile |> Option.exists _.Contains("\"/data/big.bin\" -filter -diff -merge")).toBe true
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "automatic Git LFS policy preserves an explicit unset for an oversized path",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let attributesPath = join [| workspace.Binding.WorkspaceRoot; ".gitattributes" |]
+                    do! workspace.WriteFile ".gitattributes" "*.bin filter=lfs diff=lfs merge=lfs -text\n"
+                    let! _ = runGitIn workspace.Binding.WorkspaceRoot [||] [| "add"; ".gitattributes" |] None
+                    let! _ =
+                        runGitIn
+                            workspace.Binding.WorkspaceRoot
+                            [||]
+                            [| "commit"; "-m"; "test: commit wildcard opt-out policy" |]
+                            None
+
+                    let storagePolicy =
+                        workspace.Session.StoragePolicy
+                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
+
+                    let! unsetResult =
+                        storagePolicy.SetPathPolicy
+                            (mkRepositoryPath "data/big.bin")
+                            false
+                            (OperationContext.detached "automatic-policy-explicit-unset")
+                        |> Async.StartAsPromise
+
+                    expectProviderValue "automatic policy explicit unset" unsetResult |> ignore
+                    let! _ = runGitIn workspace.Binding.WorkspaceRoot [||] [| "add"; ".gitattributes" |] None
+                    let! _ =
+                        runGitIn
+                            workspace.Binding.WorkspaceRoot
+                            [||]
+                            [| "commit"; "-m"; "test: commit explicit LFS opt-out" |]
+                            None
+
+                    let! attributesBefore = readFileBase64Async attributesPath
+                    let content = String.replicate (1024 * 1024) "n"
+                    do! workspace.WriteFile "data/big.bin" content
+                    let! statusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "automatic-policy-opt-out-status")
+                        |> Async.StartAsPromise
+
+                    let status = expectProviderValue "automatic policy opt-out status" statusResult
+                    let! revisionResult =
+                        workspace.Session.Core.CreateRevision
+                            {
+                                Message = "test: preserve explicit automatic LFS opt-out"
+                                Paths = [| mkRepositoryPath "data/big.bin" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (OperationContext.detached "automatic-policy-opt-out-revision")
+                        |> Async.StartAsPromise
+
+                    expectProviderValue "automatic policy opt-out revision" revisionResult |> ignore
+                    let! committed = runGitIn workspace.Binding.WorkspaceRoot [||] [| "show"; "HEAD:data/big.bin" |] None
+                    let! attributesAfter = readFileBase64Async attributesPath
+                    let! filter =
+                        runGitIn
+                            workspace.Binding.WorkspaceRoot
+                            [||]
+                            [| "check-attr"; "-z"; "filter"; "--"; "data/big.bin" |]
+                            None
+
+                    Vitest.expect(committed.Contains "git-lfs").toBe false
+                    Vitest.expect(committed.Length).toBe content.Length
+                    Vitest.expect(attributesAfter).toBe attributesBefore
+                    Vitest.expect(filter.Contains("data/big.bin\000filter\000unset\000")).toBe true
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "automatic Git LFS policy probes plans and disables a literal metacharacter path",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let relativePath =
+                        if isWindowsProcess () then
+                            "data/space [literal].bin"
+                        else
+                            "data/space [literal]*.bin"
+
+                    do! workspace.WriteFile relativePath (String.replicate (1024 * 1024) "p")
+                    let! statusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "automatic-policy-literal-status")
+                        |> Async.StartAsPromise
+
+                    let status = expectProviderValue "automatic policy literal status" statusResult
+                    let! revisionResult =
+                        workspace.Session.Core.CreateRevision
+                            {
+                                Message = "test: automatic LFS literal metacharacter path"
+                                Paths = [| mkRepositoryPath relativePath |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (OperationContext.detached "automatic-policy-literal-revision")
+                        |> Async.StartAsPromise
+
+                    expectProviderValue "automatic policy literal revision" revisionResult |> ignore
+                    let attributesPath = join [| workspace.Binding.WorkspaceRoot; ".gitattributes" |]
+                    let! generatedAttributes = tryReadUtf8FileAsync attributesPath
+                    let generatedAttributes = generatedAttributes |> Option.defaultValue ""
+                    let escapedPattern =
+                        if isWindowsProcess () then
+                            "\"/data/space \\\\[literal\\\\].bin\""
+                        else
+                            "\"/data/space \\\\[literal\\\\]\\\\*.bin\""
+
+                    if not (generatedAttributes.Contains($"{escapedPattern} filter=lfs")) then
+                        failwith $"Expected generated literal tracking rule; attributes were: {generatedAttributes}"
+
+                    do!
+                        workspace.WriteFile
+                            ".gitattributes"
+                            (generatedAttributes + "*.bin filter=lfs diff=lfs merge=lfs -text\n")
+
+                    let! _ = runGitIn workspace.Binding.WorkspaceRoot [||] [| "add"; ".gitattributes" |] None
+                    let! _ =
+                        runGitIn
+                            workspace.Binding.WorkspaceRoot
+                            [||]
+                            [| "commit"; "-m"; "test: add wildcard for literal disable" |]
+                            None
+
+                    let storagePolicy =
+                        workspace.Session.StoragePolicy
+                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
+
+                    let! disableResult =
+                        storagePolicy.SetPathPolicy
+                            (mkRepositoryPath relativePath)
+                            false
+                            (OperationContext.detached "automatic-policy-literal-disable")
+                        |> Async.StartAsPromise
+
+                    expectProviderValue "automatic policy literal disable" disableResult |> ignore
+                    let! filter =
+                        runGitIn
+                            workspace.Binding.WorkspaceRoot
+                            [||]
+                            [| "check-attr"; "-z"; "filter"; "--"; relativePath |]
+                            None
+
+                    let! disabledAttributes = tryReadUtf8FileAsync attributesPath
+                    let disabledAttributes = disabledAttributes |> Option.defaultValue ""
+                    let literalLines =
+                        disabledAttributes.Replace("\r\n", "\n").Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                        |> Array.filter _.StartsWith(escapedPattern)
+
+                    if not (filter.Contains($"{relativePath}\000filter\000unset\000")) then
+                        failwith $"Expected literal path to resolve unset; check-attr returned: {filter}"
+
+                    let expectedLiteralLines = [| $"{escapedPattern} -filter -diff -merge" |]
+
+                    if literalLines <> expectedLiteralLines then
+                        let literalSummary = String.concat " | " literalLines
+                        failwith $"Expected one literal unset line; found: {literalSummary}"
+
+                    let asteriskPath = "data/policy*.bin"
+                    let! enableAsterisk =
+                        storagePolicy.SetPathPolicy
+                            (mkRepositoryPath asteriskPath)
+                            true
+                            (OperationContext.detached "automatic-policy-asterisk-enable")
+                        |> Async.StartAsPromise
+
+                    expectProviderValue "automatic policy asterisk enable" enableAsterisk |> ignore
+                    let! disableAsterisk =
+                        storagePolicy.SetPathPolicy
+                            (mkRepositoryPath asteriskPath)
+                            false
+                            (OperationContext.detached "automatic-policy-asterisk-disable")
+                        |> Async.StartAsPromise
+
+                    expectProviderValue "automatic policy asterisk disable" disableAsterisk |> ignore
+                    let! asteriskFilter =
+                        runGitIn
+                            workspace.Binding.WorkspaceRoot
+                            [||]
+                            [| "check-attr"; "-z"; "filter"; "--"; asteriskPath |]
+                            None
+
+                    if asteriskFilter.Contains($"{asteriskPath}\000filter\000lfs\000") then
+                        let! finalAttributes = tryReadUtf8FileAsync attributesPath
+                        failwith
+                            $"Expected literal asterisk path to be disabled; check-attr returned {asteriskFilter}; attributes were {finalAttributes}."
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "automatic Git LFS policy reports local settings and commit threshold honestly",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let storagePolicy =
+                        workspace.Session.StoragePolicy
+                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
+
+                    let! setFourResult =
+                        storagePolicy.SetSettings
+                            {
+                                AutoPolicyThresholdMb = Some 4
+                                MaterializeLargeObjects = true
+                            }
+                            (OperationContext.detached "automatic-policy-set-four")
+                        |> Async.StartAsPromise
+
+                    expectProviderValue "automatic policy set four" setFourResult |> ignore
+                    let! settingsFourResult =
+                        storagePolicy.GetSettings (OperationContext.detached "automatic-policy-get-four")
+                        |> Async.StartAsPromise
+
+                    let settingsFour = expectProviderValue "automatic policy get four" settingsFourResult
+                    Vitest.expect(settingsFour.AutoPolicyThresholdMb).toEqual (Some 4)
+                    Vitest.expect(settingsFour.MaterializeLargeObjects).toBe true
+                    do! workspace.WriteFile "four-megabyte-threshold.bin" (String.replicate (1024 * 1024) "f")
+
+                    let! firstStatusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "automatic-policy-four-status")
+                        |> Async.StartAsPromise
+
+                    let firstStatus = expectProviderValue "automatic policy four status" firstStatusResult
+                    let! firstRevisionResult =
+                        workspace.Session.Core.CreateRevision
+                            {
+                                Message = "test: automatic policy four MiB threshold"
+                                Paths = [| mkRepositoryPath "four-megabyte-threshold.bin" |]
+                                ExpectedWorkspaceVersion = firstStatus.WorkspaceVersion
+                            }
+                            (OperationContext.detached "automatic-policy-four-revision")
+                        |> Async.StartAsPromise
+
+                    expectProviderValue "automatic policy four revision" firstRevisionResult |> ignore
+                    let! firstCommitted =
+                        runGitIn
+                            workspace.Binding.WorkspaceRoot
+                            [||]
+                            [| "show"; "HEAD:four-megabyte-threshold.bin" |]
+                            None
+
+                    Vitest.expect(firstCommitted.Contains "git-lfs").toBe false
+
+                    let! setOneResult =
+                        storagePolicy.SetSettings
+                            {
+                                AutoPolicyThresholdMb = Some 1
+                                MaterializeLargeObjects = false
+                            }
+                            (OperationContext.detached "automatic-policy-set-one")
+                        |> Async.StartAsPromise
+
+                    expectProviderValue "automatic policy set one" setOneResult |> ignore
+                    let! settingsOneResult =
+                        storagePolicy.GetSettings (OperationContext.detached "automatic-policy-get-one")
+                        |> Async.StartAsPromise
+
+                    let settingsOne = expectProviderValue "automatic policy get one" settingsOneResult
+                    Vitest.expect(settingsOne.AutoPolicyThresholdMb).toEqual (Some 1)
+                    Vitest.expect(settingsOne.MaterializeLargeObjects).toBe false
+                    do! workspace.WriteFile "one-megabyte-threshold.bin" (String.replicate (1024 * 1024) "o")
+
+                    let! secondStatusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "automatic-policy-one-status")
+                        |> Async.StartAsPromise
+
+                    let secondStatus = expectProviderValue "automatic policy one status" secondStatusResult
+                    let! secondRevisionResult =
+                        workspace.Session.Core.CreateRevision
+                            {
+                                Message = "test: automatic policy one MiB threshold"
+                                Paths = [| mkRepositoryPath "one-megabyte-threshold.bin" |]
+                                ExpectedWorkspaceVersion = secondStatus.WorkspaceVersion
+                            }
+                            (OperationContext.detached "automatic-policy-one-revision")
+                        |> Async.StartAsPromise
+
+                    expectProviderValue "automatic policy one revision" secondRevisionResult |> ignore
+                    let! secondCommitted =
+                        runGitIn
+                            workspace.Binding.WorkspaceRoot
+                            [||]
+                            [| "show"; "HEAD:one-megabyte-threshold.bin" |]
+                            None
+
+                    Vitest.expect(secondCommitted.Contains "git-lfs").toBe true
+                    let! _ =
+                        runGitIn
+                            workspace.Binding.WorkspaceRoot
+                            [||]
+                            [| "config"; "--local"; "versioncontrolservice.lfs.autotrackthresholdmb"; "garbage" |]
+                            None
+
+                    let! corruptSettingsResult =
+                        storagePolicy.GetSettings (OperationContext.detached "automatic-policy-corrupt-settings")
+                        |> Async.StartAsPromise
+
+                    let corruptSettingsFailure = expectProviderFailure "automatic policy corrupt settings" corruptSettingsResult
+                    Vitest.expect(corruptSettingsFailure.Code).toBe "invalid_lfs_threshold"
+
+                    do! workspace.WriteFile "corrupt-threshold.bin" (String.replicate (1024 * 1024) "c")
+                    let! corruptStatusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "automatic-policy-corrupt-status")
+                        |> Async.StartAsPromise
+
+                    let corruptStatus = expectProviderValue "automatic policy corrupt status" corruptStatusResult
+                    let! corruptRevisionResult =
+                        workspace.Session.Core.CreateRevision
+                            {
+                                Message = "test: reject corrupt automatic threshold"
+                                Paths = [| mkRepositoryPath "corrupt-threshold.bin" |]
+                                ExpectedWorkspaceVersion = corruptStatus.WorkspaceVersion
+                            }
+                            (OperationContext.detached "automatic-policy-corrupt-revision")
+                        |> Async.StartAsPromise
+
+                    let corruptRevisionFailure = expectProviderFailure "automatic policy corrupt revision" corruptRevisionResult
+                    Vitest.expect(corruptRevisionFailure.Code).toBe "invalid_lfs_threshold"
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "automatic Git LFS policy ignores global settings while local settings win",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+                let originalGlobal = tryGetProcessEnvironment "GIT_CONFIG_GLOBAL" |> Option.ofObj
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let globalConfig = join [| dirname workspace.Binding.WorkspaceRoot; "automatic-policy-global.config" |]
+                    let! _ =
+                        runGitIn
+                            workspace.Binding.WorkspaceRoot
+                            [||]
+                            [| "config"; "--file"; globalConfig; "versioncontrolservice.lfs.autotrackthresholdmb"; "4" |]
+                            None
+
+                    let! _ =
+                        runGitIn
+                            workspace.Binding.WorkspaceRoot
+                            [||]
+                            [| "config"; "--file"; globalConfig; "versioncontrolservice.lfs.materializelargeobjects"; "true" |]
+                            None
+
+                    setProcessEnvironment "GIT_CONFIG_GLOBAL" globalConfig
+                    let storagePolicy =
+                        workspace.Session.StoragePolicy
+                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
+
+                    let! defaultSettingsResult =
+                        storagePolicy.GetSettings (OperationContext.detached "automatic-policy-global-default-settings")
+                        |> Async.StartAsPromise
+
+                    let defaultSettings = expectProviderValue "automatic policy global default settings" defaultSettingsResult
+                    Vitest.expect(defaultSettings.AutoPolicyThresholdMb).toEqual (Some 1)
+                    Vitest.expect(defaultSettings.MaterializeLargeObjects).toBe false
+                    do! workspace.WriteFile "global-only.bin" (String.replicate (1024 * 1024) "g")
+                    let! firstStatusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "automatic-policy-global-status")
+                        |> Async.StartAsPromise
+
+                    let firstStatus = expectProviderValue "automatic policy global status" firstStatusResult
+                    let! firstRevisionResult =
+                        workspace.Session.Core.CreateRevision
+                            {
+                                Message = "test: ignore global automatic LFS settings"
+                                Paths = [| mkRepositoryPath "global-only.bin" |]
+                                ExpectedWorkspaceVersion = firstStatus.WorkspaceVersion
+                            }
+                            (OperationContext.detached "automatic-policy-global-revision")
+                        |> Async.StartAsPromise
+
+                    expectProviderValue "automatic policy global revision" firstRevisionResult |> ignore
+                    let! firstCommitted =
+                        runGitIn workspace.Binding.WorkspaceRoot [||] [| "show"; "HEAD:global-only.bin" |] None
+
+                    Vitest.expect(firstCommitted.Contains "git-lfs").toBe true
+                    let! _ =
+                        runGitIn
+                            workspace.Binding.WorkspaceRoot
+                            [||]
+                            [| "config"; "--file"; globalConfig; "versioncontrolservice.lfs.autotrackthresholdmb"; "1" |]
+                            None
+
+                    let! localSettingsResult =
+                        storagePolicy.SetSettings
+                            {
+                                AutoPolicyThresholdMb = Some 4
+                                MaterializeLargeObjects = true
+                            }
+                            (OperationContext.detached "automatic-policy-local-wins-set")
+                        |> Async.StartAsPromise
+
+                    expectProviderValue "automatic policy local wins set" localSettingsResult |> ignore
+                    let! localReportedResult =
+                        storagePolicy.GetSettings (OperationContext.detached "automatic-policy-local-wins-get")
+                        |> Async.StartAsPromise
+
+                    let localReported = expectProviderValue "automatic policy local wins get" localReportedResult
+                    Vitest.expect(localReported.AutoPolicyThresholdMb).toEqual (Some 4)
+                    Vitest.expect(localReported.MaterializeLargeObjects).toBe true
+                    do! workspace.WriteFile "local-wins.bin" (String.replicate (1024 * 1024) "l")
+                    let! secondStatusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "automatic-policy-local-wins-status")
+                        |> Async.StartAsPromise
+
+                    let secondStatus = expectProviderValue "automatic policy local wins status" secondStatusResult
+                    let! secondRevisionResult =
+                        workspace.Session.Core.CreateRevision
+                            {
+                                Message = "test: local automatic LFS settings win"
+                                Paths = [| mkRepositoryPath "local-wins.bin" |]
+                                ExpectedWorkspaceVersion = secondStatus.WorkspaceVersion
+                            }
+                            (OperationContext.detached "automatic-policy-local-wins-revision")
+                        |> Async.StartAsPromise
+
+                    expectProviderValue "automatic policy local wins revision" secondRevisionResult |> ignore
+                    let! secondCommitted =
+                        runGitIn workspace.Binding.WorkspaceRoot [||] [| "show"; "HEAD:local-wins.bin" |] None
+
+                    Vitest.expect(secondCommitted.Contains "git-lfs").toBe false
+                    match originalGlobal with
+                    | Some value -> setProcessEnvironment "GIT_CONFIG_GLOBAL" value
+                    | None -> clearProcessEnvironment "GIT_CONFIG_GLOBAL"
+
+                    do! harness.Cleanup()
+                with error ->
+                    match originalGlobal with
+                    | Some value -> setProcessEnvironment "GIT_CONFIG_GLOBAL" value
+                    | None -> clearProcessEnvironment "GIT_CONFIG_GLOBAL"
+
                     do! harness.Cleanup()
                     return raise error
             }

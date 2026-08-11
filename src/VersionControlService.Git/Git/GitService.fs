@@ -46,6 +46,9 @@ let MaterializeLargeObjectsKey = "versioncontrolservice.lfs.materializelargeobje
 [<Literal>]
 let DefaultAutoTrackThresholdMb = 1
 
+[<Literal>]
+let InvalidLfsThresholdMessage = "The automatic LFS threshold must be a positive whole MiB value."
+
 let private gitLfsDefaultDownloadLargeFiles = false
 
 let private normalizeOptionalGitRef (value: string option) =
@@ -188,7 +191,7 @@ let validateLfsThresholdMb (thresholdMb: int) =
     if thresholdMb > 0 then
         Ok thresholdMb
     else
-        Error(exn "The automatic LFS threshold must be a positive whole MiB value.")
+        Error(exn InvalidLfsThresholdMessage)
 
 // GitService parses the stored threshold because the setting is interpreted by git workflow code here.
 let private tryParseConfiguredThresholdMb (value: string option) =
@@ -824,16 +827,41 @@ let private runGitCapturedWithOutput progressCallback request =
     GitLfsAdapter.runGitCapturedWithOutput observeOutput request
 
 // GitService reads the threshold because stage/commit need the value while deciding whether to enforce LFS automatically.
-let private getConfiguredLfsThresholdMb (git: ISimpleGit) : JS.Promise<int> = promise {
-    try
-        let! configResult = git.getConfig (AutoTrackThresholdKey, "local")
+let private getConfiguredLfsThresholdMb (arcPath: string) : JS.Promise<GitResult<int>> = promise {
+    let! result =
+        runGitCaptured {
+            WorkingDirectory = Some arcPath
+            Arguments = [| "config"; "--local"; "--get-all"; AutoTrackThresholdKey |]
+            Environment = None
+            StandardInput = None
+            CancelCheck = None
+            TimeoutMs = Some 5000
+        }
 
-        return
-            configResult.value
-            |> tryParseConfiguredThresholdMb
-            |> Option.defaultValue DefaultAutoTrackThresholdMb
-    with _ ->
-        return DefaultAutoTrackThresholdMb
+    let values =
+        result.StdoutText.Replace("\r\n", "\n").Split('\n', StringSplitOptions.RemoveEmptyEntries)
+        |> Array.map _.Trim()
+        |> Array.filter (String.IsNullOrWhiteSpace >> not)
+
+    if result.ExitCode = 1 && values.Length = 0 && String.IsNullOrWhiteSpace result.StderrText then
+        return Ok DefaultAutoTrackThresholdMb
+    elif result.ExitCode = 0 && not result.TimedOut then
+        match values with
+        | [| value |] ->
+            match tryParseConfiguredThresholdMb (Some value) with
+            | Some thresholdMb -> return Ok thresholdMb
+            | None -> return Error(createFailure GitFailureKind.InvalidLfsThreshold InvalidLfsThresholdMessage)
+        | _ -> return Error(createFailure GitFailureKind.InvalidLfsThreshold InvalidLfsThresholdMessage)
+    else
+        let detail =
+            if result.TimedOut then
+                "Reading the local automatic LFS threshold timed out."
+            elif not (String.IsNullOrWhiteSpace result.StderrText) then
+                result.StderrText
+            else
+                result.StdoutText
+
+        return Error(createFailure (classifyFailureKind detail) detail)
 }
 
 // GitService reads the download preference because pull/sync need it while deciding whether to hydrate LFS content or keep pointers.
@@ -878,6 +906,39 @@ let private getOversizedWorkingTreePaths
     (thresholdBytes: int64)
     : JS.Promise<GitResult<string[]>> =
     promise {
+        let rec regularFilesUnder (absolutePath: string) : JS.Promise<Result<string[], exn>> = promise {
+            try
+                let! stats = lstatAsync absolutePath
+
+                if stats.isFile () then
+                    return Ok [| absolutePath |]
+                elif stats.isDirectory () then
+                    let! entries = readdirWithTypesAsync absolutePath (ReaddirOptions(withFileTypes = true))
+                    let files = ResizeArray<string>()
+                    let mutable nestedFailure: exn option = None
+
+                    for entry in entries do
+                        if nestedFailure.IsNone && entry.isFile () then
+                            files.Add(join [| absolutePath; entry.name |])
+                        elif nestedFailure.IsNone && entry.isDirectory () then
+                            let! nestedResult = regularFilesUnder (join [| absolutePath; entry.name |])
+
+                            match nestedResult with
+                            | Ok nested ->
+                                for nestedPath in nested do
+                                    files.Add nestedPath
+                            | Error error -> nestedFailure <- Some error
+
+                    match nestedFailure with
+                    | Some error -> return Error error
+                    | None -> return Ok(files.ToArray())
+                else
+                    return Ok [||]
+            with error ->
+                return Error error
+        }
+
+        let repositoryRoot = resolve [| arcPath |]
         let oversizedPaths = ResizeArray<string>()
         let mutable failure: GitFailure option = None
 
@@ -888,14 +949,30 @@ let private getOversizedWorkingTreePaths
                 match tryResolveArcRelativePath arcPath selectedPath with
                 | Error validationError -> failure <- Some(toFailure validationError)
                 | Ok(_, absolutePath) ->
-                    let! fileSizeOption = tryGetFileSizeInBytes absolutePath
+                    let! filesResult = regularFilesUnder absolutePath
 
-                    if fileSizeOption |> Option.exists (fun fileSize -> fileSize >= thresholdBytes) then
-                        oversizedPaths.Add selectedPath
+                    match filesResult with
+                    | Error error ->
+                        match tryGetNodeErrorCode error with
+                        | Some "ENOENT" -> ()
+                        | _ -> failure <- Some(toFailure error)
+                    | Ok files ->
+                        for filePath in files do
+                            match failure with
+                            | Some _ -> ()
+                            | None ->
+                                try
+                                    let! fileSizeOption = tryGetFileSizeInBytes filePath
+
+                                    if fileSizeOption |> Option.exists (fun fileSize -> fileSize >= thresholdBytes) then
+                                        let relativePath = relative repositoryRoot filePath |> fun value -> value.Replace("\\", "/")
+                                        oversizedPaths.Add relativePath
+                                with error ->
+                                    failure <- Some(toFailure error)
 
         match failure with
         | Some failure -> return Error failure
-        | None -> return Ok(oversizedPaths.ToArray())
+        | None -> return Ok(oversizedPaths.ToArray() |> Array.distinct)
     }
 
 // GitService keeps automatic LFS mutation in the explicit staging flow so only user-selected paths are re-staged.
@@ -905,45 +982,61 @@ let private enforceStageTimeLfsTrackingForPaths
     (git: ISimpleGit)
     : JS.Promise<GitResult<unit>> =
     promise {
-        let! thresholdMb = getConfiguredLfsThresholdMb git
-        let thresholdBytes = thresholdMbToBytes thresholdMb
-        let! oversizedPathsResult = getOversizedWorkingTreePaths arcPath selectedPaths thresholdBytes
-
-        match oversizedPathsResult with
+        match! getConfiguredLfsThresholdMb arcPath with
         | Error failure -> return Error failure
-        | Ok oversizedPaths when oversizedPaths.Length = 0 -> return Ok()
-        | Ok oversizedPaths ->
-            let pathsToTrack =
-                oversizedPaths
-                |> Array.filter (fun relativePath -> not (isTrackedByAttributes arcPath relativePath))
+        | Ok thresholdMb ->
+            let thresholdBytes = thresholdMbToBytes thresholdMb
+            let! oversizedPathsResult = getOversizedWorkingTreePaths arcPath selectedPaths thresholdBytes
 
-            let mutable failure: GitFailure option = None
+            match oversizedPathsResult with
+            | Error failure -> return Error failure
+            | Ok oversizedPaths when oversizedPaths.Length = 0 -> return Ok()
+            | Ok oversizedPaths ->
+                match! GitLfsAdapter.checkFilterAttributes arcPath oversizedPaths with
+                | Error message ->
+                    return
+                        Error(
+                            createFailure
+                                (classifyFailureKind message)
+                                $"Could not inspect automatic Git LFS attributes: {message}"
+                        )
+                | Ok attributes ->
+                    let filters = attributes |> Map.ofArray
+                    let pathsToTrack =
+                        oversizedPaths
+                        |> Array.filter (fun relativePath ->
+                            match Map.tryFind relativePath filters |> Option.defaultValue "unspecified" with
+                            | "lfs"
+                            | "unset" -> false
+                            | _ -> true)
 
-            for pathToTrack in pathsToTrack do
-                match failure with
-                | Some _ -> ()
-                | None ->
-                    let! trackResult = runGitLfsTrackCommand arcPath pathToTrack thresholdMb
+                    let mutable failure: GitFailure option = None
 
-                    match trackResult with
-                    | Ok() -> ()
-                    | Error trackFailure -> failure <- Some trackFailure
+                    for pathToTrack in pathsToTrack do
+                        match failure with
+                        | Some _ -> ()
+                        | None ->
+                            let! trackResult = runGitLfsTrackCommand arcPath pathToTrack thresholdMb
 
-            match failure with
-            | Some failure -> return Error failure
-            | None ->
-                if pathsToTrack.Length = 0 then
-                    return Ok()
-                else
-                    let pathsToRestage = [| ".gitattributes"; yield! oversizedPaths |] |> Array.distinct
+                            match trackResult with
+                            | Ok() -> ()
+                            | Error trackFailure -> failure <- Some trackFailure
 
-                    let! restageResult = runSimpleGit (fun currentGit -> currentGit.add pathsToRestage) git
+                    match failure with
+                    | Some failure -> return Error failure
+                    | None ->
+                        if pathsToTrack.Length = 0 then
+                            return Ok()
+                        else
+                            let pathsToRestage = [| ".gitattributes"; yield! oversizedPaths |] |> Array.distinct
 
-                    match restageResult with
-                    | Ok _ -> return Ok()
-                    | Error failure when failure.Kind = GitFailureKind.LfsInstallRequired ->
-                        return Error(createLfsInstallRequiredFailure (Some thresholdMb) None)
-                    | Error failure -> return Error failure
+                            let! restageResult = runSimpleGit (fun currentGit -> currentGit.add pathsToRestage) git
+
+                            match restageResult with
+                            | Ok _ -> return Ok()
+                            | Error failure when failure.Kind = GitFailureKind.LfsInstallRequired ->
+                                return Error(createLfsInstallRequiredFailure (Some thresholdMb) None)
+                            | Error failure -> return Error failure
     }
 
 let private tryGetIndexedBlobId (git: ISimpleGit) (relativePath: string) : JS.Promise<GitResult<string option>> = promise {
@@ -1024,38 +1117,40 @@ module private GitStatusCode =
 
         normalized <> "." && normalized <> "?"
 
-let private validateCommitLfsPolicy (git: ISimpleGit) : JS.Promise<GitResult<unit>> = promise {
-    let! thresholdMb = getConfiguredLfsThresholdMb git
-    let thresholdBytes = thresholdMbToBytes thresholdMb
-    let! statusResult = runSimpleGit (fun currentGit -> currentGit.status ()) git
-
-    match statusResult with
+let private validateCommitLfsPolicy (arcPath: string) (git: ISimpleGit) : JS.Promise<GitResult<unit>> = promise {
+    match! getConfiguredLfsThresholdMb arcPath with
     | Error failure -> return Error failure
-    | Ok status ->
-        let stagedPaths =
-            valueOrEmptyArray status.files
-            |> Array.filter (fun fileStatus -> GitStatusCode.isStagedIndexStatus fileStatus.index)
-            |> Array.map _.path
-            |> Array.distinct
+    | Ok thresholdMb ->
+        let thresholdBytes = thresholdMbToBytes thresholdMb
+        let! statusResult = runSimpleGit (fun currentGit -> currentGit.status ()) git
 
-        let oversizedPaths = ResizeArray<string>()
-        let mutable failure: GitFailure option = None
+        match statusResult with
+        | Error failure -> return Error failure
+        | Ok status ->
+            let stagedPaths =
+                valueOrEmptyArray status.files
+                |> Array.filter (fun fileStatus -> GitStatusCode.isStagedIndexStatus fileStatus.index)
+                |> Array.map _.path
+                |> Array.distinct
 
-        for stagedPath in stagedPaths do
+            let oversizedPaths = ResizeArray<string>()
+            let mutable failure: GitFailure option = None
+
+            for stagedPath in stagedPaths do
+                match failure with
+                | Some _ -> ()
+                | None ->
+                    let! stagedSizeResult = tryGetIndexedBlobSizeInBytes git stagedPath
+
+                    match stagedSizeResult with
+                    | Error stagedFailure -> failure <- Some stagedFailure
+                    | Ok(Some stagedSize) when stagedSize >= thresholdBytes -> oversizedPaths.Add stagedPath
+                    | Ok _ -> ()
+
             match failure with
-            | Some _ -> ()
-            | None ->
-                let! stagedSizeResult = tryGetIndexedBlobSizeInBytes git stagedPath
-
-                match stagedSizeResult with
-                | Error stagedFailure -> failure <- Some stagedFailure
-                | Ok(Some stagedSize) when stagedSize > thresholdBytes -> oversizedPaths.Add stagedPath
-                | Ok _ -> ()
-
-        match failure with
-        | Some failure -> return Error failure
-        | None when oversizedPaths.Count = 0 -> return Ok()
-        | None -> return Error(createCommitLfsValidationFailure thresholdMb (oversizedPaths.ToArray()))
+            | Some failure -> return Error failure
+            | None when oversizedPaths.Count = 0 -> return Ok()
+            | None -> return Error(createCommitLfsValidationFailure thresholdMb (oversizedPaths.ToArray()))
 }
 
 // Worktree-populating commands skip implicit LFS downloads; explicit LFS hydration uses authenticated transfers.
@@ -1288,18 +1383,22 @@ let getBranches (arcPath: string) : JS.Promise<GitResult<GitBranchRefDto[]>> =
         })
 
 /// Exposes persisted LFS workflow settings.
-let getLfsSettings (arcPath: string) : JS.Promise<GitResult<GitLfsSettingsDto>> =
-    withLocalGit
-        arcPath
-        (fun git -> promise {
-            let! thresholdMb = getConfiguredLfsThresholdMb git
-            let! downloadLargeFiles = getConfiguredLfsDownloadLargeFiles git
+let getLfsSettings (arcPath: string) : JS.Promise<GitResult<GitLfsSettingsDto>> = promise {
+    match! getConfiguredLfsThresholdMb arcPath with
+    | Error failure -> return Error failure
+    | Ok thresholdMb ->
+        return!
+            withLocalGit
+                arcPath
+                (fun git -> promise {
+                    let! downloadLargeFiles = getConfiguredLfsDownloadLargeFiles git
 
-            return {
-                AutoTrackThresholdMb = thresholdMb
-                DownloadLargeFiles = downloadLargeFiles
-            }
-        })
+                    return {
+                        AutoTrackThresholdMb = thresholdMb
+                        DownloadLargeFiles = downloadLargeFiles
+                    }
+                })
+}
 
 /// Returns aggregate unstaged diff counts for the active repository.
 let getDiffSummary (arcPath: string) : JS.Promise<GitResult<GitDiffSummaryDto>> =
@@ -1831,11 +1930,35 @@ let private createMissingLfsAttributesFailure safePath actionDescription =
     exn
         $"'{safePath}' is listed by Git LFS, but the current .gitattributes does not register it. Restore Git LFS tracking for this path before {actionDescription}."
 
-let private createLfsCheckoutFailure arcPath safePath =
-    if not (isTrackedByAttributes arcPath safePath) then
+let private checkPathTrackedByAttributes arcPath safePath : JS.Promise<GitResult<bool>> = promise {
+    match! GitLfsAdapter.checkFilterAttributes arcPath [| safePath |] with
+    | Error message ->
+        return
+            Error(
+                createFailure
+                    (classifyFailureKind message)
+                    $"Could not inspect Git LFS attributes for '{safePath}': {message}"
+            )
+    | Ok attributes ->
+        return
+            attributes
+            |> Array.tryFind (fun (path, _) -> path = safePath)
+            |> Option.exists (fun (_, value) -> value = "lfs")
+            |> Ok
+}
+
+let private createLfsCheckoutFailure safePath trackedByAttributes =
+    if not trackedByAttributes then
         createMissingLfsAttributesFailure safePath "downloading it"
     else
         exn $"Could not download '{safePath}' into the working tree."
+
+let private failLfsCheckout arcPath safePath : JS.Promise<unit> = promise {
+    match! checkPathTrackedByAttributes arcPath safePath with
+    | Error failure -> return abortGitPromise failure.Message
+    | Ok trackedByAttributes ->
+        return abortGitPromiseWith (createLfsCheckoutFailure safePath trackedByAttributes)
+}
 
 let private requireDownloadedLfsFile
     arcPath
@@ -1851,21 +1974,21 @@ let private requireDownloadedLfsFile
         if context.Cancellation.IsCancellationRequested() then
             return abortGitPromise "Git LFS operation canceled."
         elif not finalListing.checkout then
-            return abortGitPromiseWith (createLfsCheckoutFailure arcPath safePath)
+            return! failLfsCheckout arcPath safePath
         else
             let! finalStats = statAsync absolutePath
             let expectedSize = int64 expectedListing.size
             let actualSize = int64 finalStats.size
 
             if actualSize <> expectedSize then
-                return abortGitPromiseWith (createLfsCheckoutFailure arcPath safePath)
+                return! failLfsCheckout arcPath safePath
             else
                 let! finalStatus = git.status ()
 
                 if context.Cancellation.IsCancellationRequested() then
                     return abortGitPromise "Git LFS operation canceled."
                 elif not (isPathCleanInStatus finalStatus safePath) then
-                    return abortGitPromiseWith (createLfsCheckoutFailure arcPath safePath)
+                    return! failLfsCheckout arcPath safePath
                 else
                     return ()
     }
@@ -1939,9 +2062,15 @@ let freeLocalLfsCopy
                 $"'{safePath}' has local changes. Save, discard, or commit them before freeing the local LFS copy.")
             context
 
-    match lfsFileResult with
-    | Error failure -> return Error failure
-    | Ok(safePath, _, listing) when not listing.checkout ->
+    let! trackedResult =
+        match lfsFileResult with
+        | Ok(safePath, _, listing) when listing.checkout -> checkPathTrackedByAttributes arcPath safePath
+        | _ -> promise { return Ok true }
+
+    match lfsFileResult, trackedResult with
+    | Error failure, _ -> return Error failure
+    | _, Error failure -> return Error failure
+    | Ok(safePath, _, listing), _ when not listing.checkout ->
         context.ReportProgress {
             PhaseCode = "lfs-dematerialize"
             Item = Some safePath
@@ -1951,9 +2080,9 @@ let freeLocalLfsCopy
         }
 
         return Ok()
-    | Ok(safePath, _, _) when not (isTrackedByAttributes arcPath safePath) ->
+    | Ok(safePath, _, _), Ok false ->
         return errorResult (createMissingLfsAttributesFailure safePath "freeing the local LFS copy")
-    | Ok(safePath, absolutePath, listing) ->
+    | Ok(safePath, absolutePath, listing), Ok true ->
         context.ReportProgress {
             PhaseCode = "lfs-dematerialize"
             Item = Some safePath
@@ -2190,7 +2319,7 @@ let commit (arcPath: string) (message: string) : JS.Promise<GitResult<string>> =
             withLocalGit
                 arcPath
                 (fun git -> promise {
-                    let! lfsResult = validateCommitLfsPolicy git
+                            let! lfsResult = validateCommitLfsPolicy arcPath git
 
                     match lfsResult with
                     | Error failure -> return abortGitPromise failure.Message
