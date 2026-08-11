@@ -15,6 +15,16 @@ type GitCredential = {
     Secret: string
 }
 
+type RevisionIdentity = {
+    Name: string
+    Email: string
+}
+
+type GitIdentityStrategy = {
+    /// Resolves the identity to attribute to revisions created in the workspace, or None to use repository configuration.
+    ResolveIdentity: string -> Async<RevisionIdentity option>
+}
+
 /// Resolves a credential for (host, connection profile); None means anonymous
 /// (public HTTPS, SSH agent, or local remotes).
 type GitCredentialStrategy = {
@@ -24,6 +34,10 @@ type GitCredentialStrategy = {
 /// The default strategy: everything is anonymous.
 let anonymous: GitCredentialStrategy = {
     ResolveCredential = fun _ _ -> async { return None }
+}
+
+let anonymousIdentity: GitIdentityStrategy = {
+    ResolveIdentity = fun _workspaceRoot -> async { return None }
 }
 
 [<Emit("Buffer.from($0, 'utf8').toString('base64')")>]

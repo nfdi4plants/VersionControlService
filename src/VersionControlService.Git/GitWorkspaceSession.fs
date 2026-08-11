@@ -211,6 +211,7 @@ type private SessionState = {
     ConnectionProfileId: string option
     /// Injected credential resolution; never global state.
     Credentials: GitCredentialStrategy.GitCredentialStrategy
+    RevisionIdentity: GitCredentialStrategy.GitIdentityStrategy
     /// Active conflict-session identity and rotating handle version.
     mutable ConflictSession: (string * int) option
     /// Monotonic counter so re-opened merges never reuse a closed session ID.
@@ -242,6 +243,79 @@ let private credentialAuthenticationForRemote
         remoteUrl
         state.ConnectionProfileId
         remoteName
+
+let private identityMissingFailure () =
+    {
+        OperationFailure.create
+            Validation
+            "identity_missing"
+            "Git requires user.name and user.email to create a revision. Configure the repository identity or supply a Git identity strategy." with
+            RecoveryAction =
+                Some {
+                    Code = "configure_git_identity"
+                    Instructions =
+                        Some "Configure git user.name and user.email, or supply a GitIdentityStrategy for the workspace."
+                }
+    }
+
+let private readConfiguredIdentityValue
+    (state: SessionState)
+    (key: string)
+    (context: OperationContext)
+    : Async<Result<string option, OperationFailure>> =
+    async {
+        let! result = runGit state.Hooks state.RepoPath [| "config"; "--get"; key |] None context
+
+        match result with
+        | Error failure -> return Error failure
+        | Ok output when output.ExitCode = 0 ->
+            let value = output.StdOut.Trim()
+            return Ok(if String.IsNullOrWhiteSpace value then None else Some value)
+        | Ok output when output.ExitCode = 1 -> return Ok None
+        | Ok output ->
+            return
+                Error(
+                    OperationFailure.createRedacted
+                        ProviderError
+                        "git_failure"
+                        $"git config --get {key} failed: {output.StdErr}"
+                )
+    }
+
+let private resolveRevisionIdentity
+    (state: SessionState)
+    (context: OperationContext)
+    : Async<Result<string[], OperationFailure>> =
+    async {
+        let! resolvedIdentity = state.RevisionIdentity.ResolveIdentity state.RepoPath
+
+        match resolvedIdentity with
+        | Some identity when
+            String.IsNullOrWhiteSpace identity.Name
+            || String.IsNullOrWhiteSpace identity.Email ->
+            return Error(identityMissingFailure ())
+        | Some identity ->
+            return
+                Ok [|
+                    "-c"
+                    $"user.name={identity.Name}"
+                    "-c"
+                    $"user.email={identity.Email}"
+                |]
+        | None ->
+            let! emailResult = readConfiguredIdentityValue state "user.email" context
+
+            match emailResult with
+            | Error failure -> return Error failure
+            | Ok None -> return Error(identityMissingFailure ())
+            | Ok(Some _) ->
+                let! nameResult = readConfiguredIdentityValue state "user.name" context
+
+                match nameResult with
+                | Error failure -> return Error failure
+                | Ok(Some _) -> return Ok [||]
+                | Ok None -> return Error(identityMissingFailure ())
+    }
 
 // ---------------------------------------------------------------------------
 // Status and workspace version
@@ -1295,14 +1369,20 @@ let private createRevision (state: SessionState) (request: CreateRevisionRequest
 
             let transactionBarrier point = barrier state.Hooks state.RepoPath point context
 
-            return!
-                GitSelectedRevision.createRevision
-                    runner
-                    transactionBarrier
-                    state.RepoPath
-                    request.Message
-                    request.Paths
-                    context
+            let! identityResult = resolveRevisionIdentity state context
+
+            match identityResult with
+            | Error failure -> return Failed failure
+            | Ok identityArguments ->
+                return!
+                    GitSelectedRevision.createRevision
+                        runner
+                        transactionBarrier
+                        state.RepoPath
+                        request.Message
+                        request.Paths
+                        identityArguments
+                        context
     }
 
 let private restorePaths (state: SessionState) (request: RestoreRequest) (context: OperationContext) =
@@ -2259,7 +2339,11 @@ let private previewUpdate (state: SessionState) (context: OperationContext) =
             | _ -> return! previewRefreshedState state context syncState
     }
 
-let private update (state: SessionState) (request: UpdateRequest) (context: OperationContext) =
+let private updateWithIdentity
+    (state: SessionState)
+    (request: UpdateRequest)
+    (context: OperationContext)
+    =
     async {
         let! refreshResult = refresh state context
 
@@ -2277,16 +2361,29 @@ let private update (state: SessionState) (request: UpdateRequest) (context: Oper
                 let targetReference =
                     syncState.TargetRevision |> Option.map RevisionId.value |> Option.get
 
-                do! barrier state.Hooks state.RepoPath "update-merge" context
+                let! identityResult = resolveRevisionIdentity state context
 
                 let! mergeResult =
-                    runGitEnv
-                        state.Hooks
-                        state.RepoPath
-                        [| "merge"; "--no-edit"; targetReference |]
-                        None
-                        [| "GIT_LFS_SKIP_SMUDGE", "1" |]
-                        context
+                    match identityResult with
+                    | Error failure -> async { return Error failure }
+                    | Ok identityArguments ->
+                        async {
+                            do! barrier state.Hooks state.RepoPath "update-merge" context
+
+                            return!
+                                runGitEnv
+                                    state.Hooks
+                                    state.RepoPath
+                                    [|
+                                        yield! identityArguments
+                                        "merge"
+                                        "--no-edit"
+                                        targetReference
+                                    |]
+                                    None
+                                    [| "GIT_LFS_SKIP_SMUDGE", "1" |]
+                                    context
+                        }
 
                 match mergeResult with
                 | Error failure -> return Failed failure
@@ -2429,6 +2526,9 @@ let private update (state: SessionState) (request: UpdateRequest) (context: Oper
                                 Instructions = Some "Resolve every conflict item, then finalize."
                             }
     }
+
+let private update (state: SessionState) (request: UpdateRequest) (context: OperationContext) =
+    updateWithIdentity state request context
 
 let private publish (state: SessionState) (request: PublishRequest) (context: OperationContext) =
     async {
@@ -3165,9 +3265,10 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                         | Ok branchResult ->
                             let branchRef = branchResult.StdOut.Trim()
                             let! expectedHead = revParse state "HEAD" context
+                            let! identityResult = resolveRevisionIdentity state context
 
-                            match expectedHead with
-                            | None ->
+                            match expectedHead, identityResult with
+                            | None, _ ->
                                 return
                                     Failed(
                                         OperationFailure.create
@@ -3175,7 +3276,8 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                             "git_failure"
                                             "The current head could not be resolved."
                                     )
-                            | Some expectedHeadValue ->
+                            | Some _, Error failure -> return Failed failure
+                            | Some expectedHeadValue, Ok identityArguments ->
                                 do! barrier state.Hooks state.RepoPath "finalize-precheck-done" context
 
                                 let! treeResult =
@@ -3192,6 +3294,7 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                             state.Hooks
                                             state.RepoPath
                                             [|
+                                                yield! identityArguments
                                                 "commit-tree"
                                                 treeOutput.StdOut.Trim()
                                                 "-p"
@@ -3627,9 +3730,10 @@ let private createBrowser (state: SessionState) : RepositoryBrowserService = {
 // Session and factory
 // ---------------------------------------------------------------------------
 
-let createSessionWithCredentials
+let createSessionWithCredentialsAndIdentity
     (hooks: GitSessionHooks)
     (credentials: GitCredentialStrategy.GitCredentialStrategy)
+    (revisionIdentity: GitCredentialStrategy.GitIdentityStrategy)
     (binding: WorkspaceBinding)
     : WorkspaceSession =
     let state = {
@@ -3639,6 +3743,7 @@ let createSessionWithCredentials
         Location = binding.Location
         ConnectionProfileId = binding.ConnectionProfileId
         Credentials = credentials
+        RevisionIdentity = revisionIdentity
         ConflictSession = None
         ConflictGeneration = 0
     }
@@ -3697,6 +3802,13 @@ let createSessionWithCredentials
             Maintenance = Some(GitLfsExtensions.createMaintenance state.RepoPath)
             RepositoryBrowser = Some(createBrowser state)
     }
+
+let createSessionWithCredentials
+    (hooks: GitSessionHooks)
+    (credentials: GitCredentialStrategy.GitCredentialStrategy)
+    (binding: WorkspaceBinding)
+    : WorkspaceSession =
+    createSessionWithCredentialsAndIdentity hooks credentials GitCredentialStrategy.anonymousIdentity binding
 
 /// Session with the anonymous credential strategy.
 let createSession (hooks: GitSessionHooks) (binding: WorkspaceBinding) : WorkspaceSession =
@@ -3759,9 +3871,10 @@ let private adoptionUnsupportedFailure (detail: string) =
         "adoption_unsupported"
         $"The workspace cannot be adopted without guessing because Git cannot parse its repository metadata: {detail}"
 
-let createFactoryWithCredentials
+let createFactoryWithCredentialsAndIdentity
     (hooks: GitSessionHooks)
     (credentials: GitCredentialStrategy.GitCredentialStrategy)
+    (revisionIdentity: GitCredentialStrategy.GitIdentityStrategy)
     : ProviderFactory =
     let checkDependencies (context: OperationContext) : Async<OperationResult<DependencyStatus[]>> =
         async {
@@ -4202,7 +4315,9 @@ let createFactoryWithCredentials
         }
     Open =
         fun binding _ -> async {
-            return OperationResult.succeeded (createSessionWithCredentials hooks credentials binding)
+            return
+                OperationResult.succeeded
+                    (createSessionWithCredentialsAndIdentity hooks credentials revisionIdentity binding)
         }
     CheckDependencies = checkDependencies
     InstallDependency =
@@ -4276,6 +4391,12 @@ let createFactoryWithCredentials
                         )
             }
     }
+
+let createFactoryWithCredentials
+    (hooks: GitSessionHooks)
+    (credentials: GitCredentialStrategy.GitCredentialStrategy)
+    : ProviderFactory =
+    createFactoryWithCredentialsAndIdentity hooks credentials GitCredentialStrategy.anonymousIdentity
 
 /// Factory with the anonymous credential strategy.
 let createFactory (hooks: GitSessionHooks) : ProviderFactory =

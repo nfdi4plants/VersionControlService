@@ -166,6 +166,32 @@ let private createSyncFixture (hooks: GitWorkspaceSession.GitSessionHooks) = pro
     return root, workPath, barePath, session
 }
 
+let private syncBinding (workPath: string) (barePath: string) : WorkspaceBinding = {
+    SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
+    ProviderId = gitProviderId
+    WorkspaceRoot = workPath
+    ProviderStateRef = None
+    Location = {
+        ProviderId = gitProviderId
+        DisplayName = None
+        ProviderLocation = barePath
+        ConnectionProfileId = None
+    }
+    ConnectionProfileId = None
+}
+
+let private identitySession
+    (hooks: GitWorkspaceSession.GitSessionHooks)
+    (identity: GitCredentialStrategy.GitIdentityStrategy)
+    (workPath: string)
+    (barePath: string)
+    =
+    GitWorkspaceSession.createSessionWithCredentialsAndIdentity
+        hooks
+        GitCredentialStrategy.anonymous
+        identity
+        (syncBinding workPath barePath)
+
 /// Commits target-side mutations through a scratch clone, like another client.
 let private advanceTarget (root: string) (barePath: string) (mutations: (string * string) list) = promise {
     let clonePath = join [| root; $"advance-{DateTime.Now.Ticks}" |]
@@ -436,6 +462,193 @@ Vitest.describe (
                         .expect(failure.RecoveryAction |> Option.map _.Code)
                         .toEqual (Some "refresh_conflict_session")
 
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+)
+
+Vitest.describe (
+    "Git / synchronization revision identity",
+    fun () ->
+        Vitest.test (
+            "up-to-date update without revision identity remains a NoOp",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, barePath, _ = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+
+                try
+                    let emptyGlobal = join [| root; "empty-global.gitconfig" |]
+                    let emptySystem = join [| root; "empty-system.gitconfig" |]
+                    do! writeUtf8FileAsync emptyGlobal ""
+                    do! writeUtf8FileAsync emptySystem ""
+                    let! _ = runGitIn workPath [| "config"; "--local"; "--unset-all"; "user.name" |]
+                    let! _ = runGitIn workPath [| "config"; "--local"; "--unset-all"; "user.email" |]
+
+                    let environment = [| "GIT_CONFIG_GLOBAL", emptyGlobal; "GIT_CONFIG_SYSTEM", emptySystem |]
+                    let hooks = {
+                        GitWorkspaceSession.GitSessionHooks.none with
+                            RunProcess =
+                                Some(fun request processContext ->
+                                    NodeProcess.run
+                                        { request with
+                                            Environment = Array.append environment request.Environment }
+                                        processContext)
+                    }
+
+                    let session = GitWorkspaceSession.createSession hooks (syncBinding workPath barePath)
+                    let! status = sessionStatus session
+                    let! updateResult =
+                        (syncService session).Update
+                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                            (ctx "revision-identity-noop-update")
+                        |> Async.StartAsPromise
+
+                    match updateResult with
+                    | Succeeded outcome ->
+                        match outcome.Effect with
+                        | NoOp _ -> ()
+                        | Performed -> failwith "Expected the up-to-date update to be a NoOp."
+                    | PartiallySucceeded(_, failure)
+                    | Failed failure ->
+                        failwith $"Expected a NoOp, received {failure.Category}/{failure.Code}."
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "update merge commits use the injected revision identity",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let identity: GitCredentialStrategy.GitIdentityStrategy = {
+                    ResolveIdentity = fun _workspaceRoot ->
+                        async {
+                            return Some { Name = "Merge Author"; Email = "merge@example.org" }
+                        }
+                }
+
+                let! root, workPath, barePath, _ = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+                let session = identitySession GitWorkspaceSession.GitSessionHooks.none identity workPath barePath
+
+                try
+                    do! advanceTarget root barePath [ "target-only.txt", "target content\n" ]
+                    do! writeUtf8FileAsync (join [| workPath; "workspace-only.txt" |]) "workspace content\n"
+
+                    let! saveStatus = sessionStatus session
+                    let! saveResult =
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: local merge side"
+                                Paths = [| mkPath "workspace-only.txt" |]
+                                ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+                            }
+                            (ctx "revision-identity-merge-local")
+                        |> Async.StartAsPromise
+
+                    expectValue "local merge side" saveResult |> ignore
+                    let! updateStatus = sessionStatus session
+                    let! updateResult =
+                        (syncService session).Update
+                            { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
+                            (ctx "revision-identity-merge-update")
+                        |> Async.StartAsPromise
+
+                    expectValue "revision identity merge update" updateResult |> ignore
+
+                    let! commitIdentity = runGitIn workPath [| "log"; "-1"; "--format=%an;%ae;%cn;%ce" |]
+                    Vitest.expect(commitIdentity.Trim()).toBe "Merge Author;merge@example.org;Merge Author;merge@example.org"
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "conflict finalize commits use the injected revision identity",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let identity: GitCredentialStrategy.GitIdentityStrategy = {
+                    ResolveIdentity = fun _workspaceRoot ->
+                        async {
+                            return Some { Name = "Finalize Author"; Email = "finalize@example.org" }
+                        }
+                }
+
+                let! root, workPath, barePath, _ = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+                let session = identitySession GitWorkspaceSession.GitSessionHooks.none identity workPath barePath
+
+                try
+                    do! advanceTarget root barePath [ "base.txt", "target version\n" ]
+                    do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) "workspace version\n"
+
+                    let! saveStatus = sessionStatus session
+                    let! saveResult =
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: local conflicting change"
+                                Paths = [| mkPath "base.txt" |]
+                                ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+                            }
+                            (ctx "revision-identity-finalize-local")
+                        |> Async.StartAsPromise
+
+                    expectValue "local conflicting change" saveResult |> ignore
+                    let! updateStatus = sessionStatus session
+                    let! updateResult =
+                        (syncService session).Update
+                            { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
+                            (ctx "revision-identity-finalize-update")
+                        |> Async.StartAsPromise
+
+                    match updateResult with
+                    | Failed failure
+                    | PartiallySucceeded(_, failure) when failure.Code = "conflicts_detected" -> ()
+                    | Failed failure
+                    | PartiallySucceeded(_, failure) ->
+                        failwith $"Expected conflicts_detected, received {failure.Category}/{failure.Code}."
+                    | Succeeded _ -> failwith "Expected a conflict session."
+
+                    let conflicts = conflictService session
+                    let! activeResult = conflicts.GetActiveSession(ctx "revision-identity-finalize-session") |> Async.StartAsPromise
+                    let summary =
+                        match expectValue "revision identity finalize session" activeResult with
+                        | Some value -> value
+                        | None -> failwith "Expected an active conflict session."
+
+                    let! resolveStatus = sessionStatus session
+                    let! resolveResult =
+                        conflicts.Resolve
+                            {
+                                Handle = summary.Handle
+                                ExpectedWorkspaceVersion = resolveStatus.WorkspaceVersion
+                                Path = mkPath "base.txt"
+                                Resolution = PickCandidate "target"
+                            }
+                            (ctx "revision-identity-finalize-resolve")
+                        |> Async.StartAsPromise
+
+                    let resolution = expectValue "revision identity finalize resolution" resolveResult
+                    let! finalizeStatus = sessionStatus session
+                    let! finalizeResult =
+                        conflicts.Finalize
+                            {
+                                Handle = resolution.RefreshedHandle
+                                ExpectedWorkspaceVersion = finalizeStatus.WorkspaceVersion
+                                Message = Some "test: revision identity finalize"
+                            }
+                            (ctx "revision-identity-finalize")
+                        |> Async.StartAsPromise
+
+                    expectValue "revision identity finalize" finalizeResult |> ignore
+                    let! commitIdentity = runGitIn workPath [| "log"; "-1"; "--format=%an;%ae;%cn;%ce" |]
+                    Vitest.expect(commitIdentity.Trim()).toBe "Finalize Author;finalize@example.org;Finalize Author;finalize@example.org"
                     do! removeDirectoryAsync root
                 with error ->
                     do! removeDirectoryAsync root

@@ -10,6 +10,7 @@ open VersionControlService.Tests.NodePath
 open Vitest
 
 module GitWorkspaceSession = VersionControlService.Git.GitWorkspaceSession
+module GitCredentialStrategy = VersionControlService.Git.GitCredentialStrategy
 module NodeProcess = VersionControlService.Runtime.Node.Process
 
 let private fsPromisesDynamic: obj = importAll "fs/promises"
@@ -135,6 +136,11 @@ let private configureUser (repoPath: string) = promise {
     let! _ = runGitIn repoPath [||] [| "config"; "core.autocrlf"; "false" |] None
     return ()
 }
+
+let private mkRepositoryPath (value: string) =
+    match RepositoryPath.tryCreate value with
+    | Ok path -> path
+    | Error message -> failwith message
 
 let private gitProviderId =
     match ProviderId.tryCreate "git" with
@@ -708,6 +714,327 @@ Vitest.describe (
                     Vitest.expect(synchronization.LocalRevisionCount).toEqual None
                     Vitest.expect(synchronization.TargetRevisionCount).toEqual None
                     Vitest.expect(synchronization.Relationship).toEqual NoTarget
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+)
+
+Vitest.describe (
+    "Git / revision identity",
+    fun () ->
+        Vitest.test (
+            "CreateRevision uses the injected revision identity",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+
+                    let identity: GitCredentialStrategy.GitIdentityStrategy = {
+                        ResolveIdentity = fun _workspaceRoot ->
+                            async {
+                                return Some { Name = "Test Author"; Email = "author@example.org" }
+                            }
+                    }
+
+                    let factory =
+                        GitWorkspaceSession.createFactoryWithCredentialsAndIdentity
+                            GitWorkspaceSession.GitSessionHooks.none
+                            GitCredentialStrategy.anonymous
+                            identity
+
+                    let! sessionResult =
+                        factory.Open workspace.Binding (OperationContext.detached "revision-identity-open")
+                        |> Async.StartAsPromise
+
+                    let session = expectProviderValue "revision identity open" sessionResult
+
+                    do! workspace.WriteFile "revision-identity.txt" "identity content\n"
+                    let! status =
+                        session.Core.GetStatus(OperationContext.detached "revision-identity-status")
+                        |> Async.StartAsPromise
+
+                    let status = expectProviderValue "revision identity status" status
+
+                    let! revisionResult =
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: revision identity"
+                                Paths = [| mkRepositoryPath "revision-identity.txt" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (OperationContext.detached "revision-identity-create")
+                        |> Async.StartAsPromise
+
+                    expectProviderValue "revision identity create" revisionResult |> ignore
+
+                    let! commitIdentity =
+                        runGitIn
+                            workspace.Binding.WorkspaceRoot
+                            [||]
+                            [| "log"; "-1"; "--format=%an;%ae;%cn;%ce" |]
+                            None
+
+                    Vitest.expect(commitIdentity.Trim()).toBe "Test Author;author@example.org;Test Author;author@example.org"
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "revision identity None falls back to repository configuration",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+
+                    let identity: GitCredentialStrategy.GitIdentityStrategy = {
+                        ResolveIdentity = fun _workspaceRoot -> async { return None }
+                    }
+
+                    let session =
+                        GitWorkspaceSession.createSessionWithCredentialsAndIdentity
+                            GitWorkspaceSession.GitSessionHooks.none
+                            GitCredentialStrategy.anonymous
+                            identity
+                            workspace.Binding
+
+                    do! workspace.WriteFile "configured-identity.txt" "configured identity\n"
+                    let! status =
+                        session.Core.GetStatus(OperationContext.detached "configured-identity-status")
+                        |> Async.StartAsPromise
+
+                    let status = expectProviderValue "configured identity status" status
+
+                    let! revisionResult =
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: configured identity"
+                                Paths = [| mkRepositoryPath "configured-identity.txt" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (OperationContext.detached "configured-identity-create")
+                        |> Async.StartAsPromise
+
+                    expectProviderValue "configured identity create" revisionResult |> ignore
+
+                    let! commitIdentity =
+                        runGitIn
+                            workspace.Binding.WorkspaceRoot
+                            [||]
+                            [| "log"; "-1"; "--format=%an;%ae;%cn;%ce" |]
+                            None
+
+                    Vitest.expect(commitIdentity.Trim()).toBe "VCS Harness;harness@example.org;VCS Harness;harness@example.org"
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "incomplete revision identity fails before git commit",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let mutable currentIdentity: GitCredentialStrategy.RevisionIdentity = {
+                        Name = " "
+                        Email = "author@example.org"
+                    }
+
+                    let identity: GitCredentialStrategy.GitIdentityStrategy = {
+                        ResolveIdentity = fun _workspaceRoot -> async { return Some currentIdentity }
+                    }
+
+                    let session =
+                        GitWorkspaceSession.createSessionWithCredentialsAndIdentity
+                            GitWorkspaceSession.GitSessionHooks.none
+                            GitCredentialStrategy.anonymous
+                            identity
+                            workspace.Binding
+
+                    let reject path content contextName = promise {
+                        do! workspace.WriteFile path content
+                        let! statusResult =
+                            session.Core.GetStatus(OperationContext.detached $"{contextName}-status")
+                            |> Async.StartAsPromise
+
+                        let status = expectProviderValue $"{contextName} status" statusResult
+                        let! revisionResult =
+                            session.Core.CreateRevision
+                                {
+                                    Message = "test: incomplete revision identity"
+                                    Paths = [| mkRepositoryPath path |]
+                                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                }
+                                (OperationContext.detached contextName)
+                            |> Async.StartAsPromise
+
+                        return expectProviderFailure contextName revisionResult
+                    }
+
+                    let! blankNameFailure = reject "blank-name.txt" "blank name\n" "blank-name-revision-identity"
+                    Vitest.expect(blankNameFailure.Category).toEqual Validation
+                    Vitest.expect(blankNameFailure.Code).toBe "identity_missing"
+                    Vitest.expect(blankNameFailure.StateChanged).toBe false
+
+                    currentIdentity <- { Name = "Test Author"; Email = "\t" }
+                    let! blankEmailFailure = reject "blank-email.txt" "blank email\n" "blank-email-revision-identity"
+                    Vitest.expect(blankEmailFailure.Category).toEqual Validation
+                    Vitest.expect(blankEmailFailure.Code).toBe "identity_missing"
+                    Vitest.expect(blankEmailFailure.StateChanged).toBe false
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "revision identity resolves once per operation instead of at session open",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let mutable currentIdentity: GitCredentialStrategy.RevisionIdentity = {
+                        Name = "First Author"
+                        Email = "first@example.org"
+                    }
+
+                    let identity: GitCredentialStrategy.GitIdentityStrategy = {
+                        ResolveIdentity = fun _workspaceRoot -> async { return Some currentIdentity }
+                    }
+
+                    let session =
+                        GitWorkspaceSession.createSessionWithCredentialsAndIdentity
+                            GitWorkspaceSession.GitSessionHooks.none
+                            GitCredentialStrategy.anonymous
+                            identity
+                            workspace.Binding
+
+                    let create path content message contextName = promise {
+                        do! workspace.WriteFile path content
+                        let! status =
+                            session.Core.GetStatus(OperationContext.detached $"{contextName}-status")
+                            |> Async.StartAsPromise
+
+                        let status = expectProviderValue $"{contextName} status" status
+
+                        let! result =
+                            session.Core.CreateRevision
+                                {
+                                    Message = message
+                                    Paths = [| mkRepositoryPath path |]
+                                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                }
+                                (OperationContext.detached contextName)
+                            |> Async.StartAsPromise
+
+                        expectProviderValue $"{contextName} create" result |> ignore
+                    }
+
+                    do! create "first-identity.txt" "first\n" "test: first identity" "first-revision-identity"
+                    currentIdentity <- { Name = "Second Author"; Email = "second@example.org" }
+                    do! create "second-identity.txt" "second\n" "test: second identity" "second-revision-identity"
+
+                    let! commitIdentities =
+                        runGitIn
+                            workspace.Binding.WorkspaceRoot
+                            [||]
+                            [| "log"; "-2"; "--format=%an;%ae;%cn;%ce" |]
+                            None
+
+                    let lines =
+                        commitIdentities.Replace("\r\n", "\n").Trim().Split([| '\n' |], StringSplitOptions.RemoveEmptyEntries)
+
+                    Vitest.expect(lines).toEqual ([|
+                        "Second Author;second@example.org;Second Author;second@example.org"
+                        "First Author;first@example.org;First Author;first@example.org"
+                    |])
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "missing revision identity fails before ref movement",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let emptyGlobal = join [| workspace.Binding.WorkspaceRoot; "empty-global.gitconfig" |]
+                    let emptySystem = join [| workspace.Binding.WorkspaceRoot; "empty-system.gitconfig" |]
+                    do! writeUtf8FileAsync emptyGlobal ""
+                    do! writeUtf8FileAsync emptySystem ""
+
+                    let environment = [| "GIT_CONFIG_GLOBAL", emptyGlobal; "GIT_CONFIG_SYSTEM", emptySystem |]
+                    let hooks = {
+                        GitWorkspaceSession.GitSessionHooks.none with
+                            RunProcess =
+                                Some(fun request processContext ->
+                                    NodeProcess.run
+                                        { request with
+                                            Environment = Array.append environment request.Environment }
+                                        processContext)
+                    }
+
+                    let! _ = runGitIn workspace.Binding.WorkspaceRoot environment [| "config"; "--local"; "--unset-all"; "user.name" |] None
+                    let! _ = runGitIn workspace.Binding.WorkspaceRoot environment [| "config"; "--local"; "--unset-all"; "user.email" |] None
+                    let identity: GitCredentialStrategy.GitIdentityStrategy = {
+                        ResolveIdentity = fun _workspaceRoot -> async { return None }
+                    }
+
+                    let session =
+                        GitWorkspaceSession.createSessionWithCredentialsAndIdentity
+                            hooks
+                            GitCredentialStrategy.anonymous
+                            identity
+                            workspace.Binding
+
+                    let! headBefore = runGitIn workspace.Binding.WorkspaceRoot environment [| "rev-parse"; "HEAD" |] None
+                    do! workspace.WriteFile "missing-identity.txt" "missing identity\n"
+                    let! status =
+                        session.Core.GetStatus(OperationContext.detached "missing-identity-status")
+                        |> Async.StartAsPromise
+
+                    let status = expectProviderValue "missing identity status" status
+
+                    let! revisionResult =
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: missing identity"
+                                Paths = [| mkRepositoryPath "missing-identity.txt" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (OperationContext.detached "missing-identity-create")
+                        |> Async.StartAsPromise
+
+                    let failure = expectProviderFailure "missing revision identity" revisionResult
+                    Vitest.expect(failure.Category).toEqual Validation
+                    Vitest.expect(failure.Code).toBe "identity_missing"
+                    Vitest.expect(failure.RecoveryAction.IsSome).toBe true
+                    Vitest.expect(failure.StateChanged).toBe false
+
+                    let! headAfter = runGitIn workspace.Binding.WorkspaceRoot environment [| "rev-parse"; "HEAD" |] None
+                    Vitest.expect(headAfter.Trim()).toBe (headBefore.Trim())
                     do! harness.Cleanup()
                 with error ->
                     do! harness.Cleanup()

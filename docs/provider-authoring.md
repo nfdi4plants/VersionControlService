@@ -18,6 +18,8 @@ An external provider needs one project reference or package reference: `VersionC
 
 Factories receive credentials and provider settings through constructor arguments. Do not use global mutable registries. A factory can open multiple independent sessions, including sessions with different connection profiles.
 
+The Git provider also accepts a `GitIdentityStrategy` extension point for host-supplied revision attribution. Its `ResolveIdentity` function receives the workspace root and is called for each operation that may create a revision; the result is not cached when a session opens. Returning `Some` supplies the author and committer name and email for that operation. Returning `None` uses the repository's configured `user.name` and `user.email`. If neither a strategy identity nor a complete repository identity is available, the operation fails before mutation with the stable validation code `identity_missing` and a recovery action describing how to configure Git or supply the strategy.
+
 ## Session contract
 
 Every `WorkspaceSession` supplies `CoreVersionControl`: status, refs, switching, selected-path revisions, restoration, and diff summaries. `WorkspaceSession.createCoreOnly` is the shortest correct starting point for a provider with no extensions.

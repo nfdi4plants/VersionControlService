@@ -515,6 +515,7 @@ let createRevision
     (repoPath: string)
     (message: string)
     (paths: RepositoryPath[])
+    (identityArguments: string[])
     (context: OperationContext)
     : Async<OperationResult<RevisionId>> =
     async {
@@ -743,6 +744,7 @@ let createRevision
                                                         )
                                             else
                                                 let commitArguments = [|
+                                                    yield! identityArguments
                                                     "commit-tree"
                                                     newTree
                                                     yield!
