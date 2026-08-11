@@ -11,6 +11,7 @@ open VersionControlService.LakeFs.LakeFsTypes
 module LakeFsApi = VersionControlService.LakeFs.LakeFsApi
 module LakeFsCredentials = VersionControlService.LakeFs.LakeFsCredentials
 module LakeFsIndex = VersionControlService.LakeFs.LakeFsWorkspaceIndex
+module LakeFsMaterialization = VersionControlService.LakeFs.LakeFsMaterialization
 module LakeFsProviderOptions = VersionControlService.LakeFs.LakeFsProviderOptions
 module LakeFsStateStore = VersionControlService.LakeFs.LakeFsStateStore
 module LakeFsPathSafety = VersionControlService.LakeFs.LakeFsPathSafety
@@ -65,6 +66,7 @@ let private mkProviderRef (value: string) =
 type private SessionState = {
     Binding: WorkspaceBinding
     StateDirectory: string
+    RecoveryDirectory: string
     Location: LakeFsLocation
     Credentials: LakeFsCredentials.LakeFsCredentialStrategy
     Hooks: LakeFsSessionHooks
@@ -126,6 +128,23 @@ let private temporaryPath (state: SessionState) label =
         NodeFileSystem.mkdirSync directory (NodeFileSystem.MkdirOptions(recursive = false))
 
     NodePath.join [| directory; $"{label}-{NodeInterop.randomUuid()}.tmp" |]
+
+let private cleanupConflictCandidates (state: SessionState) =
+    let directory = NodePath.join [| state.StateDirectory; "temporary" |]
+
+    if NodeFileSystem.existsSync directory then
+        try
+            for name in NodeFileSystem.readdirSync directory do
+                if
+                    name.StartsWith("conflict-candidate-", StringComparison.Ordinal)
+                    || name.StartsWith("conflict-resolution-", StringComparison.Ordinal)
+                then
+                    try
+                        NodeFileSystem.unlinkSync (NodePath.join [| directory; name |])
+                    with _ ->
+                        ()
+        with _ ->
+            ()
 
 let private writeLocal (state: SessionState) (path: string) (content: string) =
     LakeFsPathSafety.writeUtf8File state.Binding.WorkspaceRoot (repositoryPath path) content
@@ -211,6 +230,7 @@ let private staleFailure () =
 let private withValidatedMutation
     (state: SessionState)
     (expectedVersion: string)
+    (allowRecovery: bool)
     (body: unit -> Async<OperationResult<'T>>)
     : Async<OperationResult<'T>> =
     async {
@@ -227,7 +247,17 @@ let private withValidatedMutation
                      && persisted.OwnershipToken = state.Index.OwnershipToken ->
                 state.Index <- persisted
 
-                if workspaceVersion state <> expectedVersion then
+                if not allowRecovery then
+                    match LakeFsMaterialization.loadPendingRecoveries state.RecoveryDirectory with
+                    | Error failure -> return Failed failure
+                    | Ok pending when pending.Length > 0 ->
+                        return Failed(LakeFsMaterialization.pendingFailure pending)
+                    | Ok _ ->
+                        if workspaceVersion state <> expectedVersion then
+                            return Failed(staleFailure ())
+                        else
+                            return! body ()
+                elif workspaceVersion state <> expectedVersion then
                     return Failed(staleFailure ())
                 else
                     return! body ()
@@ -257,6 +287,20 @@ let private withValidatedMutation
                     )
         finally
             state.Busy <- false
+    }
+
+let private pendingRecoveryGate (state: SessionState) =
+    match LakeFsMaterialization.loadPendingRecoveries state.RecoveryDirectory with
+    | Error failure -> Error failure
+    | Ok pending when pending.Length > 0 ->
+        Error(LakeFsMaterialization.pendingFailure pending)
+    | Ok _ -> Ok()
+
+let private guardConflictMutation state operation =
+    async {
+        match pendingRecoveryGate state with
+        | Error failure -> return Failed failure
+        | Ok() -> return! operation
     }
 
 let private saveIndex (state: SessionState) =
@@ -951,14 +995,49 @@ let private createRevision (state: SessionState) (request: CreateRevisionRequest
                                                     commitAfter
     }
 
-let private restorePaths (state: SessionState) (request: RestoreRequest) (context: OperationContext) =
+let private materializationResultToOperation
+    (state: SessionState)
+    (result: LakeFsMaterialization.MaterializationResult)
+    : OperationResult<unit> =
+    match result with
+    | LakeFsMaterialization.Materialized(saved, affectedPaths, warnings) ->
+        state.Index <- saved
+
+        Succeeded {
+            OperationOutcome.performed () with
+                Warnings = warnings
+                AffectedPaths = affectedPaths
+                ResultingWorkspaceVersion = Some(workspaceVersion state)
+        }
+    | LakeFsMaterialization.MaterializationFailed failure -> Failed failure
+    | LakeFsMaterialization.MaterializationPartiallyApplied(saved, failure) ->
+        saved |> Option.iter (fun index -> state.Index <- index)
+
+        PartiallySucceeded(
+            {
+                OperationOutcome.performed () with
+                    AffectedPaths = failure.AffectedPaths
+                    ResultingWorkspaceVersion = Some(workspaceVersion state)
+            },
+            failure
+        )
+
+let private validateRestoreRequest (request: RestoreRequest) =
+    if request.Paths.Length = 0 then
+        Error(
+            OperationFailure.create
+                Validation
+                "no_paths_selected"
+                "Select at least one path."
+        )
+    else
+        LakeFsPathSafety.validateMaterializationPaths request.Paths
+
+let private restorePathsWithoutRecovery (state: SessionState) (request: RestoreRequest) (context: OperationContext) =
     async {
-        if request.Paths.Length = 0 then
-            return OperationResult.validationFailed "no_paths_selected" "Select at least one path."
-        else
-            match LakeFsPathSafety.validateMaterializationPaths request.Paths with
-            | Error failure -> return Failed failure
-            | Ok() ->
+        match validateRestoreRequest request with
+        | Error failure -> return Failed failure
+        | Ok() ->
                 let! connection = connect state
 
                 match connection with
@@ -1038,44 +1117,42 @@ let private restorePaths (state: SessionState) (request: RestoreRequest) (contex
                             match prepared with
                             | Error failure -> return Failed failure
                             | Ok plan ->
-                                let recoveryDirectory =
-                                    NodePath.join [| state.StateDirectory; "recovery" |]
-
                                 let! applied =
                                     LakeFsMaterialization.apply
                                         state.Binding.WorkspaceRoot
                                         state.StateDirectory
-                                        recoveryDirectory
+                                        state.RecoveryDirectory
                                         state.Index.WorkspaceRevision
                                         workspaceRef
                                         plan
                                         (fun point barrierContext -> barrier state point barrierContext)
                                         context
 
-                                match applied with
-                                | LakeFsMaterialization.Materialized(saved, affectedPaths) ->
-                                    state.Index <- saved
+                                return materializationResultToOperation state applied
+    }
 
-                                    return
-                                        Succeeded {
-                                            OperationOutcome.performed () with
-                                                AffectedPaths = affectedPaths
-                                                ResultingWorkspaceVersion = Some(workspaceVersion state)
-                                        }
-                                | LakeFsMaterialization.MaterializationFailed failure ->
-                                    return Failed failure
-                                | LakeFsMaterialization.MaterializationPartiallyApplied(saved, failure) ->
-                                    saved |> Option.iter (fun index -> state.Index <- index)
+let private restorePaths (state: SessionState) (request: RestoreRequest) (context: OperationContext) =
+    async {
+        match validateRestoreRequest request with
+        | Error failure -> return Failed failure
+        | Ok() ->
+            let! recovery =
+                LakeFsMaterialization.reapplyPending
+                    state.Binding.WorkspaceRoot
+                    state.StateDirectory
+                    state.RecoveryDirectory
+                    (fun point barrierContext -> barrier state point barrierContext)
+                    context
 
-                                    return
-                                        PartiallySucceeded(
-                                            {
-                                                OperationOutcome.performed () with
-                                                    AffectedPaths = failure.AffectedPaths
-                                                    ResultingWorkspaceVersion = Some(workspaceVersion state)
-                                            },
-                                            failure
-                                        )
+            match recovery with
+            | Error failure -> return Failed failure
+            | Ok(Some result) ->
+                match materializationResultToOperation state result with
+                | Succeeded _ -> return! restorePathsWithoutRecovery state request context
+                | Failed failure -> return Failed failure
+                | PartiallySucceeded(outcome, failure) ->
+                    return PartiallySucceeded(outcome, failure)
+            | Ok None -> return! restorePathsWithoutRecovery state request context
     }
 
 let private listRefs (state: SessionState) (context: OperationContext) =
@@ -1108,6 +1185,7 @@ let private listRefs (state: SessionState) (context: OperationContext) =
 /// Downloads the given ref's objects (under the prefix) into the workspace and
 /// rebuilds the index entries. Used by open, switch, and update.
 let private materializationRecoveryFailure
+    (recoveryDirectory: string)
     (expectedRevision: string option)
     (observedRevision: string)
     (affectedPaths: string[])
@@ -1119,12 +1197,7 @@ let private materializationRecoveryFailure
             Retryable = true
             AffectedPaths = affectedPaths
             RecoveryAction =
-                Some {
-                    Code = "reconcile_materialization"
-                    Instructions =
-                        Some
-                            "Refresh the workspace, inspect the listed paths, and retry materialization deliberately."
-                }
+                Some(LakeFsStateStore.reconcileRecoveryAction [| recoveryDirectory |])
             RevisionEvidence = [|
                 yield! source.RevisionEvidence
                 yield!
@@ -1243,42 +1316,18 @@ let private materializeRef
                                 NextIndex = finalizeIndex plan.NextIndex
                         }
 
-                        let recoveryDirectory =
-                            NodePath.join [| state.StateDirectory; "recovery" |]
-
                         let! applied =
                             LakeFsMaterialization.apply
                                 state.Binding.WorkspaceRoot
                                 state.StateDirectory
-                                recoveryDirectory
+                                state.RecoveryDirectory
                                 state.Index.WorkspaceRevision
                                 reference
                                 plan
                                 (fun point barrierContext -> barrier state point barrierContext)
                                 context
 
-                        match applied with
-                        | LakeFsMaterialization.Materialized(saved, affectedPaths) ->
-                            state.Index <- saved
-
-                            return
-                                Succeeded {
-                                    OperationOutcome.performed () with
-                                        AffectedPaths = affectedPaths
-                                }
-                        | LakeFsMaterialization.MaterializationFailed failure ->
-                            return Failed failure
-                        | LakeFsMaterialization.MaterializationPartiallyApplied(saved, failure) ->
-                            saved |> Option.iter (fun index -> state.Index <- index)
-
-                            return
-                                PartiallySucceeded(
-                                    {
-                                        OperationOutcome.performed () with
-                                            AffectedPaths = failure.AffectedPaths
-                                    },
-                                    failure
-                                )
+                        return materializationResultToOperation state applied
     }
 
 // ---------------------------------------------------------------------------
@@ -1415,6 +1464,7 @@ let private switchWorkspaceToRef
                     PartiallySucceeded(
                         materializationOutcome,
                         materializationRecoveryFailure
+                            state.RecoveryDirectory
                             expectedWorkspace
                             targetRevision
                             materializationOutcome.AffectedPaths
@@ -2002,6 +2052,7 @@ let private update (state: SessionState) (request: UpdateRequest) (context: Oper
                                                         PartiallySucceeded(
                                                             outcome,
                                                             materializationRecoveryFailure
+                                                                state.RecoveryDirectory
                                                                 expectedWorkspace
                                                                 materializationRef
                                                                 [||]
@@ -2262,6 +2313,7 @@ let private completeConflictFinalize
                 PartiallySucceeded(
                     OperationOutcome.performed (Some(mkRevisionId resultingRevision)),
                     materializationRecoveryFailure
+                        state.RecoveryDirectory
                         state.Index.WorkspaceRevision
                         resultingRevision
                         [||]
@@ -2273,9 +2325,10 @@ let private completeConflictFinalize
                     mapOutcomeValue (Some(mkRevisionId resultingRevision)) outcome,
                     failure
                 )
-        | Succeeded _ ->
+        | Succeeded outcome ->
+            cleanupConflictCandidates state
             state.Conflict <- None
-            return OperationResult.succeeded (Some(mkRevisionId resultingRevision))
+            return Succeeded(mapOutcomeValue (Some(mkRevisionId resultingRevision)) outcome)
     }
 
 let private partialConflictFinalize
@@ -2334,7 +2387,7 @@ let private partialConflictFinalize
 let private createConflictService (state: SessionState) : ConflictResolutionService = {
     GetActiveSession = fun _ -> async { return OperationResult.succeeded (conflictSummary state) }
     Resolve =
-        fun request context -> async {
+        fun request context -> guardConflictMutation state (async {
             match validateHandle state request.Handle request.ExpectedWorkspaceVersion with
             | Error failure -> return Failed failure
             | Ok conflict ->
@@ -2350,9 +2403,9 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                             RemainingItems =
                                 conflictSummary state |> Option.map _.Items |> Option.defaultValue [||]
                         }
-        }
+        })
     Finalize =
-        fun request context -> async {
+        fun request context -> guardConflictMutation state (async {
             match validateHandle state request.Handle request.ExpectedWorkspaceVersion with
             | Error failure -> return Failed failure
             | Ok conflict ->
@@ -2654,17 +2707,18 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                                 commit.Id
                                                                 observedTargetAfter
                                                                 canConfirmOnRetry
-        }
+        })
     Cancel =
-        fun request context -> async {
+        fun request context -> guardConflictMutation state (async {
             match validateHandle state request.Handle request.ExpectedWorkspaceVersion with
             | Error failure -> return Failed failure
             | Ok _ ->
                 // The update never touched the workspace branch or local files for
                 // conflicting paths, so canceling only closes the session.
+                cleanupConflictCandidates state
                 state.Conflict <- None
                 return OperationResult.succeeded ()
-        }
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -2683,27 +2737,27 @@ let private createSessionFromState (state: SessionState) : WorkspaceSession =
         ListRefs = fun context -> listRefs state context |> LakeFsPathSafety.guard
         CreateRef =
             fun request context ->
-                withValidatedMutation state request.ExpectedWorkspaceVersion (fun () ->
+                withValidatedMutation state request.ExpectedWorkspaceVersion false (fun () ->
                     createRef state request context)
                 |> LakeFsPathSafety.guard
         PreflightSwitchRef =
             fun request context ->
-                withValidatedMutation state request.ExpectedWorkspaceVersion (fun () ->
+                withValidatedMutation state request.ExpectedWorkspaceVersion false (fun () ->
                     preflightSwitchRef state request context)
                 |> LakeFsPathSafety.guard
         SwitchRef =
             fun request context ->
-                withValidatedMutation state request.ExpectedWorkspaceVersion (fun () ->
+                withValidatedMutation state request.ExpectedWorkspaceVersion false (fun () ->
                     switchRef state request context)
                 |> LakeFsPathSafety.guard
         CreateRevision =
             fun request context ->
-                withValidatedMutation state request.ExpectedWorkspaceVersion (fun () ->
+                withValidatedMutation state request.ExpectedWorkspaceVersion false (fun () ->
                     createRevision state request context)
                 |> LakeFsPathSafety.guard
         RestorePaths =
             fun request context ->
-                withValidatedMutation state request.ExpectedWorkspaceVersion (fun () ->
+                withValidatedMutation state request.ExpectedWorkspaceVersion true (fun () ->
                     restorePaths state request context)
                 |> LakeFsPathSafety.guard
         GetDiffSummary = fun context -> getDiffSummary state context |> LakeFsPathSafety.guard
@@ -2730,12 +2784,12 @@ let private createSessionFromState (state: SessionState) : WorkspaceSession =
                     PreviewUpdate = fun context -> previewUpdate state context |> LakeFsPathSafety.guard
                     Update =
                         fun request context ->
-                            withValidatedMutation state request.ExpectedWorkspaceVersion (fun () ->
+                            withValidatedMutation state request.ExpectedWorkspaceVersion false (fun () ->
                                 update state request context)
                             |> LakeFsPathSafety.guard
                     Publish =
                         fun request context ->
-                            withValidatedMutation state request.ExpectedWorkspaceVersion (fun () ->
+                            withValidatedMutation state request.ExpectedWorkspaceVersion false (fun () ->
                                 publish state request context)
                             |> LakeFsPathSafety.guard
                 }
@@ -2792,6 +2846,7 @@ let private openSessionFromStateDirectory
                             let state = {
                                 Binding = binding
                                 StateDirectory = providerState.StateDirectory
+                                RecoveryDirectory = providerState.RecoveryDirectory
                                 Location = location
                                 Credentials = credentials
                                 Hooks = hooks
@@ -2906,6 +2961,7 @@ let private openSessionFromStateDirectory
                                         PartiallySucceeded(
                                             mapOutcomeValue state outcome,
                                             materializationRecoveryFailure
+                                                state.RecoveryDirectory
                                                 state.Index.WorkspaceRevision
                                                 target.CommitId
                                                 outcome.AffectedPaths
@@ -2926,6 +2982,7 @@ let private openSessionFromStateDirectory
                         let state = {
                             Binding = binding
                             StateDirectory = providerState.StateDirectory
+                            RecoveryDirectory = providerState.RecoveryDirectory
                             Location = location
                             Credentials = credentials
                             Hooks = hooks
@@ -2935,12 +2992,22 @@ let private openSessionFromStateDirectory
                             Busy = false
                         }
 
-                        if providerState.IsReady then
-                            return OperationResult.succeeded (createSessionFromState state)
-                        else
-                            match LakeFsStateStore.markReady providerState with
-                            | Error failure -> return Failed failure
-                            | Ok _ -> return OperationResult.succeeded (createSessionFromState state)
+                        let openLoadedState () = async {
+                            if providerState.IsReady then
+                                return OperationResult.succeeded (createSessionFromState state)
+                            else
+                                match LakeFsStateStore.markReady providerState with
+                                | Error failure -> return Failed failure
+                                | Ok _ -> return OperationResult.succeeded (createSessionFromState state)
+                        }
+
+                        match
+                            LakeFsMaterialization.loadPendingRecoveries state.RecoveryDirectory
+                        with
+                        | Error failure -> return Failed failure
+                        | Ok _ ->
+                            LakeFsStateStore.sweepTransientEntries providerState
+                            return! openLoadedState ()
                     else
                         return
                             Failed(

@@ -10,6 +10,7 @@ open Fable.Core
 open Fable.Core.JsInterop
 
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
+module NodeInterop = VersionControlService.Runtime.Node.Interop
 module NodePath = VersionControlService.Runtime.Node.Path
 
 [<Literal>]
@@ -67,15 +68,42 @@ let createOwnershipToken () = randomToken ()
 let indexPath (stateDirectory: string) =
     NodePath.join [| stateDirectory; IndexFileName |]
 
-/// Atomic save: write to a temporary sibling, then rename over the index file.
+let private removeStaleTemporaries target =
+    let directory = NodePath.dirname target
+    let prefix = NodePath.basename target + "."
+
+    try
+        for name in NodeFileSystem.readdirSync directory do
+            if name.StartsWith(prefix, StringComparison.Ordinal) && name.EndsWith(".tmp", StringComparison.Ordinal) then
+                let path = NodePath.join [| directory; name |]
+
+                try
+                    NodeFileSystem.unlinkSync path
+                with _ ->
+                    ()
+    with _ ->
+        ()
+
+/// Atomic save: write to a unique temporary sibling, then rename over the index file.
 /// An interrupted write never corrupts the previous index.
 let save (stateDirectory: string) (index: WorkspaceIndex) : Result<WorkspaceIndex, string> =
     try
         let next = { index with Generation = index.Generation + 1 }
         let target = indexPath stateDirectory
-        let temporary = target + ".tmp"
-        NodeFileSystem.writeFileSync temporary (jsonStringify next) NodeFileSystem.TextEncoding.Utf8
-        NodeFileSystem.renameSync temporary target
+        let temporary = $"{target}.{NodeInterop.randomUuid()}.tmp"
+
+        try
+            NodeFileSystem.writeUtf8FileExclusiveAndFlushSync temporary (jsonStringify next)
+            NodeFileSystem.renameSync temporary target
+        with error ->
+            if NodeFileSystem.existsSync temporary then
+                try
+                    NodeFileSystem.unlinkSync temporary
+                with _ ->
+                    ()
+
+            raise error
+
         Ok next
     with error ->
         Error $"Saving the lakeFS workspace index failed: {error.Message}"
@@ -89,6 +117,7 @@ type LoadResult =
 /// construction: version 1 is current; anything newer is rejected structurally.
 let load (stateDirectory: string) : LoadResult =
     let target = indexPath stateDirectory
+    removeStaleTemporaries target
 
     if not (NodeFileSystem.existsSync target) then
         Missing

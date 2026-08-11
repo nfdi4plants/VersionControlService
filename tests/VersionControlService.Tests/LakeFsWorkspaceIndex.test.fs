@@ -10,6 +10,7 @@ module LakeFsWorkspaceIndex = VersionControlService.LakeFs.LakeFsWorkspaceIndex
 module LakeFsProviderOptions = VersionControlService.LakeFs.LakeFsProviderOptions
 module LakeFsStateStore = VersionControlService.LakeFs.LakeFsStateStore
 module RuntimeNodePath = VersionControlService.Runtime.Node.Path
+module RuntimeNodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 
 let private fsPromisesDynamic: obj = importAll "fs/promises"
 let private osDynamic: obj = importAll "os"
@@ -135,6 +136,51 @@ Vitest.describe (
                     let addedClassified = added = LakeFsWorkspaceIndex.AddedObject
                     Vitest.expect(addedClassified).toBe (true)
 
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "lakeFS atomic index save uses unique flushed temporaries and removes stale temps",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root = createTempDirectoryAsync ()
+
+                try
+                    let fixedTemporary = LakeFsWorkspaceIndex.indexPath root + ".tmp"
+                    do! writeUtf8FileAsync fixedTemporary "fixed-name collision sentinel"
+
+                    let firstSaved =
+                        LakeFsWorkspaceIndex.save root sampleIndex
+                        |> Result.defaultWith failwith
+
+                    let secondSaved =
+                        LakeFsWorkspaceIndex.save root firstSaved
+                        |> Result.defaultWith failwith
+
+                    Vitest.expect(secondSaved.Generation).toBe(2)
+                    Vitest.expect(RuntimeNodeFileSystem.existsSync fixedTemporary).toBe(true)
+
+                    let uniqueTemporary =
+                        LakeFsWorkspaceIndex.indexPath root + ".stale-unique-name.tmp"
+
+                    do! writeUtf8FileAsync uniqueTemporary "stale interrupted index save"
+
+                    match LakeFsWorkspaceIndex.load root with
+                    | LakeFsWorkspaceIndex.Loaded loaded ->
+                        Vitest.expect(loaded.Generation).toBe(2)
+                    | _ -> failwith "Expected an intact index beside the stale temporary."
+
+                    Vitest.expect(RuntimeNodeFileSystem.existsSync uniqueTemporary).toBe(false)
+
+                    let residuals =
+                        RuntimeNodeFileSystem.readdirSync root
+                        |> Array.filter (fun name -> name.StartsWith("index.json.") && name.EndsWith(".tmp"))
+
+                    Vitest.expect(residuals).toEqual [||]
                     do! removeDirectoryAsync root
                 with error ->
                     do! removeDirectoryAsync root

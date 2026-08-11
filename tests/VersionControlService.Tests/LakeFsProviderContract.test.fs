@@ -27,6 +27,9 @@ module RuntimeNodeInterop = VersionControlService.Runtime.Node.Interop
 [<Emit("process.env[$0] ?? null")>]
 let private getEnvironmentVariable (_name: string) : string = jsNative
 
+[<Emit("JSON.stringify($0, null, 2)")>]
+let private jsonStringify (_value: obj) : string = jsNative
+
 let private fsPromisesDynamic: obj = importAll "fs/promises"
 let private osDynamic: obj = importAll "os"
 
@@ -50,6 +53,9 @@ let private injectNextCrossVolumeRename () : (unit -> unit) = jsNative
 
 [<Emit("((targetPath) => { const fs = require('node:fs'); const moduleApi = require('node:module'); const originalRename = fs.renameSync; const originalLstat = fs.lstatSync; let installed = false; fs.renameSync = (...args) => { const result = originalRename(...args); if (args[1] === targetPath) installed = true; return result; }; fs.lstatSync = (path, ...args) => { const stats = originalLstat(path, ...args); if (installed && path === targetPath) return new Proxy(stats, { get(value, property) { if (property === 'isSymbolicLink') return () => true; return Reflect.get(value, property); } }); return stats; }; moduleApi.syncBuiltinESMExports(); return () => { fs.renameSync = originalRename; fs.lstatSync = originalLstat; moduleApi.syncBuiltinESMExports(); }; })($0)")>]
 let private injectPostRenameLinkObservation (_targetPath: string) : (unit -> unit) = jsNative
+
+[<Emit("(() => { const fs = require('node:fs/promises'); const moduleApi = require('node:module'); const original = fs.rm; let pending = true; fs.rm = (...args) => { if (pending && String(args[0]).includes('transactions')) { pending = false; const error = new Error('injected cleanup failure'); error.code = 'EACCES'; return Promise.reject(error); } return original(...args); }; moduleApi.syncBuiltinESMExports(); return () => { fs.rm = original; moduleApi.syncBuiltinESMExports(); }; })()")>]
+let private injectNextTransactionCleanupFailure () : (unit -> unit) = jsNative
 
 let lakeFsProviderOptions: LakeFsProviderOptions.LakeFsProviderOptions = {
     StateRoot = join [| osDynamic?tmpdir () |> unbox<string>; "vcs-lakefs-provider-state" |]
@@ -121,6 +127,150 @@ let private removeFileAsync (path: string) : JS.Promise<unit> = promise {
 }
 
 let private context name = OperationContext.detached name
+
+let private repositoryPath value =
+    RepositoryPath.tryCreate value |> Result.defaultWith failwith
+
+type private MaterializationRecoveryScenario = {
+    Root: string
+    State: LakeFsStateStore.ResolvedState
+    WorkspaceRoot: string
+    CurrentIndex: LakeFsWorkspaceIndex.WorkspaceIndex
+    Plan: LakeFsMaterialization.MaterializationPlan
+    Paths: RepositoryPath[]
+    Targets: string[]
+    OldContents: string[]
+    NewContents: string[]
+}
+
+let private createMaterializationRecoveryScenario () = promise {
+    let! root = createTempDirectoryAsync ()
+    let workspaceRoot = join [| root; "workspace" |]
+    let stateRoot = join [| root; "provider-state" |]
+    do! ensureDirectoryAsync workspaceRoot
+
+    let options: LakeFsProviderOptions.LakeFsProviderOptions = { StateRoot = stateRoot }
+
+    let state =
+        LakeFsStateStore.create options workspaceRoot
+        |> Result.defaultWith (fun failure -> failwith failure.Message)
+
+    let paths = [|
+        repositoryPath "000-first.txt"
+        repositoryPath "100-second.txt"
+        repositoryPath "zzz-third.txt"
+    |]
+
+    let targets =
+        paths
+        |> Array.map (RepositoryPath.value >> fun path -> join [| workspaceRoot; path |])
+
+    let oldContents = [| "old first bytes\n"; "old second bytes\n"; "old third bytes\n" |]
+    let newContents = [| "new first bytes\n"; "new second bytes\n"; "new third bytes\n" |]
+
+    for target, content in Array.zip targets oldContents do
+        do! writeUtf8FileAsync target content
+
+    let initialIndex: LakeFsWorkspaceIndex.WorkspaceIndex = {
+        SchemaVersion = LakeFsWorkspaceIndex.CurrentSchemaVersion
+        Repository = "recovery-repository"
+        TargetRef = "main"
+        Prefix = ""
+        WorkspaceBranch = "vcs-workspace-recovery"
+        OwnershipToken = "recovery-ownership-token"
+        BaseRevision = Some "expected-revision"
+        WorkspaceRevision = Some "expected-revision"
+        Generation = 0
+        Entries =
+            Array.map3
+                (fun path target content ->
+                    let stats = RuntimeNodeFileSystem.lstatSync target
+
+                    {
+                        Path = RepositoryPath.value path
+                        BaseChecksum = $"old-{RepositoryPath.value path}"
+                        LocalHash = LakeFsWorkspaceIndex.hashMetadata content
+                        LocalSize = stats.size
+                        LocalMtimeMs = 0.0
+                    })
+                paths
+                targets
+                oldContents
+    }
+
+    let currentIndex =
+        LakeFsWorkspaceIndex.save state.StateDirectory initialIndex
+        |> Result.defaultWith failwith
+
+    let objects: LakeFsMaterialization.MaterializationObject[] =
+        Array.map3
+            (fun path target _ -> {
+                Path = path
+                ObjectKey = RepositoryPath.value path
+                TargetPath = target
+                BaseChecksum = $"new-{RepositoryPath.value path}"
+                Mtime = 1.0
+            })
+            paths
+            targets
+            newContents
+
+    let! prepared =
+        LakeFsMaterialization.prepare
+            state.TransactionsDirectory
+            currentIndex
+            false
+            objects
+            [||]
+            (fun prepared temporaryPath _ -> async {
+                let index = paths |> Array.findIndex ((=) prepared.Path)
+                let content = newContents[index]
+                RuntimeNodeFileSystem.writeUtf8FileExclusiveAndFlushSync temporaryPath content
+
+                return
+                    Ok {
+                        BytesCopied = float content.Length
+                        Sha256 = LakeFsWorkspaceIndex.hashMetadata content
+                    }
+            })
+            (fun _ _ -> async.Return())
+            (context "recovery-scenario-prepare")
+        |> Async.StartAsPromise
+
+    return {
+        Root = root
+        State = state
+        WorkspaceRoot = workspaceRoot
+        CurrentIndex = currentIndex
+        Plan = prepared |> Result.defaultWith (fun failure -> failwith failure.Message)
+        Paths = paths
+        Targets = targets
+        OldContents = oldContents
+        NewContents = newContents
+    }
+}
+
+let private partiallyApplyRecoveryScenario scenario = promise {
+    let mutable applied = 0
+
+    return!
+        LakeFsMaterialization.apply
+            scenario.WorkspaceRoot
+            scenario.State.StateDirectory
+            scenario.State.RecoveryDirectory
+            scenario.CurrentIndex.WorkspaceRevision
+            "observed-revision"
+            scenario.Plan
+            (fun point _ -> async {
+                if point = "materialization-apply-object" then
+                    applied <- applied + 1
+
+                    if applied = 1 then
+                        failwith "injected apply failure"
+            })
+            (context "recovery-scenario-partial-apply")
+        |> Async.StartAsPromise
+}
 
 let private expectApi operation = function
     | Ok value -> value
@@ -199,9 +349,13 @@ type private WorkspaceControl = {
 }
 
 let private finalizePathMutations = Collections.Generic.Dictionary<string, unit -> JS.Promise<unit>>()
+let private materializationApplyFailures = Collections.Generic.Dictionary<string, int>()
 
 let private armFinalizePathMutation workspaceRoot mutation =
     finalizePathMutations[workspaceRoot] <- mutation
+
+let private armMaterializationApplyFailure workspaceRoot =
+    materializationApplyFailures[workspaceRoot] <- 1
 
 let createLakeFsHarness () : ProviderTestHarness =
     let tempRoots = ResizeArray<string>()
@@ -308,6 +462,15 @@ let createLakeFsHarness () : ProviderTestHarness =
                     if point = "publish-connect" && publishShouldBreak then
                         publishShouldBreak <- false
                         failNextConnection <- true
+
+                    if point = "materialization-apply-object" then
+                        match materializationApplyFailures.TryGetValue root with
+                        | true, remaining when remaining <= 1 ->
+                            materializationApplyFailures.Remove root |> ignore
+                            failwith "injected materialization recovery failure"
+                        | true, remaining ->
+                            materializationApplyFailures[root] <- remaining - 1
+                        | false, _ -> ()
 
                     if point = "publish-precheck-done" then
                         match control.RaceMutations with
@@ -581,6 +744,7 @@ let createLakeFsHarness () : ProviderTestHarness =
                 controls.Clear()
                 stateDirectories.Clear()
                 finalizePathMutations.Clear()
+                materializationApplyFailures.Clear()
                 return ()
             }
     }
@@ -614,9 +778,6 @@ let private expectOperationValue operation = function
     | Succeeded outcome -> outcome.Value
     | PartiallySucceeded(_, failure)
     | Failed failure -> failwith $"{operation} failed ({failure.Category}/{failure.Code}): {failure.Message}"
-
-let private repositoryPath value =
-    RepositoryPath.tryCreate value |> Result.defaultWith failwith
 
 let private createSingleFileConflict harness = promise {
     let! workspace = harness.CreateWorkspace()
@@ -683,6 +844,281 @@ let private createSingleFileConflict harness = promise {
 
     return workspace, conflicts, summary
 }
+
+Vitest.describe (
+    "lakeFS materialization recovery conflict cleanup",
+    fun () ->
+        Vitest.test (
+            "lakeFS materialization recovery removes conflict candidates on finalize and cancel",
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
+            fun () -> promise {
+                if not (integrationEnabled ()) then
+                    return failwith "lakeFS integration skipped: Docker not available"
+
+                let harness = createLakeFsHarness ()
+
+                try
+                    let! canceledWorkspace, canceledConflicts, canceledSummary =
+                        createSingleFileConflict harness
+
+                    let canceledTemporaryDirectory =
+                        join [|
+                            lakeFsProviderOptions.StateRoot
+                            canceledWorkspace.Binding.ProviderStateRef.Value
+                            "temporary"
+                        |]
+
+                    let candidatesBeforeCancel =
+                        RuntimeNodeFileSystem.readdirSync canceledTemporaryDirectory
+                        |> Array.filter (fun name -> name.StartsWith("conflict-candidate-", StringComparison.Ordinal))
+
+                    Vitest.expect(candidatesBeforeCancel.Length > 0).toBe(true)
+
+                    let! cancelStatusResult =
+                        canceledWorkspace.Session.Core.GetStatus(context "recovery-cancel-status")
+                        |> Async.StartAsPromise
+
+                    let cancelStatus = expectOperationValue "recovery cancel status" cancelStatusResult
+                    let! cancelResult =
+                        canceledConflicts.Cancel
+                            {
+                                Handle = canceledSummary.Handle
+                                ExpectedWorkspaceVersion = cancelStatus.WorkspaceVersion
+                            }
+                            (context "recovery-cancel")
+                        |> Async.StartAsPromise
+
+                    expectOperationValue "recovery cancel" cancelResult |> ignore
+
+                    let candidatesAfterCancel =
+                        RuntimeNodeFileSystem.readdirSync canceledTemporaryDirectory
+                        |> Array.filter (fun name -> name.StartsWith("conflict-candidate-", StringComparison.Ordinal))
+
+                    Vitest.expect(candidatesAfterCancel).toEqual [||]
+
+                    let! finalizedWorkspace, finalizedConflicts, finalizedSummary =
+                        createSingleFileConflict harness
+
+                    let finalizedTemporaryDirectory =
+                        join [|
+                            lakeFsProviderOptions.StateRoot
+                            finalizedWorkspace.Binding.ProviderStateRef.Value
+                            "temporary"
+                        |]
+
+                    let! resolutionStatusResult =
+                        finalizedWorkspace.Session.Core.GetStatus(context "recovery-finalize-resolution-status")
+                        |> Async.StartAsPromise
+
+                    let resolutionStatus =
+                        expectOperationValue "recovery finalize resolution status" resolutionStatusResult
+
+                    let! resolutionResult =
+                        finalizedConflicts.Resolve
+                            {
+                                Handle = finalizedSummary.Handle
+                                ExpectedWorkspaceVersion = resolutionStatus.WorkspaceVersion
+                                Path = finalizedSummary.Items[0].Path
+                                Resolution = PickCandidate "target"
+                            }
+                            (context "recovery-finalize-resolution")
+                        |> Async.StartAsPromise
+
+                    let resolution =
+                        expectOperationValue "recovery finalize resolution" resolutionResult
+
+                    let! finalizeStatusResult =
+                        finalizedWorkspace.Session.Core.GetStatus(context "recovery-finalize-status")
+                        |> Async.StartAsPromise
+
+                    let finalizeStatus = expectOperationValue "recovery finalize status" finalizeStatusResult
+                    let! finalizeResult =
+                        finalizedConflicts.Finalize
+                            {
+                                Handle = resolution.RefreshedHandle
+                                ExpectedWorkspaceVersion = finalizeStatus.WorkspaceVersion
+                                Message = Some "cleanup candidates"
+                            }
+                            (context "recovery-finalize")
+                        |> Async.StartAsPromise
+
+                    expectOperationValue "recovery finalize" finalizeResult |> ignore
+
+                    let candidatesAfterFinalize =
+                        RuntimeNodeFileSystem.readdirSync finalizedTemporaryDirectory
+                        |> Array.filter (fun name -> name.StartsWith("conflict-candidate-", StringComparison.Ordinal))
+
+                    Vitest.expect(candidatesAfterFinalize).toEqual [||]
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+)
+
+Vitest.describe (
+    "lakeFS materialization recovery session gating",
+    fun () ->
+        Vitest.test (
+            "lakeFS materialization recovery blocks mutations and replays the retained plan",
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
+            fun () -> promise {
+                if not (integrationEnabled ()) then
+                    return failwith "lakeFS integration skipped: Docker not available"
+
+                let harness = createLakeFsHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+
+                    do!
+                        harness.AdvanceTarget workspace [|
+                            { Path = "base.txt"; Content = None }
+                            { Path = "000-recovery-a.txt"; Content = Some "recovery a\n" }
+                            { Path = "100-recovery-b.txt"; Content = Some "recovery b\n" }
+                            { Path = "zzz-recovery-c.txt"; Content = Some "recovery c\n" }
+                        |]
+
+                    let! beforeUpdateResult =
+                        workspace.Session.Core.GetStatus(context "recovery-gating-before-update")
+                        |> Async.StartAsPromise
+
+                    let beforeUpdate = expectOperationValue "recovery gating before update" beforeUpdateResult
+                    armMaterializationApplyFailure workspace.Binding.WorkspaceRoot
+
+                    let synchronization =
+                        workspace.Session.Synchronization
+                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization services.")
+
+                    let! updateResult =
+                        synchronization.Update
+                            { ExpectedWorkspaceVersion = beforeUpdate.WorkspaceVersion }
+                            (context "recovery-gating-update")
+                        |> Async.StartAsPromise
+
+                    let partialFailure =
+                        match updateResult with
+                        | PartiallySucceeded(_, failure) -> failure
+                        | Succeeded _ -> failwith "Injected materialization recovery failure unexpectedly succeeded."
+                        | Failed failure -> failwith $"Injected materialization recovery was not partial: {failure.Code}"
+
+                    Vitest.expect(partialFailure.RecoveryAction |> Option.map _.Code).toEqual (Some "reconcile_materialization")
+                    Vitest.expect(partialFailure.AffectedPaths.Length).toBe 1
+
+                    let! partialStatusResult =
+                        workspace.Session.Core.GetStatus(context "recovery-gating-partial-status")
+                        |> Async.StartAsPromise
+
+                    let partialStatus = expectOperationValue "recovery gating partial status" partialStatusResult
+                    let replacedPath = repositoryPath partialFailure.AffectedPaths[0]
+
+                    Vitest.expect(
+                        partialStatus.Changes
+                        |> Array.exists (fun change -> RepositoryPath.value change.Path = partialFailure.AffectedPaths[0])
+                    ).toBe(false)
+
+                    let resolvedState =
+                        LakeFsStateStore.resolve
+                            lakeFsProviderOptions
+                            workspace.Binding.WorkspaceRoot
+                            workspace.Binding.ProviderStateRef
+                        |> Result.defaultWith (fun failure -> failwith failure.Message)
+
+                    let referencedTransaction =
+                        RuntimeNodeFileSystem.readdirSync resolvedState.TransactionsDirectory
+                        |> Array.exactlyOne
+                        |> fun name -> join [| resolvedState.TransactionsDirectory; name |]
+
+                    let! _ = harness.OpenSecondSession workspace
+                    Vitest.expect(RuntimeNodeFileSystem.existsSync referencedTransaction).toBe(true)
+
+                    let! emptyRestoreResult =
+                        workspace.Session.Core.RestorePaths
+                            {
+                                Paths = [||]
+                                ExpectedWorkspaceVersion = partialStatus.WorkspaceVersion
+                            }
+                            (context "recovery-gating-empty-restore")
+                        |> Async.StartAsPromise
+
+                    match emptyRestoreResult with
+                    | Failed failure -> Vitest.expect(failure.Code).toBe "no_paths_selected"
+                    | _ -> failwith "An empty restore bypassed request validation during recovery."
+
+                    Vitest.expect(RuntimeNodeFileSystem.existsSync referencedTransaction).toBe(true)
+
+                    let expectBlocked operation result =
+                        match result with
+                        | Failed failure ->
+                            Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "reconcile_materialization")
+                            Vitest.expect(failure.Category).toEqual FailureCategory.ProviderError
+                        | Succeeded _
+                        | PartiallySucceeded _ -> failwith $"{operation} unexpectedly mutated during recovery."
+
+                    let! createRevisionResult =
+                        workspace.Session.Core.CreateRevision
+                            {
+                                Message = "blocked during materialization recovery"
+                                Paths = [| replacedPath |]
+                                ExpectedWorkspaceVersion = partialStatus.WorkspaceVersion
+                            }
+                            (context "recovery-gating-create-revision")
+                        |> Async.StartAsPromise
+
+                    expectBlocked "CreateRevision" createRevisionResult
+
+                    let! blockedUpdateResult =
+                        synchronization.Update
+                            { ExpectedWorkspaceVersion = partialStatus.WorkspaceVersion }
+                            (context "recovery-gating-blocked-update")
+                        |> Async.StartAsPromise
+
+                    expectBlocked "Update" blockedUpdateResult
+
+                    do! workspace.WriteFile "caller-only.txt" "caller-selected edit\n"
+
+                    let! callerStatusResult =
+                        workspace.Session.Core.GetStatus(context "recovery-gating-caller-status")
+                        |> Async.StartAsPromise
+
+                    let callerStatus = expectOperationValue "recovery caller status" callerStatusResult
+
+                    let! replayResult =
+                        workspace.Session.Core.RestorePaths
+                            {
+                                Paths = [| repositoryPath "caller-only.txt" |]
+                                ExpectedWorkspaceVersion = callerStatus.WorkspaceVersion
+                            }
+                            (context "recovery-gating-replay")
+                        |> Async.StartAsPromise
+
+                    match replayResult with
+                    | Succeeded outcome ->
+                        Vitest.expect(outcome.AffectedPaths).toEqual [| "caller-only.txt" |]
+                    | PartiallySucceeded(_, failure)
+                    | Failed failure ->
+                        failwith $"Recovery followed by the caller restore failed: {failure.Code}"
+
+                    let stateDirectory = stateDirectoryForBinding workspace.Binding
+                    let recoveryDirectory = join [| stateDirectory; "recovery" |]
+                    Vitest.expect(RuntimeNodeFileSystem.readdirSync recoveryDirectory).toEqual [||]
+
+                    let! replayedA = workspace.ReadFile "000-recovery-a.txt"
+                    let! replayedB = workspace.ReadFile "100-recovery-b.txt"
+                    let! replayedC = workspace.ReadFile "zzz-recovery-c.txt"
+                    Vitest.expect(replayedA).toEqual(Some "recovery a\n")
+                    Vitest.expect(replayedB).toEqual(Some "recovery b\n")
+                    Vitest.expect(replayedC).toEqual(Some "recovery c\n")
+                    let! callerFile = workspace.ReadFile "caller-only.txt"
+                    Vitest.expect(callerFile).toEqual None
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+)
 
 Vitest.describe (
     "lakeFS provisioning profile external state",
@@ -836,6 +1272,105 @@ Vitest.describe (
 
                     do! removeDirectoryAsync root
                 with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "lakeFS materialization recovery treats cleanup failures as warnings and sweeps orphans",
+            fun () -> promise {
+                let! root = createTempDirectoryAsync ()
+                let workspaceRoot = join [| root; "workspace" |]
+                let stateRoot = join [| root; "provider-state" |]
+                let options: LakeFsProviderOptions.LakeFsProviderOptions = { StateRoot = stateRoot }
+                let restoreCleanupFailure = injectNextTransactionCleanupFailure ()
+
+                try
+                    do! ensureDirectoryAsync workspaceRoot
+
+                    let state =
+                        LakeFsStateStore.create options workspaceRoot
+                        |> Result.defaultWith (fun failure -> failwith failure.Message)
+
+                    let path = repositoryPath "cleanup-warning.txt"
+                    let targetPath = join [| workspaceRoot; RepositoryPath.value path |]
+                    let currentIndex: LakeFsWorkspaceIndex.WorkspaceIndex = {
+                        SchemaVersion = LakeFsWorkspaceIndex.CurrentSchemaVersion
+                        Repository = "cleanup-repository"
+                        TargetRef = "main"
+                        Prefix = ""
+                        WorkspaceBranch = "vcs-workspace-cleanup"
+                        OwnershipToken = "cleanup-ownership-token"
+                        BaseRevision = Some "revision"
+                        WorkspaceRevision = Some "revision"
+                        Generation = 0
+                        Entries = [||]
+                    }
+
+                    let! prepared =
+                        LakeFsMaterialization.prepare
+                            state.TransactionsDirectory
+                            currentIndex
+                            false
+                            [| {
+                                   Path = path
+                                   ObjectKey = "cleanup-warning.txt"
+                                   TargetPath = targetPath
+                                   BaseChecksum = "checksum"
+                                   Mtime = 1.0
+                               } |]
+                            [||]
+                            (fun _ temporaryPath _ -> async {
+                                let content = "cleanup warning bytes\n"
+                                RuntimeNodeFileSystem.writeUtf8FileExclusiveAndFlushSync temporaryPath content
+
+                                return
+                                    Ok {
+                                        BytesCopied = float content.Length
+                                        Sha256 = LakeFsWorkspaceIndex.hashMetadata content
+                                    }
+                            })
+                            (fun _ _ -> async.Return())
+                            (context "cleanup-warning-prepare")
+                        |> Async.StartAsPromise
+
+                    let plan = prepared |> Result.defaultWith (fun failure -> failwith failure.Message)
+                    let! applied =
+                        LakeFsMaterialization.apply
+                            workspaceRoot
+                            state.StateDirectory
+                            state.RecoveryDirectory
+                            currentIndex.WorkspaceRevision
+                            "revision"
+                            plan
+                            (fun _ _ -> async.Return())
+                            (context "cleanup-warning-apply")
+                        |> Async.StartAsPromise
+
+                    restoreCleanupFailure ()
+
+                    match applied with
+                    | LakeFsMaterialization.Materialized(_, _, warnings) ->
+                        Vitest.expect(warnings |> Array.map _.Code).toContain "materialization_cleanup_failed"
+                    | _ -> failwith "Cleanup failure must remain a successful materialization."
+
+                    Vitest.expect(RuntimeNodeFileSystem.readdirSync state.RecoveryDirectory).toEqual [||]
+                    Vitest.expect(RuntimeNodeFileSystem.readdirSync state.TransactionsDirectory).toHaveLength 1
+
+                    let orphan = join [| state.TemporaryDirectory; "conflict-candidate-orphan.tmp" |]
+                    do! writeUtf8FileAsync orphan "orphan"
+
+                    match LakeFsStateStore.resolve options workspaceRoot (Some state.StateId) with
+                    | Error failure -> failwith $"Reopening provider state failed: {failure.Code}"
+                    | Ok reopened ->
+                        LakeFsStateStore.sweepTransientEntries reopened
+
+                    Vitest.expect(RuntimeNodeFileSystem.existsSync orphan).toBe(false)
+                    Vitest.expect(RuntimeNodeFileSystem.readdirSync state.TransactionsDirectory).toEqual [||]
+                    do! removeDirectoryAsync root
+                with error ->
+                    restoreCleanupFailure ()
                     do! removeDirectoryAsync root
                     return raise error
             }
@@ -1051,7 +1586,7 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "lakeFS materialization is transactional",
+            "lakeFS materialization recovery preserves partial indexes and re-applies retained plans",
             fun () -> promise {
                 let! root = createTempDirectoryAsync ()
                 let workspaceRoot = join [| root; "workspace" |]
@@ -1059,9 +1594,11 @@ Vitest.describe (
                 let transactionsDirectory = join [| stateDirectory; "transactions" |]
                 let recoveryDirectory = join [| stateDirectory; "recovery" |]
                 let firstPath = repositoryPath "000-first.txt"
-                let secondPath = repositoryPath "zzz-second.txt"
+                let secondPath = repositoryPath "100-second.txt"
+                let thirdPath = repositoryPath "zzz-third.txt"
                 let firstTarget = join [| workspaceRoot; RepositoryPath.value firstPath |]
                 let secondTarget = join [| workspaceRoot; RepositoryPath.value secondPath |]
+                let thirdTarget = join [| workspaceRoot; RepositoryPath.value thirdPath |]
 
                 try
                     do! ensureDirectoryAsync workspaceRoot
@@ -1070,6 +1607,7 @@ Vitest.describe (
                     do! ensureDirectoryAsync recoveryDirectory
                     do! writeUtf8FileAsync firstTarget "old first bytes\n"
                     do! writeUtf8FileAsync secondTarget "old second bytes\n"
+                    do! writeUtf8FileAsync thirdTarget "old third bytes\n"
 
                     let currentIndex: LakeFsWorkspaceIndex.WorkspaceIndex = {
                         SchemaVersion = LakeFsWorkspaceIndex.CurrentSchemaVersion
@@ -1094,10 +1632,17 @@ Vitest.describe (
                         }
                         {
                             Path = secondPath
-                            ObjectKey = "zzz-second.txt"
+                            ObjectKey = "100-second.txt"
                             TargetPath = secondTarget
                             BaseChecksum = "second-checksum"
                             Mtime = 2.0
+                        }
+                        {
+                            Path = thirdPath
+                            ObjectKey = "zzz-third.txt"
+                            TargetPath = thirdTarget
+                            BaseChecksum = "third-checksum"
+                            Mtime = 3.0
                         }
                     |]
 
@@ -1157,17 +1702,17 @@ Vitest.describe (
                             [||]
                             (fun prepared temporaryPath _ -> async {
                                 let content =
-                                    if prepared.Path = firstPath then
-                                        "new first bytes\n"
-                                    else
-                                        "new second bytes\n"
+                                    match prepared.Path with
+                                    | path when path = firstPath -> "new first bytes\n"
+                                    | path when path = secondPath -> "new second bytes\n"
+                                    | _ -> "new third bytes\n"
 
                                 RuntimeNodeFileSystem.writeUtf8FileExclusiveAndFlushSync temporaryPath content
 
                                 return
                                     Ok {
                                         BytesCopied = float content.Length
-                                        Sha256 = $"hash-{RepositoryPath.value prepared.Path}"
+                                        Sha256 = LakeFsWorkspaceIndex.hashMetadata content
                                     }
                             })
                             (fun _ _ -> async.Return())
@@ -1195,13 +1740,17 @@ Vitest.describe (
                         |> Async.StartAsPromise
 
                     match appliedResult with
-                    | LakeFsMaterialization.MaterializationPartiallyApplied(None, failure) ->
+                    | LakeFsMaterialization.MaterializationPartiallyApplied(Some saved, failure) ->
                         Vitest.expect(failure.Code).toBe "materialization_apply_failed"
                         Vitest.expect(failure.StateChanged).toBe true
                         Vitest.expect(failure.AffectedPaths).toEqual [| "000-first.txt" |]
                         Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "reconcile_materialization")
-                    | LakeFsMaterialization.MaterializationPartiallyApplied(Some _, _) ->
-                        failwith "The index was published after an interrupted apply."
+                        Vitest.expect(saved.Entries.Length).toBe 1
+                        Vitest.expect(saved.Entries[0].Path).toBe "000-first.txt"
+                        Vitest.expect(saved.Entries[0].LocalHash).toBe (LakeFsWorkspaceIndex.hashMetadata "new first bytes\n")
+                    | LakeFsMaterialization.MaterializationPartiallyApplied(None, failure) ->
+                        let details = String.concat ";" failure.Details
+                        failwith $"The visible replacement was returned without publishing its index: {failure.Code} ({details})."
                     | LakeFsMaterialization.MaterializationFailed failure ->
                         failwith $"Visible apply mutation was concealed as Failed: {failure.Code}"
                     | LakeFsMaterialization.Materialized _ ->
@@ -1211,37 +1760,10 @@ Vitest.describe (
                     let! secondAfterApply = tryReadUtf8FileAsync secondTarget
                     Vitest.expect(firstAfterApply).toEqual(Some "new first bytes\n")
                     Vitest.expect(secondAfterApply).toEqual(Some "old second bytes\n")
-                    Vitest.expect(RuntimeNodeFileSystem.readdirSync transactionsDirectory).toEqual [||]
+                    let! thirdAfterApply = tryReadUtf8FileAsync thirdTarget
+                    Vitest.expect(thirdAfterApply).toEqual(Some "old third bytes\n")
+                    Vitest.expect(RuntimeNodeFileSystem.readdirSync transactionsDirectory).toHaveLength 1
                     Vitest.expect(RuntimeNodeFileSystem.readdirSync recoveryDirectory).toHaveLength 1
-
-                    let! successfulPlanResult =
-                        LakeFsMaterialization.prepare
-                            transactionsDirectory
-                            currentIndex
-                            false
-                            objects
-                            [||]
-                            (fun prepared temporaryPath _ -> async {
-                                let content =
-                                    if prepared.Path = firstPath then
-                                        "final first bytes\n"
-                                    else
-                                        "final second bytes\n"
-
-                                RuntimeNodeFileSystem.writeUtf8FileExclusiveAndFlushSync temporaryPath content
-
-                                return
-                                    Ok {
-                                        BytesCopied = float content.Length
-                                        Sha256 = $"final-hash-{RepositoryPath.value prepared.Path}"
-                                    }
-                            })
-                            (fun _ _ -> async.Return())
-                            (context "transactional-prepare-final")
-                        |> Async.StartAsPromise
-
-                    let successfulPlan =
-                        successfulPlanResult |> Result.defaultWith (fun failure -> failwith failure.Message)
 
                     let! successfulApply =
                         LakeFsMaterialization.apply
@@ -1250,32 +1772,604 @@ Vitest.describe (
                             recoveryDirectory
                             currentIndex.WorkspaceRevision
                             "observed-revision"
-                            successfulPlan
+                            plan
                             (fun _ _ -> async.Return())
-                            (context "transactional-apply-final")
+                            (context "transactional-apply-recovery")
                         |> Async.StartAsPromise
 
                     match successfulApply with
-                    | LakeFsMaterialization.Materialized(saved, affectedPaths) ->
-                        Vitest.expect(affectedPaths).toEqual [| "000-first.txt"; "zzz-second.txt" |]
-                        Vitest.expect(saved.Entries.Length).toBe 2
+                    | LakeFsMaterialization.Materialized(saved, affectedPaths, _) ->
+                        Vitest.expect(affectedPaths).toEqual [| "100-second.txt"; "zzz-third.txt" |]
+                        Vitest.expect(saved.Entries.Length).toBe 3
                     | LakeFsMaterialization.MaterializationFailed failure
                     | LakeFsMaterialization.MaterializationPartiallyApplied(_, failure) ->
                         failwith $"Successful materialization failed ({failure.Code}): {failure.Message}"
 
                     match LakeFsWorkspaceIndex.load stateDirectory with
                     | LakeFsWorkspaceIndex.Loaded saved ->
-                        Vitest.expect(saved.Entries.Length).toBe 2
+                        Vitest.expect(saved.Entries.Length).toBe 3
                     | _ -> failwith "Successful materialization did not publish its index."
 
                     Vitest.expect(RuntimeNodeFileSystem.readdirSync transactionsDirectory).toEqual [||]
+                    Vitest.expect(RuntimeNodeFileSystem.readdirSync recoveryDirectory).toEqual [||]
                     do! removeDirectoryAsync root
                 with error ->
                     do! removeDirectoryAsync root
                     return raise error
             }
         )
-)
+
+        Vitest.test (
+            "lakeFS materialization recovery retains prepared bytes after a zero-visible replay failure",
+            fun () -> promise {
+                let! scenario = createMaterializationRecoveryScenario ()
+
+                try
+                    let! partial = partiallyApplyRecoveryScenario scenario
+
+                    match partial with
+                    | LakeFsMaterialization.MaterializationPartiallyApplied _ -> ()
+                    | _ -> failwith "Expected the injected apply failure to retain recovery state."
+
+                    let missingReplacement = scenario.Plan.Replacements[1]
+                    do! removeFileAsync missingReplacement.TemporaryPath
+
+                    let! replay =
+                        LakeFsMaterialization.reapplyPending
+                            scenario.WorkspaceRoot
+                            scenario.State.StateDirectory
+                            scenario.State.RecoveryDirectory
+                            (fun _ _ -> async.Return())
+                            (context "recovery-zero-visible-replay")
+                        |> Async.StartAsPromise
+
+                    match replay with
+                    | Ok(Some(LakeFsMaterialization.MaterializationFailed _))
+                    | Ok(Some(LakeFsMaterialization.MaterializationPartiallyApplied _)) -> ()
+                    | Ok(Some(LakeFsMaterialization.Materialized _)) ->
+                        failwith "A replay with missing prepared bytes unexpectedly succeeded."
+                    | Ok None -> failwith "The retained recovery record was not loaded."
+                    | Error failure -> failwith $"Loading recovery failed unexpectedly: {failure.Code}"
+
+                    Vitest.expect(RuntimeNodeFileSystem.existsSync scenario.Plan.TransactionDirectory).toBe(true)
+                    Vitest.expect(RuntimeNodeFileSystem.readdirSync scenario.State.RecoveryDirectory).toHaveLength(1)
+
+                    RuntimeNodeFileSystem.writeUtf8FileExclusiveAndFlushSync
+                        missingReplacement.TemporaryPath
+                        scenario.NewContents[1]
+
+                    let! completed =
+                        LakeFsMaterialization.reapplyPending
+                            scenario.WorkspaceRoot
+                            scenario.State.StateDirectory
+                            scenario.State.RecoveryDirectory
+                            (fun _ _ -> async.Return())
+                            (context "recovery-zero-visible-complete")
+                        |> Async.StartAsPromise
+
+                    match completed with
+                    | Ok(Some(LakeFsMaterialization.Materialized _)) -> ()
+                    | Ok(Some(LakeFsMaterialization.MaterializationFailed failure))
+                    | Ok(Some(LakeFsMaterialization.MaterializationPartiallyApplied(_, failure))) ->
+                        failwith $"The retained recovery did not complete: {failure.Code}"
+                    | Ok None -> failwith "The retained recovery disappeared before completion."
+                    | Error failure -> failwith $"Loading retained recovery failed: {failure.Code}"
+
+                    Vitest.expect(RuntimeNodeFileSystem.readdirSync scenario.State.RecoveryDirectory).toEqual [||]
+                    do! removeDirectoryAsync scenario.Root
+                with error ->
+                    do! removeDirectoryAsync scenario.Root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "lakeFS materialization recovery preserves a diverged user edit and retained prepared bytes",
+            fun () -> promise {
+                let! scenario = createMaterializationRecoveryScenario ()
+
+                try
+                    let! partial = partiallyApplyRecoveryScenario scenario
+
+                    match partial with
+                    | LakeFsMaterialization.MaterializationPartiallyApplied _ -> ()
+                    | _ -> failwith "Expected the injected apply failure to retain recovery state."
+
+                    let userEdit = "user edit after partial materialization\n"
+                    do! writeUtf8FileAsync scenario.Targets[0] userEdit
+
+                    let! replay =
+                        LakeFsMaterialization.reapplyPending
+                            scenario.WorkspaceRoot
+                            scenario.State.StateDirectory
+                            scenario.State.RecoveryDirectory
+                            (fun _ _ -> async.Return())
+                            (context "recovery-diverged-replay")
+                        |> Async.StartAsPromise
+
+                    let failure =
+                        match replay with
+                        | Ok(Some(LakeFsMaterialization.MaterializationFailed failure))
+                        | Ok(Some(LakeFsMaterialization.MaterializationPartiallyApplied(_, failure))) -> failure
+                        | Ok(Some(LakeFsMaterialization.Materialized _)) ->
+                            failwith "A replay overwrote a diverged user edit."
+                        | Ok None -> failwith "The retained recovery record was not loaded."
+                        | Error failure -> failure
+
+                    Vitest.expect(failure.Code).toBe "materialization_target_diverged"
+                    Vitest.expect(failure.AffectedPaths).toEqual [| RepositoryPath.value scenario.Paths[0] |]
+                    Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual(Some "reconcile_materialization")
+                    Vitest.expect(
+                        failure.RecoveryAction
+                        |> Option.bind _.Instructions
+                        |> Option.exists (fun instructions -> instructions.Contains("RestorePaths"))
+                    ).toBe(true)
+
+                    let! preservedEdit = tryReadUtf8FileAsync scenario.Targets[0]
+                    Vitest.expect(preservedEdit).toEqual(Some userEdit)
+                    Vitest.expect(RuntimeNodeFileSystem.existsSync scenario.Plan.Replacements[0].TemporaryPath).toBe(true)
+                    Vitest.expect(RuntimeNodeFileSystem.existsSync scenario.Plan.TransactionDirectory).toBe(true)
+                    Vitest.expect(RuntimeNodeFileSystem.readdirSync scenario.State.RecoveryDirectory).toHaveLength(1)
+                    do! removeDirectoryAsync scenario.Root
+                with error ->
+                    do! removeDirectoryAsync scenario.Root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "lakeFS materialization recovery does not publish a replacement that reports StateChanged failure",
+            fun () -> promise {
+                let! scenario = createMaterializationRecoveryScenario ()
+                let restoreFileSystem = injectPostRenameLinkObservation scenario.Targets[0]
+
+                try
+                    let! applied =
+                        LakeFsMaterialization.apply
+                            scenario.WorkspaceRoot
+                            scenario.State.StateDirectory
+                            scenario.State.RecoveryDirectory
+                            scenario.CurrentIndex.WorkspaceRevision
+                            "observed-revision"
+                            scenario.Plan
+                            (fun _ _ -> async.Return())
+                            (context "recovery-statechanged-replacement")
+                        |> Async.StartAsPromise
+
+                    match applied with
+                    | LakeFsMaterialization.MaterializationPartiallyApplied(Some saved, failure) ->
+                        Vitest.expect(failure.StateChanged).toBe(true)
+                        Vitest.expect(failure.AffectedPaths).toContain(RepositoryPath.value scenario.Paths[0])
+
+                        let failedEntry =
+                            saved.Entries
+                            |> Array.find (fun entry -> entry.Path = RepositoryPath.value scenario.Paths[0])
+
+                        Vitest.expect(failedEntry.LocalHash)
+                            .toBe(LakeFsWorkspaceIndex.hashMetadata scenario.OldContents[0])
+                    | LakeFsMaterialization.MaterializationPartiallyApplied(None, failure) ->
+                        failwith $"The unchanged index was not retained: {failure.Code}"
+                    | LakeFsMaterialization.MaterializationFailed failure ->
+                        failwith $"The visible replacement was concealed as Failed: {failure.Code}"
+                    | LakeFsMaterialization.Materialized _ ->
+                        failwith "The injected post-replacement validation unexpectedly succeeded."
+
+                    restoreFileSystem ()
+                    let! target = tryReadUtf8FileAsync scenario.Targets[0]
+                    Vitest.expect(target).toEqual(Some scenario.NewContents[0])
+                    Vitest.expect(RuntimeNodeFileSystem.existsSync scenario.Plan.Replacements[0].TemporaryPath)
+                        .toBe(true)
+                    do! removeDirectoryAsync scenario.Root
+                with error ->
+                    restoreFileSystem ()
+                    do! removeDirectoryAsync scenario.Root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "lakeFS materialization recovery open sweep preserves referenced transactions",
+            fun () -> promise {
+                let! scenario = createMaterializationRecoveryScenario ()
+
+                try
+                    let! partial = partiallyApplyRecoveryScenario scenario
+
+                    match partial with
+                    | LakeFsMaterialization.MaterializationPartiallyApplied _ -> ()
+                    | _ -> failwith "Expected the injected apply failure to retain recovery state."
+
+                    let orphanTransaction = join [| scenario.State.TransactionsDirectory; "orphan-transaction" |]
+                    let orphanTemporary = join [| scenario.State.TemporaryDirectory; "conflict-candidate-orphan.tmp" |]
+                    do! ensureDirectoryAsync orphanTransaction
+                    do! writeUtf8FileAsync orphanTemporary "orphan"
+
+                    match LakeFsStateStore.loadRecoveryRecords scenario.State.RecoveryDirectory with
+                    | Ok records ->
+                        Vitest.expect(records).toHaveLength(1)
+                        Vitest.expect(records[0].Record.TransactionId).toBe(scenario.Plan.TransactionId)
+                    | Error failure -> failwith $"Loading typed recovery state failed: {failure.Code}"
+
+                    LakeFsStateStore.sweepTransientEntries scenario.State
+
+                    Vitest.expect(RuntimeNodeFileSystem.existsSync scenario.Plan.TransactionDirectory).toBe(true)
+                    Vitest.expect(RuntimeNodeFileSystem.existsSync orphanTransaction).toBe(false)
+                    Vitest.expect(RuntimeNodeFileSystem.existsSync orphanTemporary).toBe(false)
+                    do! removeDirectoryAsync scenario.Root
+                with error ->
+                    do! removeDirectoryAsync scenario.Root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "lakeFS materialization recovery grafts replay onto the newest persisted index",
+            fun () -> promise {
+                let! scenario = createMaterializationRecoveryScenario ()
+
+                try
+                    let! partial = partiallyApplyRecoveryScenario scenario
+
+                    match partial with
+                    | LakeFsMaterialization.MaterializationPartiallyApplied _ -> ()
+                    | _ -> failwith "Expected the injected apply failure to retain recovery state."
+
+                    let persisted =
+                        match LakeFsWorkspaceIndex.load scenario.State.StateDirectory with
+                        | LakeFsWorkspaceIndex.Loaded loaded -> loaded
+                        | _ -> failwith "Expected the partial index to be persisted."
+
+                    let unrelatedEntry: LakeFsWorkspaceIndex.IndexEntry = {
+                        Path = "unrelated.txt"
+                        BaseChecksum = "unrelated-checksum"
+                        LocalHash = LakeFsWorkspaceIndex.hashMetadata "unrelated\n"
+                        LocalSize = 10.0
+                        LocalMtimeMs = 2.0
+                    }
+
+                    let concurrentIndex =
+                        LakeFsWorkspaceIndex.save
+                            scenario.State.StateDirectory
+                            {
+                                persisted with
+                                    BaseRevision = Some "newer-base-revision"
+                                    WorkspaceRevision = Some "newer-workspace-revision"
+                                    Entries = Array.append persisted.Entries [| unrelatedEntry |]
+                            }
+                        |> Result.defaultWith failwith
+
+                    let! replay =
+                        LakeFsMaterialization.reapplyPending
+                            scenario.WorkspaceRoot
+                            scenario.State.StateDirectory
+                            scenario.State.RecoveryDirectory
+                            (fun _ _ -> async.Return())
+                            (context "recovery-newest-index-replay")
+                        |> Async.StartAsPromise
+
+                    match replay with
+                    | Ok(Some(LakeFsMaterialization.Materialized _)) -> ()
+                    | Ok(Some(LakeFsMaterialization.MaterializationFailed failure))
+                    | Ok(Some(LakeFsMaterialization.MaterializationPartiallyApplied(_, failure))) ->
+                        failwith $"Replaying onto the newest index failed: {failure.Code}"
+                    | Ok None -> failwith "The retained recovery record was not replayed."
+                    | Error failure -> failwith $"Loading retained recovery failed: {failure.Code}"
+
+                    match LakeFsWorkspaceIndex.load scenario.State.StateDirectory with
+                    | LakeFsWorkspaceIndex.Loaded replayed ->
+                        Vitest.expect(replayed.Generation > concurrentIndex.Generation).toBe(true)
+                        Vitest.expect(replayed.BaseRevision).toEqual(Some "newer-base-revision")
+                        Vitest.expect(replayed.WorkspaceRevision).toEqual(Some "newer-workspace-revision")
+                        Vitest.expect(replayed.Entries |> Array.exists (fun entry -> entry.Path = "unrelated.txt"))
+                            .toBe(true)
+                    | _ -> failwith "The replayed index was not readable."
+
+                    do! removeDirectoryAsync scenario.Root
+                with error ->
+                    do! removeDirectoryAsync scenario.Root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "lakeFS materialization recovery handles missing corrupt and unknown-schema metadata structurally",
+            fun () -> promise {
+                let! root = createTempDirectoryAsync ()
+                let recoveryDirectory = join [| root; "missing-recovery" |]
+
+                try
+                    match LakeFsStateStore.loadRecoveryRecords recoveryDirectory with
+                    | Ok records -> Vitest.expect(records).toEqual [||]
+                    | Error failure -> failwith $"A missing recovery directory failed: {failure.Code}"
+
+                    do! ensureDirectoryAsync recoveryDirectory
+                    let recordPath = join [| recoveryDirectory; "materialization-invalid.json" |]
+
+                    let expectAction
+                        (result:
+                            Result<
+                                LakeFsStateStore.LoadedRecoveryRecord[],
+                                OperationFailure
+                             >)
+                        =
+                        match result with
+                        | Error failure ->
+                            Vitest.expect(failure.Code).toBe "materialization_recovery_corrupt"
+                            Vitest.expect(failure.RecoveryAction |> Option.map _.Code)
+                                .toEqual(Some "reconcile_materialization")
+                            Vitest.expect(
+                                failure.RecoveryAction
+                                |> Option.bind _.Instructions
+                                |> Option.exists (fun instructions ->
+                                    instructions.Contains(recordPath)
+                                    && instructions.Contains("RestorePaths"))
+                            ).toBe(true)
+                        | Ok _ -> failwith "Invalid recovery metadata was accepted."
+
+                    do! writeUtf8FileAsync recordPath "{\"SchemaVersion\":99}"
+                    LakeFsStateStore.loadRecoveryRecords recoveryDirectory |> expectAction
+                    do! removeFileAsync recordPath
+                    do! writeUtf8FileAsync recordPath "broken recovery json {"
+                    LakeFsStateStore.loadRecoveryRecords recoveryDirectory |> expectAction
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "lakeFS materialization recovery drains every retained record in stable order",
+            fun () -> promise {
+                let! scenario = createMaterializationRecoveryScenario ()
+
+                try
+                    let transactionDirectories = ResizeArray<string>()
+
+                    for suffix in [| "a"; "b" |] do
+                        let transactionId = $"{suffix}-{RuntimeNodeInterop.randomUuid()}"
+                        let transactionDirectory =
+                            join [| scenario.State.TransactionsDirectory; transactionId |]
+
+                        do! ensureDirectoryAsync transactionDirectory
+                        transactionDirectories.Add transactionDirectory
+
+                        let record: LakeFsStateStore.RecoveryRecord = {
+                            SchemaVersion = LakeFsStateStore.RecoverySchemaVersion
+                            TransactionId = transactionId
+                            TransactionDirectory = transactionDirectory
+                            ExpectedWorkspace = scenario.CurrentIndex.WorkspaceRevision
+                            ObservedMaterialization = "observed-revision"
+                            AffectedPaths = [||]
+                            Replacements = [||]
+                            Removals = [||]
+                            CurrentIndex = box scenario.CurrentIndex
+                            NextIndex = box scenario.CurrentIndex
+                        }
+
+                        RuntimeNodeFileSystem.writeUtf8FileExclusiveAndFlushSync
+                            (join [|
+                                scenario.State.RecoveryDirectory
+                                $"materialization-{transactionId}.json"
+                            |])
+                            (jsonStringify record)
+
+                    let! replay =
+                        LakeFsMaterialization.reapplyPending
+                            scenario.WorkspaceRoot
+                            scenario.State.StateDirectory
+                            scenario.State.RecoveryDirectory
+                            (fun _ _ -> async.Return())
+                            (context "recovery-drain-all")
+                        |> Async.StartAsPromise
+
+                    match replay with
+                    | Ok(Some(LakeFsMaterialization.Materialized _)) -> ()
+                    | Ok(Some(LakeFsMaterialization.MaterializationFailed failure))
+                    | Ok(Some(LakeFsMaterialization.MaterializationPartiallyApplied(_, failure))) ->
+                        failwith $"Draining retained recovery failed: {failure.Code}"
+                    | Ok None -> failwith "Retained recovery records were not loaded."
+                    | Error failure -> failwith $"Loading retained recovery failed: {failure.Code}"
+
+                    Vitest.expect(RuntimeNodeFileSystem.readdirSync scenario.State.RecoveryDirectory).toEqual [||]
+
+                    for directory in transactionDirectories do
+                        Vitest.expect(RuntimeNodeFileSystem.existsSync directory).toBe(false)
+
+                    do! removeDirectoryAsync scenario.Root
+                with error ->
+                    do! removeDirectoryAsync scenario.Root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "lakeFS materialization recovery removes phantom index entries for already-absent targets",
+            fun () -> promise {
+                let! scenario = createMaterializationRecoveryScenario ()
+
+                try
+                    do! removeFileAsync scenario.Targets[0]
+                    let transactionId = RuntimeNodeInterop.randomUuid()
+                    let transactionDirectory =
+                        join [| scenario.State.TransactionsDirectory; transactionId |]
+
+                    do! ensureDirectoryAsync transactionDirectory
+
+                    let removalPlan: LakeFsMaterialization.MaterializationPlan = {
+                        TransactionId = transactionId
+                        TransactionDirectory = transactionDirectory
+                        Replacements = [||]
+                        Removals = [| scenario.Paths[0], scenario.Targets[0] |]
+                        CurrentIndex = scenario.CurrentIndex
+                        NextIndex = {
+                            scenario.CurrentIndex with
+                                Entries =
+                                    scenario.CurrentIndex.Entries
+                                    |> Array.filter (fun entry ->
+                                        entry.Path <> RepositoryPath.value scenario.Paths[0])
+                        }
+                    }
+
+                    let! applied =
+                        LakeFsMaterialization.apply
+                            scenario.WorkspaceRoot
+                            scenario.State.StateDirectory
+                            scenario.State.RecoveryDirectory
+                            scenario.CurrentIndex.WorkspaceRevision
+                            "observed-revision"
+                            removalPlan
+                            (fun _ _ -> async.Return())
+                            (context "recovery-absent-removal")
+                        |> Async.StartAsPromise
+
+                    match applied with
+                    | LakeFsMaterialization.Materialized(saved, affectedPaths, _) ->
+                        Vitest.expect(affectedPaths).toEqual [||]
+                        Vitest.expect(
+                            saved.Entries
+                            |> Array.exists (fun entry ->
+                                entry.Path = RepositoryPath.value scenario.Paths[0])
+                        ).toBe(false)
+                    | LakeFsMaterialization.MaterializationFailed failure
+                    | LakeFsMaterialization.MaterializationPartiallyApplied(_, failure) ->
+                        failwith $"Removing an absent indexed target failed: {failure.Code}"
+
+                    do! removeDirectoryAsync scenario.Root
+                with error ->
+                    do! removeDirectoryAsync scenario.Root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "lakeFS materialization recovery gates conflict resolve finalize and cancel",
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
+            fun () -> promise {
+                if not (integrationEnabled ()) then
+                    return failwith "lakeFS integration skipped: Docker not available"
+
+                let harness = createLakeFsHarness ()
+
+                try
+                    let! workspace, conflicts, summary = createSingleFileConflict harness
+                    let! resolutionStatusResult =
+                        workspace.Session.Core.GetStatus(context "recovery-conflict-resolution-status")
+                        |> Async.StartAsPromise
+
+                    let resolutionStatus =
+                        expectOperationValue "recovery conflict resolution status" resolutionStatusResult
+
+                    let! resolutionResult =
+                        conflicts.Resolve
+                            {
+                                Handle = summary.Handle
+                                ExpectedWorkspaceVersion = resolutionStatus.WorkspaceVersion
+                                Path = summary.Items[0].Path
+                                Resolution = PickCandidate "target"
+                            }
+                            (context "recovery-conflict-preresolve")
+                        |> Async.StartAsPromise
+
+                    let resolution =
+                        expectOperationValue "recovery conflict preresolve" resolutionResult
+
+                    let! pendingStatusResult =
+                        workspace.Session.Core.GetStatus(context "recovery-conflict-pending-status")
+                        |> Async.StartAsPromise
+
+                    let pendingStatus =
+                        expectOperationValue "recovery conflict pending status" pendingStatusResult
+
+                    let state =
+                        LakeFsStateStore.resolve
+                            lakeFsProviderOptions
+                            workspace.Binding.WorkspaceRoot
+                            workspace.Binding.ProviderStateRef
+                        |> Result.defaultWith (fun failure -> failwith failure.Message)
+
+                    let index =
+                        match LakeFsWorkspaceIndex.load state.StateDirectory with
+                        | LakeFsWorkspaceIndex.Loaded loaded -> loaded
+                        | _ -> failwith "Expected a persisted index for conflict recovery gating."
+
+                    let transactionId = RuntimeNodeInterop.randomUuid()
+                    let transactionDirectory = join [| state.TransactionsDirectory; transactionId |]
+                    do! ensureDirectoryAsync transactionDirectory
+
+                    let record: LakeFsStateStore.RecoveryRecord = {
+                        SchemaVersion = LakeFsStateStore.RecoverySchemaVersion
+                        TransactionId = transactionId
+                        TransactionDirectory = transactionDirectory
+                        ExpectedWorkspace = index.WorkspaceRevision
+                        ObservedMaterialization = index.WorkspaceRevision |> Option.defaultValue "unknown"
+                        AffectedPaths = [| "base.txt" |]
+                        Replacements = [||]
+                        Removals = [||]
+                        CurrentIndex = box index
+                        NextIndex = box index
+                    }
+
+                    let recoveryPath =
+                        join [| state.RecoveryDirectory; $"materialization-{transactionId}.json" |]
+
+                    RuntimeNodeFileSystem.writeUtf8FileExclusiveAndFlushSync
+                        recoveryPath
+                        (jsonStringify record)
+
+                    let expectRecoveryGate operation result =
+                        match result with
+                        | Failed failure ->
+                            Vitest.expect(failure.Code).toBe "materialization_recovery_pending"
+                            Vitest.expect(failure.RecoveryAction |> Option.map _.Code)
+                                .toEqual(Some "reconcile_materialization")
+                        | _ -> failwith $"Conflict {operation} bypassed pending recovery."
+
+                        Vitest.expect(RuntimeNodeFileSystem.readdirSync state.RecoveryDirectory)
+                            .toEqual [| RuntimeNodePath.basename recoveryPath |]
+
+                    let! blockedResolve =
+                        conflicts.Resolve
+                            {
+                                Handle = resolution.RefreshedHandle
+                                ExpectedWorkspaceVersion = pendingStatus.WorkspaceVersion
+                                Path = summary.Items[0].Path
+                                Resolution = PickCandidate "workspace"
+                            }
+                            (context "recovery-conflict-blocked-resolve")
+                        |> Async.StartAsPromise
+
+                    expectRecoveryGate "resolve" blockedResolve
+
+                    let! blockedFinalize =
+                        conflicts.Finalize
+                            {
+                                Handle = resolution.RefreshedHandle
+                                ExpectedWorkspaceVersion = pendingStatus.WorkspaceVersion
+                                Message = Some "must remain blocked"
+                            }
+                            (context "recovery-conflict-blocked-finalize")
+                        |> Async.StartAsPromise
+
+                    expectRecoveryGate "finalize" blockedFinalize
+
+                    let! blockedCancel =
+                        conflicts.Cancel
+                            {
+                                Handle = resolution.RefreshedHandle
+                                ExpectedWorkspaceVersion = pendingStatus.WorkspaceVersion
+                            }
+                            (context "recovery-conflict-blocked-cancel")
+                        |> Async.StartAsPromise
+
+                    expectRecoveryGate "cancel" blockedCancel
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+    )
 
 Vitest.describe (
     "lakeFS binary conflicts",

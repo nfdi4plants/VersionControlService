@@ -260,6 +260,20 @@ Vitest.describe (
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index before interrupted restore."
 
+                    let! listedResult =
+                        LakeFsApi.listObjects
+                            (connection ())
+                            before.Repository
+                            before.WorkspaceBranch
+                            before.Prefix
+                            (OperationContext.detached "restore-materialization-list")
+                        |> Async.StartAsPromise
+
+                    let expectedFirstStat =
+                        listedResult
+                        |> Result.defaultWith (fun failure -> failwith failure.Message)
+                        |> Array.find (fun stat -> stat.Path = "000-restore-first.txt")
+
                     let! statusResult =
                         session.Core.GetStatus
                             (OperationContext.detached "restore-materialization-status")
@@ -297,13 +311,38 @@ Vitest.describe (
 
                     match LakeFsWorkspaceIndex.load stateDirectory with
                     | LakeFsWorkspaceIndex.Loaded after ->
+                        let expectedFirst: LakeFsWorkspaceIndex.IndexEntry = {
+                            Path = "000-restore-first.txt"
+                            BaseChecksum = expectedFirstStat.Checksum
+                            LocalHash =
+                                LakeFsWorkspaceIndex.hashMetadata "tracked first bytes\n"
+                            LocalSize = 20.0
+                            LocalMtimeMs = expectedFirstStat.Mtime
+                        }
+
+                        let expectedEntries =
+                            before.Entries
+                            |> Array.map (fun entry ->
+                                if entry.Path = expectedFirst.Path then expectedFirst else entry)
+
                         Vitest.expect(after.WorkspaceRevision).toEqual before.WorkspaceRevision
-                        Vitest.expect(after.Entries).toEqual before.Entries
+                        Vitest.expect(after.Entries).toEqual expectedEntries
                     | _ -> failwith "Expected interrupted restore to preserve the published index."
 
-                    Vitest.expect(
+                    let transactionDirectories =
                         NodeFileSystem.readdirSync (NodePath.join [| stateDirectory; "transactions" |])
-                    ).toEqual [||]
+
+                    let recoveryDirectory = NodePath.join [| stateDirectory; "recovery" |]
+                    let recoveryFiles = NodeFileSystem.readdirSync recoveryDirectory
+                    Vitest.expect(transactionDirectories.Length).toBe 1
+                    Vitest.expect(recoveryFiles.Length).toBe 1
+                    let recoveryText =
+                        NodeFileSystem.readFileSync
+                            (NodePath.join [| recoveryDirectory; recoveryFiles[0] |])
+                            NodeFileSystem.TextEncoding.Utf8
+
+                    Vitest.expect(recoveryText.Contains "000-restore-first.txt").toBe true
+                    Vitest.expect(recoveryText.Contains "zzz-restore-second.txt").toBe true
                     do! harness.Cleanup()
                 with error ->
                     do! harness.Cleanup()
@@ -743,6 +782,20 @@ Vitest.describe (
                     let committed =
                         committedResult |> Result.defaultWith (fun failure -> failwith failure.Message)
 
+                    let! listedResult =
+                        LakeFsApi.listObjects
+                            (connection ())
+                            parsed.Repository
+                            committed.Id
+                            ""
+                            (OperationContext.detached "materialization-apply-list")
+                        |> Async.StartAsPromise
+
+                    let expectedFirstStat =
+                        listedResult
+                        |> Result.defaultWith (fun failure -> failwith failure.Message)
+                        |> Array.find (fun stat -> stat.Path = "000-apply-first.txt")
+
                     do! workspace.WriteFile "000-apply-first.txt" "old first bytes\n"
                     do! workspace.WriteFile "zzz-apply-second.txt" "old second bytes\n"
 
@@ -814,13 +867,25 @@ Vitest.describe (
 
                     match LakeFsWorkspaceIndex.load stateDirectory with
                     | LakeFsWorkspaceIndex.Loaded after ->
+                        let expectedFirst: LakeFsWorkspaceIndex.IndexEntry = {
+                            Path = "000-apply-first.txt"
+                            BaseChecksum = expectedFirstStat.Checksum
+                            LocalHash = LakeFsWorkspaceIndex.hashMetadata "new first bytes\n"
+                            LocalSize = 16.0
+                            LocalMtimeMs = expectedFirstStat.Mtime
+                        }
+
                         Vitest.expect(after.WorkspaceRevision).toEqual before.WorkspaceRevision
-                        Vitest.expect(after.Entries).toEqual before.Entries
+                        Vitest.expect(after.Entries).toEqual (Array.append before.Entries [| expectedFirst |])
+                        Vitest.expect(
+                            after.Entries
+                            |> Array.exists (fun entry -> entry.Path = "zzz-apply-second.txt")
+                        ).toBe false
                     | _ -> failwith "Expected apply failure to preserve the published index."
 
                     let transactionsDirectory = NodePath.join [| stateDirectory; "transactions" |]
                     let recoveryDirectory = NodePath.join [| stateDirectory; "recovery" |]
-                    Vitest.expect(NodeFileSystem.readdirSync transactionsDirectory).toEqual [||]
+                    Vitest.expect(NodeFileSystem.readdirSync transactionsDirectory).toHaveLength 1
                     let recoveryFiles = NodeFileSystem.readdirSync recoveryDirectory
                     Vitest.expect(recoveryFiles.Length).toBe 1
                     let recoveryText =
@@ -829,7 +894,7 @@ Vitest.describe (
                             NodeFileSystem.TextEncoding.Utf8
 
                     Vitest.expect(recoveryText.Contains "000-apply-first.txt").toBe true
-                    Vitest.expect(recoveryText.Contains "zzz-apply-second.txt").toBe false
+                    Vitest.expect(recoveryText.Contains "zzz-apply-second.txt").toBe true
                     do! harness.Cleanup()
                 with error ->
                     do! harness.Cleanup()
@@ -893,6 +958,20 @@ Vitest.describe (
 
                     let committed =
                         committedResult |> Result.defaultWith (fun failure -> failwith failure.Message)
+
+                    let! listedResult =
+                        LakeFsApi.listObjects
+                            (connection ())
+                            parsed.Repository
+                            committed.Id
+                            ""
+                            (OperationContext.detached "materialization-apply-cancel-list")
+                        |> Async.StartAsPromise
+
+                    let expectedFirstStat =
+                        listedResult
+                        |> Result.defaultWith (fun failure -> failwith failure.Message)
+                        |> Array.find (fun stat -> stat.Path = "000-cancel-first.txt")
 
                     do! workspace.WriteFile "000-cancel-first.txt" "old first bytes\n"
                     do! workspace.WriteFile "zzz-cancel-second.txt" "old second bytes\n"
@@ -971,13 +1050,25 @@ Vitest.describe (
 
                     match LakeFsWorkspaceIndex.load stateDirectory with
                     | LakeFsWorkspaceIndex.Loaded after ->
+                        let expectedFirst: LakeFsWorkspaceIndex.IndexEntry = {
+                            Path = "000-cancel-first.txt"
+                            BaseChecksum = expectedFirstStat.Checksum
+                            LocalHash = LakeFsWorkspaceIndex.hashMetadata "new first bytes\n"
+                            LocalSize = 16.0
+                            LocalMtimeMs = expectedFirstStat.Mtime
+                        }
+
                         Vitest.expect(after.WorkspaceRevision).toEqual before.WorkspaceRevision
-                        Vitest.expect(after.Entries).toEqual before.Entries
+                        Vitest.expect(after.Entries).toEqual (Array.append before.Entries [| expectedFirst |])
+                        Vitest.expect(
+                            after.Entries
+                            |> Array.exists (fun entry -> entry.Path = "zzz-cancel-second.txt")
+                        ).toBe false
                     | _ -> failwith "Expected apply cancellation to preserve the published index."
 
                     let transactionsDirectory = NodePath.join [| stateDirectory; "transactions" |]
                     let recoveryDirectory = NodePath.join [| stateDirectory; "recovery" |]
-                    Vitest.expect(NodeFileSystem.readdirSync transactionsDirectory).toEqual [||]
+                    Vitest.expect(NodeFileSystem.readdirSync transactionsDirectory).toHaveLength 1
                     let recoveryFiles = NodeFileSystem.readdirSync recoveryDirectory
                     Vitest.expect(recoveryFiles.Length).toBe 1
                     do! harness.Cleanup()
