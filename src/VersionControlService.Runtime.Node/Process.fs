@@ -58,7 +58,9 @@ let private isWindows () : bool =
 /// children get their process group signaled, with a direct SIGKILL fallback.
 let killProcessTree (pid: int) : unit =
     if isWindows () then
-        childProcessModule?spawn ("taskkill", [| "/pid"; string pid; "/T"; "/F" |])
+        // Wait for taskkill itself to finish. Otherwise the canceled process can
+        // report close while a descendant still holds its working directory.
+        childProcessModule?spawnSync ("taskkill", [| "/pid"; string pid; "/T"; "/F" |])
         |> ignore
     else
         try
