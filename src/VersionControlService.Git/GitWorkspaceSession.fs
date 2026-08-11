@@ -257,18 +257,53 @@ let private comparisonReadCanceledFailure (path: string) =
             AffectedPaths = [| path |]
     }
 
+type private UnmergedWorktreePathKind =
+    | RegularWorktreeFile of NodeFileSystem.Stats
+    | MissingWorktreePath
+    | WorktreeDirectory
+    | WorktreeSymlink
+    | OtherWorktreeEntry
+    | NonDirectoryWorktreeParent
+
+type private ClassifiedUnmergedWorktreePath = {
+    AbsolutePath: string
+    Kind: UnmergedWorktreePathKind
+    InspectionError: exn option
+}
+
 type private ContainedWorktreeFile = {
     AbsolutePath: string
     Stats: NodeFileSystem.Stats
 }
 
-let private validateContainedWorktreeFile (state: SessionState) (path: string) =
+let private unmergedWorktreeKindMarker = function
+    | MissingWorktreePath -> "missing"
+    | WorktreeDirectory -> "directory"
+    | WorktreeSymlink -> "symlink"
+    | OtherWorktreeEntry
+    | NonDirectoryWorktreeParent -> "other"
+    | RegularWorktreeFile _ -> invalidOp "Regular files contribute content hashes, not kind markers."
+
+[<Emit("$0?.code")>]
+let private getNodeErrorCode (_error: exn) : string = jsNative
+
+let private tryGetNodeErrorCode (error: exn) : string option =
+    getNodeErrorCode error |> Option.ofObj
+
+/// Classifies token-participating path kinds without following leaf symlinks; parent symlinks fail containment.
+let private classifyUnmergedWorktreePath
+    (state: SessionState)
+    (path: string)
+    (context: OperationContext)
+    =
     async {
         let repositoryRoot = NodePath.resolve [| state.RepoPath |]
         let absolutePath = NodePath.resolve [| repositoryRoot; path |]
         let relativePath = NodePath.relative repositoryRoot absolutePath
 
-        if
+        if context.Cancellation.IsCancellationRequested() then
+            return Error(comparisonReadCanceledFailure path)
+        elif
             String.IsNullOrEmpty relativePath
             || relativePath = "."
             || relativePath = ".."
@@ -279,58 +314,100 @@ let private validateContainedWorktreeFile (state: SessionState) (path: string) =
             return Error(unsafeWorkspacePathFailure path)
         else
             let segments = path.Replace("\\", "/").Split('/')
-            let mutable currentPath = repositoryRoot
-            let mutable validationFailure = None
-            let mutable leafStats = None
-            let mutable index = 0
 
-            while validationFailure.IsNone && index < segments.Length do
-                currentPath <- NodePath.join [| currentPath; segments[index] |]
+            let classified kind inspectionError =
+                Ok {
+                    AbsolutePath = absolutePath
+                    Kind = kind
+                    InspectionError = inspectionError
+                }
 
-                try
-                    let! stats = NodeFileSystem.lstatAsync currentPath |> Async.AwaitPromise
-
-                    if stats.isSymbolicLink () then
-                        validationFailure <- Some(unsafeWorkspacePathFailure path)
-                    elif index < segments.Length - 1 && not (stats.isDirectory ()) then
-                        validationFailure <-
-                            Some(
+            let rec inspect index currentPath =
+                async {
+                    if context.Cancellation.IsCancellationRequested() then
+                        return Error(comparisonReadCanceledFailure path)
+                    elif index >= segments.Length then
+                        return
+                            Error(
                                 workspaceEvidenceFailure
                                     path
-                                    $"A parent of the unmerged path '{path}' is not a directory."
+                                    $"The unmerged path '{path}' could not be identified."
                             )
-                    elif index = segments.Length - 1 && not (stats.isFile ()) then
-                        validationFailure <-
-                            Some(
-                                workspaceEvidenceFailure path $"The unmerged path '{path}' is not a regular file."
-                            )
-                    elif index = segments.Length - 1 then
-                        leafStats <- Some stats
-                with error ->
-                    validationFailure <-
-                        Some(
-                            workspaceEvidenceFailure
-                                path
-                                $"The unmerged path '{path}' could not be inspected: {error.Message}"
-                        )
+                    else
+                        let nextPath = NodePath.join [| currentPath; segments[index] |]
 
-                index <- index + 1
+                        try
+                            let! stats = NodeFileSystem.lstatAsync nextPath |> Async.AwaitPromise
 
-            match validationFailure with
-            | Some failure -> return Error failure
-            | None ->
-                match leafStats with
-                | Some stats ->
-                    return
-                        Ok {
-                            AbsolutePath = absolutePath
-                            Stats = stats
-                        }
-                | None ->
-                    return
-                        Error(
-                            workspaceEvidenceFailure path $"The unmerged path '{path}' could not be identified."
-                        )
+                            if context.Cancellation.IsCancellationRequested() then
+                                return Error(comparisonReadCanceledFailure path)
+                            elif stats.isSymbolicLink () then
+                                if index < segments.Length - 1 then
+                                    return Error(unsafeWorkspacePathFailure path)
+                                else
+                                    return classified WorktreeSymlink None
+                            elif index < segments.Length - 1 then
+                                if stats.isDirectory () then
+                                    return! inspect (index + 1) nextPath
+                                else
+                                    return classified NonDirectoryWorktreeParent None
+                            elif stats.isFile () then
+                                return classified (RegularWorktreeFile stats) None
+                            elif stats.isDirectory () then
+                                return classified WorktreeDirectory None
+                            else
+                                return classified OtherWorktreeEntry None
+                        with error ->
+                            if context.Cancellation.IsCancellationRequested() then
+                                return Error(comparisonReadCanceledFailure path)
+                            else
+                                match tryGetNodeErrorCode error with
+                                | Some "ENOENT" -> return classified MissingWorktreePath (Some error)
+                                | Some "ENOTDIR" -> return classified NonDirectoryWorktreeParent (Some error)
+                                | _ ->
+                                    return
+                                        Error(
+                                            workspaceEvidenceFailure
+                                                path
+                                                $"The unmerged path '{path}' could not be inspected: {error.Message}"
+                                        )
+                }
+
+            return! inspect 0 repositoryRoot
+    }
+
+let private validateContainedWorktreeFile
+    (state: SessionState)
+    (path: string)
+    (context: OperationContext)
+    =
+    async {
+        let! classification = classifyUnmergedWorktreePath state path context
+
+        match classification with
+        | Error failure -> return Error failure
+        | Ok { AbsolutePath = absolutePath; Kind = RegularWorktreeFile stats } ->
+            return
+                Ok {
+                    AbsolutePath = absolutePath
+                    Stats = stats
+                }
+        | Ok { Kind = WorktreeSymlink } -> return Error(unsafeWorkspacePathFailure path)
+        | Ok { InspectionError = Some error } ->
+            return
+                Error(
+                    workspaceEvidenceFailure
+                        path
+                        $"The unmerged path '{path}' could not be inspected: {error.Message}"
+                )
+        | Ok { Kind = NonDirectoryWorktreeParent } ->
+            return
+                Error(
+                    workspaceEvidenceFailure path $"A parent of the unmerged path '{path}' is not a directory."
+                )
+        | Ok _ ->
+            return
+                Error(workspaceEvidenceFailure path $"The unmerged path '{path}' is not a regular file.")
     }
 
 let private sameFileIdentity (left: NodeFileSystem.Stats) (right: NodeFileSystem.Stats) =
@@ -343,7 +420,7 @@ let private withValidatedWorktreeHandle
     (consume: NodeFileSystem.FileHandle -> Async<Result<'T, OperationFailure>>)
     : Async<Result<'T, OperationFailure>> =
     async {
-        let! beforeOpen = validateContainedWorktreeFile state path
+        let! beforeOpen = validateContainedWorktreeFile state path context
 
         match beforeOpen with
         | Error failure -> return Error failure
@@ -379,7 +456,7 @@ let private withValidatedWorktreeHandle
                         let! consumeResult =
                             async {
                                 try
-                                    let! afterOpen = validateContainedWorktreeFile state path
+                                    let! afterOpen = validateContainedWorktreeFile state path context
 
                                     match afterOpen with
                                     | Error failure -> return Error failure
@@ -540,16 +617,44 @@ let private computeUnmergedContentPart (state: SessionState) (context: Operation
                 output.StdOut.Split '\000'
                 |> Array.filter (fun path -> not (String.IsNullOrEmpty path))
 
+            let markerEvidence path kind =
+                $"{path}\000{unmergedWorktreeKindMarker kind}"
+
+            let pathEvidence path classification =
+                async {
+                    match classification.Kind with
+                    | RegularWorktreeFile _ ->
+                        let! hashed = hashUnmergedWorktreePath state path context
+
+                        match hashed with
+                        | Ok item -> return Ok item
+                        | Error failure when failure.Code = "workspace_evidence_unavailable" ->
+                            let! reclassification = classifyUnmergedWorktreePath state path context
+
+                            match reclassification with
+                            | Error reclassificationFailure -> return Error reclassificationFailure
+                            | Ok { Kind = RegularWorktreeFile _ } -> return Error failure
+                            | Ok reclassified -> return Ok(markerEvidence path reclassified.Kind)
+                        | Error failure -> return Error failure
+                    | kind -> return Ok(markerEvidence path kind)
+                }
+
             let rec collect index evidence =
                 async {
                     if index >= paths.Length then
                         return Ok(NodeInterop.sha256Utf8 (String.concat "\000" (List.rev evidence)))
                     else
-                        let! hashed = hashUnmergedWorktreePath state paths[index] context
+                        let path = paths[index]
+                        let! classification = classifyUnmergedWorktreePath state path context
 
-                        match hashed with
+                        match classification with
                         | Error failure -> return Error failure
-                        | Ok item -> return! collect (index + 1) (item :: evidence)
+                        | Ok classified ->
+                            let! itemResult = pathEvidence path classified
+
+                            match itemResult with
+                            | Error failure -> return Error failure
+                            | Ok item -> return! collect (index + 1) (item :: evidence)
                 }
 
             return! collect 0 []
@@ -973,20 +1078,30 @@ let private readConflictCombinedPreview
         if GitService.isExplicitlyUnsupportedPath path then
             return Ok(Some(unsupportedConflictPreview path))
         else
-            let! bufferResult =
-                withValidatedWorktreeHandle state path context (readHandleContentBuffer state path context)
+            let! classification = classifyUnmergedWorktreePath state path context
 
-            match bufferResult with
+            match classification with
             | Error failure -> return Error failure
-            | Ok ContentTooLarge ->
-                return Ok(Some(UnsupportedPreview(Some $"Conflict preview for '{path}' exceeds the text preview limit.")))
-            | Ok(CompleteContent buffer) ->
-                if GitService.isLikelyBinaryBuffer buffer then
-                    return Ok(Some(unsupportedConflictPreview path))
-                elif not (NodeInterop.bufferIsValidUtf8 buffer) then
-                    return Ok(Some(unsupportedConflictPreview path))
-                else
-                    return Ok(Some(TextPreview(NodeInterop.bufferToUtf8String buffer)))
+            | Ok { Kind = MissingWorktreePath }
+            | Ok { Kind = WorktreeDirectory }
+            | Ok { Kind = OtherWorktreeEntry }
+            | Ok { Kind = NonDirectoryWorktreeParent } -> return Ok None
+            | Ok { Kind = WorktreeSymlink }
+            | Ok { Kind = RegularWorktreeFile _ } ->
+                let! bufferResult =
+                    withValidatedWorktreeHandle state path context (readHandleContentBuffer state path context)
+
+                match bufferResult with
+                | Error failure -> return Error failure
+                | Ok ContentTooLarge ->
+                    return Ok(Some(UnsupportedPreview(Some $"Conflict preview for '{path}' exceeds the text preview limit.")))
+                | Ok(CompleteContent buffer) ->
+                    if GitService.isLikelyBinaryBuffer buffer then
+                        return Ok(Some(unsupportedConflictPreview path))
+                    elif not (NodeInterop.bufferIsValidUtf8 buffer) then
+                        return Ok(Some(unsupportedConflictPreview path))
+                    else
+                        return Ok(Some(TextPreview(NodeInterop.bufferToUtf8String buffer)))
     }
 
 /// Active merge state as a provider-managed conflict session. Present whenever

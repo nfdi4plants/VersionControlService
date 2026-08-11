@@ -110,6 +110,12 @@ let private expectValue (operationName: string) (result: OperationResult<'T>) : 
         failwith $"{operationName} unexpectedly returned partial success ({failure.Code})."
     | Failed failure -> failwith $"{operationName} failed ({failure.Category}/{failure.Code}): {failure.Message}"
 
+let private expectSucceeded operationName result =
+    expectValue operationName result
+
+let private isConflictedChange (change: FileChange) =
+    change.Kind = ConflictedChange
+
 /// Isolated workspace with a local bare origin: (workspaceRoot, barePath, session).
 let private createSyncFixture (hooks: GitWorkspaceSession.GitSessionHooks) = promise {
     let! root = createTempDirectoryAsync ()
@@ -300,6 +306,51 @@ let private createNestedUnmergedConflictFixture () =
 let private createNestedUnmergedConflictFixtureWithHooks hooks =
     createPathUnmergedConflictFixtureWithHooks hooks "nested/conflict.txt"
 
+let private createRenameRenameConflictFixture () = promise {
+    let! root, workPath, _, session = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+    let! _ = runGitIn workPath [| "checkout"; "-b"; "rename-left" |]
+    let! _ = runGitIn workPath [| "mv"; "base.txt"; "left.txt" |]
+    let! _ = runGitIn workPath [| "commit"; "-m"; "rename: left" |]
+    let! _ = runGitIn workPath [| "checkout"; "main" |]
+    let! _ = runGitIn workPath [| "checkout"; "-b"; "rename-right" |]
+    let! _ = runGitIn workPath [| "mv"; "base.txt"; "right.txt" |]
+    let! _ = runGitIn workPath [| "commit"; "-m"; "rename: right" |]
+
+    let mutable mergeSucceeded = false
+
+    try
+        let! _ = runGitIn workPath [| "merge"; "rename-left" |]
+        mergeSucceeded <- true
+    with _ ->
+        ()
+
+    if mergeSucceeded then
+        return failwith "Expected the rename/rename merge to conflict."
+
+    let! porcelain = runGitIn workPath [| "status"; "--porcelain=v2" |]
+
+    let renameConflictPaths =
+        porcelain.Split '\n'
+        |> Array.choose (fun line ->
+            let parts = (line.TrimEnd '\r').Split([| ' ' |], 11)
+
+            if parts.Length = 11 && parts[0] = "u" && parts[1] = "DD" then
+                Some parts[10]
+            else
+                None)
+
+    if renameConflictPaths.Length = 0 then
+        return failwith $"Expected porcelain DD entries, received: {porcelain}"
+
+    for conflictPath in renameConflictPaths do
+        let! exists = pathExistsAsync (join [| workPath; conflictPath |])
+
+        if exists then
+            return failwith $"Expected the rename/rename conflict path '{conflictPath}' to be absent from the worktree."
+
+    return root, workPath, session
+}
+
 Vitest.describe (
     "Git conflict preview tracks out-of-band edits",
     fun () ->
@@ -376,6 +427,109 @@ Vitest.describe (
                     return raise error
             }
         )
+)
+
+Vitest.describe (
+    "Git unmerged worktree evidence",
+    fun () ->
+        Vitest.test (
+            "preserves unmerged worktree evidence for rename/rename paths with no worktree files",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, _, session = createRenameRenameConflictFixture ()
+
+                try
+                    let! status = Async.StartAsPromise(session.Core.GetStatus(ctx "status-rename-unmerged"))
+                    let workspace = expectSucceeded "status with missing unmerged worktree file" status
+                    Vitest
+                        .expect(workspace.Changes |> Array.exists (fun change ->
+                            isConflictedChange change
+                            && RepositoryPath.value change.Path = "base.txt"))
+                        .toBe true
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "rotates unmerged worktree evidence after a conflicted file is deleted",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, session, conflicts, capturedSummary, _ = createUnmergedConflictFixture ()
+
+                try
+                    let! beforeDeletionStatus =
+                        Async.StartAsPromise(session.Core.GetStatus(ctx "status-before-unmerged-deletion"))
+
+                    let beforeDeletion =
+                        expectSucceeded "status before deleting unmerged worktree file" beforeDeletionStatus
+
+                    let conflictFile = join [| workPath; "base.txt" |]
+                    do! removePathAsync conflictFile
+
+                    let! deletedStatus = Async.StartAsPromise(session.Core.GetStatus(ctx "status-deleted-unmerged"))
+                    let deletedWorkspace = expectSucceeded "status with deleted unmerged worktree file" deletedStatus
+                    Vitest.expect(deletedWorkspace.Changes |> Array.filter isConflictedChange |> Array.length > 0).toBe true
+                    Vitest.expect(deletedWorkspace.WorkspaceVersion).not.toBe (beforeDeletion.WorkspaceVersion)
+
+                    let! staleResolve =
+                        Async.StartAsPromise(
+                            conflicts.Resolve
+                                {
+                                    Handle = capturedSummary.Handle
+                                    ExpectedWorkspaceVersion = beforeDeletion.WorkspaceVersion
+                                    Path = mkPath "base.txt"
+                                    Resolution = PickCandidate "target"
+                                }
+                                (ctx "missing-unmerged-stale-resolve")
+                        )
+
+                    let failure =
+                        match staleResolve with
+                        | Failed failure -> failure
+                        | PartiallySucceeded(_, failure) -> failure
+                        | Succeeded _ -> failwith "Expected the deleted unmerged worktree file to stale the captured request."
+
+                    Vitest.expect(failure.Category).toEqual (Concurrency)
+                    Vitest.expect(failure.Code).toBe ("precondition_failed")
+                    Vitest
+                        .expect(failure.RecoveryAction |> Option.map _.Code)
+                        .toEqual (Some "refresh_conflict_session")
+
+                    do! ensureDirectoryAsync conflictFile
+
+                    let! directoryStatus =
+                        Async.StartAsPromise(session.Core.GetStatus(ctx "status-directory-replaced-unmerged"))
+
+                    let directoryWorkspace =
+                        expectSucceeded "status with directory-replaced unmerged worktree file" directoryStatus
+
+                    Vitest
+                        .expect(directoryWorkspace.Changes |> Array.filter isConflictedChange |> Array.length > 0)
+                        .toBe true
+
+                    Vitest.expect(directoryWorkspace.WorkspaceVersion).not.toBe (deletedWorkspace.WorkspaceVersion)
+
+                    let! cancelResult =
+                        Async.StartAsPromise(
+                            conflicts.Cancel
+                                {
+                                    Handle = capturedSummary.Handle
+                                    ExpectedWorkspaceVersion = directoryWorkspace.WorkspaceVersion
+                                }
+                                (ctx "directory-replaced-unmerged-cancel")
+                        )
+
+                    expectSucceeded "cancel after directory-replaced unmerged worktree file" cancelResult |> ignore
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
 )
 
 Vitest.describe (
@@ -806,26 +960,6 @@ Vitest.describe (
                     let failure = expectFailure "status with failed unmerged probe" result
                     Vitest.expect(failure.Category).toEqual (Network)
                     Vitest.expect(failure.Code).toBe ("unmerged_probe_failed")
-                    do! removeDirectoryAsync root
-                with error ->
-                    do! removeDirectoryAsync root
-                    return raise error
-            }
-        )
-
-        Vitest.test (
-            "propagates an unreadable unmerged worktree path instead of minting a token",
-            TestOptions(timeout = 120000),
-            fun () -> promise {
-                let! root, workPath, session, _, _, _ = createUnmergedConflictFixture ()
-
-                try
-                    let conflictFile = join [| workPath; "base.txt" |]
-                    do! removePathAsync conflictFile
-                    do! ensureDirectoryAsync conflictFile
-                    let! result = Async.StartAsPromise(session.Core.GetStatus(ctx "unreadable-unmerged-path"))
-                    let failure = expectFailure "status with unreadable unmerged path" result
-                    Vitest.expect(failure.Category).toEqual (ProviderError)
                     do! removeDirectoryAsync root
                 with error ->
                     do! removeDirectoryAsync root
