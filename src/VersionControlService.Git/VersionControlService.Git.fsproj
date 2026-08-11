@@ -30,8 +30,9 @@
     <ProjectReference Include="..\VersionControlService.Runtime.Node\VersionControlService.Runtime.Node.fsproj" />
   </ItemGroup>
   <ItemGroup>
-    <PackageReference Include="ARCtrl.Javascript" />
     <PackageReference Include="Fable.Core" />
+    <PackageReference Include="Fable.Promise" />
+    <PackageReference Include="Thoth.Json.JavaScript" />
   </ItemGroup>
   <ItemGroup>
     <Content Include="VersionControlService.Git.fsproj" Pack="true" PackagePath="fable\" />

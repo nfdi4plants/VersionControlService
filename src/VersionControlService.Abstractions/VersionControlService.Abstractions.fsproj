@@ -1,6 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
+    <PackageId>VersionControlService.Abstractions</PackageId>
+    <Description>Provider-neutral version control contracts, workspace sessions, and provider resolution.</Description>
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="Identifiers.fs" />

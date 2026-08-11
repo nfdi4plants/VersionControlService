@@ -31,6 +31,9 @@ let mutable private cachedSystemInstalled = false
 [<Literal>]
 let private lfsLsFilesTimeoutMs = 15000
 
+[<Emit("console.warn($0)")>]
+let private warn (message: string) : unit = jsNative
+
 /// Parses Git LFS's platform-specific version banner (`git-lfs/3.6.1`,
 /// `git lfs 3.6.1`, ...). A successful executable probe without a version is
 /// still installed, but is not considered compatible for dependent workflows.
@@ -801,7 +804,7 @@ let readLsFilesByRelativePath
                             else
                                 parseError.Message
 
-                        Browser.Dom.console.warn $"Git LFS ls-files parse warning: {reason}"
+                        warn $"Git LFS ls-files parse warning: {reason}"
                         return Error reason
         with error ->
             let message =
@@ -819,7 +822,7 @@ let tryGetLsFilesByRelativePath (repoRoot: string) : JS.Promise<Dictionary<strin
     match! readLsFilesByRelativePath repoRoot with
     | Ok filesByRelativePath -> return filesByRelativePath
     | Error message ->
-        Browser.Dom.console.warn $"Git LFS ls-files warning: {message}"
+        warn $"Git LFS ls-files warning: {message}"
         return Dictionary<string, GitLfsLsFileInfo>()
 }
 

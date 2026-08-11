@@ -1,25 +1,17 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
-    <DefineConstants>FABLE_COMPILER</DefineConstants>
-    <DefineConstants>FABLE_COMPILER_JAVASCRIPT</DefineConstants>
     <PackageId>VersionControlService</PackageId>
-    <Version>0.0.1</Version>
-    <Authors>nfdi4plants</Authors>
     <Description>Provider-neutral version control workspace services for Fable and .NET consumers.</Description>
-    <PackageTags>fsharp;fable;git;version-control</PackageTags>
+    <IncludeBuildOutput>false</IncludeBuildOutput>
+    <SuppressDependenciesWhenPacking>false</SuppressDependenciesWhenPacking>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <NoWarn>$(NoWarn);NU5128</NoWarn>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\VersionControlService.Abstractions\VersionControlService.Abstractions.fsproj" />
     <ProjectReference Include="..\VersionControlService.Runtime.Node\VersionControlService.Runtime.Node.fsproj" />
     <ProjectReference Include="..\VersionControlService.Git\VersionControlService.Git.fsproj" />
-  </ItemGroup>
-  <ItemGroup>
-    <PackageReference Include="Fable.Core" />
-    <PackageReference Include="YAMLicious" />
-  </ItemGroup>
-  <ItemGroup>
-    <Content Include="VersionControlService.fsproj" Pack="true" PackagePath="fable\" />
-    <Content Include="Resolution\*.fs" Pack="true" PackagePath="fable\Resolution\" />
+    <ProjectReference Include="..\VersionControlService.LakeFs\VersionControlService.LakeFs.fsproj" />
   </ItemGroup>
 </Project>

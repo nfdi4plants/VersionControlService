@@ -1,9 +1,26 @@
 <Project>
     <PropertyGroup>
         <DisableImplicitFSharpCoreReference>true</DisableImplicitFSharpCoreReference>
+        <Authors>nfdi4plants</Authors>
+        <RepositoryUrl>https://github.com/nfdi4plants/VersionControlService</RepositoryUrl>
+        <RepositoryType>git</RepositoryType>
+        <PackageLicenseExpression>MIT</PackageLicenseExpression>
+        <PackageTags>fsharp;fable;version-control;provider-spi</PackageTags>
+        <Description Condition="'$(Description)' == ''">Provider-neutral version control workspace services.</Description>
+        <Deterministic>true</Deterministic>
+        <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
+        <PublishRepositoryUrl>true</PublishRepositoryUrl>
+        <EmbedUntrackedSources>true</EmbedUntrackedSources>
+        <DebugType>portable</DebugType>
+        <IncludeSymbols>true</IncludeSymbols>
+        <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+        <!-- NuGet asks referenced projects for their package version with
+             BuildProjectReferences=false. Return an exact range there so the
+             five coordinated prerelease packages cannot be mixed by restore. -->
+        <PackageVersion Condition="'$(BuildProjectReferences)' == 'false' and '$(Version)' != ''">[$(Version)]</PackageVersion>
     </PropertyGroup>
-    <ItemGroup>
-        <!-- Depends on the same version of FSharp.Core for all the projects -->
+    <ItemGroup Condition="'$(MSBuildProjectName)' == 'VersionControlService.Abstractions' or '$(MSBuildProjectName)' == 'Build'">
+        <!-- Provider packages consume FSharp.Core transitively through Abstractions. -->
         <PackageReference Include="FSharp.Core" />
     </ItemGroup>
 </Project>
