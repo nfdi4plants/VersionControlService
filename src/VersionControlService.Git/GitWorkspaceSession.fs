@@ -2003,6 +2003,85 @@ let private revParse (state: SessionState) (reference: string) (context: Operati
         | _ -> return None
     }
 
+/// A merge process killed part-way can leave MERGE_HEAD, a half-applied index and
+/// worktree, and its index.lock behind. Cleanup runs on a copy of the context
+/// without the cancellation, because the process runner refuses to start anything
+/// on a context that is already canceled.
+let private recoverCanceledMerge
+    (state: SessionState)
+    (headBefore: RevisionId option)
+    (failure: OperationFailure)
+    (context: OperationContext)
+    : Async<OperationFailure> =
+    async {
+        let cleanupContext = {
+            context with
+                Cancellation = OperationCancellation.none
+        }
+
+        let residue (code: string) (instructions: string) = {
+            failure with
+                StateChanged = true
+                RecoveryAction =
+                    Some {
+                        Code = code
+                        Instructions = Some instructions
+                    }
+        }
+
+        // The lock goes first. git merge --abort cannot run while a dead process's
+        // lock is still in place.
+        let! lockPath = resolveGitStatePath state "index.lock" cleanupContext
+
+        let lockError =
+            match lockPath with
+            | Some path when NodeFileSystem.existsSync path ->
+                try
+                    NodeFileSystem.unlinkSync path
+                    None
+                with error ->
+                    Some error.Message
+            | _ -> None
+
+        match lockError with
+        | Some message ->
+            return
+                residue
+                    "remove_index_lock"
+                    $"Remove the stale index.lock from the repository state and refresh. Cleanup failed: {message}"
+        | None ->
+            let! mergeHead = tryGetMergeHead state cleanupContext
+
+            match mergeHead with
+            | Some _ ->
+                let! abortResult = runGit state.Hooks state.RepoPath [| "merge"; "--abort" |] None cleanupContext
+
+                match abortResult with
+                | Ok output when output.ExitCode = 0 -> return failure
+                | Ok output ->
+                    return
+                        residue
+                            "abort_merge"
+                            $"Run git merge --abort in the workspace and refresh. Cleanup failed: {output.StdErr}"
+                | Error abortFailure ->
+                    return
+                        residue
+                            "abort_merge"
+                            $"Run git merge --abort in the workspace and refresh. Cleanup failed: {abortFailure.Message}"
+            | None ->
+                // No merge state means either nothing happened or the merge finished
+                // before the kill. A moved HEAD tells the two apart.
+                let! headAfter = revParse state "HEAD" cleanupContext
+
+                match headBefore, headAfter with
+                | Some before, Some after when RevisionId.value before <> after ->
+                    return
+                        residue
+                            "refresh_workspace"
+                            "The merge finished before the cancellation took effect. Refresh to load the updated workspace."
+                | _ -> return failure
+    }
+
 let private synchronizationState (state: SessionState) (context: OperationContext) =
     async {
         let! upstreamResult = tryConfiguredUpstream state context
@@ -2397,6 +2476,9 @@ let private updateWithIdentity
                         }
 
                 match mergeResult with
+                | Error failure when failure.Category = Canceled ->
+                    let! recovered = recoverCanceledMerge state syncState.WorkspaceRevision failure context
+                    return Failed recovered
                 | Error failure -> return Failed failure
                 | Ok output when output.ExitCode = 0 ->
                     let! updatedState = synchronizationState state context
@@ -4122,6 +4204,59 @@ let createFactoryWithCredentialsAndIdentity
                         location.ConnectionProfileId
                         "origin"
 
+                // Remember what the target looked like so a killed or failed clone can be
+                // undone without touching anything the caller already had there.
+                let targetExistedBefore = NodeFileSystem.existsSync request.TargetPath
+
+                let targetWasEmptyDirectory =
+                    targetExistedBefore
+                    && (let stats = NodeFileSystem.lstatSync request.TargetPath
+
+                        stats.isDirectory ()
+                        && not (stats.isSymbolicLink ())
+                        && (NodeFileSystem.readdirSync request.TargetPath).Length = 0)
+
+                let removeCloneResidue () =
+                    async {
+                        try
+                            if not targetExistedBefore then
+                                if NodeFileSystem.existsSync request.TargetPath then
+                                    do!
+                                        NodeFileSystem.rmAsync
+                                            request.TargetPath
+                                            (NodeFileSystem.RmOptions(recursive = true, force = true))
+                                        |> Async.AwaitPromise
+                            elif targetWasEmptyDirectory then
+                                for entry in NodeFileSystem.readdirSync request.TargetPath do
+                                    do!
+                                        NodeFileSystem.rmAsync
+                                            (NodePath.join [| request.TargetPath; entry |])
+                                            (NodeFileSystem.RmOptions(recursive = true, force = true))
+                                        |> Async.AwaitPromise
+
+                            return None
+                        with error ->
+                            return Some error.Message
+                    }
+
+                // When the residue could not be removed the failure says so, with the
+                // path the caller has to clear, so StateChanged stays truthful.
+                let withResidue (failure: OperationFailure) (cleanupError: string option) =
+                    match cleanupError with
+                    | None -> failure
+                    | Some message ->
+                        {
+                            failure with
+                                StateChanged = true
+                                RecoveryAction =
+                                    Some {
+                                        Code = "remove_clone_target"
+                                        Instructions =
+                                            Some
+                                                $"Remove '{request.TargetPath}' before retrying the clone. Cleanup failed: {message}"
+                                    }
+                        }
+
                 // Large objects stay as pointers during the Git transfer; hydration is a
                 // separate step so its failure can be reported as partial success.
                 let! result =
@@ -4143,9 +4278,12 @@ let createFactoryWithCredentialsAndIdentity
                         context
 
                 match result with
-                | Error failure -> return Failed failure
+                | Error failure ->
+                    let! cleanupError = removeCloneResidue ()
+                    return Failed(withResidue failure cleanupError)
                 | Ok output when output.ExitCode <> 0 ->
                     let combined = output.StdErr + output.StdOut
+                    let! cleanupError = removeCloneResidue ()
 
                     if combined.Contains "already exists and is not an empty directory" then
                         return
@@ -4158,7 +4296,12 @@ let createFactoryWithCredentialsAndIdentity
                     else
                         return
                             Failed(
-                                OperationFailure.createRedacted ProviderError "clone_failed" $"Clone failed: {combined}"
+                                withResidue
+                                    (OperationFailure.createRedacted
+                                        ProviderError
+                                        "clone_failed"
+                                        $"Clone failed: {combined}")
+                                    cleanupError
                             )
                 | Ok _ ->
                     let binding = bindingFor request.TargetPath location

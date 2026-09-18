@@ -10,6 +10,7 @@ open Vitest
 module GitWorkspaceSession = VersionControlService.Git.GitWorkspaceSession
 module GitCredentialStrategy = VersionControlService.Git.GitCredentialStrategy
 module NodeProcess = VersionControlService.Runtime.Node.Process
+module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 
 let private fsPromisesDynamic: obj = importAll "fs/promises"
 let private osDynamic: obj = importAll "os"
@@ -527,7 +528,7 @@ Vitest.describe (
             TestOptions(timeout = 120000),
             fun () -> promise {
                 let identity: GitCredentialStrategy.GitIdentityStrategy = {
-                    ResolveIdentity = fun _workspaceRoot ->
+                    ResolveIdentity = fun _request ->
                         async {
                             return Some { Name = "Merge Author"; Email = "merge@example.org" }
                         }
@@ -575,7 +576,7 @@ Vitest.describe (
             TestOptions(timeout = 120000),
             fun () -> promise {
                 let identity: GitCredentialStrategy.GitIdentityStrategy = {
-                    ResolveIdentity = fun _workspaceRoot ->
+                    ResolveIdentity = fun _request ->
                         async {
                             return Some { Name = "Finalize Author"; Email = "finalize@example.org" }
                         }
@@ -2241,6 +2242,214 @@ Vitest.describe (
                         )
 
                     expectValue "publish after cancellations" retryPublish |> ignore
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "canceled clone removes the target directory it created",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request context ->
+                            async {
+                                if request.Arguments |> Array.contains "clone" then
+                                    let targetPath = request.Arguments[request.Arguments.Length - 1]
+                                    do! ensureDirectoryAsync targetPath |> Async.AwaitPromise
+                                    do!
+                                        writeUtf8FileAsync (join [| targetPath; "partial.txt" |]) "partial\n"
+                                        |> Async.AwaitPromise
+
+                                    return
+                                        OperationResult.failed (
+                                            OperationFailure.create
+                                                Canceled
+                                                "operation_canceled"
+                                                "simulated kill during clone"
+                                        )
+                                else
+                                    return! NodeProcess.run request context
+                            })
+                    Barrier = None
+                }
+
+                let! root, _, barePath, _ = createSyncFixture hooks
+                let targetPath = join [| root; "partial-clone" |]
+
+                try
+                    let factory = GitWorkspaceSession.createFactory hooks
+
+                    let! cloneResult =
+                        Async.StartAsPromise(
+                            factory.Clone
+                                {
+                                    Location = {
+                                        ProviderId = gitProviderId
+                                        DisplayName = None
+                                        ProviderLocation = barePath
+                                        ConnectionProfileId = None
+                                    }
+                                    TargetPath = targetPath
+                                    TargetRef = None
+                                    MaterializeAllObjects = false
+                                }
+                                (ctx "clone-residue")
+                        )
+
+                    let failure = expectProviderFailure "canceled clone residue" cloneResult
+                    Vitest.expect(failure.Category).toEqual (Canceled)
+                    Vitest.expect(failure.Code).toBe ("operation_canceled")
+                    Vitest.expect(failure.StateChanged).toBe (false)
+                    Vitest.expect(NodeFileSystem.existsSync targetPath).toBe (false)
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "failed clone into an existing empty directory leaves it empty",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request context ->
+                            async {
+                                if request.Arguments |> Array.contains "clone" then
+                                    let targetPath = request.Arguments[request.Arguments.Length - 1]
+                                    do! ensureDirectoryAsync targetPath |> Async.AwaitPromise
+                                    do!
+                                        writeUtf8FileAsync (join [| targetPath; "partial.txt" |]) "partial\n"
+                                        |> Async.AwaitPromise
+
+                                    return
+                                        OperationResult.failed (
+                                            OperationFailure.createRedacted
+                                                ProviderError
+                                                "clone_failed"
+                                                "simulated clone failure"
+                                        )
+                                else
+                                    return! NodeProcess.run request context
+                            })
+                    Barrier = None
+                }
+
+                let! root, _, barePath, _ = createSyncFixture hooks
+                let targetPath = join [| root; "empty-target" |]
+
+                try
+                    do! ensureDirectoryAsync targetPath
+                    let factory = GitWorkspaceSession.createFactory hooks
+
+                    let! cloneResult =
+                        Async.StartAsPromise(
+                            factory.Clone
+                                {
+                                    Location = {
+                                        ProviderId = gitProviderId
+                                        DisplayName = None
+                                        ProviderLocation = barePath
+                                        ConnectionProfileId = None
+                                    }
+                                    TargetPath = targetPath
+                                    TargetRef = None
+                                    MaterializeAllObjects = false
+                                }
+                                (ctx "failed-clone-residue")
+                        )
+
+                    let failure = expectProviderFailure "failed clone residue" cloneResult
+                    Vitest.expect(failure.Code).toBe ("clone_failed")
+                    Vitest.expect(failure.StateChanged).toBe (false)
+                    Vitest.expect(NodeFileSystem.existsSync targetPath).toBe (true)
+                    Vitest.expect((NodeFileSystem.statSync targetPath).isDirectory()).toBe (true)
+                    Vitest.expect(NodeFileSystem.readdirSync targetPath).toEqual [||]
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        // The fake MERGE_HEAD plus lock stands in for a git merge process that was killed after it wrote its state files.
+        Vitest.test (
+            "canceled update aborts a half-finished merge and removes the stale index lock",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable targetHash = ""
+                let mutable armCancel: OperationCancellation.Source option = None
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess = None
+                    Barrier =
+                        Some(fun root point _context ->
+                            async {
+                                if point = "update-merge" then
+                                    do!
+                                        writeUtf8FileAsync
+                                            (join [| root; ".git"; "MERGE_HEAD" |])
+                                            (targetHash + "\n")
+                                        |> Async.AwaitPromise
+
+                                    do!
+                                        writeUtf8FileAsync (join [| root; ".git"; "index.lock" |]) ""
+                                        |> Async.AwaitPromise
+
+                                    match armCancel with
+                                    | Some source ->
+                                        armCancel <- None
+                                        source.Cancel()
+                                    | None -> ()
+                            })
+                }
+
+                let! root, workPath, barePath, session = createSyncFixture hooks
+
+                try
+                    do! advanceTarget root barePath [ "merge-residue.txt", "content\n" ]
+                    let! observedTargetHash = runGitIn barePath [| "rev-parse"; "main" |]
+                    targetHash <- observedTargetHash.Trim()
+
+                    let! beforeUpdate = sessionStatus session
+                    let source = OperationCancellation.Source()
+                    armCancel <- Some source
+                    let context = OperationContext.create "cancel-update-merge" source.Cancellation ignore
+
+                    let! updateResult =
+                        Async.StartAsPromise(
+                            (syncService session).Update
+                                { ExpectedWorkspaceVersion = beforeUpdate.WorkspaceVersion }
+                                context
+                        )
+
+                    let failure = expectProviderFailure "canceled update merge residue" updateResult
+                    Vitest.expect(failure.Category).toEqual (Canceled)
+                    Vitest.expect(failure.Code).toBe ("operation_canceled")
+                    Vitest.expect(failure.StateChanged).toBe (false)
+
+                    let! mergeHead = tryReadUtf8FileAsync (join [| workPath; ".git"; "MERGE_HEAD" |])
+                    let! indexLock = tryReadUtf8FileAsync (join [| workPath; ".git"; "index.lock" |])
+                    let! mergeResidue = tryReadUtf8FileAsync (join [| workPath; "merge-residue.txt" |])
+                    let! status = runGitIn workPath [| "status"; "--porcelain" |]
+                    let! afterUpdate = sessionStatus session
+
+                    Vitest.expect(mergeHead).toEqual (None)
+                    Vitest.expect(indexLock).toEqual (None)
+                    Vitest.expect(mergeResidue).toEqual (None)
+                    Vitest.expect(status.Trim()).toBe ("")
+                    Vitest.expect(afterUpdate.ActiveConflictSession).toEqual (None)
 
                     do! removeDirectoryAsync root
                 with error ->
