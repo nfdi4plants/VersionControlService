@@ -2384,42 +2384,52 @@ Vitest.describe (
             }
         )
 
-        // No merge runs here. The barrier writes the state files a killed true merge
-        // leaves behind and cancels before the spawn, so the test pins the recovery
-        // sequence (lock removal, then merge --abort) and nothing else.
+        // The hook stands in for a true merge killed after it wrote MERGE_HEAD and its
+        // index lock. Cancellation is reported from inside the spawn, the way a killed
+        // process reports it, so the recovery sequence (lock removal, then merge --abort)
+        // runs for real.
         Vitest.test (
             "canceled update aborts a half-finished merge and removes the stale index lock",
             TestOptions(timeout = 120000),
             fun () -> promise {
                 let mutable targetHash = ""
-                let mutable armCancel: OperationCancellation.Source option = None
+                let mutable workspacePath = ""
 
                 let hooks: GitWorkspaceSession.GitSessionHooks = {
                     RunBytesProcess = None
-                    RunProcess = None
-                    Barrier =
-                        Some(fun repoPath point _context ->
+                    RunProcess =
+                        Some(fun request context ->
                             async {
-                                if point = "update-merge" then
+                                // The recovery's own `git merge --abort` must reach real git.
+                                if
+                                    request.Arguments |> Array.contains "merge"
+                                    && not (request.Arguments |> Array.contains "--abort")
+                                then
                                     do!
                                         writeUtf8FileAsync
-                                            (join [| repoPath; ".git"; "MERGE_HEAD" |])
+                                            (join [| workspacePath; ".git"; "MERGE_HEAD" |])
                                             (targetHash + "\n")
                                         |> Async.AwaitPromise
 
                                     do!
-                                        writeUtf8FileAsync (join [| repoPath; ".git"; "index.lock" |]) ""
+                                        writeUtf8FileAsync (join [| workspacePath; ".git"; "index.lock" |]) ""
                                         |> Async.AwaitPromise
 
-                                    match armCancel with
-                                    | Some source ->
-                                        armCancel <- None
-                                        source.Cancel()
-                                    | None -> ()
+                                    return
+                                        OperationResult.failed (
+                                            OperationFailure.create
+                                                Canceled
+                                                "operation_canceled"
+                                                "simulated kill during merge"
+                                        )
+                                else
+                                    return! NodeProcess.run request context
                             })
+                    Barrier = None
                 }
 
                 let! root, workPath, barePath, session = createSyncFixture hooks
+                workspacePath <- workPath
 
                 try
                     do! advanceTarget root barePath [ "merge-residue.txt", "content\n" ]
@@ -2427,15 +2437,12 @@ Vitest.describe (
                     targetHash <- observedTargetHash.Trim()
 
                     let! beforeUpdate = sessionStatus session
-                    let source = OperationCancellation.Source()
-                    armCancel <- Some source
-                    let context = OperationContext.create "cancel-update-merge" source.Cancellation ignore
 
                     let! updateResult =
                         Async.StartAsPromise(
                             (syncService session).Update
                                 { ExpectedWorkspaceVersion = beforeUpdate.WorkspaceVersion }
-                                context
+                                (ctx "cancel-update-merge")
                         )
 
                     let failure = expectProviderFailure "canceled update merge residue" updateResult
@@ -2647,6 +2654,138 @@ Vitest.describe (
                     let! headAfter = runGitIn workPath [| "rev-parse"; "HEAD" |]
                     Vitest.expect(landed).toEqual (Some "content\n")
                     Vitest.expect(headAfter.Trim()).toBe (targetHash.Trim())
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        // git writes the index before it moves HEAD, so a kill in that window leaves the
+        // target's new file staged. The recovery has to unstage it as well as delete it.
+        Vitest.test (
+            "canceled fast-forward merge unstages a file git had already added",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable workspacePath = ""
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request context ->
+                            async {
+                                if request.Arguments |> Array.contains "merge" then
+                                    do!
+                                        writeUtf8FileAsync (join [| workspacePath; "staged-residue.txt" |]) "content\n"
+                                        |> Async.AwaitPromise
+
+                                    let! _ = runGitIn workspacePath [| "add"; "--"; "staged-residue.txt" |] |> Async.AwaitPromise
+
+                                    return
+                                        OperationResult.failed (
+                                            OperationFailure.create
+                                                Canceled
+                                                "operation_canceled"
+                                                "simulated kill after the index write"
+                                        )
+                                else
+                                    return! NodeProcess.run request context
+                            })
+                    Barrier = None
+                }
+
+                let! root, workPath, barePath, session = createSyncFixture hooks
+                workspacePath <- workPath
+
+                try
+                    do! advanceTarget root barePath [ "staged-residue.txt", "content\n" ]
+                    let! beforeUpdate = sessionStatus session
+
+                    let! updateResult =
+                        Async.StartAsPromise(
+                            (syncService session).Update
+                                { ExpectedWorkspaceVersion = beforeUpdate.WorkspaceVersion }
+                                (ctx "cancel-ff-staged")
+                        )
+
+                    let failure = expectProviderFailure "canceled staged fast-forward" updateResult
+                    Vitest.expect(failure.Category).toEqual (Canceled)
+                    Vitest.expect(failure.StateChanged).toBe (false)
+                    Vitest.expect(failure.RecoveryAction).toEqual (None)
+
+                    let! residue = tryReadUtf8FileAsync (join [| workPath; "staged-residue.txt" |])
+                    let! status = runGitIn workPath [| "status"; "--porcelain" |]
+                    Vitest.expect(residue).toEqual (None)
+                    Vitest.expect(status.Trim()).toBe ("")
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        // The user edited base.txt before the update and the target changes the same
+        // file. git would refuse that fast-forward, and a kill before the refusal writes
+        // nothing. An unrelated scratch file appearing meanwhile moves the workspace
+        // version, so the recovery runs, and it must leave the user's edit alone.
+        Vitest.test (
+            "canceled merge recovery never restores paths the user had changed beforehand",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable workspacePath = ""
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request context ->
+                            async {
+                                if request.Arguments |> Array.contains "merge" then
+                                    do!
+                                        writeUtf8FileAsync (join [| workspacePath; "scratch.txt" |]) "editor scratch\n"
+                                        |> Async.AwaitPromise
+
+                                    return
+                                        OperationResult.failed (
+                                            OperationFailure.create
+                                                Canceled
+                                                "operation_canceled"
+                                                "simulated kill before the overwrite check"
+                                        )
+                                else
+                                    return! NodeProcess.run request context
+                            })
+                    Barrier = None
+                }
+
+                let! root, workPath, barePath, session = createSyncFixture hooks
+                workspacePath <- workPath
+
+                try
+                    do! advanceTarget root barePath [ "base.txt", "target base\n" ]
+                    do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) "local edit\n"
+                    let! beforeUpdate = sessionStatus session
+
+                    let! updateResult =
+                        Async.StartAsPromise(
+                            (syncService session).Update
+                                { ExpectedWorkspaceVersion = beforeUpdate.WorkspaceVersion }
+                                (ctx "cancel-protected")
+                        )
+
+                    let failure = expectProviderFailure "canceled protected merge" updateResult
+                    Vitest.expect(failure.Category).toEqual (Canceled)
+                    Vitest.expect(failure.StateChanged).toBe (true)
+
+                    Vitest
+                        .expect(failure.RecoveryAction |> Option.map (fun action -> action.Code))
+                        .toEqual (Some "restore_workspace")
+
+                    let! baseContent = tryReadUtf8FileAsync (join [| workPath; "base.txt" |])
+                    let! scratch = tryReadUtf8FileAsync (join [| workPath; "scratch.txt" |])
+                    Vitest.expect(baseContent).toEqual (Some "local edit\n")
+                    Vitest.expect(scratch).toEqual (Some "editor scratch\n")
 
                     do! removeDirectoryAsync root
                 with error ->

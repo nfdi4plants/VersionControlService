@@ -4,6 +4,7 @@
 /// place secrets in bindings, requests, or output.
 module VersionControlService.Git.GitCredentialStrategy
 
+open System
 open System.Text.RegularExpressions
 open Fable.Core
 
@@ -23,7 +24,8 @@ type RevisionIdentity = {
 /// What the application receives when the Git provider asks it for a revision
 /// identity. TargetHost is the DNS host of the remote the revision will be published
 /// to: the configured publish remote of the current branch when there is one,
-/// otherwise the bound location. It is None for local paths. ConnectionProfileId is
+/// otherwise the bound location. It is None when no host can be read from that
+/// value, which includes local paths. ConnectionProfileId is
 /// the session profile, the same value credential resolution receives, so an
 /// application that keeps several accounts per host can pick the matching one.
 type RevisionIdentityRequest = {
@@ -54,20 +56,40 @@ let anonymousIdentity: GitIdentityStrategy = {
 
 let private scpRemoteHostPattern = Regex(@"^[^\s@/:]+@([^\s/:]+):.+$")
 
-/// Host of a remote URL for identity selection. Credential lookup treats scp-style
-/// SSH remotes (user@host:path) as anonymous because git's own transport
-/// authenticates them, but an application can still match an account to that host,
-/// so identity selection reads it. Local paths and other forms give None.
+/// Host of a remote URL for identity selection. Credential lookup only reads https
+/// and ssh URLs and treats everything else as anonymous, because git's own transport
+/// authenticates it. An application can still match an account to the host of an
+/// http or git URL or of an scp-style remote (user@host:path), so identity selection
+/// reads those too. Local paths and forms without a readable host give None.
 let tryIdentityHost (remoteUrl: string) : string option =
     match GitAuthAdapter.tryExtractHostFromRemoteUrl remoteUrl with
     | Ok host -> Some host
     | Error _ ->
-        let scpMatch = scpRemoteHostPattern.Match(remoteUrl.Trim())
+        let trimmed = remoteUrl.Trim()
 
-        if scpMatch.Success then
-            Some(scpMatch.Groups.[1].Value.ToLowerInvariant())
-        else
-            None
+        let schemeHost =
+            if
+                trimmed.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+                || trimmed.StartsWith("git://", StringComparison.OrdinalIgnoreCase)
+            then
+                let mutable uri = Unchecked.defaultof<Uri>
+
+                if Uri.TryCreate(trimmed, UriKind.Absolute, &uri) && not (String.IsNullOrWhiteSpace uri.Host) then
+                    Some(uri.Host.Trim().ToLowerInvariant())
+                else
+                    None
+            else
+                None
+
+        match schemeHost with
+        | Some host -> Some host
+        | None ->
+            let scpMatch = scpRemoteHostPattern.Match trimmed
+
+            if scpMatch.Success then
+                Some(scpMatch.Groups.[1].Value.ToLowerInvariant())
+            else
+                None
 
 [<Emit("Buffer.from($0, 'utf8').toString('base64')")>]
 let private toBase64 (_value: string) : string = jsNative
