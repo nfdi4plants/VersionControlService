@@ -4598,16 +4598,13 @@ let createFactoryWithCredentialsAndIdentity
                                 else
                                     hydrationOutput.StdErr
 
+                            let failure = hydrationFailure "clone" detail
+
                             return
                                 OperationResult.partiallySucceeded
                                     (OperationOutcome.performed binding)
-                                    (hydrationFailure "clone" detail)
-                                    {
-                                        Code = "retry_materialization"
-                                        Instructions =
-                                            Some
-                                                "Retry downloading large objects once the object store is reachable."
-                                    }
+                                    failure
+                                    (materializationRecovery failure)
                         | Error hydrationFailure ->
                             return
                                 OperationResult.partiallySucceeded

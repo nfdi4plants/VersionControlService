@@ -2531,6 +2531,68 @@ Vitest.describe (
             }
         )
 
+        // Same kill, this time against a file that already exists in HEAD, so the
+        // recovery has to put the HEAD content back instead of deleting a new file.
+        Vitest.test (
+            "canceled fast-forward merge restores a tracked file to its HEAD content",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable workspacePath = ""
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request context ->
+                            async {
+                                if request.Arguments |> Array.contains "merge" then
+                                    do!
+                                        writeUtf8FileAsync (join [| workspacePath; "base.txt" |]) "rewritten base\n"
+                                        |> Async.AwaitPromise
+
+                                    return
+                                        OperationResult.failed (
+                                            OperationFailure.create
+                                                Canceled
+                                                "operation_canceled"
+                                                "simulated kill during fast-forward"
+                                        )
+                                else
+                                    return! NodeProcess.run request context
+                            })
+                    Barrier = None
+                }
+
+                let! root, workPath, barePath, session = createSyncFixture hooks
+                workspacePath <- workPath
+
+                try
+                    do! advanceTarget root barePath [ "base.txt", "rewritten base\n" ]
+                    let! beforeUpdate = sessionStatus session
+
+                    let! updateResult =
+                        Async.StartAsPromise(
+                            (syncService session).Update
+                                { ExpectedWorkspaceVersion = beforeUpdate.WorkspaceVersion }
+                                (ctx "cancel-ff-tracked")
+                        )
+
+                    let failure = expectProviderFailure "canceled tracked fast-forward" updateResult
+                    Vitest.expect(failure.Category).toEqual (Canceled)
+                    Vitest.expect(failure.StateChanged).toBe (false)
+                    Vitest.expect(failure.RecoveryAction).toEqual (None)
+
+                    let! baseContent = tryReadUtf8FileAsync (join [| workPath; "base.txt" |])
+                    let! status = runGitIn workPath [| "status"; "--porcelain" |]
+                    Vitest.expect(baseContent).toEqual (Some "base content\n")
+                    Vitest.expect(status.Trim()).toBe ("")
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
         // The hook lets the real merge finish and only then reports the cancellation,
         // which is what a kill signal that arrives too late looks like to the caller.
         Vitest.test (
