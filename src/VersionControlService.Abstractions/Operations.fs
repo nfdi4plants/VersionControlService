@@ -6,7 +6,10 @@ open System
 type OperationCancellation = {
     /// True once cancellation has been requested.
     IsCancellationRequested: unit -> bool
-    /// Registers a callback invoked when cancellation is requested; invoked immediately when already canceled.
+    /// Registers a callback invoked when cancellation is requested. It runs immediately when
+    /// already canceled. Implementations must make IsCancellationRequested return true before
+    /// they invoke callbacks: providers read the flag inside abort handlers to tell a
+    /// cancellation from a transport failure.
     Register: (unit -> unit) -> unit
 }
 
