@@ -1681,6 +1681,14 @@ let uploadObjects
         elif cancelCheck () then
             return Error(exn "Git LFS upload cancelled.")
         else
+            // stdout is a pipe, so request live progress explicitly. Git LFS otherwise
+            // suppresses updates and its asynchronous final summary can race process exit.
+            // Keep this override local to the upload without changing the caller's auth env.
+            let uploadEnvironment: obj =
+                Fable.Core.JsInterop.emitJsExpr
+                    commandAuth.Environment
+                    "({ ...$0, GIT_LFS_FORCE_PROGRESS: '1' })"
+
             let! exactUploadResult =
                 runSpawnedGit {
                     WorkingDirectory = Some repoPath
@@ -1692,7 +1700,7 @@ let uploadObjects
                         remoteName
                         "--stdin"
                     |]
-                    Environment = Some commandAuth.Environment
+                    Environment = Some uploadEnvironment
                     StandardInput = Some(String.concat "\n" [| yield! lfsObjectIds; yield "" |])
                     CancelCheck = Some cancelCheck
                     TimeoutMs = None
@@ -1714,7 +1722,7 @@ let uploadObjects
                                 remoteName
                                 refSpec
                             |]
-                            Environment = Some commandAuth.Environment
+                            Environment = Some uploadEnvironment
                             StandardInput = None
                             CancelCheck = Some cancelCheck
                             TimeoutMs = None

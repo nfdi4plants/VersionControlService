@@ -3667,13 +3667,31 @@ Vitest.describe (
                     let! publishStatus = sessionStatus session
 
                     let! publishResult =
-                        (syncService session).Publish
-                            {
-                                ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
-                                ExpectedTargetRevision = None
-                            }
-                            publishContext
-                        |> Async.StartAsPromise
+                        promise {
+                            let previousGoMaxProcs: obj = emitJsExpr () "process.env.GOMAXPROCS"
+                            let previousForceProgress: obj = emitJsExpr () "process.env.GIT_LFS_FORCE_PROGRESS"
+
+                            try
+                                // A single Go scheduler exposes Git LFS exiting before its final
+                                // piped summary is written. The provider must request live progress,
+                                // even when the host environment has disabled it.
+                                emitJsStatement
+                                    ()
+                                    "process.env.GOMAXPROCS = '1'; process.env.GIT_LFS_FORCE_PROGRESS = '0';"
+
+                                return!
+                                    (syncService session).Publish
+                                        {
+                                            ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                            ExpectedTargetRevision = None
+                                        }
+                                        publishContext
+                                    |> Async.StartAsPromise
+                            finally
+                                emitJsStatement
+                                    (previousGoMaxProcs, previousForceProgress)
+                                    "for (const [key, value] of [['GOMAXPROCS', $0], ['GIT_LFS_FORCE_PROGRESS', $1]]) { if (value == null) delete process.env[key]; else process.env[key] = value; }"
+                        }
 
                     expectValue "explicit LFS publish" publishResult |> ignore
 
