@@ -1598,12 +1598,11 @@ let getMergeConflictViewData
                         })
     }
 
-/// Plans and performs only the explicit LFS portion of a provider publish.
-/// The caller owns the subsequent ref mutation and must set
-/// `GIT_LFS_SKIP_PUSH=1` when this function returns `Ok true`.
-/// Plans and performs the explicit LFS upload for a push. `fetchAuth` is scoped to the
-/// remote's fetch URL and only serves the ls-remote that reads remote tips. `commandAuth`
-/// is scoped to the push URL and serves the dry run and the upload.
+/// Plans and performs only the explicit LFS portion of a provider publish. The caller
+/// owns the subsequent ref mutation and must set `GIT_LFS_SKIP_PUSH=1` when this
+/// function returns `Ok true`. `fetchAuth` is scoped to the remote's fetch URL and only
+/// serves the ls-remote that reads remote tips. `commandAuth` is scoped to the push URL
+/// and serves the dry run and the upload.
 let prepareExplicitLfsPush
     (arcPath: string)
     (remoteName: string)
