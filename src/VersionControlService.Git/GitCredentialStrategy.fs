@@ -19,9 +19,18 @@ type RevisionIdentity = {
     Email: string
 }
 
+/// What the host knows when it is asked for a revision identity. TargetHost is the
+/// host of the bound remote location, the same host credentials resolve against, so
+/// a host can pick the account whose identity matches where the revision will be
+/// published. It is None for local paths and other locations without a URL host.
+type RevisionIdentityRequest = {
+    WorkspaceRoot: string
+    TargetHost: string option
+}
+
 type GitIdentityStrategy = {
     /// Resolves the identity to attribute to revisions created in the workspace, or None to use repository configuration.
-    ResolveIdentity: string -> Async<RevisionIdentity option>
+    ResolveIdentity: RevisionIdentityRequest -> Async<RevisionIdentity option>
 }
 
 /// Resolves a credential for (host, connection profile); None means anonymous
@@ -36,7 +45,7 @@ let anonymous: GitCredentialStrategy = {
 }
 
 let anonymousIdentity: GitIdentityStrategy = {
-    ResolveIdentity = fun _workspaceRoot -> async { return None }
+    ResolveIdentity = fun _request -> async { return None }
 }
 
 [<Emit("Buffer.from($0, 'utf8').toString('base64')")>]

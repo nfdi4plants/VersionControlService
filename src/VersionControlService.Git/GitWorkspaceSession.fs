@@ -289,7 +289,16 @@ let private resolveRevisionIdentity
     (context: OperationContext)
     : Async<Result<string[], OperationFailure>> =
     async {
-        let! resolvedIdentity = state.RevisionIdentity.ResolveIdentity state.RepoPath
+        // The host comes from the bound location, so identity and credentials resolve
+        // against the same hub without the host reading git configuration itself.
+        let identityRequest: GitCredentialStrategy.RevisionIdentityRequest = {
+            WorkspaceRoot = state.RepoPath
+            TargetHost =
+                VersionControlService.Git.GitAuthAdapter.tryExtractHostFromRemoteUrl state.Location.ProviderLocation
+                |> Result.toOption
+        }
+
+        let! resolvedIdentity = state.RevisionIdentity.ResolveIdentity identityRequest
 
         match resolvedIdentity with
         | Some identity when
