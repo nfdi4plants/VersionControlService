@@ -93,7 +93,10 @@ let request
                         BodyText = bodyText
                     }
             with error ->
-                if context.Cancellation.IsCancellationRequested() || error.Message.Contains "abort" then
+                // Only a requested cancellation counts as canceled. The abort signal handed to fetch
+                // comes from this context, so an aborted request always has the flag set, and
+                // transport errors that merely mention "abort" stay network failures.
+                if context.Cancellation.IsCancellationRequested() then
                     return
                         Error(
                             OperationFailure.create Canceled "operation_canceled" "The lakeFS request was canceled."

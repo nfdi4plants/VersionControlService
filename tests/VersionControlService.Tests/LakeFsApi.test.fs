@@ -516,3 +516,40 @@ Vitest.describe (
             }
         )
 )
+
+Vitest.describe (
+    "lakeFS API failure classification",
+    fun () ->
+        Vitest.test (
+            "a transport error that mentions abort is a network failure when nothing was canceled",
+            TestOptions(timeout = 30000),
+            fun () -> promise {
+                // The client only classifies a request as canceled when its own context asked
+                // for it. Proxies and sockets report aborts of their own, and those are outages.
+                let originalFetch: obj = emitJsExpr () "globalThis.fetch"
+
+                emitJsStatement
+                    ()
+                    "globalThis.fetch = async () => { throw new Error('socket hang up: request aborted by upstream proxy'); }"
+
+                try
+                    let connection: LakeFsConnection = {
+                        Endpoint = "http://127.0.0.1:1"
+                        AccessKeyId = "AKIA-test"
+                        SecretAccessKey = "irrelevant"
+                    }
+
+                    let! result =
+                        Async.StartAsPromise(LakeFsApi.getBranch connection "repo" "main" (ctx "abort-text"))
+
+                    match result with
+                    | Error failure ->
+                        Vitest.expect(failure.Category).toEqual (Network)
+                        Vitest.expect(failure.Code).toBe ("network_failure")
+                        Vitest.expect(failure.Retryable).toBe (true)
+                    | Ok _ -> failwith "Expected the failing transport to report an error."
+                finally
+                    emitJsStatement originalFetch "globalThis.fetch = $0"
+            }
+        )
+)
