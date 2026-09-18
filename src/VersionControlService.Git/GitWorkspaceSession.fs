@@ -33,9 +33,6 @@ module GitSessionHooks =
         Barrier = None
     }
 
-[<Emit("Date.now()")>]
-let private nowMilliseconds () : float = jsNative
-
 let private publicationVerificationTimeoutMilliseconds = 30_000
 
 let private gitProviderId =
@@ -961,7 +958,16 @@ let private resolvePublishRemoteUrl
             match urls with
             | [| url |] -> return Ok { Name = remoteName; Url = url }
             | _ -> return Error(configuredTargetInvalidFailure ())
-        | Ok _ -> return Error(configuredTargetInvalidFailure ())
+        // Exit code 2 is "No such remote". Anything else is git failing to answer.
+        | Ok output when output.ExitCode = 2 || output.ExitCode = 0 -> return Error(configuredTargetInvalidFailure ())
+        | Ok output ->
+            return
+                Error(
+                    OperationFailure.createRedacted
+                        ProviderError
+                        "git_failure"
+                        $"git remote get-url {remoteName} failed: {output.StdErr + output.StdOut}"
+                )
     }
 
 let private readOptionalConfigValue
@@ -2065,6 +2071,9 @@ type private MergeStart = {
     WorkspaceVersion: string
     Head: string option
     MergeHeadPresent: bool
+    /// True when index.lock already existed before the merge was spawned, so a lock
+    /// found afterwards was not created by this update.
+    IndexLockPresent: bool
     /// Paths that were changed or untracked before the merge. They may hold the
     /// user's work and are never treated as merge residue.
     PreexistingPaths: Set<string>
@@ -2104,6 +2113,12 @@ let private captureMergeStart
         | Ok version ->
             let! head = revParse state "HEAD" context
             let! mergeHead = tryGetMergeHead state context
+            let! lockPath = resolveGitStatePath state "index.lock" context
+
+            let lockPresent =
+                match lockPath with
+                | Some path -> NodeFileSystem.existsSync path
+                | None -> false
 
             let! status =
                 runGit
@@ -2129,6 +2144,7 @@ let private captureMergeStart
                         WorkspaceVersion = version
                         Head = head
                         MergeHeadPresent = mergeHead.IsSome
+                        IndexLockPresent = lockPresent
                         PreexistingPaths = statusPaths output.StdOut
                     }
     }
@@ -2171,11 +2187,14 @@ let private rewrittenTargetPaths
             if candidates.Length = 0 then
                 return Ok [||]
             else
+                // --ignored lists ignored files one by one under --untracked-files=all.
+                // The overwrite check exempts them, so a killed fast-forward may have
+                // written exactly those, and the report must not drop them.
                 let! status =
                     runGit
                         state.Hooks
                         state.RepoPath
-                        [| "status"; "--porcelain"; "-z"; "--untracked-files=all" |]
+                        [| "status"; "--porcelain"; "-z"; "--untracked-files=all"; "--ignored" |]
                         None
                         context
 
@@ -2235,6 +2254,19 @@ let private recoverCanceledMerge
 
         match lockPath with
         | None -> return inspect "the index.lock path could not be resolved"
+        | Some lockPath when NodeFileSystem.existsSync lockPath && start.IndexLockPresent ->
+            // The lock predates this update, so git merge refused to start and the
+            // repository is as it was. Another process holds the index or left the lock.
+            return {
+                failure with
+                    RecoveryAction =
+                        Some {
+                            Code = "remove_index_lock"
+                            Instructions =
+                                Some
+                                    "An index.lock was already present before the update started, so another process holds the index or left a stale lock. The update changed nothing. Clear the lock once no git process is running, then retry."
+                        }
+            }
         | Some lockPath when NodeFileSystem.existsSync lockPath ->
             return
                 residue
@@ -2298,6 +2330,12 @@ let private recoverCanceledMerge
 
                             match rewritten with
                             | Error message -> return inspect message
+                            | Ok [||] ->
+                                return
+                                    residue
+                                        "inspect_workspace"
+                                        "The workspace differs from its pre-merge state, but no path the update could have rewritten has changed. Review the status and refresh."
+                                        [||]
                             | Ok affected ->
                                 return
                                     residue

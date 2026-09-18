@@ -56,7 +56,7 @@ let anonymousIdentity: GitIdentityStrategy = {
 
 /// Host of a URL-form remote. Userinfo is everything up to the last "@" before the
 /// path, so a user name containing "@" does not leak into the host. Bracketed IPv6
-/// hosts are captured whole. System.Uri is avoided here because the Fable runtime
+/// hosts are captured whole. This does not use System.Uri because the Fable runtime
 /// cuts a host at its first colon.
 let private schemeHostPattern =
     Regex(
@@ -69,15 +69,23 @@ let private schemeHostPattern =
 let private scpHostPattern = Regex(@"^(?:[^/]*@)?(\[[^\]]+\]|[^/:\[]+):")
 
 let private normalizeHost (host: string) =
-    host.Trim().TrimStart('[').TrimEnd(']').ToLowerInvariant()
+    let trimmed = host.Trim()
+
+    let unbracketed =
+        if trimmed.StartsWith "[" && trimmed.EndsWith "]" then
+            trimmed.Substring(1, trimmed.Length - 2)
+        else
+            trimmed
+
+    unbracketed.ToLowerInvariant()
 
 /// Host of a remote URL for identity selection. Credential lookup only reads https
 /// and ssh URLs and treats everything else as anonymous, because git's own transport
 /// authenticates it. An application can still match an account to the host of an
-/// http, git, git+ssh or scp-style remote, so identity selection reads those too. Hosts are
-/// lowercased and IPv6 brackets are dropped. Percent-encoded and internationalized
-/// host names are returned as written. Local paths, file URLs and forms without a
-/// readable host give None.
+/// http, git, git+ssh or scp-style remote, so identity selection reads those too. The
+/// parser lowercases hosts and drops IPv6 brackets. It passes percent-encoded and
+/// internationalized names through as written. It gives None for local paths, for
+/// file URLs, and for any other form without a readable host.
 let tryIdentityHost (remoteUrl: string) : string option =
     let trimmed = remoteUrl.Trim()
     let schemeMatch = schemeHostPattern.Match trimmed

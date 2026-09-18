@@ -156,7 +156,10 @@ Vitest.describe (
                                     async {
                                         observedCommands.Add request.Arguments
 
-                                        if request.Arguments |> Array.contains "get-url" then
+                                        if
+                                            request.Arguments |> Array.contains "get-url"
+                                            && request.Arguments |> Array.contains "origin"
+                                        then
                                             let output: NodeProcess.ProcessOutput = {
                                                 ExitCode = 0
                                                 StdOut = testHttpsUrl + "
@@ -498,4 +501,42 @@ Vitest.describe (
                     return raise error
             }
         )
+)
+
+Vitest.describe (
+    "identity host parsing",
+    fun () ->
+        let cases: (string * string option) list = [
+            "https://Hub.Example.org/group/project.git", Some "hub.example.org"
+            "http://Hub.Example.org/repo", Some "hub.example.org"
+            "git://Hub.Example.org/repo", Some "hub.example.org"
+            "ssh://git@Hub.Example.org:2222/repo", Some "hub.example.org"
+            "ssh://first@last@Hub.Example.org:2222/repo", Some "hub.example.org"
+            "git+ssh://git@hub.example.org/repo", Some "hub.example.org"
+            "ssh+git://git@hub.example.org/repo", Some "hub.example.org"
+            "https://[2001:db8::1]:8443/repo", Some "2001:db8::1"
+            "ssh://git@[fe80::1%25eth0]/repo", Some "fe80::1%25eth0"
+            "git@Hub.Example.org:group/project.git", Some "hub.example.org"
+            "Hub.Example.org:repo", Some "hub.example.org"
+            "first@last@Hub.Example.org:repo", Some "hub.example.org"
+            "git@[2001:db8::1]:repo", Some "2001:db8::1"
+            "user@host:", Some "host"
+            "host:", Some "host"
+            "file:///C:/repos/project.git", None
+            "file://server/share/project.git", None
+            @"C:\repos\project.git", None
+            "C:/repos/project.git", None
+            @"\\server\share\project.git", None
+            "//server/share/project.git", None
+            "../relative/path:with-colon", None
+            "./local", None
+            "", None
+        ]
+
+        for input, expected in cases do
+            Vitest.test (
+                $"reads the identity host of '{input}'",
+                TestOptions(timeout = 30000),
+                fun () -> promise { Vitest.expect(GitCredentialStrategy.tryIdentityHost input).toEqual expected }
+            )
 )

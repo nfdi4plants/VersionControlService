@@ -906,9 +906,34 @@ Vitest.describe (
 
                     do! createRevision workspace.Binding "identity-pushurl"
 
+                    // Two distinct push URLs would publish to two hosts, which one identity
+                    // cannot serve, so the target counts as invalid and there is no host.
+                    let! _ =
+                        runGitIn
+                            workspaceRoot
+                            [||]
+                            [| "config"; "--add"; "remote.origin.pushurl"; "https://second.example.org/group/project.git" |]
+                            None
+
+                    do! createRevision workspace.Binding "identity-two-pushurls"
+                    let! _ = runGitIn workspaceRoot [||] [| "config"; "--unset-all"; "remote.origin.pushurl" |] None
+
+                    // insteadOf rewriting changes where git actually pushes, so the host
+                    // comes from the rewritten URL.
+                    let! _ = setOriginUrl "git@scp.example.org:group/project.git"
+
+                    let! _ =
+                        runGitIn
+                            workspaceRoot
+                            [||]
+                            [| "config"; "url.https://rewritten.example.org/.insteadOf"; "git@scp.example.org:" |]
+                            None
+
+                    do! createRevision workspace.Binding "identity-insteadof"
+                    let! _ = runGitIn workspaceRoot [||] [| "config"; "--remove-section"; "url.https://rewritten.example.org/" |] None
+
                     // An upstream that names no remote is an invalid target: no host at all,
                     // rather than a host the revision will never be published to.
-                    let! _ = runGitIn workspaceRoot [||] [| "config"; "--unset-all"; "remote.origin.pushurl" |] None
                     let! _ = runGitIn workspaceRoot [||] [| "config"; "branch.main.remote"; "." |] None
                     do! createRevision workspace.Binding "identity-invalid-upstream"
                     let! _ = runGitIn workspaceRoot [||] [| "config"; "branch.main.remote"; "origin" |] None
@@ -926,7 +951,7 @@ Vitest.describe (
 
                     do! createRevision fallbackBinding "identity-fallback"
 
-                    Vitest.expect(requests.Count).toBe 6
+                    Vitest.expect(requests.Count).toBe 8
 
                     for request in requests do
                         Vitest.expect(request.WorkspaceRoot).toBe workspaceRoot
@@ -938,7 +963,9 @@ Vitest.describe (
                     Vitest.expect(requests.[2].TargetHost).toEqual (Some "scp.example.org")
                     Vitest.expect(requests.[3].TargetHost).toEqual (Some "push.example.org")
                     Vitest.expect(requests.[4].TargetHost).toEqual None
-                    Vitest.expect(requests.[5].TargetHost).toEqual (Some "fallback.example.org")
+                    Vitest.expect(requests.[5].TargetHost).toEqual (Some "rewritten.example.org")
+                    Vitest.expect(requests.[6].TargetHost).toEqual None
+                    Vitest.expect(requests.[7].TargetHost).toEqual (Some "fallback.example.org")
                     do! harness.Cleanup()
                 with error ->
                     do! harness.Cleanup()

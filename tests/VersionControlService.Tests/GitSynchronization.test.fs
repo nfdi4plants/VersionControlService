@@ -1016,6 +1016,15 @@ Vitest.describe (
                     expectValue "publish with upstream credentials" publishResult |> ignore
                     Vitest.expect(credentialCalls.ToArray()).toEqual [| upstreamHost, Some "publish-profile" |]
 
+                    // The credential host must come from the effective push URL query, which
+                    // the hook answered, and not from the raw remote.<name>.url value.
+                    let askedForPushUrl =
+                        observed
+                        |> Seq.exists (fun request ->
+                            request.Arguments = [| "remote"; "get-url"; "--push"; "--all"; "upstream" |])
+
+                    Vitest.expect(askedForPushUrl).toBe true
+
                     let pushRequest =
                         observed
                         |> Seq.find (fun request -> request.Arguments |> Array.contains "push")
@@ -2502,6 +2511,15 @@ Vitest.describe (
                                     request.Arguments |> Array.contains "merge"
                                     && not (request.Arguments |> Array.contains "--abort")
                                 then
+                                    // A true merge stages the incoming file before it writes
+                                    // MERGE_HEAD. The abort has to undo that staging.
+                                    do!
+                                        writeUtf8FileAsync (join [| workspacePath; "merge-residue.txt" |]) "content\n"
+                                        |> Async.AwaitPromise
+
+                                    let! _ =
+                                        runGitIn workspacePath [| "add"; "--"; "merge-residue.txt" |] |> Async.AwaitPromise
+
                                     do!
                                         writeUtf8FileAsync
                                             (join [| workspacePath; ".git"; "MERGE_HEAD" |])
@@ -2831,8 +2849,9 @@ Vitest.describe (
         // The user edited base.txt before the update and the target changes the same
         // file. git would refuse that fast-forward, and a kill before the refusal writes
         // nothing. An unrelated scratch file appearing meanwhile moves the workspace
-        // version, so the recovery runs. It must leave the user's edit alone and must not
-        // list base.txt as a rewritten path, because it was already changed beforehand.
+        // version, so the recovery runs. It must leave the user's edit alone, and because
+        // base.txt was already changed beforehand it is not a rewritten path, so the
+        // report says that nothing attributable to the update changed.
         Vitest.test (
             "canceled merge recovery never restores paths the user had changed beforehand",
             TestOptions(timeout = 120000),
@@ -2883,7 +2902,7 @@ Vitest.describe (
 
                     Vitest
                         .expect(failure.RecoveryAction |> Option.map (fun action -> action.Code))
-                        .toEqual (Some "restore_workspace")
+                        .toEqual (Some "inspect_workspace")
 
                     Vitest.expect(failure.AffectedPaths).toEqual [||]
 
