@@ -178,13 +178,22 @@ Vitest.describe (
                             (OperationContext.detached "integration-restore-collision")
                         |> Async.StartAsPromise
 
-                    let failure = expectFailure "restore collision" restoreResult
-                    Vitest.expect(failure.Code).toBe "path_collision"
-                    Vitest.expect(failure.StateChanged).toBe false
-                    let! upper = workspace.ReadFile "Case.txt"
-                    let! lower = workspace.ReadFile "case.txt"
-                    Vitest.expect(upper).toEqual None
-                    Vitest.expect(lower).toEqual None
+                    if workspace.LocalFileSystemAliasesCase then
+                        let failure = expectFailure "restore collision" restoreResult
+                        Vitest.expect(failure.Code).toBe "path_collision"
+                        Vitest.expect(failure.StateChanged).toBe false
+                        let! upper = workspace.ReadFile "Case.txt"
+                        let! lower = workspace.ReadFile "case.txt"
+                        Vitest.expect(upper).toEqual None
+                        Vitest.expect(lower).toEqual None
+                    else
+                        // A case-sensitive filesystem keeps both names side by side, so there is
+                        // nothing to reject and both files have to arrive with their own content.
+                        expectValue "restore distinct-case paths" restoreResult |> ignore
+                        let! upper = workspace.ReadFile "Case.txt"
+                        let! lower = workspace.ReadFile "case.txt"
+                        Vitest.expect(upper).toEqual (Some "upper restore content\n")
+                        Vitest.expect(lower).toEqual (Some "lower restore content\n")
                     do! harness.Cleanup()
                 with error ->
                     do! harness.Cleanup()

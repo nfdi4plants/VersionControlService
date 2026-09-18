@@ -16,9 +16,13 @@ module NodeProcess = VersionControlService.Runtime.Node.Process
 let private fsPromisesDynamic: obj = importAll "fs/promises"
 let private osDynamic: obj = importAll "os"
 
-let private createTempDirectoryAsync () : JS.Promise<string> =
+let private createTempDirectoryAsync () : JS.Promise<string> = promise {
     let prefix = join [| osDynamic?tmpdir () |> unbox<string>; "vcs-git-harness-" |]
-    fsPromisesDynamic?mkdtemp (prefix) |> unbox<JS.Promise<string>>
+    let! created = fsPromisesDynamic?mkdtemp (prefix) |> unbox<JS.Promise<string>>
+    // GitHub's Windows runners hand out TEMP as an 8.3 short path (RUNNER~1). Git reports the
+    // long form, so resolve the directory once here and every path comparison agrees.
+    return! fsPromisesDynamic?realpath (created) |> unbox<JS.Promise<string>>
+}
 
 let private removeDirectoryAsync (path: string) : JS.Promise<unit> = promise {
     let! _ =
@@ -97,6 +101,9 @@ let private nodeExecutablePath: string = jsNative
 
 [<Emit("process.platform === 'win32'")>]
 let private isWindowsProcess () : bool = jsNative
+
+[<Emit("process.platform === 'win32' || process.platform === 'darwin'")>]
+let private localFileSystemAliasesCase () : bool = jsNative
 
 [<Emit("process.env.PATH || ''")>]
 let private currentProcessPath () : string = jsNative
@@ -337,10 +344,11 @@ let createGitHarness () : ProviderTestHarness =
             WriteFile = fun path content -> writeUtf8FileAsync (join [| binding.WorkspaceRoot; path |]) content
             ReadFile = fun path -> tryReadUtf8FileAsync (join [| binding.WorkspaceRoot; path |])
             RemoveFile = fun path -> removeFileAsync (join [| binding.WorkspaceRoot; path |])
-            // Windows NTFS: case-insensitive, normalization-sensitive, Windows name rules.
-            LocalFileSystemAliasesCase = true
+            // Windows and macOS default filesystems alias case, and only Windows enforces its
+            // reserved names. Linux runners do neither, so the flags follow the platform.
+            LocalFileSystemAliasesCase = localFileSystemAliasesCase ()
             LocalFileSystemAliasesNormalization = false
-            LocalFileSystemWindowsRules = true
+            LocalFileSystemWindowsRules = isWindowsProcess ()
         }
     }
 
@@ -2181,10 +2189,12 @@ Vitest.describe (
                     else
                         let dispatcher = join [| fakeRoot; "fake-git.js" |]
 
+                        // Same contract as the Windows fake above: answer the repository probe with
+                        // "true" and stay silent for status, so the maintenance path reaches dedup.
                         do!
                             writeUtf8FileAsync
                                 dispatcher
-                                ("if (process.argv.includes('dedup')) console.log('deduplicate: 75% ("
+                                ("if (process.argv.includes('rev-parse')) console.log('true');\nelse if (process.argv.includes('dedup')) console.log('deduplicate: 75% ("
                                  + completedBytesText
                                  + "/"
                                  + totalBytesText

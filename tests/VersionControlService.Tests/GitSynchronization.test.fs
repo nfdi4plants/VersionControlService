@@ -15,9 +15,13 @@ module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 let private fsPromisesDynamic: obj = importAll "fs/promises"
 let private osDynamic: obj = importAll "os"
 
-let private createTempDirectoryAsync () : JS.Promise<string> =
+let private createTempDirectoryAsync () : JS.Promise<string> = promise {
     let prefix = join [| osDynamic?tmpdir () |> unbox<string>; "vcs-git-sync-" |]
-    fsPromisesDynamic?mkdtemp (prefix) |> unbox<JS.Promise<string>>
+    let! created = fsPromisesDynamic?mkdtemp (prefix) |> unbox<JS.Promise<string>>
+    // GitHub's Windows runners hand out TEMP as an 8.3 short path (RUNNER~1). Git reports the
+    // long form, so resolve the directory once here and every path comparison agrees.
+    return! fsPromisesDynamic?realpath (created) |> unbox<JS.Promise<string>>
+}
 
 let private removeDirectoryAsync (path: string) : JS.Promise<unit> = promise {
     let! _ =

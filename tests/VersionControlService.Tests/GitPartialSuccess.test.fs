@@ -16,9 +16,13 @@ let private osDynamic: obj = importAll "os"
 [<Import("vi", "vitest")>]
 let private vitestTimers: obj = jsNative
 
-let private createTempDirectoryAsync () : JS.Promise<string> =
+let private createTempDirectoryAsync () : JS.Promise<string> = promise {
     let prefix = join [| osDynamic?tmpdir () |> unbox<string>; "vcs-git-partial-" |]
-    fsPromisesDynamic?mkdtemp (prefix) |> unbox<JS.Promise<string>>
+    let! created = fsPromisesDynamic?mkdtemp (prefix) |> unbox<JS.Promise<string>>
+    // GitHub's Windows runners hand out TEMP as an 8.3 short path (RUNNER~1). Git reports the
+    // long form, so resolve the directory once here and every path comparison agrees.
+    return! fsPromisesDynamic?realpath (created) |> unbox<JS.Promise<string>>
+}
 
 let private removeDirectoryAsync (path: string) : JS.Promise<unit> = promise {
     let! _ =
@@ -2135,6 +2139,11 @@ Vitest.describe (
                             pointer.Replace("\r\n", "\n").Split('\n')
                             |> Array.find _.StartsWith("oid sha256:")
                             |> fun line -> line.Substring("oid sha256:".Length).Trim()
+
+                        // Leave the pointer itself in the working tree. With the full file still
+                        // there, a racy index refresh re-runs the clean filter and quietly recreates
+                        // the object this test is about to delete.
+                        do! writeUtf8FileAsync (join [| workPath; "missing-upload.bin" |]) pointer
 
                         do!
                             removeDirectoryAsync (
