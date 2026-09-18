@@ -88,6 +88,20 @@ let private hydrationFailure (operation: string) (detail: string) =
         "hydration_failed"
         $"Large-object hydration failed after a successful {operation}: {detail}"
 
+/// Recovery for a large-object hydration that did not finish after the Git transfer
+/// itself succeeded. A user cancellation gets its own wording so nobody goes looking
+/// for an outage that did not happen.
+let private materializationRecovery (failure: OperationFailure) : RecoveryAction = {
+    Code = "retry_materialization"
+    Instructions =
+        Some(
+            if failure.Category = Canceled then
+                "The large-object download was canceled. Retry materialization to finish downloading."
+            else
+                "Retry downloading large objects once the object store is reachable."
+        )
+}
+
 let private awaitGit (operation: JS.Promise<GitService.GitResult<'T>>) : Async<Result<'T, OperationFailure>> =
     async {
         let! result = Async.AwaitPromise operation
@@ -1082,29 +1096,36 @@ let private resolveRevisionIdentity
         // host follows the configured publish remote the same way publish credentials
         // do. Without a publish remote the bound location is what remains. A broken
         // upstream configuration does not block a local revision here. Publish
-        // reports it.
-        let! branchResult = currentBranchName state context
+        // reports it. Sessions built without a strategy keep the default, which never
+        // reads the request, so they skip the branch and remote lookups entirely.
+        let! resolvedIdentity =
+            if LanguagePrimitives.PhysicalEquality state.RevisionIdentity GitCredentialStrategy.anonymousIdentity then
+                async { return None }
+            else
+                async {
+                    let! branchResult = currentBranchName state context
 
-        let! targetUrl =
-            async {
-                match branchResult with
-                | Error _ -> return state.Location.ProviderLocation
-                | Ok branch ->
-                    let! remoteResult = resolvePublishRemote state branch context
+                    let! targetUrl =
+                        async {
+                            match branchResult with
+                            | Error _ -> return state.Location.ProviderLocation
+                            | Ok branch ->
+                                let! remoteResult = resolvePublishRemote state branch context
 
-                    match remoteResult with
-                    | Ok(Some remote) -> return remote.Url
-                    | Ok None
-                    | Error _ -> return state.Location.ProviderLocation
-            }
+                                match remoteResult with
+                                | Ok(Some remote) -> return remote.Url
+                                | Ok None
+                                | Error _ -> return state.Location.ProviderLocation
+                        }
 
-        let identityRequest: GitCredentialStrategy.RevisionIdentityRequest = {
-            WorkspaceRoot = state.RepoPath
-            TargetHost = GitCredentialStrategy.tryIdentityHost targetUrl
-            ConnectionProfileId = state.ConnectionProfileId
-        }
+                    let identityRequest: GitCredentialStrategy.RevisionIdentityRequest = {
+                        WorkspaceRoot = state.RepoPath
+                        TargetHost = GitCredentialStrategy.tryIdentityHost targetUrl
+                        ConnectionProfileId = state.ConnectionProfileId
+                    }
 
-        let! resolvedIdentity = state.RevisionIdentity.ResolveIdentity identityRequest
+                    return! state.RevisionIdentity.ResolveIdentity identityRequest
+                }
 
         match resolvedIdentity with
         | Some identity when
@@ -2020,13 +2041,167 @@ let private revParse (state: SessionState) (reference: string) (context: Operati
         | _ -> return None
     }
 
-/// A merge process killed part-way can leave MERGE_HEAD, a half-applied index and
-/// worktree, and its index.lock behind. Cleanup runs on a copy of the context
-/// without the cancellation, because the process runner refuses to start anything
-/// on a context that is already canceled.
+/// What update records right before it spawns git merge, so cleanup after a cancel
+/// can tell this merge's residue apart from state that was already in the repository.
+type private MergeStart = {
+    WorkspaceVersion: string
+    Head: string option
+    MergeHeadPresent: bool
+    StartedAtMs: float
+}
+
+let private captureMergeStart
+    (state: SessionState)
+    (context: OperationContext)
+    : Async<Result<MergeStart, OperationFailure>> =
+    async {
+        let! version = computeWorkspaceVersion state context
+
+        match version with
+        | Error failure -> return Error failure
+        | Ok version ->
+            let! head = revParse state "HEAD" context
+            let! mergeHead = tryGetMergeHead state context
+
+            return
+                Ok {
+                    WorkspaceVersion = version
+                    Head = head
+                    MergeHeadPresent = mergeHead.IsSome
+                    StartedAtMs = nowMilliseconds ()
+                }
+    }
+
+let private gitOutcome (result: Result<NodeProcess.ProcessOutput, OperationFailure>) =
+    match result with
+    | Ok output when output.ExitCode = 0 -> Ok()
+    | Ok output -> Error output.StdErr
+    | Error failure -> Error failure.Message
+
+/// Restores the paths a fast-forward rewrites: everything that differs between HEAD
+/// and the target. git refuses the fast-forward while any of them carries local
+/// changes or sits under an untracked file, so once rewriting has begun these paths
+/// held nothing of the user's, and putting them back from HEAD discards no work.
+/// Returns the affected paths.
+let private restoreTargetPaths
+    (state: SessionState)
+    (targetReference: string)
+    (context: OperationContext)
+    : Async<Result<string[], string>> =
+    async {
+        let! diff =
+            runGit state.Hooks state.RepoPath [| "diff"; "--name-only"; "-z"; "HEAD"; targetReference |] None context
+
+        match diff with
+        | Error failure -> return Error failure.Message
+        | Ok output when output.ExitCode <> 0 -> return Error output.StdErr
+        | Ok output ->
+            let paths = output.StdOut.Split '\000' |> Array.filter (fun path -> path <> "")
+
+            if paths.Length = 0 then
+                return Ok [||]
+            else
+                let! listing =
+                    runGit state.Hooks state.RepoPath [| "ls-tree"; "-r"; "--name-only"; "-z"; "HEAD" |] None context
+
+                match listing with
+                | Error failure -> return Error failure.Message
+                | Ok listed when listed.ExitCode <> 0 -> return Error listed.StdErr
+                | Ok listed ->
+                    let inHead = listed.StdOut.Split '\000' |> Array.filter (fun path -> path <> "") |> Set.ofArray
+                    let tracked, added = paths |> Array.partition inHead.Contains
+                    let toRepositoryPaths (values: string[]) = values |> Array.choose (fun value -> RepositoryPath.tryCreate value |> Result.toOption)
+                    let trackedPaths = toRepositoryPaths tracked
+                    let addedPaths = toRepositoryPaths added
+
+                    if trackedPaths.Length <> tracked.Length || addedPaths.Length <> added.Length then
+                        return Error "a rewritten path is not a valid repository path"
+                    else
+                        // Paths in HEAD go back to their HEAD content in index and worktree.
+                        let! restored =
+                            if trackedPaths.Length = 0 then
+                                async { return Ok() }
+                            else
+                                async {
+                                    let! result =
+                                        runGit
+                                            state.Hooks
+                                            state.RepoPath
+                                            [|
+                                                "restore"
+                                                "--source=HEAD"
+                                                "--staged"
+                                                "--worktree"
+                                                yield! GitPathTransport.pathspecFromStdinArguments
+                                            |]
+                                            (Some(GitPathTransport.nulDelimitedLiteralPathspecs trackedPaths))
+                                            context
+
+                                    return gitOutcome result
+                                }
+
+                        match restored with
+                        | Error message -> return Error message
+                        | Ok() ->
+                            // Paths the target adds are not in HEAD. A killed checkout may have
+                            // written them to the worktree and, if it got as far as the index
+                            // write, staged them. Both go.
+                            let! unstaged =
+                                if addedPaths.Length = 0 then
+                                    async { return Ok() }
+                                else
+                                    async {
+                                        let! result =
+                                            runGit
+                                                state.Hooks
+                                                state.RepoPath
+                                                [|
+                                                    "rm"
+                                                    "--cached"
+                                                    "--ignore-unmatch"
+                                                    "--quiet"
+                                                    yield! GitPathTransport.pathspecFromStdinArguments
+                                                |]
+                                                (Some(GitPathTransport.nulDelimitedLiteralPathspecs addedPaths))
+                                                context
+
+                                        return gitOutcome result
+                                    }
+
+                            match unstaged with
+                            | Error message -> return Error message
+                            | Ok() ->
+                                let removal =
+                                    try
+                                        for path in added do
+                                            let absolute = NodePath.join [| state.RepoPath; path |]
+
+                                            if NodeFileSystem.existsSync absolute then
+                                                let stats = NodeFileSystem.lstatSync absolute
+
+                                                if stats.isFile () || stats.isSymbolicLink () then
+                                                    NodeFileSystem.unlinkSync absolute
+
+                                        Ok()
+                                    with error ->
+                                        Error error.Message
+
+                                match removal with
+                                | Error message -> return Error message
+                                | Ok() -> return Ok paths
+    }
+
+/// Cleans up after a canceled `git merge`. A true merge that was killed leaves
+/// MERGE_HEAD with a half-applied index and worktree. A fast-forward writes no
+/// MERGE_HEAD at all and may have rewritten part of the worktree before the kill.
+/// Either can leave the dead process's index.lock behind. Cleanup runs on a copy of
+/// the context without the cancellation, because the process runner refuses to start
+/// anything on a context that is already canceled. Whatever cannot be undone or
+/// observed is reported with StateChanged set.
 let private recoverCanceledMerge
     (state: SessionState)
-    (headBefore: RevisionId option)
+    (start: MergeStart)
+    (targetReference: string)
     (failure: OperationFailure)
     (context: OperationContext)
     : Async<OperationFailure> =
@@ -2036,67 +2211,117 @@ let private recoverCanceledMerge
                 Cancellation = OperationCancellation.none
         }
 
-        let residue (code: string) (instructions: string) = {
+        let residue (code: string) (instructions: string) (affected: string[]) = {
             failure with
                 StateChanged = true
+                AffectedPaths = affected
                 RecoveryAction =
                     Some {
                         Code = code
-                        Instructions = Some instructions
+                        Instructions = Some(Redaction.redact instructions)
                     }
         }
 
-        // The lock goes first. git merge --abort cannot run while a dead process's
-        // lock is still in place.
+        let inspect (detail: string) =
+            residue
+                "inspect_workspace"
+                $"Git could not report the workspace state after the cancellation: {detail}. Refresh before retrying."
+                [||]
+
+        // The lock goes first, because git merge --abort cannot run while it is in
+        // place. Only a lock newer than this merge's start can be ours. An older one
+        // belongs to another process and stays.
         let! lockPath = resolveGitStatePath state "index.lock" cleanupContext
 
-        let lockError =
-            match lockPath with
-            | Some path when NodeFileSystem.existsSync path ->
+        match lockPath with
+        | None -> return inspect "the index.lock path could not be resolved"
+        | Some lockPath ->
+            let lockResult =
                 try
-                    NodeFileSystem.unlinkSync path
-                    None
+                    if NodeFileSystem.existsSync lockPath then
+                        let stats = NodeFileSystem.lstatSync lockPath
+
+                        if stats.mtimeMs >= start.StartedAtMs - 1000.0 then
+                            NodeFileSystem.unlinkSync lockPath
+
+                    Ok()
                 with error ->
-                    Some error.Message
-            | _ -> None
+                    Error error.Message
 
-        match lockError with
-        | Some message ->
-            return
-                residue
-                    "remove_index_lock"
-                    $"Remove the stale index.lock from the repository state and refresh. Cleanup failed: {message}"
-        | None ->
-            let! mergeHead = tryGetMergeHead state cleanupContext
+            match lockResult with
+            | Error message ->
+                return
+                    residue
+                        "remove_index_lock"
+                        $"Remove the stale index.lock from the repository state, run git merge --abort if a merge is still open, and refresh. Cleanup failed: {message}"
+                        [||]
+            | Ok() ->
+                let! mergeHeadPath = resolveGitStatePath state "MERGE_HEAD" cleanupContext
 
-            match mergeHead with
-            | Some _ ->
-                let! abortResult = runGit state.Hooks state.RepoPath [| "merge"; "--abort" |] None cleanupContext
+                match mergeHeadPath with
+                | None -> return inspect "the MERGE_HEAD path could not be resolved"
+                | Some mergeHeadPath ->
+                    // Merge state that was already there before this merge started is
+                    // someone else's work in progress and is left alone.
+                    let mergeHeadPresent = NodeFileSystem.existsSync mergeHeadPath
 
-                match abortResult with
-                | Ok output when output.ExitCode = 0 -> return failure
-                | Ok output ->
-                    return
-                        residue
-                            "abort_merge"
-                            $"Run git merge --abort in the workspace and refresh. Cleanup failed: {output.StdErr}"
-                | Error abortFailure ->
-                    return
-                        residue
-                            "abort_merge"
-                            $"Run git merge --abort in the workspace and refresh. Cleanup failed: {abortFailure.Message}"
-            | None ->
-                // No merge state means either nothing happened or the merge finished
-                // before the kill. A moved HEAD tells the two apart.
-                let! headAfter = revParse state "HEAD" cleanupContext
+                    let! aborted =
+                        if mergeHeadPresent && not start.MergeHeadPresent then
+                            async {
+                                let! result =
+                                    runGit state.Hooks state.RepoPath [| "merge"; "--abort" |] None cleanupContext
 
-                match headBefore, headAfter with
-                | Some before, Some after when RevisionId.value before <> after ->
-                    return
-                        residue
-                            "refresh_workspace"
-                            "The merge finished before the cancellation took effect. Refresh to load the updated workspace."
-                | _ -> return failure
+                                return gitOutcome result
+                            }
+                        else
+                            async { return Ok() }
+
+                    match aborted with
+                    | Error message ->
+                        return
+                            residue
+                                "abort_merge"
+                                $"Run git merge --abort in the workspace and refresh. Cleanup failed: {message}"
+                                [||]
+                    | Ok() ->
+                        let! versionAfter = computeWorkspaceVersion state cleanupContext
+
+                        match versionAfter with
+                        | Error observeFailure -> return inspect observeFailure.Message
+                        | Ok version when version = start.WorkspaceVersion -> return failure
+                        | Ok _ ->
+                            let! headAfter = revParse state "HEAD" cleanupContext
+
+                            if headAfter <> start.Head then
+                                return
+                                    residue
+                                        "refresh_workspace"
+                                        "The merge finished before the cancellation took effect. Refresh to load the updated workspace."
+                                        [||]
+                            else
+                                // HEAD did not move and no merge state remains, yet the
+                                // workspace differs: a fast-forward was killed while rewriting.
+                                let! restored = restoreTargetPaths state targetReference cleanupContext
+
+                                match restored with
+                                | Error message ->
+                                    return
+                                        residue
+                                            "restore_workspace"
+                                            $"The update was canceled while git was rewriting files. Restore the paths that differ from HEAD and refresh. Cleanup failed: {message}"
+                                            [||]
+                                | Ok affected ->
+                                    let! versionRestored = computeWorkspaceVersion state cleanupContext
+
+                                    match versionRestored with
+                                    | Ok version when version = start.WorkspaceVersion -> return failure
+                                    | Ok _ ->
+                                        return
+                                            residue
+                                                "restore_workspace"
+                                                "The update was canceled while git was rewriting files, and the workspace could not be returned to its previous state. Review the affected paths and refresh."
+                                                affected
+                                    | Error observeFailure -> return inspect observeFailure.Message
     }
 
 let private synchronizationState (state: SessionState) (context: OperationContext) =
@@ -2469,11 +2694,13 @@ let private updateWithIdentity
                     syncState.TargetRevision |> Option.map RevisionId.value |> Option.get
 
                 let! identityResult = resolveRevisionIdentity state context
+                let! startResult = captureMergeStart state context
 
                 let! mergeResult =
-                    match identityResult with
-                    | Error failure -> async { return Error failure }
-                    | Ok identityArguments ->
+                    match identityResult, startResult with
+                    | Error failure, _
+                    | _, Error failure -> async { return Error failure }
+                    | Ok identityArguments, Ok _ ->
                         async {
                             do! barrier state.Hooks state.RepoPath "update-merge" context
 
@@ -2492,12 +2719,12 @@ let private updateWithIdentity
                                     context
                         }
 
-                match mergeResult with
-                | Error failure when failure.Category = Canceled ->
-                    let! recovered = recoverCanceledMerge state syncState.WorkspaceRevision failure context
+                match mergeResult, startResult with
+                | Error failure, Ok start when failure.Category = Canceled ->
+                    let! recovered = recoverCanceledMerge state start targetReference failure context
                     return Failed recovered
-                | Error failure -> return Failed failure
-                | Ok output when output.ExitCode = 0 ->
+                | Error failure, _ -> return Failed failure
+                | Ok output, _ when output.ExitCode = 0 ->
                     let! updatedState = synchronizationState state context
 
                     match updatedState with
@@ -2591,11 +2818,7 @@ let private updateWithIdentity
                                         failure with
                                             AffectedPaths = affectedPaths
                                     }
-                                    {
-                                        Code = "retry_materialization"
-                                        Instructions =
-                                            Some "Retry downloading large objects once the object store is reachable."
-                                    }
+                                    (materializationRecovery failure)
 
                             match hydration with
                             | Ok hydrationOutput when hydrationOutput.ExitCode = 0 -> return Succeeded outcome
@@ -2614,7 +2837,7 @@ let private updateWithIdentity
                                         hydrationFailure with
                                             Code = "hydration_failed"
                                     }
-                | Ok _ ->
+                | Ok _, _ ->
                     // Conflicting merge: the conflict-session cycle turns this into a
                     // provider-managed session; the shell reports the structured code.
                     let! updatedState = synchronizationState state context
@@ -4222,16 +4445,23 @@ let createFactoryWithCredentialsAndIdentity
                         "origin"
 
                 // Remember what the target looked like so a killed or failed clone can be
-                // undone without touching anything the caller already had there.
-                let targetExistedBefore = NodeFileSystem.existsSync request.TargetPath
+                // undone without touching anything the caller already had there. When the
+                // target cannot be inspected, nothing is cleaned up later.
+                let targetExistedBefore, targetWasEmptyDirectory =
+                    try
+                        let existed = NodeFileSystem.existsSync request.TargetPath
 
-                let targetWasEmptyDirectory =
-                    targetExistedBefore
-                    && (let stats = NodeFileSystem.lstatSync request.TargetPath
+                        let empty =
+                            existed
+                            && (let stats = NodeFileSystem.lstatSync request.TargetPath
 
-                        stats.isDirectory ()
-                        && not (stats.isSymbolicLink ())
-                        && (NodeFileSystem.readdirSync request.TargetPath).Length = 0)
+                                stats.isDirectory ()
+                                && not (stats.isSymbolicLink ())
+                                && (NodeFileSystem.readdirSync request.TargetPath).Length = 0)
+
+                        existed, empty
+                    with _ ->
+                        true, false
 
                 let removeCloneResidue () =
                     async {
@@ -4241,14 +4471,24 @@ let createFactoryWithCredentialsAndIdentity
                                     do!
                                         NodeFileSystem.rmAsync
                                             request.TargetPath
-                                            (NodeFileSystem.RmOptions(recursive = true, force = true))
+                                            (NodeFileSystem.RmOptions(
+                                                recursive = true,
+                                                force = true,
+                                                maxRetries = 5,
+                                                retryDelay = 100
+                                            ))
                                         |> Async.AwaitPromise
                             elif targetWasEmptyDirectory then
                                 for entry in NodeFileSystem.readdirSync request.TargetPath do
                                     do!
                                         NodeFileSystem.rmAsync
                                             (NodePath.join [| request.TargetPath; entry |])
-                                            (NodeFileSystem.RmOptions(recursive = true, force = true))
+                                            (NodeFileSystem.RmOptions(
+                                                recursive = true,
+                                                force = true,
+                                                maxRetries = 5,
+                                                retryDelay = 100
+                                            ))
                                         |> Async.AwaitPromise
 
                             return None
@@ -4269,8 +4509,10 @@ let createFactoryWithCredentialsAndIdentity
                                     Some {
                                         Code = "remove_clone_target"
                                         Instructions =
-                                            Some
-                                                $"Remove '{request.TargetPath}' before retrying the clone. Cleanup failed: {message}"
+                                            Some(
+                                                Redaction.redact
+                                                    $"Remove '{request.TargetPath}' before retrying the clone. Cleanup failed: {message}"
+                                            )
                                     }
                         }
 
@@ -4300,9 +4542,10 @@ let createFactoryWithCredentialsAndIdentity
                     return Failed(withResidue failure cleanupError)
                 | Ok output when output.ExitCode <> 0 ->
                     let combined = output.StdErr + output.StdOut
-                    let! cleanupError = removeCloneResidue ()
 
                     if combined.Contains "already exists and is not an empty directory" then
+                        // git refused before writing anything. Whatever is in the target
+                        // now belongs to someone else, so nothing is removed.
                         return
                             Failed(
                                 OperationFailure.create
@@ -4311,6 +4554,8 @@ let createFactoryWithCredentialsAndIdentity
                                     "The clone target directory is not empty."
                             )
                     else
+                        let! cleanupError = removeCloneResidue ()
+
                         return
                             Failed(
                                 withResidue
@@ -4368,12 +4613,7 @@ let createFactoryWithCredentialsAndIdentity
                                 OperationResult.partiallySucceeded
                                     (OperationOutcome.performed binding)
                                     hydrationFailure
-                                    {
-                                        Code = "retry_materialization"
-                                        Instructions =
-                                            Some
-                                                "Retry downloading large objects once the object store is reachable."
-                                    }
+                                    (materializationRecovery hydrationFailure)
         }
     Adopt =
         fun request context ->

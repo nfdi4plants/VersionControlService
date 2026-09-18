@@ -2331,13 +2331,15 @@ Vitest.describe (
                                         writeUtf8FileAsync (join [| targetPath; "partial.txt" |]) "partial\n"
                                         |> Async.AwaitPromise
 
-                                    return
-                                        OperationResult.failed (
-                                            OperationFailure.createRedacted
-                                                ProviderError
-                                                "clone_failed"
-                                                "simulated clone failure"
-                                        )
+                                    // A real failing clone exits nonzero, so the provider, not the
+                                    // test, produces the failure code.
+                                    let output: NodeProcess.ProcessOutput = {
+                                        ExitCode = 128
+                                        StdOut = ""
+                                        StdErr = "fatal: simulated clone failure"
+                                    }
+
+                                    return OperationResult.succeeded output
                                 else
                                     return! NodeProcess.run request context
                             })
@@ -2382,7 +2384,9 @@ Vitest.describe (
             }
         )
 
-        // The fake MERGE_HEAD plus lock stands in for a git merge process that was killed after it wrote its state files.
+        // No merge runs here. The barrier writes the state files a killed true merge
+        // leaves behind and cancels before the spawn, so the test pins the recovery
+        // sequence (lock removal, then merge --abort) and nothing else.
         Vitest.test (
             "canceled update aborts a half-finished merge and removes the stale index lock",
             TestOptions(timeout = 120000),
@@ -2394,17 +2398,17 @@ Vitest.describe (
                     RunBytesProcess = None
                     RunProcess = None
                     Barrier =
-                        Some(fun root point _context ->
+                        Some(fun repoPath point _context ->
                             async {
                                 if point = "update-merge" then
                                     do!
                                         writeUtf8FileAsync
-                                            (join [| root; ".git"; "MERGE_HEAD" |])
+                                            (join [| repoPath; ".git"; "MERGE_HEAD" |])
                                             (targetHash + "\n")
                                         |> Async.AwaitPromise
 
                                     do!
-                                        writeUtf8FileAsync (join [| root; ".git"; "index.lock" |]) ""
+                                        writeUtf8FileAsync (join [| repoPath; ".git"; "index.lock" |]) ""
                                         |> Async.AwaitPromise
 
                                     match armCancel with
@@ -2450,6 +2454,137 @@ Vitest.describe (
                     Vitest.expect(mergeResidue).toEqual (None)
                     Vitest.expect(status.Trim()).toBe ("")
                     Vitest.expect(afterUpdate.ActiveConflictSession).toEqual (None)
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        // A fast-forward writes no MERGE_HEAD. The hook stands in for a merge process
+        // killed after it rewrote one file and left its index lock behind.
+        Vitest.test (
+            "canceled fast-forward merge restores the files git had rewritten",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable workspacePath = ""
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request context ->
+                            async {
+                                if request.Arguments |> Array.contains "merge" then
+                                    do!
+                                        writeUtf8FileAsync (join [| workspacePath; "ff-residue.txt" |]) "content\n"
+                                        |> Async.AwaitPromise
+
+                                    do!
+                                        writeUtf8FileAsync (join [| workspacePath; ".git"; "index.lock" |]) ""
+                                        |> Async.AwaitPromise
+
+                                    return
+                                        OperationResult.failed (
+                                            OperationFailure.create
+                                                Canceled
+                                                "operation_canceled"
+                                                "simulated kill during fast-forward"
+                                        )
+                                else
+                                    return! NodeProcess.run request context
+                            })
+                    Barrier = None
+                }
+
+                let! root, workPath, barePath, session = createSyncFixture hooks
+                workspacePath <- workPath
+
+                try
+                    do! advanceTarget root barePath [ "ff-residue.txt", "content\n" ]
+                    let! beforeUpdate = sessionStatus session
+
+                    let! updateResult =
+                        Async.StartAsPromise(
+                            (syncService session).Update
+                                { ExpectedWorkspaceVersion = beforeUpdate.WorkspaceVersion }
+                                (ctx "cancel-ff-merge")
+                        )
+
+                    let failure = expectProviderFailure "canceled fast-forward" updateResult
+                    Vitest.expect(failure.Category).toEqual (Canceled)
+                    Vitest.expect(failure.Code).toBe ("operation_canceled")
+                    Vitest.expect(failure.StateChanged).toBe (false)
+                    Vitest.expect(failure.RecoveryAction).toEqual (None)
+
+                    let! residue = tryReadUtf8FileAsync (join [| workPath; "ff-residue.txt" |])
+                    let! indexLock = tryReadUtf8FileAsync (join [| workPath; ".git"; "index.lock" |])
+                    let! status = runGitIn workPath [| "status"; "--porcelain" |]
+                    Vitest.expect(residue).toEqual (None)
+                    Vitest.expect(indexLock).toEqual (None)
+                    Vitest.expect(status.Trim()).toBe ("")
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        // The hook lets the real merge finish and only then reports the cancellation,
+        // which is what a kill signal that arrives too late looks like to the caller.
+        Vitest.test (
+            "a merge that finished before the cancellation landed reports refresh_workspace",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request context ->
+                            async {
+                                if request.Arguments |> Array.contains "merge" then
+                                    let! _ = NodeProcess.run request context
+
+                                    return
+                                        OperationResult.failed (
+                                            OperationFailure.create
+                                                Canceled
+                                                "operation_canceled"
+                                                "simulated late cancellation"
+                                        )
+                                else
+                                    return! NodeProcess.run request context
+                            })
+                    Barrier = None
+                }
+
+                let! root, workPath, barePath, session = createSyncFixture hooks
+
+                try
+                    do! advanceTarget root barePath [ "late-cancel.txt", "content\n" ]
+                    let! targetHash = runGitIn barePath [| "rev-parse"; "main" |]
+                    let! beforeUpdate = sessionStatus session
+
+                    let! updateResult =
+                        Async.StartAsPromise(
+                            (syncService session).Update
+                                { ExpectedWorkspaceVersion = beforeUpdate.WorkspaceVersion }
+                                (ctx "late-cancel-merge")
+                        )
+
+                    let failure = expectProviderFailure "late canceled merge" updateResult
+                    Vitest.expect(failure.Category).toEqual (Canceled)
+                    Vitest.expect(failure.Code).toBe ("operation_canceled")
+                    Vitest.expect(failure.StateChanged).toBe (true)
+
+                    Vitest
+                        .expect(failure.RecoveryAction |> Option.map (fun action -> action.Code))
+                        .toEqual (Some "refresh_workspace")
+
+                    let! landed = tryReadUtf8FileAsync (join [| workPath; "late-cancel.txt" |])
+                    let! headAfter = runGitIn workPath [| "rev-parse"; "HEAD" |]
+                    Vitest.expect(landed).toEqual (Some "content\n")
+                    Vitest.expect(headAfter.Trim()).toBe (targetHash.Trim())
 
                     do! removeDirectoryAsync root
                 with error ->
