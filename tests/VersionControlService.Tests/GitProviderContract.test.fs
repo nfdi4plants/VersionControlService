@@ -827,7 +827,7 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "revision identity requests carry the bound location host",
+            "revision identity requests carry the publish remote host and connection profile",
             TestOptions(timeout = 120000),
             fun () -> promise {
                 let harness = createGitHarness ()
@@ -873,27 +873,51 @@ Vitest.describe (
                         expectProviderValue $"{name} create" revisionResult |> ignore
                     }
 
-                    // A local location has no host, so the host sees None and falls back
-                    // to whatever account it treats as active.
+                    let workspaceRoot = workspace.Binding.WorkspaceRoot
+                    let setOriginUrl (url: string) = runGitIn workspaceRoot [||] [| "remote"; "set-url"; "origin"; url |] None
+
+                    // The harness clone publishes to a local bare repository, which has no host.
                     do! createRevision workspace.Binding "identity-local"
 
-                    // The bound remote location decides the host, the same way credential
-                    // resolution does, so identity and credentials agree on the hub.
-                    let remoteBinding = {
+                    // The configured publish remote decides the host, the same way publish
+                    // credentials do, even though the binding still points at the local path.
+                    let! _ = setOriginUrl "https://Hub.Example.org/group/project.git"
+
+                    let profileBinding = {
+                        workspace.Binding with
+                            ConnectionProfileId = Some "profile-a"
+                    }
+
+                    do! createRevision profileBinding "identity-remote"
+
+                    // scp-style SSH remotes name their host too.
+                    let! _ = setOriginUrl "git@scp.example.org:group/project.git"
+                    do! createRevision workspace.Binding "identity-scp"
+
+                    // Without any publish remote the bound location is what remains.
+                    let! _ = runGitIn workspaceRoot [||] [| "remote"; "remove"; "origin" |] None
+
+                    let fallbackBinding = {
                         workspace.Binding with
                             Location = {
                                 workspace.Binding.Location with
-                                    ProviderLocation = "https://Hub.Example.org/group/project.git"
+                                    ProviderLocation = "https://fallback.example.org/group/project.git"
                             }
                     }
 
-                    do! createRevision remoteBinding "identity-remote"
+                    do! createRevision fallbackBinding "identity-fallback"
 
-                    Vitest.expect(requests.Count).toBe 2
-                    Vitest.expect(requests.[0].WorkspaceRoot).toBe workspace.Binding.WorkspaceRoot
+                    Vitest.expect(requests.Count).toBe 4
+
+                    for request in requests do
+                        Vitest.expect(request.WorkspaceRoot).toBe workspaceRoot
+
                     Vitest.expect(requests.[0].TargetHost).toEqual None
-                    Vitest.expect(requests.[1].WorkspaceRoot).toBe workspace.Binding.WorkspaceRoot
+                    Vitest.expect(requests.[0].ConnectionProfileId).toEqual workspace.Binding.ConnectionProfileId
                     Vitest.expect(requests.[1].TargetHost).toEqual (Some "hub.example.org")
+                    Vitest.expect(requests.[1].ConnectionProfileId).toEqual (Some "profile-a")
+                    Vitest.expect(requests.[2].TargetHost).toEqual (Some "scp.example.org")
+                    Vitest.expect(requests.[3].TargetHost).toEqual (Some "fallback.example.org")
                     do! harness.Cleanup()
                 with error ->
                     do! harness.Cleanup()
@@ -1173,64 +1197,71 @@ Vitest.describe (
                 // git refuses the switch and ends its error text with "Aborting". The
                 // failure classifier must not read that word as a user cancellation.
                 let! root = createTempDirectoryAsync ()
-                let repoPath = join [| root; "work" |]
-                let! _ = runGitIn root [||] [| "init"; "-b"; "main"; repoPath |] None
-                do! configureUser repoPath
-                do! writeUtf8FileAsync (join [| repoPath; "base.txt" |]) "main content\n"
-                let! _ = runGitIn repoPath [||] [| "add"; "-A" |] None
-                let! _ = runGitIn repoPath [||] [| "commit"; "-m"; "test: main" |] None
-                let! _ = runGitIn repoPath [||] [| "checkout"; "-b"; "other" |] None
-                do! writeUtf8FileAsync (join [| repoPath; "base.txt" |]) "other content\n"
-                let! _ = runGitIn repoPath [||] [| "commit"; "-am"; "test: other" |] None
-                let! _ = runGitIn repoPath [||] [| "checkout"; "main" |] None
-                do! writeUtf8FileAsync (join [| repoPath; "base.txt" |]) "local edit\n"
 
-                let binding: WorkspaceBinding = {
-                    SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
-                    ProviderId = gitProviderId
-                    WorkspaceRoot = repoPath
-                    ProviderStateRef = None
-                    Location = {
+                try
+                    let repoPath = join [| root; "work" |]
+                    let! _ = runGitIn root [||] [| "init"; "-b"; "main"; repoPath |] None
+                    do! configureUser repoPath
+                    do! writeUtf8FileAsync (join [| repoPath; "base.txt" |]) "main content\n"
+                    let! _ = runGitIn repoPath [||] [| "add"; "-A" |] None
+                    let! _ = runGitIn repoPath [||] [| "commit"; "-m"; "test: main" |] None
+                    let! _ = runGitIn repoPath [||] [| "checkout"; "-b"; "other" |] None
+                    do! writeUtf8FileAsync (join [| repoPath; "base.txt" |]) "other content\n"
+                    let! _ = runGitIn repoPath [||] [| "commit"; "-am"; "test: other" |] None
+                    let! _ = runGitIn repoPath [||] [| "checkout"; "main" |] None
+                    do! writeUtf8FileAsync (join [| repoPath; "base.txt" |]) "local edit\n"
+
+                    let binding: WorkspaceBinding = {
+                        SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
                         ProviderId = gitProviderId
-                        DisplayName = None
-                        ProviderLocation = repoPath
+                        WorkspaceRoot = repoPath
+                        ProviderStateRef = None
+                        Location = {
+                            ProviderId = gitProviderId
+                            DisplayName = None
+                            ProviderLocation = repoPath
+                            ConnectionProfileId = None
+                        }
                         ConnectionProfileId = None
                     }
-                    ConnectionProfileId = None
-                }
 
-                let session =
-                    GitWorkspaceSession.createSession GitWorkspaceSession.GitSessionHooks.none binding
+                    let session =
+                        GitWorkspaceSession.createSession GitWorkspaceSession.GitSessionHooks.none binding
 
-                let! statusResult =
-                    session.Core.GetStatus(OperationContext.detached "aborting-status")
-                    |> Async.StartAsPromise
+                    let! statusResult =
+                        session.Core.GetStatus(OperationContext.detached "aborting-status")
+                        |> Async.StartAsPromise
 
-                let status = expectProviderValue "aborting status" statusResult
+                    let status = expectProviderValue "aborting status" statusResult
 
-                let otherRef =
-                    match ProviderRef.tryCreate "git-local:other" with
-                    | Ok reference -> reference
-                    | Error message -> failwith message
+                    let otherRef =
+                        match ProviderRef.tryCreate "git-local:other" with
+                        | Ok reference -> reference
+                        | Error message -> failwith message
 
-                let! createResult =
-                    session.Core.CreateRef
-                        {
-                            Name = "from-other"
-                            BaseRef = Some otherRef
-                            SwitchTo = true
-                            ExpectedWorkspaceVersion = status.WorkspaceVersion
-                        }
-                        (OperationContext.detached "aborting-create")
-                    |> Async.StartAsPromise
+                    let! createResult =
+                        session.Core.CreateRef
+                            {
+                                Name = "from-other"
+                                BaseRef = Some otherRef
+                                SwitchTo = true
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (OperationContext.detached "aborting-create")
+                        |> Async.StartAsPromise
 
-                let failure = expectProviderFailure "aborted checkout" createResult
-                Vitest.expect(failure.Category = Canceled).toBe false
-                Vitest.expect(failure.Code = "operation_canceled").toBe false
-                Vitest.expect(failure.StateChanged).toBe false
+                    let failure = expectProviderFailure "aborted checkout" createResult
+                    Vitest.expect(failure.Message.ToLowerInvariant().Contains "aborting").toBe true
+                    Vitest.expect(failure.Category).toEqual ProviderError
+                    Vitest.expect(failure.Code).toBe "git_failure"
+                    Vitest.expect(failure.StateChanged).toBe false
 
-                let! branch = runGitIn repoPath [||] [| "rev-parse"; "--abbrev-ref"; "HEAD" |] None
-                Vitest.expect(branch.Trim()).toBe "main"
+                    let! branch = runGitIn repoPath [||] [| "rev-parse"; "--abbrev-ref"; "HEAD" |] None
+                    Vitest.expect(branch.Trim()).toBe "main"
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
             }
         )
 

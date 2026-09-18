@@ -246,88 +246,6 @@ let private credentialAuthenticationForRemote
         state.ConnectionProfileId
         remoteName
 
-let private identityMissingFailure () =
-    {
-        OperationFailure.create
-            Validation
-            "identity_missing"
-            "Git requires user.name and user.email to create a revision. Configure the repository identity or supply a Git identity strategy." with
-            RecoveryAction =
-                Some {
-                    Code = "configure_git_identity"
-                    Instructions =
-                        Some "Configure git user.name and user.email, or supply a GitIdentityStrategy for the workspace."
-                }
-    }
-
-let private readConfiguredIdentityValue
-    (state: SessionState)
-    (key: string)
-    (context: OperationContext)
-    : Async<Result<string option, OperationFailure>> =
-    async {
-        let! result = runGit state.Hooks state.RepoPath [| "config"; "--get"; key |] None context
-
-        match result with
-        | Error failure -> return Error failure
-        | Ok output when output.ExitCode = 0 ->
-            let value = output.StdOut.Trim()
-            return Ok(if String.IsNullOrWhiteSpace value then None else Some value)
-        | Ok output when output.ExitCode = 1 -> return Ok None
-        | Ok output ->
-            return
-                Error(
-                    OperationFailure.createRedacted
-                        ProviderError
-                        "git_failure"
-                        $"git config --get {key} failed: {output.StdErr}"
-                )
-    }
-
-let private resolveRevisionIdentity
-    (state: SessionState)
-    (context: OperationContext)
-    : Async<Result<string[], OperationFailure>> =
-    async {
-        // The host comes from the bound location, so identity and credentials resolve
-        // against the same hub without the host reading git configuration itself.
-        let identityRequest: GitCredentialStrategy.RevisionIdentityRequest = {
-            WorkspaceRoot = state.RepoPath
-            TargetHost =
-                VersionControlService.Git.GitAuthAdapter.tryExtractHostFromRemoteUrl state.Location.ProviderLocation
-                |> Result.toOption
-        }
-
-        let! resolvedIdentity = state.RevisionIdentity.ResolveIdentity identityRequest
-
-        match resolvedIdentity with
-        | Some identity when
-            String.IsNullOrWhiteSpace identity.Name
-            || String.IsNullOrWhiteSpace identity.Email ->
-            return Error(identityMissingFailure ())
-        | Some identity ->
-            return
-                Ok [|
-                    "-c"
-                    $"user.name={identity.Name}"
-                    "-c"
-                    $"user.email={identity.Email}"
-                |]
-        | None ->
-            let! emailResult = readConfiguredIdentityValue state "user.email" context
-
-            match emailResult with
-            | Error failure -> return Error failure
-            | Ok None -> return Error(identityMissingFailure ())
-            | Ok(Some _) ->
-                let! nameResult = readConfiguredIdentityValue state "user.name" context
-
-                match nameResult with
-                | Error failure -> return Error failure
-                | Ok(Some _) -> return Ok [||]
-                | Ok None -> return Error(identityMissingFailure ())
-    }
-
 // ---------------------------------------------------------------------------
 // Status and workspace version
 // ---------------------------------------------------------------------------
@@ -969,6 +887,251 @@ let private configuredRemoteExists (state: SessionState) (remoteName: string) (c
                     names
                     |> Array.exists (fun candidate -> String.Equals(candidate, remoteName, StringComparison.Ordinal))
                 )
+    }
+
+let private currentBranchName (state: SessionState) (context: OperationContext) =
+    async {
+        let! result =
+            runGitChecked state.Hooks state.RepoPath [| "branch"; "--show-current" |] None context
+
+        match result with
+        | Error failure -> return Error failure
+        | Ok output ->
+            let name = output.StdOut.Trim()
+
+            if name = "" then
+                return
+                    Error(OperationFailure.create Validation "detached_head" "The workspace has no current branch.")
+            else
+                return Ok name
+    }
+
+type private PublishRemote = {
+    Name: string
+    Url: string
+}
+
+let private configuredTargetInvalidFailure () =
+    OperationFailure.create
+        Validation
+        "configured_target_invalid"
+        "The configured Git upstream does not identify a remote."
+
+let private resolvePublishRemoteUrl
+    (state: SessionState)
+    (remoteName: string)
+    (context: OperationContext)
+    =
+    async {
+        let! result =
+            runGit
+                state.Hooks
+                state.RepoPath
+                [| "config"; "--get"; $"remote.{remoteName}.url" |]
+                None
+                context
+
+        match result with
+        | Error failure -> return Error failure
+        | Ok output when output.ExitCode = 0 && not (String.IsNullOrWhiteSpace output.StdOut) ->
+            return
+                Ok {
+                    Name = remoteName
+                    Url = output.StdOut.Trim()
+                }
+        | Ok _ -> return Error(configuredTargetInvalidFailure ())
+    }
+
+let private readOptionalConfigValue
+    (state: SessionState)
+    (key: string)
+    (context: OperationContext)
+    =
+    async {
+        let! result = runGit state.Hooks state.RepoPath [| "config"; "--get"; key |] None context
+
+        match result with
+        | Error failure -> return Error failure
+        | Ok output when output.ExitCode = 0 && not (String.IsNullOrWhiteSpace output.StdOut) ->
+            return Ok(Some(output.StdOut.Trim()))
+        | Ok output
+            when output.ExitCode = 1
+                 && String.IsNullOrWhiteSpace output.StdOut
+                 && String.IsNullOrWhiteSpace output.StdErr ->
+            return Ok None
+        | Ok output ->
+            return
+                Error(
+                    OperationFailure.createRedacted
+                        ProviderError
+                        "git_failure"
+                        $"git config --get {key} failed: {output.StdErr + output.StdOut}"
+                )
+    }
+
+let private configuredBranchRemote
+    (state: SessionState)
+    (branch: string)
+    (context: OperationContext)
+    =
+    async {
+        let! remoteResult = readOptionalConfigValue state $"branch.{branch}.remote" context
+
+        match remoteResult with
+        | Error failure -> return Error failure
+        | Ok remote ->
+            let! mergeResult = readOptionalConfigValue state $"branch.{branch}.merge" context
+
+            match remote, mergeResult with
+            | _, Error failure -> return Error failure
+            | None, Ok None -> return Ok None
+            | Some remoteName, Ok(Some _) -> return Ok(Some remoteName)
+            | _ -> return Error(configuredTargetInvalidFailure ())
+    }
+
+let private resolvePublishRemote
+    (state: SessionState)
+    (branch: string)
+    (context: OperationContext)
+    =
+    async {
+        let! upstreamResult = tryConfiguredUpstream state context
+
+        match upstreamResult with
+        | Error failure -> return Error failure
+        | Ok(Some upstream) when upstream.LogicalRef.Kind = RemoteRef ->
+            let! remoteResult = configuredUpstreamRemote state upstream.LogicalRef.Name context
+
+            match remoteResult with
+            | Ok(Some remote) ->
+                let! remoteUrlResult = resolvePublishRemoteUrl state remote context
+                return remoteUrlResult |> Result.map Some
+            | Ok None -> return Error(configuredTargetInvalidFailure ())
+            | Error failure -> return Error failure
+        | Ok(Some _) -> return Error(configuredTargetInvalidFailure ())
+        | Ok None ->
+            let! branchRemoteResult = configuredBranchRemote state branch context
+
+            match branchRemoteResult with
+            | Error failure -> return Error failure
+            | Ok(Some ".") -> return Error(configuredTargetInvalidFailure ())
+            | Ok(Some remoteName) ->
+                let! existsResult = configuredRemoteExists state remoteName context
+
+                match existsResult with
+                | Error failure -> return Error failure
+                | Ok false -> return Error(configuredTargetInvalidFailure ())
+                | Ok true ->
+                    let! remoteUrlResult = resolvePublishRemoteUrl state remoteName context
+                    return remoteUrlResult |> Result.map Some
+            | Ok None ->
+                let! originResult = configuredRemoteExists state "origin" context
+
+                match originResult with
+                | Error failure -> return Error failure
+                | Ok false -> return Ok None
+                | Ok true ->
+                    let! remoteUrlResult = resolvePublishRemoteUrl state "origin" context
+                    return remoteUrlResult |> Result.map Some
+    }
+
+let private identityMissingFailure () =
+    {
+        OperationFailure.create
+            Validation
+            "identity_missing"
+            "Git requires user.name and user.email to create a revision. Configure the repository identity or supply a Git identity strategy." with
+            RecoveryAction =
+                Some {
+                    Code = "configure_git_identity"
+                    Instructions =
+                        Some "Configure git user.name and user.email, or supply a GitIdentityStrategy for the workspace."
+                }
+    }
+
+let private readConfiguredIdentityValue
+    (state: SessionState)
+    (key: string)
+    (context: OperationContext)
+    : Async<Result<string option, OperationFailure>> =
+    async {
+        let! result = runGit state.Hooks state.RepoPath [| "config"; "--get"; key |] None context
+
+        match result with
+        | Error failure -> return Error failure
+        | Ok output when output.ExitCode = 0 ->
+            let value = output.StdOut.Trim()
+            return Ok(if String.IsNullOrWhiteSpace value then None else Some value)
+        | Ok output when output.ExitCode = 1 -> return Ok None
+        | Ok output ->
+            return
+                Error(
+                    OperationFailure.createRedacted
+                        ProviderError
+                        "git_failure"
+                        $"git config --get {key} failed: {output.StdErr}"
+                )
+    }
+
+let private resolveRevisionIdentity
+    (state: SessionState)
+    (context: OperationContext)
+    : Async<Result<string[], OperationFailure>> =
+    async {
+        // The identity should match the hub the revision will be published to, so the
+        // host follows the configured publish remote the same way publish credentials
+        // do. Without a publish remote the bound location is what remains. A broken
+        // upstream configuration does not block a local revision here. Publish
+        // reports it.
+        let! branchResult = currentBranchName state context
+
+        let! targetUrl =
+            async {
+                match branchResult with
+                | Error _ -> return state.Location.ProviderLocation
+                | Ok branch ->
+                    let! remoteResult = resolvePublishRemote state branch context
+
+                    match remoteResult with
+                    | Ok(Some remote) -> return remote.Url
+                    | Ok None
+                    | Error _ -> return state.Location.ProviderLocation
+            }
+
+        let identityRequest: GitCredentialStrategy.RevisionIdentityRequest = {
+            WorkspaceRoot = state.RepoPath
+            TargetHost = GitCredentialStrategy.tryIdentityHost targetUrl
+            ConnectionProfileId = state.ConnectionProfileId
+        }
+
+        let! resolvedIdentity = state.RevisionIdentity.ResolveIdentity identityRequest
+
+        match resolvedIdentity with
+        | Some identity when
+            String.IsNullOrWhiteSpace identity.Name
+            || String.IsNullOrWhiteSpace identity.Email ->
+            return Error(identityMissingFailure ())
+        | Some identity ->
+            return
+                Ok [|
+                    "-c"
+                    $"user.name={identity.Name}"
+                    "-c"
+                    $"user.email={identity.Email}"
+                |]
+        | None ->
+            let! emailResult = readConfiguredIdentityValue state "user.email" context
+
+            match emailResult with
+            | Error failure -> return Error failure
+            | Ok None -> return Error(identityMissingFailure ())
+            | Ok(Some _) ->
+                let! nameResult = readConfiguredIdentityValue state "user.name" context
+
+                match nameResult with
+                | Error failure -> return Error failure
+                | Ok(Some _) -> return Ok [||]
+                | Ok None -> return Error(identityMissingFailure ())
     }
 
 let private toWorkspaceStatus (state: SessionState) (status: GitStatusDto) (context: OperationContext) =
@@ -1846,152 +2009,6 @@ let private getDiffSummary (state: SessionState) (context: OperationContext) =
 // ---------------------------------------------------------------------------
 // Synchronization (shell: direct git commands over the configured origin)
 // ---------------------------------------------------------------------------
-
-let private currentBranchName (state: SessionState) (context: OperationContext) =
-    async {
-        let! result =
-            runGitChecked state.Hooks state.RepoPath [| "branch"; "--show-current" |] None context
-
-        match result with
-        | Error failure -> return Error failure
-        | Ok output ->
-            let name = output.StdOut.Trim()
-
-            if name = "" then
-                return
-                    Error(OperationFailure.create Validation "detached_head" "The workspace has no current branch.")
-            else
-                return Ok name
-    }
-
-type private PublishRemote = {
-    Name: string
-    Url: string
-}
-
-let private configuredTargetInvalidFailure () =
-    OperationFailure.create
-        Validation
-        "configured_target_invalid"
-        "The configured Git upstream does not identify a remote."
-
-let private resolvePublishRemoteUrl
-    (state: SessionState)
-    (remoteName: string)
-    (context: OperationContext)
-    =
-    async {
-        let! result =
-            runGit
-                state.Hooks
-                state.RepoPath
-                [| "config"; "--get"; $"remote.{remoteName}.url" |]
-                None
-                context
-
-        match result with
-        | Error failure -> return Error failure
-        | Ok output when output.ExitCode = 0 && not (String.IsNullOrWhiteSpace output.StdOut) ->
-            return
-                Ok {
-                    Name = remoteName
-                    Url = output.StdOut.Trim()
-                }
-        | Ok _ -> return Error(configuredTargetInvalidFailure ())
-    }
-
-let private readOptionalConfigValue
-    (state: SessionState)
-    (key: string)
-    (context: OperationContext)
-    =
-    async {
-        let! result = runGit state.Hooks state.RepoPath [| "config"; "--get"; key |] None context
-
-        match result with
-        | Error failure -> return Error failure
-        | Ok output when output.ExitCode = 0 && not (String.IsNullOrWhiteSpace output.StdOut) ->
-            return Ok(Some(output.StdOut.Trim()))
-        | Ok output
-            when output.ExitCode = 1
-                 && String.IsNullOrWhiteSpace output.StdOut
-                 && String.IsNullOrWhiteSpace output.StdErr ->
-            return Ok None
-        | Ok output ->
-            return
-                Error(
-                    OperationFailure.createRedacted
-                        ProviderError
-                        "git_failure"
-                        $"git config --get {key} failed: {output.StdErr + output.StdOut}"
-                )
-    }
-
-let private configuredBranchRemote
-    (state: SessionState)
-    (branch: string)
-    (context: OperationContext)
-    =
-    async {
-        let! remoteResult = readOptionalConfigValue state $"branch.{branch}.remote" context
-
-        match remoteResult with
-        | Error failure -> return Error failure
-        | Ok remote ->
-            let! mergeResult = readOptionalConfigValue state $"branch.{branch}.merge" context
-
-            match remote, mergeResult with
-            | _, Error failure -> return Error failure
-            | None, Ok None -> return Ok None
-            | Some remoteName, Ok(Some _) -> return Ok(Some remoteName)
-            | _ -> return Error(configuredTargetInvalidFailure ())
-    }
-
-let private resolvePublishRemote
-    (state: SessionState)
-    (branch: string)
-    (context: OperationContext)
-    =
-    async {
-        let! upstreamResult = tryConfiguredUpstream state context
-
-        match upstreamResult with
-        | Error failure -> return Error failure
-        | Ok(Some upstream) when upstream.LogicalRef.Kind = RemoteRef ->
-            let! remoteResult = configuredUpstreamRemote state upstream.LogicalRef.Name context
-
-            match remoteResult with
-            | Ok(Some remote) ->
-                let! remoteUrlResult = resolvePublishRemoteUrl state remote context
-                return remoteUrlResult |> Result.map Some
-            | Ok None -> return Error(configuredTargetInvalidFailure ())
-            | Error failure -> return Error failure
-        | Ok(Some _) -> return Error(configuredTargetInvalidFailure ())
-        | Ok None ->
-            let! branchRemoteResult = configuredBranchRemote state branch context
-
-            match branchRemoteResult with
-            | Error failure -> return Error failure
-            | Ok(Some ".") -> return Error(configuredTargetInvalidFailure ())
-            | Ok(Some remoteName) ->
-                let! existsResult = configuredRemoteExists state remoteName context
-
-                match existsResult with
-                | Error failure -> return Error failure
-                | Ok false -> return Error(configuredTargetInvalidFailure ())
-                | Ok true ->
-                    let! remoteUrlResult = resolvePublishRemoteUrl state remoteName context
-                    return remoteUrlResult |> Result.map Some
-            | Ok None ->
-                let! originResult = configuredRemoteExists state "origin" context
-
-                match originResult with
-                | Error failure -> return Error failure
-                | Ok false -> return Ok None
-                | Ok true ->
-                    let! remoteUrlResult = resolvePublishRemoteUrl state "origin" context
-                    return remoteUrlResult |> Result.map Some
-    }
 
 let private revParse (state: SessionState) (reference: string) (context: OperationContext) =
     async {

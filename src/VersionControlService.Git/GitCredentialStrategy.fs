@@ -4,6 +4,7 @@
 /// place secrets in bindings, requests, or output.
 module VersionControlService.Git.GitCredentialStrategy
 
+open System.Text.RegularExpressions
 open Fable.Core
 
 module GitAuthAdapter = VersionControlService.Git.GitAuthAdapter
@@ -19,13 +20,16 @@ type RevisionIdentity = {
     Email: string
 }
 
-/// What the host knows when it is asked for a revision identity. TargetHost is the
-/// host of the bound remote location, the same host credentials resolve against, so
-/// a host can pick the account whose identity matches where the revision will be
-/// published. It is None for local paths and other locations without a URL host.
+/// What the application receives when the Git provider asks it for a revision
+/// identity. TargetHost is the DNS host of the remote the revision will be published
+/// to: the configured publish remote of the current branch when there is one,
+/// otherwise the bound location. It is None for local paths. ConnectionProfileId is
+/// the session profile, the same value credential resolution receives, so an
+/// application that keeps several accounts per host can pick the matching one.
 type RevisionIdentityRequest = {
     WorkspaceRoot: string
     TargetHost: string option
+    ConnectionProfileId: string option
 }
 
 type GitIdentityStrategy = {
@@ -47,6 +51,23 @@ let anonymous: GitCredentialStrategy = {
 let anonymousIdentity: GitIdentityStrategy = {
     ResolveIdentity = fun _request -> async { return None }
 }
+
+let private scpRemoteHostPattern = Regex(@"^[^\s@/:]+@([^\s/:]+):.+$")
+
+/// Host of a remote URL for identity selection. Credential lookup treats scp-style
+/// SSH remotes (user@host:path) as anonymous because git's own transport
+/// authenticates them, but an application can still match an account to that host,
+/// so identity selection reads it. Local paths and other forms give None.
+let tryIdentityHost (remoteUrl: string) : string option =
+    match GitAuthAdapter.tryExtractHostFromRemoteUrl remoteUrl with
+    | Ok host -> Some host
+    | Error _ ->
+        let scpMatch = scpRemoteHostPattern.Match(remoteUrl.Trim())
+
+        if scpMatch.Success then
+            Some(scpMatch.Groups.[1].Value.ToLowerInvariant())
+        else
+            None
 
 [<Emit("Buffer.from($0, 'utf8').toString('base64')")>]
 let private toBase64 (_value: string) : string = jsNative
