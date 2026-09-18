@@ -25,6 +25,15 @@ let private toBase64 (_value: string) : string = jsNative
 [<Emit("encodeURIComponent($0)")>]
 let private encodeUriComponent (_value: string) : string = jsNative
 
+// A Transform that hands every chunk to the callback and passes it on unchanged. Hashing and
+// progress used to hang off a "data" listener on the source stream, which switches the stream
+// to flowing mode before fetch or pipeline has attached. On Linux the first chunks were gone by
+// then, so uploads arrived empty while the byte count still reported the full file.
+// A callback that throws (a progress reporter, say) must fail the stream through the
+// transform callback. Thrown from inside the stream machinery it would escape the F# catch.
+[<Emit("new $0.Transform({ transform(chunk, encoding, callback) { try { $1(chunk); } catch (error) { callback(error); return; } callback(null, chunk); } })")>]
+let private createByteTap (_stream: obj) (_onChunk: obj -> unit) : obj = jsNative
+
 let private classifyStatus status body =
     let category, code =
         match status with
@@ -94,6 +103,7 @@ let downloadObjectToFile
     : Async<Result<StreamCopyResult, OperationFailure>> =
     async {
         let mutable completed = false
+        let mutable owned = false
         let mutable source: obj option = None
         let mutable target: obj option = None
 
@@ -128,6 +138,7 @@ let downloadObjectToFile
 
                         source <- Some readable
                         target <- Some writable
+                        writable?on ("open", fun (_: obj) -> owned <- true) |> ignore
                         let hash = NodeInterop.createSha256Hash ()
                         let mutable copied = 0.0
 
@@ -139,16 +150,14 @@ let downloadObjectToFile
                                 | true, parsed -> Some parsed
                                 | _ -> None)
 
-                        readable?on (
-                            "data",
-                            fun (chunk: obj) ->
+                        let tap =
+                            createByteTap streamDynamic (fun chunk ->
                                 NodeInterop.updateHash hash chunk
                                 copied <- copied + float (NodeInterop.bufferLength chunk)
-                                reportBytes "lakefs-download" key total context copied
-                        )
-                        |> ignore
+                                reportBytes "lakefs-download" key total context copied)
 
-                        let pipeline: JS.Promise<obj> = streamPromisesDynamic?pipeline (readable, writable) |> unbox
+                        let pipeline: JS.Promise<obj> =
+                            streamPromisesDynamic?pipeline (readable, tap, writable) |> unbox
                         do! pipeline |> Async.AwaitPromise |> Async.Ignore
 
                         if context.Cancellation.IsCancellationRequested() then
@@ -169,7 +178,9 @@ let downloadObjectToFile
             source |> Option.iter (fun value -> value?destroy () |> ignore)
             target |> Option.iter (fun value -> value?destroy () |> ignore)
 
-            if not completed && NodeFileSystem.existsSync temporaryPath then
+            // Only remove a file this call created. With "wx" the open fails on an existing
+            // path, and that file belongs to someone else.
+            if not completed && owned && NodeFileSystem.existsSync temporaryPath then
                 try
                     NodeFileSystem.unlinkSync temporaryPath
                 with _ ->
@@ -187,6 +198,7 @@ let private uploadObjectFromFileCore
     : Async<Result<StreamCopyResult, OperationFailure>> =
     async {
         let mutable source: obj option = None
+        let mutable body: obj option = None
         let mutable descriptorToClose: int option = None
 
         try
@@ -215,17 +227,25 @@ let private uploadObjectFromFileCore
                     let mutable copied = 0.0
                     let total = Some openedStats.size
 
-                    readable?on (
-                        "data",
-                        fun (chunk: obj) ->
+                    let tap =
+                        createByteTap streamDynamic (fun chunk ->
                             NodeInterop.updateHash hash chunk
                             copied <- copied + float (NodeInterop.bufferLength chunk)
-                            reportBytes "lakefs-upload" key total context copied
-                    )
-                    |> ignore
+                            reportBytes "lakefs-upload" key total context copied)
+
+                    // pipe does not forward errors, so a failed read has to tear down the tap
+                    // by hand or fetch would wait on a body that never ends. The tap needs its
+                    // own error listener from the start: until fetch attaches a reader, an
+                    // error on an unobserved stream is thrown at the process instead.
+                    let mutable readFailure: obj option = None
+                    tap?on ("error", fun (error: obj) -> readFailure <- Some error) |> ignore
+                    readable?on ("error", fun (error: obj) -> tap?destroy (error) |> ignore) |> ignore
+                    readable?pipe (tap) |> ignore
+                    body <- Some tap
 
                     context.Cancellation.Register(fun () ->
-                        readable?destroy (NodeInterop.createError "canceled") |> ignore)
+                        readable?destroy (NodeInterop.createError "canceled") |> ignore
+                        tap?destroy (NodeInterop.createError "canceled") |> ignore)
 
                     let encodedCredentials =
                         toBase64 $"{connection.AccessKeyId}:{connection.SecretAccessKey}"
@@ -238,7 +258,7 @@ let private uploadObjectFromFileCore
                                     "Authorization" ==> $"Basic {encodedCredentials}"
                                     "Content-Type" ==> "application/octet-stream"
                                 ]
-                            "body" ==> readable
+                            "body" ==> tap
                             "duplex" ==> "half"
                             "signal" ==> NodeCancellation.toAbortSignal context.Cancellation
                         ]
@@ -254,11 +274,23 @@ let private uploadObjectFromFileCore
                             if context.Cancellation.IsCancellationRequested() then
                                 return Error(canceledFailure ())
                             else
-                                return
-                                    Ok {
-                                        BytesCopied = copied
-                                        Sha256 = NodeInterop.digestHashHex hash
-                                    }
+                                match readFailure with
+                                | Some error -> return Error(networkFailure (NodeInterop.errorMessage error))
+                                | None ->
+                                    // The counter and the hash run ahead of the socket, so a
+                                    // success answer only counts once the body really ended.
+                                    if not (unbox<bool> tap?readableEnded) then
+                                        return
+                                            Error(
+                                                networkFailure
+                                                    "lakeFS answered before the upload body was fully sent."
+                                            )
+                                    else
+                                        return
+                                            Ok {
+                                                BytesCopied = copied
+                                                Sha256 = NodeInterop.digestHashHex hash
+                                            }
                         else
                             let! body = response?text () |> unbox<JS.Promise<string>> |> Async.AwaitPromise
                             return Error(classifyStatus status body)
@@ -269,6 +301,7 @@ let private uploadObjectFromFileCore
                             return Error(networkFailure (NodeInterop.errorMessage error))
         finally
             source |> Option.iter (fun value -> value?destroy () |> ignore)
+            body |> Option.iter (fun value -> value?destroy () |> ignore)
             descriptorToClose |> Option.iter NodeFileSystem.closeFileDescriptorSync
     }
 
