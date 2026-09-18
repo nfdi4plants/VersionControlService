@@ -894,6 +894,25 @@ Vitest.describe (
                     let! _ = setOriginUrl "git@scp.example.org:group/project.git"
                     do! createRevision workspace.Binding "identity-scp"
 
+                    // A push URL wins over the fetch URL, because that is where git push goes.
+                    let! _ = setOriginUrl "https://Hub.Example.org/group/project.git"
+
+                    let! _ =
+                        runGitIn
+                            workspaceRoot
+                            [||]
+                            [| "remote"; "set-url"; "--push"; "origin"; "https://push.example.org/group/project.git" |]
+                            None
+
+                    do! createRevision workspace.Binding "identity-pushurl"
+
+                    // An upstream that names no remote is an invalid target: no host at all,
+                    // rather than a host the revision will never be published to.
+                    let! _ = runGitIn workspaceRoot [||] [| "config"; "--unset-all"; "remote.origin.pushurl" |] None
+                    let! _ = runGitIn workspaceRoot [||] [| "config"; "branch.main.remote"; "." |] None
+                    do! createRevision workspace.Binding "identity-invalid-upstream"
+                    let! _ = runGitIn workspaceRoot [||] [| "config"; "branch.main.remote"; "origin" |] None
+
                     // Without any publish remote the bound location is what remains.
                     let! _ = runGitIn workspaceRoot [||] [| "remote"; "remove"; "origin" |] None
 
@@ -907,7 +926,7 @@ Vitest.describe (
 
                     do! createRevision fallbackBinding "identity-fallback"
 
-                    Vitest.expect(requests.Count).toBe 4
+                    Vitest.expect(requests.Count).toBe 6
 
                     for request in requests do
                         Vitest.expect(request.WorkspaceRoot).toBe workspaceRoot
@@ -917,7 +936,9 @@ Vitest.describe (
                     Vitest.expect(requests.[1].TargetHost).toEqual (Some "hub.example.org")
                     Vitest.expect(requests.[1].ConnectionProfileId).toEqual (Some "profile-a")
                     Vitest.expect(requests.[2].TargetHost).toEqual (Some "scp.example.org")
-                    Vitest.expect(requests.[3].TargetHost).toEqual (Some "fallback.example.org")
+                    Vitest.expect(requests.[3].TargetHost).toEqual (Some "push.example.org")
+                    Vitest.expect(requests.[4].TargetHost).toEqual None
+                    Vitest.expect(requests.[5].TargetHost).toEqual (Some "fallback.example.org")
                     do! harness.Cleanup()
                 with error ->
                     do! harness.Cleanup()

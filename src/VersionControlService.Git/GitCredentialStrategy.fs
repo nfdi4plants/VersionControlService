@@ -54,42 +54,50 @@ let anonymousIdentity: GitIdentityStrategy = {
     ResolveIdentity = fun _request -> async { return None }
 }
 
-let private scpRemoteHostPattern = Regex(@"^[^\s@/:]+@([^\s/:]+):.+$")
+/// Host of a URL-form remote. Userinfo is everything up to the last "@" before the
+/// path, so a user name containing "@" does not leak into the host. Bracketed IPv6
+/// hosts are captured whole. System.Uri is avoided here because the Fable runtime
+/// cuts a host at its first colon.
+let private schemeHostPattern =
+    Regex(
+        @"^(?:https?|ssh|git|git\+ssh|ssh\+git)://(?:[^/]*@)?(\[[^\]]+\]|[^/:\[]+)(?::\d*)?(?:/|$)",
+        RegexOptions.IgnoreCase
+    )
+
+/// scp-style `[user@]host:path`. git reads a colon before the first slash as this form
+/// unless the text before the colon is a single drive letter.
+let private scpHostPattern = Regex(@"^(?:[^/]*@)?(\[[^\]]+\]|[^/:\[]+):")
+
+let private normalizeHost (host: string) =
+    host.Trim().TrimStart('[').TrimEnd(']').ToLowerInvariant()
 
 /// Host of a remote URL for identity selection. Credential lookup only reads https
 /// and ssh URLs and treats everything else as anonymous, because git's own transport
 /// authenticates it. An application can still match an account to the host of an
-/// http or git URL or of an scp-style remote (user@host:path), so identity selection
-/// reads those too. Local paths and forms without a readable host give None.
+/// http, git, git+ssh or scp-style remote, so identity selection reads those too. Hosts are
+/// lowercased and IPv6 brackets are dropped. Percent-encoded and internationalized
+/// host names are returned as written. Local paths, file URLs and forms without a
+/// readable host give None.
 let tryIdentityHost (remoteUrl: string) : string option =
-    match GitAuthAdapter.tryExtractHostFromRemoteUrl remoteUrl with
-    | Ok host -> Some host
-    | Error _ ->
-        let trimmed = remoteUrl.Trim()
+    let trimmed = remoteUrl.Trim()
+    let schemeMatch = schemeHostPattern.Match trimmed
 
-        let schemeHost =
-            if
-                trimmed.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
-                || trimmed.StartsWith("git://", StringComparison.OrdinalIgnoreCase)
-            then
-                let mutable uri = Unchecked.defaultof<Uri>
+    if schemeMatch.Success then
+        Some(normalizeHost schemeMatch.Groups.[1].Value)
+    elif trimmed.Contains "://" then
+        None
+    else
+        let scpMatch = scpHostPattern.Match trimmed
 
-                if Uri.TryCreate(trimmed, UriKind.Absolute, &uri) && not (String.IsNullOrWhiteSpace uri.Host) then
-                    Some(uri.Host.Trim().ToLowerInvariant())
-                else
-                    None
-            else
+        if scpMatch.Success then
+            let host = scpMatch.Groups.[1].Value
+
+            if host.Length = 1 && Char.IsLetter host.[0] then
                 None
-
-        match schemeHost with
-        | Some host -> Some host
-        | None ->
-            let scpMatch = scpRemoteHostPattern.Match trimmed
-
-            if scpMatch.Success then
-                Some(scpMatch.Groups.[1].Value.ToLowerInvariant())
             else
-                None
+                Some(normalizeHost host)
+        else
+            None
 
 [<Emit("Buffer.from($0, 'utf8').toString('base64')")>]
 let private toBase64 (_value: string) : string = jsNative

@@ -146,13 +146,27 @@ Vitest.describe (
                     // Process spy: records every provider invocation to observe injected auth.
                     let observedCommands = ResizeArray<string[]>()
 
+                    // insteadOf redirects the https remote to the local bare repository, so
+                    // git reports the file URL as the effective push URL. The hook answers
+                    // that one query with the https URL so credential scoping stays under test.
                     let hooks = {
                         GitWorkspaceSession.GitSessionHooks.none with
                             RunProcess =
                                 Some(fun request processContext ->
                                     async {
                                         observedCommands.Add request.Arguments
-                                        return! NodeProcess.run request processContext
+
+                                        if request.Arguments |> Array.contains "get-url" then
+                                            let output: NodeProcess.ProcessOutput = {
+                                                ExitCode = 0
+                                                StdOut = testHttpsUrl + "
+"
+                                                StdErr = ""
+                                            }
+
+                                            return OperationResult.succeeded output
+                                        else
+                                            return! NodeProcess.run request processContext
                                     })
                     }
 

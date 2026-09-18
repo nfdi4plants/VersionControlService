@@ -900,13 +900,34 @@ Vitest.describe (
             TestOptions(timeout = 120000),
             fun () -> promise {
                 let observed = ResizeArray<NodeProcess.ProcessRequest>()
+                let upstreamUrl = "https://upstream.local.test/upstream.git"
+
+                // The fixture redirects the https upstream to a local repository with
+                // insteadOf so the push can run for real. git would report the rewritten
+                // file URL as the effective push URL, which is where credentials would
+                // rightly stop, so the hook answers that one query with the https URL the
+                // test is about. Every other command runs unchanged.
                 let hooks = {
                     GitWorkspaceSession.GitSessionHooks.none with
                         RunProcess =
                             Some(fun request processContext ->
                                 async {
                                     observed.Add request
-                                    return! NodeProcess.run request processContext
+
+                                    if
+                                        request.Arguments |> Array.contains "get-url"
+                                        && request.Arguments |> Array.contains "upstream"
+                                    then
+                                        let output: NodeProcess.ProcessOutput = {
+                                            ExitCode = 0
+                                            StdOut = upstreamUrl + "
+"
+                                            StdErr = ""
+                                        }
+
+                                        return OperationResult.succeeded output
+                                    else
+                                        return! NodeProcess.run request processContext
                                 })
                 }
 
@@ -916,7 +937,6 @@ Vitest.describe (
                     let originHost = "origin.local.test"
                     let upstreamHost = "upstream.local.test"
                     let originUrl = $"https://{originHost}/origin.git"
-                    let upstreamUrl = $"https://{upstreamHost}/upstream.git"
                     let upstreamPath = join [| root; "credential-upstream.git" |]
                     let! _ = runGitIn root [| "init"; "--bare"; "-b"; "main"; upstreamPath |]
                     let! _ =
@@ -2385,11 +2405,10 @@ Vitest.describe (
         )
 
         // The hook stands in for a true merge killed after it wrote MERGE_HEAD and its
-        // index lock. Cancellation is reported from inside the spawn, the way a killed
-        // process reports it, so the recovery sequence (lock removal, then merge --abort)
-        // runs for real.
+        // index lock. Nothing here can prove who owns a lock, so the recovery reports
+        // it and touches nothing else.
         Vitest.test (
-            "canceled update aborts a half-finished merge and removes the stale index lock",
+            "canceled update reports a stale index lock and leaves the repository alone",
             TestOptions(timeout = 120000),
             fun () -> promise {
                 let mutable targetHash = ""
@@ -2400,7 +2419,6 @@ Vitest.describe (
                     RunProcess =
                         Some(fun request context ->
                             async {
-                                // The recovery's own `git merge --abort` must reach real git.
                                 if
                                     request.Arguments |> Array.contains "merge"
                                     && not (request.Arguments |> Array.contains "--abort")
@@ -2442,6 +2460,81 @@ Vitest.describe (
                         Async.StartAsPromise(
                             (syncService session).Update
                                 { ExpectedWorkspaceVersion = beforeUpdate.WorkspaceVersion }
+                                (ctx "cancel-update-lock")
+                        )
+
+                    let failure = expectProviderFailure "canceled update with lock" updateResult
+                    Vitest.expect(failure.Category).toEqual (Canceled)
+                    Vitest.expect(failure.Code).toBe ("operation_canceled")
+                    Vitest.expect(failure.StateChanged).toBe (true)
+
+                    Vitest
+                        .expect(failure.RecoveryAction |> Option.map (fun action -> action.Code))
+                        .toEqual (Some "remove_index_lock")
+
+                    let! mergeHead = tryReadUtf8FileAsync (join [| workPath; ".git"; "MERGE_HEAD" |])
+                    let! indexLock = tryReadUtf8FileAsync (join [| workPath; ".git"; "index.lock" |])
+                    Vitest.expect(mergeHead).toEqual (Some(targetHash + "\n"))
+                    Vitest.expect(indexLock).toEqual (Some "")
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        // The same kill, but the lock is gone (git released it before dying). The
+        // recovery then aborts the merge state this merge created.
+        Vitest.test (
+            "canceled update aborts a half-finished merge",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable targetHash = ""
+                let mutable workspacePath = ""
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request context ->
+                            async {
+                                if
+                                    request.Arguments |> Array.contains "merge"
+                                    && not (request.Arguments |> Array.contains "--abort")
+                                then
+                                    do!
+                                        writeUtf8FileAsync
+                                            (join [| workspacePath; ".git"; "MERGE_HEAD" |])
+                                            (targetHash + "\n")
+                                        |> Async.AwaitPromise
+
+                                    return
+                                        OperationResult.failed (
+                                            OperationFailure.create
+                                                Canceled
+                                                "operation_canceled"
+                                                "simulated kill during merge"
+                                        )
+                                else
+                                    return! NodeProcess.run request context
+                            })
+                    Barrier = None
+                }
+
+                let! root, workPath, barePath, session = createSyncFixture hooks
+                workspacePath <- workPath
+
+                try
+                    do! advanceTarget root barePath [ "merge-residue.txt", "content\n" ]
+                    let! observedTargetHash = runGitIn barePath [| "rev-parse"; "main" |]
+                    targetHash <- observedTargetHash.Trim()
+
+                    let! beforeUpdate = sessionStatus session
+
+                    let! updateResult =
+                        Async.StartAsPromise(
+                            (syncService session).Update
+                                { ExpectedWorkspaceVersion = beforeUpdate.WorkspaceVersion }
                                 (ctx "cancel-update-merge")
                         )
 
@@ -2449,15 +2542,14 @@ Vitest.describe (
                     Vitest.expect(failure.Category).toEqual (Canceled)
                     Vitest.expect(failure.Code).toBe ("operation_canceled")
                     Vitest.expect(failure.StateChanged).toBe (false)
+                    Vitest.expect(failure.RecoveryAction).toEqual (None)
 
                     let! mergeHead = tryReadUtf8FileAsync (join [| workPath; ".git"; "MERGE_HEAD" |])
-                    let! indexLock = tryReadUtf8FileAsync (join [| workPath; ".git"; "index.lock" |])
                     let! mergeResidue = tryReadUtf8FileAsync (join [| workPath; "merge-residue.txt" |])
                     let! status = runGitIn workPath [| "status"; "--porcelain" |]
                     let! afterUpdate = sessionStatus session
 
                     Vitest.expect(mergeHead).toEqual (None)
-                    Vitest.expect(indexLock).toEqual (None)
                     Vitest.expect(mergeResidue).toEqual (None)
                     Vitest.expect(status.Trim()).toBe ("")
                     Vitest.expect(afterUpdate.ActiveConflictSession).toEqual (None)
@@ -2470,9 +2562,10 @@ Vitest.describe (
         )
 
         // A fast-forward writes no MERGE_HEAD. The hook stands in for a merge process
-        // killed after it rewrote one file and left its index lock behind.
+        // killed after it rewrote one file. The provider reports the file and leaves it,
+        // because it cannot prove the file held nothing of the user's.
         Vitest.test (
-            "canceled fast-forward merge restores the files git had rewritten",
+            "canceled fast-forward merge reports the file git may have rewritten",
             TestOptions(timeout = 120000),
             fun () -> promise {
                 let mutable workspacePath = ""
@@ -2485,10 +2578,6 @@ Vitest.describe (
                                 if request.Arguments |> Array.contains "merge" then
                                     do!
                                         writeUtf8FileAsync (join [| workspacePath; "ff-residue.txt" |]) "content\n"
-                                        |> Async.AwaitPromise
-
-                                    do!
-                                        writeUtf8FileAsync (join [| workspacePath; ".git"; "index.lock" |]) ""
                                         |> Async.AwaitPromise
 
                                     return
@@ -2521,15 +2610,18 @@ Vitest.describe (
                     let failure = expectProviderFailure "canceled fast-forward" updateResult
                     Vitest.expect(failure.Category).toEqual (Canceled)
                     Vitest.expect(failure.Code).toBe ("operation_canceled")
-                    Vitest.expect(failure.StateChanged).toBe (false)
-                    Vitest.expect(failure.RecoveryAction).toEqual (None)
+                    Vitest.expect(failure.StateChanged).toBe (true)
+
+                    Vitest
+                        .expect(failure.RecoveryAction |> Option.map (fun action -> action.Code))
+                        .toEqual (Some "restore_workspace")
+
+                    Vitest.expect(failure.AffectedPaths).toEqual [| "ff-residue.txt" |]
 
                     let! residue = tryReadUtf8FileAsync (join [| workPath; "ff-residue.txt" |])
-                    let! indexLock = tryReadUtf8FileAsync (join [| workPath; ".git"; "index.lock" |])
                     let! status = runGitIn workPath [| "status"; "--porcelain" |]
-                    Vitest.expect(residue).toEqual (None)
-                    Vitest.expect(indexLock).toEqual (None)
-                    Vitest.expect(status.Trim()).toBe ("")
+                    Vitest.expect(residue).toEqual (Some "content\n")
+                    Vitest.expect(status.Trim()).toBe ("?? ff-residue.txt")
 
                     do! removeDirectoryAsync root
                 with error ->
@@ -2538,10 +2630,10 @@ Vitest.describe (
             }
         )
 
-        // Same kill, this time against a file that already exists in HEAD, so the
-        // recovery has to put the HEAD content back instead of deleting a new file.
+        // Same kill against a file that already exists in HEAD. The rewritten content
+        // stays in place and the path is reported.
         Vitest.test (
-            "canceled fast-forward merge restores a tracked file to its HEAD content",
+            "canceled fast-forward merge reports a rewritten tracked file",
             TestOptions(timeout = 120000),
             fun () -> promise {
                 let mutable workspacePath = ""
@@ -2585,13 +2677,18 @@ Vitest.describe (
 
                     let failure = expectProviderFailure "canceled tracked fast-forward" updateResult
                     Vitest.expect(failure.Category).toEqual (Canceled)
-                    Vitest.expect(failure.StateChanged).toBe (false)
-                    Vitest.expect(failure.RecoveryAction).toEqual (None)
+                    Vitest.expect(failure.StateChanged).toBe (true)
+
+                    Vitest
+                        .expect(failure.RecoveryAction |> Option.map (fun action -> action.Code))
+                        .toEqual (Some "restore_workspace")
+
+                    Vitest.expect(failure.AffectedPaths).toEqual [| "base.txt" |]
 
                     let! baseContent = tryReadUtf8FileAsync (join [| workPath; "base.txt" |])
                     let! status = runGitIn workPath [| "status"; "--porcelain" |]
-                    Vitest.expect(baseContent).toEqual (Some "base content\n")
-                    Vitest.expect(status.Trim()).toBe ("")
+                    Vitest.expect(baseContent).toEqual (Some "rewritten base\n")
+                    Vitest.expect(status.TrimEnd()).toBe (" M base.txt")
 
                     do! removeDirectoryAsync root
                 with error ->
@@ -2663,9 +2760,9 @@ Vitest.describe (
         )
 
         // git writes the index before it moves HEAD, so a kill in that window leaves the
-        // target's new file staged. The recovery has to unstage it as well as delete it.
+        // target's new file staged. It is reported like any other rewritten path.
         Vitest.test (
-            "canceled fast-forward merge unstages a file git had already added",
+            "canceled fast-forward merge reports a file git had already staged",
             TestOptions(timeout = 120000),
             fun () -> promise {
                 let mutable workspacePath = ""
@@ -2711,13 +2808,18 @@ Vitest.describe (
 
                     let failure = expectProviderFailure "canceled staged fast-forward" updateResult
                     Vitest.expect(failure.Category).toEqual (Canceled)
-                    Vitest.expect(failure.StateChanged).toBe (false)
-                    Vitest.expect(failure.RecoveryAction).toEqual (None)
+                    Vitest.expect(failure.StateChanged).toBe (true)
+
+                    Vitest
+                        .expect(failure.RecoveryAction |> Option.map (fun action -> action.Code))
+                        .toEqual (Some "restore_workspace")
+
+                    Vitest.expect(failure.AffectedPaths).toEqual [| "staged-residue.txt" |]
 
                     let! residue = tryReadUtf8FileAsync (join [| workPath; "staged-residue.txt" |])
                     let! status = runGitIn workPath [| "status"; "--porcelain" |]
-                    Vitest.expect(residue).toEqual (None)
-                    Vitest.expect(status.Trim()).toBe ("")
+                    Vitest.expect(residue).toEqual (Some "content\n")
+                    Vitest.expect(status.Trim()).toBe ("A  staged-residue.txt")
 
                     do! removeDirectoryAsync root
                 with error ->
@@ -2729,8 +2831,8 @@ Vitest.describe (
         // The user edited base.txt before the update and the target changes the same
         // file. git would refuse that fast-forward, and a kill before the refusal writes
         // nothing. An unrelated scratch file appearing meanwhile moves the workspace
-        // version, so the recovery runs. It must leave the user's edit alone and report
-        // the outside change as a stale version, since the provider changed nothing.
+        // version, so the recovery runs. It must leave the user's edit alone and must not
+        // list base.txt as a rewritten path, because it was already changed beforehand.
         Vitest.test (
             "canceled merge recovery never restores paths the user had changed beforehand",
             TestOptions(timeout = 120000),
@@ -2777,11 +2879,13 @@ Vitest.describe (
 
                     let failure = expectProviderFailure "canceled protected merge" updateResult
                     Vitest.expect(failure.Category).toEqual (Canceled)
-                    Vitest.expect(failure.StateChanged).toBe (false)
+                    Vitest.expect(failure.StateChanged).toBe (true)
 
                     Vitest
                         .expect(failure.RecoveryAction |> Option.map (fun action -> action.Code))
-                        .toEqual (Some "refresh_workspace")
+                        .toEqual (Some "restore_workspace")
+
+                    Vitest.expect(failure.AffectedPaths).toEqual [||]
 
                     let! baseContent = tryReadUtf8FileAsync (join [| workPath; "base.txt" |])
                     let! scratch = tryReadUtf8FileAsync (join [| workPath; "scratch.txt" |])
