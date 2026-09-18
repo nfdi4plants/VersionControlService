@@ -84,8 +84,8 @@ let private normalizeHost (host: string) =
 /// authenticates it. An application can still match an account to the host of an
 /// http, git, git+ssh or scp-style remote, so identity selection reads those too. The
 /// parser lowercases hosts and drops IPv6 brackets. It passes percent-encoded and
-/// internationalized names through as written. It gives None for local paths, for
-/// file URLs, and for any other form without a readable host.
+/// internationalized names through as written. It gives None for local paths and for
+/// any other form without a readable host, which includes file URLs.
 let tryIdentityHost (remoteUrl: string) : string option =
     let trimmed = remoteUrl.Trim()
     let schemeMatch = schemeHostPattern.Match trimmed

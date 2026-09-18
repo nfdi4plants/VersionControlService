@@ -2255,18 +2255,29 @@ let private recoverCanceledMerge
         match lockPath with
         | None -> return inspect "the index.lock path could not be resolved"
         | Some lockPath when NodeFileSystem.existsSync lockPath && start.IndexLockPresent ->
-            // The lock predates this update, so git merge refused to start and the
-            // repository is as it was. Another process holds the index or left the lock.
-            return {
-                failure with
-                    RecoveryAction =
-                        Some {
-                            Code = "remove_index_lock"
-                            Instructions =
-                                Some
-                                    "An index.lock was already present before the update started, so another process holds the index or left a stale lock. The update changed nothing. Clear the lock once no git process is running, then retry."
-                        }
-            }
+            // The lock predates this update. Usually git merge refused to start and the
+            // repository is as it was, but the other process may have released its lock in
+            // the window before the spawn, so the workspace version decides the report.
+            let! versionAfter = computeWorkspaceVersion state cleanupContext
+
+            match versionAfter with
+            | Ok version when version = start.WorkspaceVersion ->
+                return {
+                    failure with
+                        RecoveryAction =
+                            Some {
+                                Code = "remove_index_lock"
+                                Instructions =
+                                    Some
+                                        "An index.lock was already present before the update started, so another process holds the index or left a stale lock. The update did not create it and the workspace matches its pre-merge state. Clear the lock once no git process is running, then retry."
+                            }
+                }
+            | _ ->
+                return
+                    residue
+                        "remove_index_lock"
+                        "A stale .git/index.lock is present. Make sure no git process is still running on the repository, remove the lock, run git merge --abort if MERGE_HEAD exists, then refresh."
+                        [||]
         | Some lockPath when NodeFileSystem.existsSync lockPath ->
             return
                 residue
