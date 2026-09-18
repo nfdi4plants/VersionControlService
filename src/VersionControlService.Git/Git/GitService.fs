@@ -90,7 +90,9 @@ let classifyFailureKind (message: string) =
         |]
     then
         GitFailureKind.RemoteProjectAlreadyExists
-    elif containsAny [| "abort"; "cancelled"; "canceled"; "aborterror" |] then
+    // A bare "abort" token is not a cancellation marker: git prints "Aborting" when a
+    // checkout or merge would overwrite local changes, and that is an ordinary failure.
+    elif containsAny [| "cancelled"; "canceled"; "aborterror" |] then
         GitFailureKind.Canceled
     elif containsAny [| "timed out"; "timeout"; "time out" |] then
         GitFailureKind.Timeout
