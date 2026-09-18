@@ -114,9 +114,10 @@ jobs:
           powershell -NoProfile -File build/PackLocal.ps1 -Version $version -Output $feed
           powershell -NoProfile -File build/VerifyPackageGraph.ps1 -Feed $feed -Version $version
 
+          # nuget.org has to be listed first: with a directory as the first source, dotnet/sdk#51514 turns every later source into a local path on Windows.
           dotnet restore tests/VersionControlService.PackageConsumer/VersionControlService.PackageConsumer.fsproj `
-              --source $feed `
               --source 'https://api.nuget.org/v3/index.json' `
+              --source $feed `
               --packages $cache `
               --no-cache `
               -p:VersionControlServicePackageVersion=$version
