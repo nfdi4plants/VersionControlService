@@ -2047,8 +2047,8 @@ type private MergeStart = {
     WorkspaceVersion: string
     Head: string option
     MergeHeadPresent: bool
-    /// Paths that were modified, staged or untracked before the merge. They may hold
-    /// the user's work and are never treated as merge residue.
+    /// Paths that were changed or untracked before the merge. They may hold the
+    /// user's work and are never treated as merge residue.
     PreexistingPaths: Set<string>
     StartedAtMs: float
 }
@@ -2124,8 +2124,8 @@ let private gitOutcome (result: Result<NodeProcess.ProcessOutput, OperationFailu
     | Error failure -> Error failure.Message
 
 /// Puts back the paths a killed fast-forward may have rewritten: those that differ
-/// between HEAD and the target, minus every path that was already modified, staged
-/// or untracked when the merge started. git refuses to fast-forward over such a path,
+/// between HEAD and the target, minus every path that was already changed or
+/// untracked when the merge started. git refuses to fast-forward over such a path,
 /// so it cannot be merge residue, and it may hold the user's work. The remaining
 /// paths held nothing of the user's, and putting them back from HEAD discards no
 /// work. Renames are listed as their old and new path so a deleted old path comes
@@ -2375,13 +2375,44 @@ let private recoverCanceledMerge
 
                                     match versionRestored with
                                     | Ok version when version = start.WorkspaceVersion -> return failure
-                                    | Ok _ ->
-                                        return
-                                            residue
-                                                "restore_workspace"
-                                                "The update was canceled while git was rewriting files, and the workspace could not be returned to its previous state. Review the affected paths and refresh."
-                                                affected
                                     | Error observeFailure -> return inspect observeFailure.Message
+                                    | Ok _ ->
+                                        // A fast-forward can only write diff paths, and those are back at
+                                        // HEAD unless status still lists them. A difference anywhere else
+                                        // came from outside the update: the caller's version is stale,
+                                        // and the provider changed nothing.
+                                        let! status =
+                                            runGit
+                                                state.Hooks
+                                                state.RepoPath
+                                                [| "status"; "--porcelain"; "-z"; "--untracked-files=all" |]
+                                                None
+                                                cleanupContext
+
+                                        match status with
+                                        | Error observeFailure -> return inspect observeFailure.Message
+                                        | Ok output when output.ExitCode <> 0 -> return inspect output.StdErr
+                                        | Ok output ->
+                                            let dirty = statusPaths output.StdOut
+                                            let stillChanged = affected |> Array.filter dirty.Contains
+
+                                            if stillChanged.Length = 0 then
+                                                return {
+                                                    failure with
+                                                        RecoveryAction =
+                                                            Some {
+                                                                Code = "refresh_workspace"
+                                                                Instructions =
+                                                                    Some
+                                                                        "The workspace changed outside the update while it was running. Refresh before retrying."
+                                                            }
+                                                }
+                                            else
+                                                return
+                                                    residue
+                                                        "restore_workspace"
+                                                        "The update was canceled while git was rewriting files, and some of those files could not be returned to their previous state. Review the affected paths and refresh."
+                                                        stillChanged
     }
 
 let private synchronizationState (state: SessionState) (context: OperationContext) =

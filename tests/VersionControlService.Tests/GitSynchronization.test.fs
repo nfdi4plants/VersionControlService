@@ -2729,7 +2729,8 @@ Vitest.describe (
         // The user edited base.txt before the update and the target changes the same
         // file. git would refuse that fast-forward, and a kill before the refusal writes
         // nothing. An unrelated scratch file appearing meanwhile moves the workspace
-        // version, so the recovery runs, and it must leave the user's edit alone.
+        // version, so the recovery runs. It must leave the user's edit alone and report
+        // the outside change as a stale version, since the provider changed nothing.
         Vitest.test (
             "canceled merge recovery never restores paths the user had changed beforehand",
             TestOptions(timeout = 120000),
@@ -2776,11 +2777,11 @@ Vitest.describe (
 
                     let failure = expectProviderFailure "canceled protected merge" updateResult
                     Vitest.expect(failure.Category).toEqual (Canceled)
-                    Vitest.expect(failure.StateChanged).toBe (true)
+                    Vitest.expect(failure.StateChanged).toBe (false)
 
                     Vitest
                         .expect(failure.RecoveryAction |> Option.map (fun action -> action.Code))
-                        .toEqual (Some "restore_workspace")
+                        .toEqual (Some "refresh_workspace")
 
                     let! baseContent = tryReadUtf8FileAsync (join [| workPath; "base.txt" |])
                     let! scratch = tryReadUtf8FileAsync (join [| workPath; "scratch.txt" |])
