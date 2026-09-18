@@ -1573,6 +1573,7 @@ let planOutboundPush
     (repoPath: string)
     (remoteName: string)
     (branchName: string option)
+    (fetchGit: ISimpleGit)
     (git: ISimpleGit)
     : JS.Promise<Result<OutboundPushPlan, 'Failure>> =
     promise {
@@ -1598,8 +1599,11 @@ let planOutboundPush
         | Ok dryRunOutput when shouldSkipLfsUploadFromPushDryRun dryRunOutput ->
             return Ok OutboundPushPlan.SkipLfsUpload
         | Ok _ ->
+            // ls-remote connects to the remote's fetch URL, so it runs on the instance that
+            // carries fetch credentials. The dry run above and the upload later use push
+            // credentials.
             let! remoteTipIdsResult =
-                runSimpleGitRaw (fun currentGit -> currentGit.raw [| "ls-remote"; "--refs"; remoteName |]) git
+                runSimpleGitRaw (fun currentGit -> currentGit.raw [| "ls-remote"; "--refs"; remoteName |]) fetchGit
 
             match remoteTipIdsResult with
             | Error failure -> return Error failure

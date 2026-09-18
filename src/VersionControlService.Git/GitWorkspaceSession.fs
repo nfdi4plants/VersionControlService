@@ -913,38 +913,32 @@ let private configuredTargetInvalidFailure () =
         "configured_target_invalid"
         "The configured Git upstream does not identify a remote."
 
-let private resolvePublishRemoteUrl
+/// Non-empty lines of a `git remote get-url` query. Exit code 2 is "No such remote",
+/// any other nonzero exit is git failing to answer.
+let private readRemoteUrls
     (state: SessionState)
+    (arguments: string[])
     (remoteName: string)
     (context: OperationContext)
-    =
+    : Async<Result<string[], OperationFailure>> =
     async {
-        // `remote get-url --push --all` is what `git push <name>` will use: pushurl over
-        // url, with insteadOf and pushInsteadOf rewriting applied. Several push URLs would
-        // publish to several hosts, which one credential and one identity cannot serve, so
-        // that configuration counts as an invalid target.
         let! result =
-            runGit
-                state.Hooks
-                state.RepoPath
-                [| "remote"; "get-url"; "--push"; "--all"; remoteName |]
-                None
-                context
+            runGit state.Hooks state.RepoPath [| "remote"; "get-url"; yield! arguments; remoteName |] None context
 
         match result with
         | Error failure -> return Error failure
-        | Ok output when output.ExitCode = 0 && not (String.IsNullOrWhiteSpace output.StdOut) ->
+        | Ok output when output.ExitCode = 0 ->
             let urls =
                 output.StdOut.Split([| '\n' |], StringSplitOptions.RemoveEmptyEntries)
                 |> Array.map (fun url -> url.Trim())
                 |> Array.filter (fun url -> url <> "")
                 |> Array.distinct
 
-            match urls with
-            | [| url |] -> return Ok { Name = remoteName; Url = url }
-            | _ -> return Error(configuredTargetInvalidFailure ())
-        // Exit code 2 is "No such remote". Anything else is git failing to answer.
-        | Ok output when output.ExitCode = 2 || output.ExitCode = 0 -> return Error(configuredTargetInvalidFailure ())
+            if urls.Length = 0 then
+                return Error(configuredTargetInvalidFailure ())
+            else
+                return Ok urls
+        | Ok output when output.ExitCode = 2 -> return Error(configuredTargetInvalidFailure ())
         | Ok output ->
             return
                 Error(
@@ -955,31 +949,35 @@ let private resolvePublishRemoteUrl
                 )
     }
 
-/// Effective fetch URL of a remote, with insteadOf rewriting applied. Fetch, ls-remote
-/// and LFS downloads connect to this URL, so their credentials have to be scoped to it
-/// and not to the raw configuration value or to the bound location. Exit code 2 is
-/// "No such remote".
+/// The effective push URL: pushurl over url, with insteadOf and pushInsteadOf applied,
+/// which is what `git push <name>` uses. Several distinct push URLs would publish to
+/// several hosts, which one credential and one identity cannot serve, so that
+/// configuration counts as an invalid target.
+let private resolvePublishRemoteUrl
+    (state: SessionState)
+    (remoteName: string)
+    (context: OperationContext)
+    =
+    async {
+        let! urls = readRemoteUrls state [| "--push"; "--all" |] remoteName context
+
+        match urls with
+        | Error failure -> return Error failure
+        | Ok [| url |] -> return Ok { Name = remoteName; Url = url }
+        | Ok _ -> return Error(configuredTargetInvalidFailure ())
+    }
+
+/// The effective fetch URL, with insteadOf applied. Fetch, ls-remote, LFS downloads and
+/// the first fetch after Initialize connect to this URL, so their credentials have to
+/// be scoped to it and not to the raw configuration value or to the bound location.
 let private resolveRemoteFetchUrl
     (state: SessionState)
     (remoteName: string)
     (context: OperationContext)
     : Async<Result<string, OperationFailure>> =
     async {
-        let! result = runGit state.Hooks state.RepoPath [| "remote"; "get-url"; remoteName |] None context
-
-        match result with
-        | Error failure -> return Error failure
-        | Ok output when output.ExitCode = 0 && not (String.IsNullOrWhiteSpace output.StdOut) ->
-            return Ok(output.StdOut.Trim())
-        | Ok output when output.ExitCode = 2 || output.ExitCode = 0 -> return Error(configuredTargetInvalidFailure ())
-        | Ok output ->
-            return
-                Error(
-                    OperationFailure.createRedacted
-                        ProviderError
-                        "git_failure"
-                        $"git remote get-url {remoteName} failed: {output.StdErr + output.StdOut}"
-                )
+        let! urls = readRemoteUrls state [||] remoteName context
+        return urls |> Result.map (fun urls -> urls.[0])
     }
 
 /// Header-only credential arguments for a fetch-direction command against a remote.
@@ -2642,16 +2640,17 @@ let private refresh (state: SessionState) (context: OperationContext) =
 
                 let! authArguments = fetchAuthArgumentsForRemote state remote context
 
+                match authArguments with
+                | Error failure -> return Failed failure
+                | Ok authArguments ->
+
                 let! fetchResult =
-                    match authArguments with
-                    | Error failure -> async { return Error failure }
-                    | Ok authArguments ->
-                        runGitChecked
-                            state.Hooks
-                            state.RepoPath
-                            [| yield! authArguments; "fetch"; remote |]
-                            None
-                            context
+                    runGitChecked
+                        state.Hooks
+                        state.RepoPath
+                        [| yield! authArguments; "fetch"; remote |]
+                        None
+                        context
 
                 match fetchResult with
                 | Error failure -> return Failed { failure with Retryable = true }
@@ -3102,6 +3101,7 @@ let private publish (state: SessionState) (request: PublishRequest) (context: Op
                                             state.RepoPath
                                             remoteName
                                             branch
+                                            fetchAuthentication
                                             authentication
                                             (Some reportLfsProgress)
                                             context.Cancellation.IsCancellationRequested
@@ -4327,9 +4327,13 @@ let private adoptionUnsupportedFailure (detail: string) =
         $"The workspace cannot be adopted without guessing because Git cannot parse its repository metadata: {detail}"
 
 /// The URL git will connect to for a location the caller supplied, with insteadOf
-/// rewriting applied. This runs outside any repository, so only global and system
-/// configuration take part, which is what clone and ls-remote see as well. When git
-/// cannot answer, the location is used as written.
+/// rewriting applied. The query runs in the process working directory, so global and
+/// system configuration take part, plus the local configuration of a repository that
+/// happens to enclose that directory. Location verification runs ls-remote from the
+/// same directory and sees the same rewriting. Clone starts without a repository and
+/// ignores an enclosing one, so a local insteadOf there can scope clone credentials to
+/// a host clone never contacts. Hosts running from inside a repository should keep
+/// that in mind. When git cannot answer, the location is used as written.
 let private expandLocationUrl (hooks: GitSessionHooks) (location: string) (context: OperationContext) : Async<string> =
     async {
         let! result = runGit hooks "." [| "ls-remote"; "--get-url"; location |] None context
@@ -4858,7 +4862,17 @@ let createFactoryWithCredentialsAndIdentity
                 match result with
                 | Error failure -> return Failed failure
                 | Ok _ ->
-                    let! effectiveLocation = expandLocationUrl hooks location.ProviderLocation context
+                    // The remote exists in the repository now, so the repository's own answer
+                    // is exactly what `git fetch origin` will use.
+                    let! effectiveLocation =
+                        async {
+                            let! result = runGit hooks request.WorkspaceRoot [| "remote"; "get-url"; "origin" |] None context
+
+                            match result with
+                            | Ok output when output.ExitCode = 0 && not (String.IsNullOrWhiteSpace output.StdOut) ->
+                                return output.StdOut.Trim()
+                            | _ -> return location.ProviderLocation
+                        }
 
                     let! authArguments =
                         GitCredentialStrategy.resolveAuthArguments

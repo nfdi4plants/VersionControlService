@@ -904,9 +904,9 @@ Vitest.describe (
 
                 // The fixture redirects the https upstream to a local repository with
                 // insteadOf so the push can run for real. git would report the rewritten
-                // file URL as the effective push URL, which is where credentials would
-                // rightly stop, so the hook answers that one query with the https URL the
-                // test is about. Every other command runs unchanged.
+                // file URL as the effective fetch and push URL, which is where credentials
+                // would rightly stop, so the hook answers both get-url queries with the
+                // https URL the test is about. Every other command runs unchanged.
                 let hooks = {
                     GitWorkspaceSession.GitSessionHooks.none with
                         RunProcess =
@@ -1129,12 +1129,12 @@ Vitest.describe (
 
                     Vitest.expect(credentialCalls.ToArray()).toEqual [| "fetch.local.test", Some "fetch-profile" |]
 
-                    let remoteGetUrlRequest =
-                        observed
-                        |> Seq.find (fun request ->
-                            request.Arguments = [| "remote"; "get-url"; "origin" |])
-
-                    Vitest.expect(remoteGetUrlRequest.Arguments).toEqual [| "remote"; "get-url"; "origin" |]
+                    Vitest
+                        .expect(
+                            observed
+                            |> Seq.exists (fun request -> request.Arguments = [| "remote"; "get-url"; "origin" |])
+                        )
+                        .toBe true
 
                     let fetchRequest =
                         observed
@@ -1312,6 +1312,66 @@ Vitest.describe (
                                 request.Arguments = [| "remote"; "get-url"; "--push"; "--all"; "origin" |])
                         )
                         .toBe true
+
+                    Vitest
+                        .expect(
+                            observed
+                            |> Seq.exists (fun request -> request.Arguments = [| "remote"; "get-url"; "origin" |])
+                        )
+                        .toBe true
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        // No stub here. git itself expands the insteadOf rule, and the credential must
+        // name the rewritten host. The fetch then fails because that host does not exist,
+        // which is fine: the assertion is about the credential call, not the transfer.
+        Vitest.test (
+            "refresh reads the insteadOf-rewritten fetch url from git",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, barePath, _ = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+
+                try
+                    let! _ =
+                        runGitIn workPath [|
+                            "config"
+                            "url.https://real.local.test/.insteadOf"
+                            "https://alias.local.test/"
+                        |]
+
+                    let! _ = runGitIn workPath [| "remote"; "set-url"; "origin"; "https://alias.local.test/origin.git" |]
+
+                    let credentialCalls = ResizeArray<string * string option>()
+
+                    let strategy: GitCredentialStrategy.GitCredentialStrategy = {
+                        ResolveCredential =
+                            fun host profileId ->
+                                async {
+                                    credentialCalls.Add(host, profileId)
+                                    return None
+                                }
+                    }
+
+                    let session =
+                        GitWorkspaceSession.createSessionWithCredentials
+                            GitWorkspaceSession.GitSessionHooks.none
+                            strategy
+                            (syncBinding workPath barePath)
+
+                    let! refreshResult =
+                        (syncService session).Refresh(ctx "refresh-insteadof")
+                        |> Async.StartAsPromise
+
+                    match refreshResult with
+                    | Succeeded _ -> failwith "Expected the fetch against a nonexistent host to fail."
+                    | _ -> ()
+
+                    Vitest.expect(credentialCalls.ToArray()).toEqual [| "real.local.test", None |]
 
                     do! removeDirectoryAsync root
                 with error ->

@@ -147,8 +147,9 @@ Vitest.describe (
                     let observedCommands = ResizeArray<string[]>()
 
                     // insteadOf redirects the https remote to the local bare repository, so
-                    // git reports the file URL as the effective push URL. The hook answers
-                    // that one query with the https URL so credential scoping stays under test.
+                    // git reports the file URL as the effective fetch and push URL. The hook
+                    // answers both get-url queries with the https URL so credential scoping
+                    // stays under test.
                     let hooks = {
                         GitWorkspaceSession.GitSessionHooks.none with
                             RunProcess =
@@ -286,8 +287,9 @@ Vitest.describe (
                             && arguments |> Array.contains expectedLfsUrl)
                     ).toBe true
 
-                    // Publish resolves the fetch host for its pre-check and the push host for
-                    // the push, and reuses that scoped material for core Git and LFS.
+                    // The first entry is the refresh above. Publish adds one resolution for its
+                    // ls-remote pre-check (fetch host) and one for the push (push host), and
+                    // reuses that scoped material for core Git and LFS.
                     Vitest.expect(strategyCalls.ToArray()).toEqual [|
                         testHost, Some "token-profile"
                         testHost, Some "token-profile"
@@ -323,10 +325,11 @@ Vitest.describe (
 
                     expectValue "credential materialization" materializeResult |> ignore
 
-                    Vitest.expect(strategyCalls.ToArray()).toEqual [|
-                        testHost, Some "token-profile"
-                        testHost, Some "token-profile"
-                    |]
+                    // LFS transfers resolve the remote through git itself, which expands the
+                    // insteadOf redirect to the local bare repository. A file transport needs no
+                    // credential, so the strategy is not consulted. The test below covers the
+                    // https case without a redirect.
+                    Vitest.expect(strategyCalls.ToArray()).toEqual [||]
 
                     for arguments in observedCommands do
                         for argument in arguments do
@@ -340,7 +343,7 @@ Vitest.describe (
 
                     let! pruneResult = maintenance.Prune(ctx "credential-prune") |> Async.StartAsPromise
                     expectValue "credential prune" pruneResult |> ignore
-                    Vitest.expect(strategyCalls.ToArray()).toEqual [| testHost, Some "token-profile" |]
+                    Vitest.expect(strategyCalls.ToArray()).toEqual [||]
 
                     // Anonymous local-path remote: a session with the anonymous strategy
                     // and no global token machinery synchronizes fine.
@@ -427,6 +430,70 @@ Vitest.describe (
                             Vitest.expect(detail.Contains testSecret).toBe (false)
                     | Succeeded _
                     | PartiallySucceeded _ -> failwith "Expected the refresh against a missing rewrite to fail."
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        // Without a redirect the LFS session reads the https remote as written and must
+        // ask the strategy for that host before it touches the network. The prune itself
+        // needs no remote round trip, so the result is not the point of the test.
+        Vitest.test (
+            "lfs maintenance scopes credentials to the remote's effective fetch url",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root = createTempDirectoryAsync ()
+
+                try
+                    let workPath = join [| root; "scoped-work" |]
+                    let! _ = runGitIn root [| "init"; "-b"; "main"; workPath |]
+                    let! _ = runGitIn workPath [| "config"; "user.name"; "VCS Cred Tests" |]
+                    let! _ = runGitIn workPath [| "config"; "user.email"; "cred@example.org" |]
+                    do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) "base\n"
+                    let! _ = runGitIn workPath [| "add"; "-A" |]
+                    let! _ = runGitIn workPath [| "commit"; "-m"; "init: base" |]
+                    let! _ = runGitIn workPath [| "remote"; "add"; "origin"; $"https://{testHost}/scoped.git" |]
+
+                    let strategyCalls = ResizeArray<string * string option>()
+
+                    let strategy: GitCredentialStrategy.GitCredentialStrategy = {
+                        ResolveCredential =
+                            fun host profileId ->
+                                async {
+                                    strategyCalls.Add(host, profileId)
+                                    return None
+                                }
+                    }
+
+                    let binding: WorkspaceBinding = {
+                        SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
+                        ProviderId = gitProviderId
+                        WorkspaceRoot = workPath
+                        ProviderStateRef = None
+                        Location = {
+                            ProviderId = gitProviderId
+                            DisplayName = None
+                            ProviderLocation = workPath
+                            ConnectionProfileId = Some "token-profile"
+                        }
+                        ConnectionProfileId = Some "token-profile"
+                    }
+
+                    let session =
+                        GitWorkspaceSession.createSessionWithCredentials
+                            GitWorkspaceSession.GitSessionHooks.none
+                            strategy
+                            binding
+
+                    let maintenance =
+                        session.Maintenance
+                        |> Option.defaultWith (fun () -> failwith "Expected Git maintenance.")
+
+                    let! _ = maintenance.Prune(ctx "scoped-prune") |> Async.StartAsPromise
+                    Vitest.expect(strategyCalls.ToArray()).toEqual [| testHost, Some "token-profile" |]
 
                     do! removeDirectoryAsync root
                 with error ->

@@ -2551,6 +2551,12 @@ Vitest.describe (
                             (join [| workspace.Binding.WorkspaceRoot; "config" |])
                             "process.stdout.write(process.env.VCS_TEST_LFS_REMOTE + '\\n');\n"
 
+                    // The LFS session reads the effective remote URL with `git remote get-url`.
+                    do!
+                        writeUtf8FileAsync
+                            (join [| workspace.Binding.WorkspaceRoot; "remote" |])
+                            "process.stdout.write(process.env.VCS_TEST_LFS_REMOTE + '\\n');\n"
+
                     do!
                         writeUtf8FileAsync
                             (join [| workspace.Binding.WorkspaceRoot; "check-attr" |])
