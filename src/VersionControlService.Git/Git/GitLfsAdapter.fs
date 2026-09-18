@@ -24,7 +24,10 @@ let private tryKillProcess (proc: obj) (signal: string) =
 let private signalProcessTree (proc: obj) (signal: string) =
     let pid: int = proc?pid |> unbox
 
-    if isWindows () then
+    // A failed spawn has no PID; zero would select the caller's process group.
+    if pid <= 0 then
+        false
+    elif isWindows () then
         try
             let result: obj =
                 childProcessDynamic?spawnSync (
@@ -50,7 +53,9 @@ let private signalProcessTree (proc: obj) (signal: string) =
 
             childProcessDynamic?execFileSync (
                 "kill",
-                [| $"-{signalName}"; $"-{pid}" |],
+                // A negative process-group ID must follow the option delimiter. Some
+                // kill implementations parse -12345 as -1 and signal unrelated processes.
+                [| $"-{signalName}"; "--"; $"-{pid}" |],
                 createObj [ "stdio" ==> "ignore" ]
             )
             |> ignore
