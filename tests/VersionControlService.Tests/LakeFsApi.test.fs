@@ -11,6 +11,7 @@ open Vitest
 module LakeFsApi = VersionControlService.LakeFs.LakeFsApi
 module LakeFsCredentials = VersionControlService.LakeFs.LakeFsCredentials
 module LakeFsProviderFactory = VersionControlService.LakeFs.LakeFsProviderFactory
+module NodeInterop = VersionControlService.Runtime.Node.Interop
 
 let private httpModule: obj = importAll "http"
 let private fsPromisesDynamic: obj = importAll "fs/promises"
@@ -253,6 +254,150 @@ Vitest.describe (
                     server?close () |> ignore
                     fsPromisesDynamic?rm (root, createObj [ "recursive" ==> true; "force" ==> true ])
                     |> ignore
+            }
+        )
+
+        Vitest.test (
+            "keeps upload bytes intact when fetch attaches after the first progress report",
+            TestOptions(timeout = 30000),
+            fun () -> promise {
+                let payload = invalidUtf8Payload (1024 * 1024 + 17)
+                let expectedHash =
+                    let hash = NodeInterop.createSha256Hash ()
+                    NodeInterop.updateHash hash payload
+                    NodeInterop.digestHashHex hash
+
+                let mutable uploaded: obj option = None
+                let handler =
+                    fun (request: obj) (response: obj) ->
+                        let method: string = unbox request?method
+
+                        if method = "POST" then
+                            let chunks = ResizeArray<obj>()
+                            request?on ("data", fun (chunk: obj) -> chunks.Add chunk) |> ignore
+                            request?on (
+                                "end",
+                                fun () ->
+                                    uploaded <- Some(concatBuffers (chunks.ToArray()))
+                                    response?writeHead (201, createObj [ "Content-Type" ==> "application/json" ])
+                                    |> ignore
+                                    response?``end`` ("{}") |> ignore
+                            )
+                            |> ignore
+                        else
+                            response?writeHead 404 |> ignore
+                            response?``end`` () |> ignore
+
+                let originalFetch: obj = emitJsExpr () "globalThis.fetch"
+                let mutable releaseFetch: (unit -> unit) option = None
+                let mutable gateTimer: int option = None
+
+                let mutable server: obj option = None
+                let mutable root: string option = None
+
+                try
+                    let serverValue = httpModule?createServer (handler)
+                    server <- Some serverValue
+
+                    let! port =
+                        Fable.Core.JS.Constructors.Promise.Create(fun resolve _ ->
+                            serverValue?listen (
+                                0,
+                                fun () -> resolve (unbox<int> (serverValue?address ())?port)
+                            )
+                            |> ignore)
+
+                    let! temporaryRoot =
+                        fsPromisesDynamic?mkdtemp (join [| osDynamic?tmpdir () |> unbox<string>; "vcs-lakefs-upload-gate-" |])
+                        |> unbox<JS.Promise<string>>
+
+                    root <- Some temporaryRoot
+                    let sourcePath = join [| temporaryRoot; "payload.bin" |]
+
+                    do!
+                        fsPromisesDynamic?writeFile (sourcePath, payload)
+                        |> unbox<JS.Promise<obj>>
+                        |> Promise.map ignore
+
+                    let fetchGate: JS.Promise<unit> =
+                        Fable.Core.JS.Constructors.Promise.Create(fun resolve reject ->
+                            let timer =
+                                JS.setTimeout
+                                    (fun () ->
+                                        gateTimer <- None
+                                        reject (NodeInterop.createError "Timed out waiting for the first upload progress report."))
+                                    5000
+
+                            gateTimer <- Some timer
+                            releaseFetch <-
+                                Some(fun () ->
+                                    gateTimer |> Option.iter JS.clearTimeout
+                                    gateTimer <- None
+                                    resolve ()))
+
+                    let gatedFetch: obj =
+                        emitJsExpr
+                            (originalFetch, fetchGate)
+                            "((original, gate) => (...args) => gate.then(() => original(...args)))($0, $1)"
+
+                    // The gate resolves in the first progress callback. Native fetch then runs
+                    // in a later microtask, after that source data event returns; the old data
+                    // listener had already consumed the chunk before fetch attached.
+                    emitJsStatement gatedFetch "globalThis.fetch = $0"
+
+                    let connection: LakeFsConnection = {
+                        Endpoint = $"http://127.0.0.1:{port}"
+                        AccessKeyId = "binary-access"
+                        SecretAccessKey = "binary-secret"
+                    }
+
+                    let mutable gateReleased = false
+                    let uploadContext =
+                        OperationContext.create
+                            "binary-upload-late-fetch"
+                            OperationCancellation.none
+                            (fun report ->
+                                if not gateReleased && (report.Completed |> Option.defaultValue 0.0) > 0.0 then
+                                    gateReleased <- true
+                                    releaseFetch |> Option.iter (fun release -> release ()))
+
+                    let! upload =
+                        LakeFsApi.uploadObjectFromFile
+                            connection
+                            "repo"
+                            "main"
+                            "binary-gated.dat"
+                            sourcePath
+                            uploadContext
+                        |> Async.StartAsPromise
+
+                    match upload with
+                    | Ok result ->
+                        Vitest.expect(result.BytesCopied).toBe (float (NodeInterop.bufferLength payload))
+                        Vitest.expect(result.Sha256).toBe expectedHash
+                    | Error failure -> failwith $"Binary upload failed: {failure.Code} ({failure.Message})"
+
+                    match uploaded with
+                    | Some bytes ->
+                        Vitest.expect(NodeInterop.bufferLength bytes).toBe (NodeInterop.bufferLength payload)
+                        Vitest.expect(buffersEqual bytes payload).toBe true
+
+                        let receivedHash =
+                            let hash = NodeInterop.createSha256Hash ()
+                            NodeInterop.updateHash hash bytes
+                            NodeInterop.digestHashHex hash
+
+                        Vitest.expect(receivedHash).toBe expectedHash
+                    | None -> failwith "The upload server did not receive a complete request body."
+                finally
+                    gateTimer |> Option.iter JS.clearTimeout
+                    emitJsStatement originalFetch "globalThis.fetch = $0"
+                    server |> Option.iter (fun value -> value?close () |> ignore)
+
+                    root
+                    |> Option.iter (fun path ->
+                        fsPromisesDynamic?rm (path, createObj [ "recursive" ==> true; "force" ==> true ])
+                        |> ignore)
             }
         )
 )
