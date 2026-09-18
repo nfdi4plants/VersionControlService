@@ -1014,7 +1014,12 @@ Vitest.describe (
                         |> Async.StartAsPromise
 
                     expectValue "publish with upstream credentials" publishResult |> ignore
-                    Vitest.expect(credentialCalls.ToArray()).toEqual [| upstreamHost, Some "publish-profile" |]
+                    // One resolution for the ls-remote pre-check (fetch URL) and one for the push
+                    // (push URL). Both name the upstream host, never origin's.
+                    Vitest.expect(credentialCalls.ToArray()).toEqual [|
+                        upstreamHost, Some "publish-profile"
+                        upstreamHost, Some "publish-profile"
+                    |]
 
                     // The credential host must come from the effective push URL query, which
                     // the hook answered, and not from the raw remote.<name>.url value.
@@ -1046,6 +1051,373 @@ Vitest.describe (
                                 argument.Contains(originHost) || argument.Contains("origin-secret"))
                         )
                         .toBe false
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "refresh scopes fetch credentials to the configured remote when the binding is a local path",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let observed = ResizeArray<NodeProcess.ProcessRequest>()
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request processContext ->
+                            async {
+                                observed.Add request
+
+                                if
+                                    request.Arguments |> Array.contains "get-url"
+                                    && request.Arguments |> Array.contains "origin"
+                                then
+                                    let output: NodeProcess.ProcessOutput = {
+                                        ExitCode = 0
+                                        StdOut = "https://fetch.local.test/origin.git\n"
+                                        StdErr = ""
+                                    }
+
+                                    return OperationResult.succeeded output
+                                else
+                                    return! NodeProcess.run request processContext
+                            })
+                    Barrier = None
+                }
+
+                let! root, workPath, barePath, _ = createSyncFixture hooks
+
+                try
+                    let credentialCalls = ResizeArray<string * string option>()
+                    let strategy: GitCredentialStrategy.GitCredentialStrategy = {
+                        ResolveCredential =
+                            fun host profileId ->
+                                async {
+                                    credentialCalls.Add(host, profileId)
+
+                                    return
+                                        Some {
+                                            Username = "fetch-user"
+                                            Secret = "fetch-secret"
+                                        }
+                                }
+                    }
+
+                    let baseBinding = syncBinding workPath barePath
+
+                    let binding = {
+                        baseBinding with
+                            Location = {
+                                baseBinding.Location with
+                                    ProviderLocation = workPath
+                                    ConnectionProfileId = Some "fetch-profile"
+                            }
+                            ConnectionProfileId = Some "fetch-profile"
+                    }
+
+                    let session = GitWorkspaceSession.createSessionWithCredentials hooks strategy binding
+
+                    let! refreshResult =
+                        (syncService session).Refresh(ctx "refresh-fetch-credentials")
+                        |> Async.StartAsPromise
+
+                    expectValue "refresh fetch credentials" refreshResult |> ignore
+
+                    Vitest.expect(credentialCalls.ToArray()).toEqual [| "fetch.local.test", Some "fetch-profile" |]
+
+                    let remoteGetUrlRequest =
+                        observed
+                        |> Seq.find (fun request ->
+                            request.Arguments = [| "remote"; "get-url"; "origin" |])
+
+                    Vitest.expect(remoteGetUrlRequest.Arguments).toEqual [| "remote"; "get-url"; "origin" |]
+
+                    let fetchRequest =
+                        observed
+                        |> Seq.find (fun request -> request.Arguments |> Array.contains "fetch")
+
+                    let expectedHeader =
+                        "http.https://fetch.local.test/.extraHeader=Authorization: Basic "
+
+                    Vitest
+                        .expect(fetchRequest.Arguments |> Array.exists (fun argument -> argument.StartsWith expectedHeader))
+                        .toBe true
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "publish authenticates the pre-check against the fetch url and the push against the push url",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let observed = ResizeArray<NodeProcess.ProcessRequest>()
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request processContext ->
+                            async {
+                                observed.Add request
+
+                                if request.Arguments |> Array.contains "get-url" then
+                                    let output: NodeProcess.ProcessOutput = {
+                                        ExitCode = 0
+                                        StdOut =
+                                            if request.Arguments |> Array.contains "--push" then
+                                                "ssh://git@push.local.test/origin.git\n"
+                                            else
+                                                "https://fetch.local.test/origin.git\n"
+                                        StdErr = ""
+                                    }
+
+                                    return OperationResult.succeeded output
+                                else
+                                    return! NodeProcess.run request processContext
+                            })
+                    Barrier = None
+                }
+
+                let! root, workPath, barePath, _ = createSyncFixture hooks
+
+                try
+                    let! _ =
+                        runGitIn workPath [|
+                            "config"
+                            "--add"
+                            $"url.{toFileRemoteUrl barePath}.insteadOf"
+                            "https://fetch.local.test/origin.git"
+                        |]
+
+                    let! _ =
+                        runGitIn workPath [|
+                            "config"
+                            "--add"
+                            $"url.{toFileRemoteUrl barePath}.insteadOf"
+                            "ssh://git@push.local.test/origin.git"
+                        |]
+
+                    let! _ = runGitIn workPath [| "remote"; "set-url"; "origin"; "https://fetch.local.test/origin.git" |]
+
+                    let! _ =
+                        runGitIn workPath [|
+                            "remote"
+                            "set-url"
+                            "--push"
+                            "origin"
+                            "ssh://git@push.local.test/origin.git"
+                        |]
+
+                    let credentialCalls = ResizeArray<string * string option>()
+                    let strategy: GitCredentialStrategy.GitCredentialStrategy = {
+                        ResolveCredential =
+                            fun host profileId ->
+                                async {
+                                    credentialCalls.Add(host, profileId)
+
+                                    if host = "fetch.local.test" then
+                                        return
+                                            Some {
+                                                Username = "fetch-user"
+                                                Secret = "fetch-secret"
+                                            }
+                                    else
+                                        return None
+                                }
+                    }
+
+                    let baseBinding = syncBinding workPath barePath
+
+                    let binding = {
+                        baseBinding with
+                            Location = { baseBinding.Location with ConnectionProfileId = Some "split-profile" }
+                            ConnectionProfileId = Some "split-profile"
+                    }
+
+                    let session = GitWorkspaceSession.createSessionWithCredentials hooks strategy binding
+                    do! writeUtf8FileAsync (join [| workPath; "split-publish.txt" |]) "split publish\n"
+                    let! status = sessionStatus session
+
+                    let! revisionResult =
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: split publish URLs"
+                                Paths = [| mkPath "split-publish.txt" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (ctx "split-publish-revision")
+                        |> Async.StartAsPromise
+
+                    expectValue "split publish revision" revisionResult |> ignore
+                    let! publishStatus = sessionStatus session
+                    observed.Clear()
+                    credentialCalls.Clear()
+
+                    let! publishResult =
+                        (syncService session).Publish
+                            {
+                                ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                            }
+                            (ctx "publish-split-urls")
+                        |> Async.StartAsPromise
+
+                    expectValue "split URL publish" publishResult |> ignore
+
+                    Vitest.expect(credentialCalls.ToArray()).toEqual [|
+                        "fetch.local.test", Some "split-profile"
+                        "push.local.test", Some "split-profile"
+                    |]
+
+                    let lsRemoteRequest =
+                        observed
+                        |> Seq.find (fun request -> request.Arguments |> Array.contains "ls-remote")
+
+                    let expectedHeader =
+                        "http.https://fetch.local.test/.extraHeader=Authorization: Basic "
+
+                    Vitest
+                        .expect(lsRemoteRequest.Arguments |> Array.exists (fun argument -> argument.StartsWith expectedHeader))
+                        .toBe true
+
+                    let pushRequest =
+                        observed
+                        |> Seq.find (fun request -> request.Arguments |> Array.contains "push")
+
+                    Vitest
+                        .expect(
+                            pushRequest.Arguments
+                            |> Array.exists (fun argument -> argument.Contains "extraHeader")
+                        )
+                        .toBe false
+
+                    Vitest
+                        .expect(
+                            pushRequest.Arguments
+                            |> Array.exists (fun argument -> argument.Contains "fetch-secret")
+                        )
+                        .toBe false
+
+                    Vitest
+                        .expect(
+                            observed
+                            |> Seq.exists (fun request ->
+                                request.Arguments = [| "remote"; "get-url"; "--push"; "--all"; "origin" |])
+                        )
+                        .toBe true
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "clone scopes credentials to the insteadOf-expanded location",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let observed = ResizeArray<NodeProcess.ProcessRequest>()
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request processContext ->
+                            async {
+                                observed.Add request
+
+                                if request.Arguments |> Array.contains "--get-url" then
+                                    return
+                                        OperationResult.succeeded {
+                                            NodeProcess.ExitCode = 0
+                                            StdOut = "https://rewritten.local.test/repo.git\n"
+                                            StdErr = ""
+                                        }
+                                elif request.Arguments |> Array.contains "clone" then
+                                    return
+                                        OperationResult.succeeded {
+                                            NodeProcess.ExitCode = 128
+                                            StdOut = ""
+                                            StdErr = "fatal: simulated clone failure"
+                                        }
+                                else
+                                    return! NodeProcess.run request processContext
+                            })
+                    Barrier = None
+                }
+
+                let credentialCalls = ResizeArray<string * string option>()
+                let strategy: GitCredentialStrategy.GitCredentialStrategy = {
+                    ResolveCredential =
+                        fun host profileId ->
+                            async {
+                                credentialCalls.Add(host, profileId)
+
+                                return
+                                    Some {
+                                        Username = "clone-user"
+                                        Secret = "clone-secret"
+                                    }
+                            }
+                }
+
+                let! root = createTempDirectoryAsync ()
+                let targetPath = join [| root; "rewritten-clone" |]
+
+                try
+                    let factory = GitWorkspaceSession.createFactoryWithCredentials hooks strategy
+
+                    let! cloneResult =
+                        factory.Clone
+                            {
+                                Location = {
+                                    ProviderId = gitProviderId
+                                    DisplayName = None
+                                    ProviderLocation = "https://alias.local.test/repo.git"
+                                    ConnectionProfileId = Some "clone-profile"
+                                }
+                                TargetPath = targetPath
+                                TargetRef = None
+                                MaterializeAllObjects = false
+                            }
+                            (ctx "clone-rewritten")
+                        |> Async.StartAsPromise
+
+                    let failure = expectProviderFailure "clone rewritten location" cloneResult
+                    Vitest.expect(failure.Code).toBe "clone_failed"
+                    Vitest.expect(credentialCalls.ToArray()).toEqual [| "rewritten.local.test", Some "clone-profile" |]
+
+                    let cloneRequest =
+                        observed
+                        |> Seq.find (fun request -> request.Arguments |> Array.contains "clone")
+
+                    let expectedHeader =
+                        "http.https://rewritten.local.test/.extraHeader=Authorization: Basic "
+
+                    Vitest
+                        .expect(cloneRequest.Arguments |> Array.exists (fun argument -> argument.StartsWith expectedHeader))
+                        .toBe true
+
+                    Vitest.expect(cloneRequest.Arguments |> Array.contains "https://alias.local.test/repo.git").toBe true
+
+                    Vitest
+                        .expect(
+                            observed
+                            |> Seq.exists (fun request ->
+                                request.Arguments = [|
+                                    "ls-remote"
+                                    "--get-url"
+                                    "https://alias.local.test/repo.git"
+                                |])
+                        )
+                        .toBe true
 
                     do! removeDirectoryAsync root
                 with error ->

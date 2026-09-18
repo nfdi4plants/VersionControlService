@@ -286,8 +286,10 @@ Vitest.describe (
                             && arguments |> Array.contains expectedLfsUrl)
                     ).toBe true
 
-                    // Publish resolves once and reuses that scoped material for core Git and LFS.
+                    // Publish resolves the fetch host for its pre-check and the push host for
+                    // the push, and reuses that scoped material for core Git and LFS.
                     Vitest.expect(strategyCalls.ToArray()).toEqual [|
+                        testHost, Some "token-profile"
                         testHost, Some "token-profile"
                         testHost, Some "token-profile"
                     |]

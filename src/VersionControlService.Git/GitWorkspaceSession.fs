@@ -231,21 +231,6 @@ type private SessionState = {
     mutable ConflictGeneration: int
 }
 
-/// Scoped credential `-c` arguments for this session's remote host, resolved
-/// through the injected strategy (empty for anonymous/SSH/local flows).
-let private credentialArguments (state: SessionState) : Async<string[]> =
-    GitCredentialStrategy.resolveAuthArguments
-        state.Credentials
-        state.Location.ProviderLocation
-        state.ConnectionProfileId
-
-let private credentialAuthentication (state: SessionState) (remoteName: string) =
-    GitCredentialStrategy.resolveCommandAuthentication
-        state.Credentials
-        state.Location.ProviderLocation
-        state.ConnectionProfileId
-        remoteName
-
 let private credentialAuthenticationForRemote
     (state: SessionState)
     (remoteName: string)
@@ -968,6 +953,65 @@ let private resolvePublishRemoteUrl
                         "git_failure"
                         $"git remote get-url {remoteName} failed: {output.StdErr + output.StdOut}"
                 )
+    }
+
+/// Effective fetch URL of a remote, with insteadOf rewriting applied. Fetch, ls-remote
+/// and LFS downloads connect to this URL, so their credentials have to be scoped to it
+/// and not to the raw configuration value or to the bound location. Exit code 2 is
+/// "No such remote".
+let private resolveRemoteFetchUrl
+    (state: SessionState)
+    (remoteName: string)
+    (context: OperationContext)
+    : Async<Result<string, OperationFailure>> =
+    async {
+        let! result = runGit state.Hooks state.RepoPath [| "remote"; "get-url"; remoteName |] None context
+
+        match result with
+        | Error failure -> return Error failure
+        | Ok output when output.ExitCode = 0 && not (String.IsNullOrWhiteSpace output.StdOut) ->
+            return Ok(output.StdOut.Trim())
+        | Ok output when output.ExitCode = 2 || output.ExitCode = 0 -> return Error(configuredTargetInvalidFailure ())
+        | Ok output ->
+            return
+                Error(
+                    OperationFailure.createRedacted
+                        ProviderError
+                        "git_failure"
+                        $"git remote get-url {remoteName} failed: {output.StdErr + output.StdOut}"
+                )
+    }
+
+/// Header-only credential arguments for a fetch-direction command against a remote.
+let private fetchAuthArgumentsForRemote
+    (state: SessionState)
+    (remoteName: string)
+    (context: OperationContext)
+    : Async<Result<string[], OperationFailure>> =
+    async {
+        let! url = resolveRemoteFetchUrl state remoteName context
+
+        match url with
+        | Error failure -> return Error failure
+        | Ok url ->
+            let! arguments = GitCredentialStrategy.resolveAuthArguments state.Credentials url state.ConnectionProfileId
+            return Ok arguments
+    }
+
+/// Command authentication (headers plus LFS URLs) for a fetch-direction command.
+let private fetchAuthenticationForRemote
+    (state: SessionState)
+    (remoteName: string)
+    (context: OperationContext)
+    : Async<Result<VersionControlService.Git.GitAuthAdapter.GitCommandAuthentication, OperationFailure>> =
+    async {
+        let! url = resolveRemoteFetchUrl state remoteName context
+
+        match url with
+        | Error failure -> return Error failure
+        | Ok url ->
+            let! authentication = credentialAuthenticationForRemote state remoteName url
+            return Ok authentication
     }
 
 let private readOptionalConfigValue
@@ -2596,15 +2640,18 @@ let private refresh (state: SessionState) (context: OperationContext) =
             | Ok(Some remote) ->
                 do! barrier state.Hooks state.RepoPath "transfer-start" context
 
-                let! authArguments = credentialArguments state
+                let! authArguments = fetchAuthArgumentsForRemote state remote context
 
                 let! fetchResult =
-                    runGitChecked
-                        state.Hooks
-                        state.RepoPath
-                        [| yield! authArguments; "fetch"; remote |]
-                        None
-                        context
+                    match authArguments with
+                    | Error failure -> async { return Error failure }
+                    | Ok authArguments ->
+                        runGitChecked
+                            state.Hooks
+                            state.RepoPath
+                            [| yield! authArguments; "fetch"; remote |]
+                            None
+                            context
 
                 match fetchResult with
                 | Error failure -> return Failed { failure with Retryable = true }
@@ -2824,7 +2871,7 @@ let private updateWithIdentity
                                     }
                                 | Ok(Some remote) ->
                                     async {
-                                        let! authentication = credentialAuthentication state remote
+                                        let! authentication = fetchAuthenticationForRemote state remote context
 
                                         let hydrationRef =
                                             syncState.TargetRef
@@ -2836,20 +2883,23 @@ let private updateWithIdentity
                                                 else
                                                     None)
 
-                                        return!
-                                            runGitEnv
-                                                state.Hooks
-                                                state.RepoPath
-                                                [|
-                                                    yield! authentication.ConfigArgs
-                                                    "lfs"
-                                                    "pull"
-                                                    remote
-                                                    yield! hydrationRef |> Option.toArray
-                                                |]
-                                                None
-                                                [| "GIT_TERMINAL_PROMPT", "0" |]
-                                                context
+                                        match authentication with
+                                        | Error failure -> return Error failure
+                                        | Ok authentication ->
+                                            return!
+                                                runGitEnv
+                                                    state.Hooks
+                                                    state.RepoPath
+                                                    [|
+                                                        yield! authentication.ConfigArgs
+                                                        "lfs"
+                                                        "pull"
+                                                        remote
+                                                        yield! hydrationRef |> Option.toArray
+                                                    |]
+                                                    None
+                                                    [| "GIT_TERMINAL_PROMPT", "0" |]
+                                                    context
                                     }
 
                             let affectedPaths =
@@ -2943,19 +2993,27 @@ let private publish (state: SessionState) (request: PublishRequest) (context: Op
                     }
                 | Ok(Some remote) ->
                     async {
-                        let! authentication =
-                            credentialAuthenticationForRemote state remote.Name remote.Url
+                        // ls-remote connects to the fetch URL and push to the push URL. With an
+                        // https fetch URL and an ssh pushurl these differ, so each command gets
+                        // credentials for the host it actually reaches.
+                        let! fetchAuthentication = fetchAuthenticationForRemote state remote.Name context
 
-                        resolvedTarget <- Some(remote, authentication)
+                        match fetchAuthentication with
+                        | Error failure -> return Error failure
+                        | Ok fetchAuthentication ->
+                            let! pushAuthentication =
+                                credentialAuthenticationForRemote state remote.Name remote.Url
 
-                        return!
-                            readRemoteBranchRevision state remote.Name authentication branch context
+                            resolvedTarget <- Some(remote, fetchAuthentication, pushAuthentication)
+
+                            return!
+                                readRemoteBranchRevision state remote.Name fetchAuthentication branch context
                     }
 
             match observedTargetResult with
             | Error failure -> return Failed failure
             | Ok observedTarget ->
-                let targetRemote, authentication =
+                let targetRemote, fetchAuthentication, authentication =
                     resolvedTarget
                     |> Option.defaultWith (fun () -> failwith "The publication target was not resolved.")
 
@@ -3134,7 +3192,7 @@ let private publish (state: SessionState) (request: PublishRequest) (context: Op
                                 readRemoteBranchRevision
                                     state
                                     remoteName
-                                    authentication
+                                    fetchAuthentication
                                     branch
                                     verificationContext
 
@@ -4268,6 +4326,20 @@ let private adoptionUnsupportedFailure (detail: string) =
         "adoption_unsupported"
         $"The workspace cannot be adopted without guessing because Git cannot parse its repository metadata: {detail}"
 
+/// The URL git will connect to for a location the caller supplied, with insteadOf
+/// rewriting applied. This runs outside any repository, so only global and system
+/// configuration take part, which is what clone and ls-remote see as well. When git
+/// cannot answer, the location is used as written.
+let private expandLocationUrl (hooks: GitSessionHooks) (location: string) (context: OperationContext) : Async<string> =
+    async {
+        let! result = runGit hooks "." [| "ls-remote"; "--get-url"; location |] None context
+
+        match result with
+        | Ok output when output.ExitCode = 0 && not (String.IsNullOrWhiteSpace output.StdOut) ->
+            return output.StdOut.Trim()
+        | _ -> return location
+    }
+
 let createFactoryWithCredentialsAndIdentity
     (hooks: GitSessionHooks)
     (credentials: GitCredentialStrategy.GitCredentialStrategy)
@@ -4390,10 +4462,12 @@ let createFactoryWithCredentialsAndIdentity
             match validateFactoryLocation request.Location with
             | Error failure -> return Failed failure
             | Ok location ->
+                let! effectiveLocation = expandLocationUrl hooks location.ProviderLocation context
+
                 let! authArguments =
                     GitCredentialStrategy.resolveAuthArguments
                         credentials
-                        location.ProviderLocation
+                        effectiveLocation
                         location.ConnectionProfileId
 
                 let! result =
@@ -4489,10 +4563,12 @@ let createFactoryWithCredentialsAndIdentity
             match validateFactoryLocation request.Location with
             | Error failure -> return Failed failure
             | Ok location ->
+                let! effectiveLocation = expandLocationUrl hooks location.ProviderLocation context
+
                 let! authentication =
                     GitCredentialStrategy.resolveCommandAuthentication
                         credentials
-                        location.ProviderLocation
+                        effectiveLocation
                         location.ConnectionProfileId
                         "origin"
 
@@ -4782,7 +4858,17 @@ let createFactoryWithCredentialsAndIdentity
                 match result with
                 | Error failure -> return Failed failure
                 | Ok _ ->
-                    let! _ = runGit hooks request.WorkspaceRoot [| "fetch"; "origin" |] None context
+                    let! effectiveLocation = expandLocationUrl hooks location.ProviderLocation context
+
+                    let! authArguments =
+                        GitCredentialStrategy.resolveAuthArguments
+                            credentials
+                            effectiveLocation
+                            location.ConnectionProfileId
+
+                    let! _ =
+                        runGit hooks request.WorkspaceRoot [| yield! authArguments; "fetch"; "origin" |] None context
+
                     return OperationResult.succeeded (bindingFor request.WorkspaceRoot location)
         }
     Open =
