@@ -774,7 +774,7 @@ Vitest.describe (
                     let! workspace = harness.CreateWorkspace()
 
                     let identity: GitCredentialStrategy.GitIdentityStrategy = {
-                        ResolveIdentity = fun _workspaceRoot ->
+                        ResolveIdentity = fun _request ->
                             async {
                                 return Some { Name = "Test Author"; Email = "author@example.org" }
                             }
@@ -827,6 +827,81 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "revision identity requests carry the bound location host",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let requests = ResizeArray<GitCredentialStrategy.RevisionIdentityRequest>()
+
+                    let identity: GitCredentialStrategy.GitIdentityStrategy = {
+                        ResolveIdentity = fun request ->
+                            async {
+                                requests.Add request
+                                return Some { Name = "Host Author"; Email = "host@example.org" }
+                            }
+                    }
+
+                    let createRevision (binding: WorkspaceBinding) (name: string) = promise {
+                        let session =
+                            GitWorkspaceSession.createSessionWithCredentialsAndIdentity
+                                GitWorkspaceSession.GitSessionHooks.none
+                                GitCredentialStrategy.anonymous
+                                identity
+                                binding
+
+                        do! workspace.WriteFile $"{name}.txt" $"{name} content\n"
+
+                        let! status =
+                            session.Core.GetStatus(OperationContext.detached $"{name}-status")
+                            |> Async.StartAsPromise
+
+                        let status = expectProviderValue $"{name} status" status
+
+                        let! revisionResult =
+                            session.Core.CreateRevision
+                                {
+                                    Message = $"test: {name}"
+                                    Paths = [| mkRepositoryPath $"{name}.txt" |]
+                                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                }
+                                (OperationContext.detached $"{name}-create")
+                            |> Async.StartAsPromise
+
+                        expectProviderValue $"{name} create" revisionResult |> ignore
+                    }
+
+                    // A local location has no host, so the host sees None and falls back
+                    // to whatever account it treats as active.
+                    do! createRevision workspace.Binding "identity-local"
+
+                    // The bound remote location decides the host, the same way credential
+                    // resolution does, so identity and credentials agree on the hub.
+                    let remoteBinding = {
+                        workspace.Binding with
+                            Location = {
+                                workspace.Binding.Location with
+                                    ProviderLocation = "https://Hub.Example.org/group/project.git"
+                            }
+                    }
+
+                    do! createRevision remoteBinding "identity-remote"
+
+                    Vitest.expect(requests.Count).toBe 2
+                    Vitest.expect(requests.[0].WorkspaceRoot).toBe workspace.Binding.WorkspaceRoot
+                    Vitest.expect(requests.[0].TargetHost).toEqual None
+                    Vitest.expect(requests.[1].WorkspaceRoot).toBe workspace.Binding.WorkspaceRoot
+                    Vitest.expect(requests.[1].TargetHost).toEqual (Some "hub.example.org")
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
             "revision identity None falls back to repository configuration",
             TestOptions(timeout = 120000),
             fun () -> promise {
@@ -836,7 +911,7 @@ Vitest.describe (
                     let! workspace = harness.CreateWorkspace()
 
                     let identity: GitCredentialStrategy.GitIdentityStrategy = {
-                        ResolveIdentity = fun _workspaceRoot -> async { return None }
+                        ResolveIdentity = fun _request -> async { return None }
                     }
 
                     let session =
@@ -894,7 +969,7 @@ Vitest.describe (
                     }
 
                     let identity: GitCredentialStrategy.GitIdentityStrategy = {
-                        ResolveIdentity = fun _workspaceRoot -> async { return Some currentIdentity }
+                        ResolveIdentity = fun _request -> async { return Some currentIdentity }
                     }
 
                     let session =
@@ -955,7 +1030,7 @@ Vitest.describe (
                     }
 
                     let identity: GitCredentialStrategy.GitIdentityStrategy = {
-                        ResolveIdentity = fun _workspaceRoot -> async { return Some currentIdentity }
+                        ResolveIdentity = fun _request -> async { return Some currentIdentity }
                     }
 
                     let session =
@@ -1038,7 +1113,7 @@ Vitest.describe (
                     let! _ = runGitIn workspace.Binding.WorkspaceRoot environment [| "config"; "--local"; "--unset-all"; "user.name" |] None
                     let! _ = runGitIn workspace.Binding.WorkspaceRoot environment [| "config"; "--local"; "--unset-all"; "user.email" |] None
                     let identity: GitCredentialStrategy.GitIdentityStrategy = {
-                        ResolveIdentity = fun _workspaceRoot -> async { return None }
+                        ResolveIdentity = fun _request -> async { return None }
                     }
 
                     let session =
@@ -1091,6 +1166,74 @@ let private processOutput exitCode stdout stderr : NodeProcess.ProcessOutput = {
 Vitest.describe (
     "Git provider validation",
     fun () ->
+        Vitest.test (
+            "a checkout that git aborts for local changes is not reported as canceled",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                // git refuses the switch and ends its error text with "Aborting". The
+                // failure classifier must not read that word as a user cancellation.
+                let! root = createTempDirectoryAsync ()
+                let repoPath = join [| root; "work" |]
+                let! _ = runGitIn root [||] [| "init"; "-b"; "main"; repoPath |] None
+                do! configureUser repoPath
+                do! writeUtf8FileAsync (join [| repoPath; "base.txt" |]) "main content\n"
+                let! _ = runGitIn repoPath [||] [| "add"; "-A" |] None
+                let! _ = runGitIn repoPath [||] [| "commit"; "-m"; "test: main" |] None
+                let! _ = runGitIn repoPath [||] [| "checkout"; "-b"; "other" |] None
+                do! writeUtf8FileAsync (join [| repoPath; "base.txt" |]) "other content\n"
+                let! _ = runGitIn repoPath [||] [| "commit"; "-am"; "test: other" |] None
+                let! _ = runGitIn repoPath [||] [| "checkout"; "main" |] None
+                do! writeUtf8FileAsync (join [| repoPath; "base.txt" |]) "local edit\n"
+
+                let binding: WorkspaceBinding = {
+                    SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
+                    ProviderId = gitProviderId
+                    WorkspaceRoot = repoPath
+                    ProviderStateRef = None
+                    Location = {
+                        ProviderId = gitProviderId
+                        DisplayName = None
+                        ProviderLocation = repoPath
+                        ConnectionProfileId = None
+                    }
+                    ConnectionProfileId = None
+                }
+
+                let session =
+                    GitWorkspaceSession.createSession GitWorkspaceSession.GitSessionHooks.none binding
+
+                let! statusResult =
+                    session.Core.GetStatus(OperationContext.detached "aborting-status")
+                    |> Async.StartAsPromise
+
+                let status = expectProviderValue "aborting status" statusResult
+
+                let otherRef =
+                    match ProviderRef.tryCreate "git-local:other" with
+                    | Ok reference -> reference
+                    | Error message -> failwith message
+
+                let! createResult =
+                    session.Core.CreateRef
+                        {
+                            Name = "from-other"
+                            BaseRef = Some otherRef
+                            SwitchTo = true
+                            ExpectedWorkspaceVersion = status.WorkspaceVersion
+                        }
+                        (OperationContext.detached "aborting-create")
+                    |> Async.StartAsPromise
+
+                let failure = expectProviderFailure "aborted checkout" createResult
+                Vitest.expect(failure.Category = Canceled).toBe false
+                Vitest.expect(failure.Code = "operation_canceled").toBe false
+                Vitest.expect(failure.StateChanged).toBe false
+
+                let! branch = runGitIn repoPath [||] [| "rev-parse"; "--abbrev-ref"; "HEAD" |] None
+                Vitest.expect(branch.Trim()).toBe "main"
+            }
+        )
+
         Vitest.test (
             "rejects invalid ref names through the provider contract",
             TestOptions(timeout = 120000),
