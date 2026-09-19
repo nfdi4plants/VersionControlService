@@ -8,6 +8,7 @@ open VersionControlService.Tests.NodePath
 open Vitest
 
 module GitWorkspaceSession = VersionControlService.Git.GitWorkspaceSession
+module GitExecution = VersionControlService.Git.GitExecution
 module NodeProcess = VersionControlService.Runtime.Node.Process
 
 let private fsPromisesDynamic: obj = importAll "fs/promises"
@@ -236,6 +237,104 @@ let private createTextPublishRevision
 Vitest.describe (
     "Git workspace partial success",
     fun () ->
+        Vitest.test (
+            "direct git runs carry the resolved environment overrides",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, _, binding = createSelectedRevisionFixture ()
+                let requests = ResizeArray<NodeProcess.ProcessRequest>()
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request operationContext ->
+                            async {
+                                requests.Add request
+                                return! NodeProcess.run request operationContext
+                            })
+                    Barrier = None
+                }
+
+                try
+                    let session = GitWorkspaceSession.createSession hooks binding
+                    let! _ = sessionStatus session
+                    let expectedPathOverrides =
+                        GitExecution.environmentOverrides ()
+                        |> Array.filter (fun (name, _) -> name = "PATH")
+
+                    Vitest.expect(requests.Count > 0).toBe true
+
+                    for request in requests do
+                        let actualPathOverrides =
+                            request.Environment
+                            |> Array.filter (fun (name, _) -> name = "PATH")
+
+                        Vitest.expect(actualPathOverrides).toEqual(expectedPathOverrides)
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "tracking then untracking a literal path removes exactly its rule",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, binding = createSelectedRevisionFixture ()
+                let relativePath = "assets/my-file name.bin"
+
+                try
+                    let assetsPath = join [| workPath; "assets" |]
+                    let! _ = fsPromisesDynamic?mkdir assetsPath |> unbox<JS.Promise<obj>>
+                    do! writeUtf8FileAsync (join [| workPath; relativePath |]) "literal content\n"
+
+                    let unrelatedRule = "*.dat filter=lfs diff=lfs merge=lfs -text"
+                    let attributesPath = join [| workPath; ".gitattributes" |]
+                    do! writeUtf8FileAsync attributesPath (unrelatedRule + "\n")
+
+                    let storagePolicy =
+                        GitWorkspaceSession.createSession GitWorkspaceSession.GitSessionHooks.none binding
+                        |> fun session -> session.StoragePolicy |> Option.defaultWith (fun () -> failwith "Expected storage policy.")
+
+                    let! tracked =
+                        storagePolicy.SetPathPolicy
+                            (repositoryPath relativePath)
+                            true
+                            (ctx "literal-track")
+                        |> Async.StartAsPromise
+
+                    match tracked with
+                    | Succeeded _ -> ()
+                    | _ -> failwith "Literal tracking failed."
+
+                    let! _ = runGitOk workPath [| "add"; ".gitattributes" |]
+                    let! untracked =
+                        storagePolicy.SetPathPolicy
+                            (repositoryPath relativePath)
+                            false
+                            (ctx "literal-untrack")
+                        |> Async.StartAsPromise
+
+                    match untracked with
+                    | Succeeded _ -> ()
+                    | _ -> failwith "Literal untracking failed."
+
+                    let! content = fsPromisesDynamic?readFile (attributesPath, "utf8") |> unbox<JS.Promise<string>>
+                    let trackingRule = "\"/assets/my-file name.bin\" filter=lfs diff=lfs merge=lfs -text"
+
+                    Vitest.expect(content.Contains unrelatedRule).toBe true
+                    Vitest.expect(content.Contains trackingRule).toBe false
+                    Vitest.expect(content.EndsWith("\n")).toBe true
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
         Vitest.test (
             "reports transfer success with hydration recovery",
             TestOptions(timeout = 120000),

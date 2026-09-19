@@ -5,11 +5,16 @@ module internal VersionControlService.Git.GitSelectedRevision
 
 open System
 open Fable.Core
+open Fable.Core.JsInterop
 open VersionControlService.Abstractions
 
 module NodeProcess = VersionControlService.Runtime.Node.Process
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodePath = VersionControlService.Runtime.Node.Path
+module NodeInterop = VersionControlService.Runtime.Node.Interop
+
+let private fileSystemDynamic: obj = importAll "node:fs"
+let private maxLfsPointerProbeBytes = 1024.0
 
 /// Runs git in the workspace with optional stdin and extra environment.
 type GitRunner =
@@ -68,10 +73,100 @@ type private SelectedLfsPlan = {
     ThresholdBytes: float
     ObservedOversizedPaths: string[]
     OversizedPaths: string[]
+    InlinePaths: string[]
     GeneratedAttributesContent: string option
     AttributesOriginalIdentity: NodeFileSystem.Stats option
     AttributesOriginalContent: string
 }
+
+type private LfsPointerInfo = {
+    Oid: string
+    SizeInBytes: float
+}
+
+type private SelectedPathPolicy = {
+    Path: string
+    SizeInBytes: float
+    IsLfsPointer: bool
+    Policy: RevisionPathPolicy
+}
+
+let private tryParseLfsPointer (pointerText: string) =
+    let lines =
+        pointerText.Replace("\r\n", "\n").Split('\n', StringSplitOptions.RemoveEmptyEntries)
+        |> Array.map _.Trim()
+        |> Array.filter (String.IsNullOrWhiteSpace >> not)
+
+    let oid =
+        lines
+        |> Array.tryPick (fun line ->
+            let prefix = "oid sha256:"
+
+            if line.StartsWith(prefix, StringComparison.Ordinal) && line.Length = prefix.Length + 64 then
+                let value = line.Substring(prefix.Length)
+
+                if value |> Seq.forall (fun character -> Char.IsDigit character || ('a' <= character && character <= 'f')) then
+                    Some value
+                else
+                    None
+            else
+                None)
+
+    let size =
+        lines
+        |> Array.tryPick (fun line ->
+            let prefix = "size "
+
+            if line.StartsWith(prefix, StringComparison.Ordinal) then
+                let value = line.Substring(prefix.Length)
+
+                if value.Length > 0 && value |> Seq.forall Char.IsDigit then
+                    match Int64.TryParse value with
+                    | true, parsed when parsed >= 0L -> Some(float parsed)
+                    | _ -> None
+                else
+                    None
+            else
+                None)
+
+    if
+        lines.Length >= 3
+        && lines.[0].Equals("version https://git-lfs.github.com/spec/v1", StringComparison.Ordinal)
+    then
+        match oid, size with
+        | Some oidValue, Some sizeValue ->
+            Some {
+                Oid = oidValue
+                SizeInBytes = sizeValue
+            }
+        | _ -> None
+    else
+        None
+
+let private readLfsPointerProbe (path: string) (knownStats: NodeFileSystem.Stats option) =
+    if knownStats |> Option.exists (fun stats -> stats.size > maxLfsPointerProbeBytes) then
+        None
+    else
+        let descriptor, openedStats = NodeFileSystem.openReadOnlyNoFollowSync path
+
+        try
+            if openedStats.size > maxLfsPointerProbeBytes then
+                None
+            else
+                let buffer = NodeInterop.bufferAlloc 1024
+                let bytesRead: int =
+                    fileSystemDynamic?readSync (descriptor, buffer, 0, 1024, null)
+                    |> unbox
+
+                if float bytesRead = openedStats.size then
+                    Some(
+                        NodeInterop.bufferSubarray buffer 0 bytesRead
+                        |> NodeInterop.bufferToUtf8String
+                    )
+                else
+                    None
+        finally
+            NodeFileSystem.closeFileDescriptorSync descriptor
 
 let private invalidThresholdFailure () =
     OperationFailure.create
@@ -124,39 +219,135 @@ let private listSelectedCandidateFiles
                 |> Ok
     }
 
-let private getOversizedSelectedPaths
+let private resolveSelectedPathPolicies
     (runGit: GitRunner)
     (barrier: TransactionBarrier)
     (repoPath: string)
     (paths: RepositoryPath[])
     (environment: (string * string)[])
-    (thresholdBytes: float)
-    : Async<Result<string[], OperationFailure>> =
+    (revisionPolicy: RevisionPolicyStrategy)
+    : Async<Result<SelectedPathPolicy[], OperationFailure>> =
     async {
-        let oversizedPaths = ResizeArray<string>()
+        let selectedPolicies = ResizeArray<SelectedPathPolicy>()
         let mutable failure = None
 
         match! listSelectedCandidateFiles runGit environment paths with
         | Error currentFailure -> failure <- Some currentFailure
         | Ok candidates ->
+            // A path deleted before planning is a valid selected deletion. Keep paths that existed before the barrier so a later lstat failure remains observable as a race.
+            let candidatesPresentBeforeBarrier =
+                candidates
+                |> Array.filter (fun candidate ->
+                    try
+                        NodeFileSystem.tryLstatSync (NodePath.join [| repoPath; candidate |])
+                        |> Option.isSome
+                    with _ ->
+                        true)
+
             do! barrier "selected-revision-lfs-candidates-listed"
 
-            for candidate in candidates do
+            for candidate in candidatesPresentBeforeBarrier do
                 match failure with
                 | Some _ -> ()
                 | None ->
-                    try
-                        let absolutePath = NodePath.join [| repoPath; candidate |]
-                        let! fileStats = NodeFileSystem.lstatAsync absolutePath |> Async.AwaitPromise
+                    let! fileStatsResult =
+                        async {
+                            try
+                                let absolutePath = NodePath.join [| repoPath; candidate |]
+                                let! fileStats = NodeFileSystem.lstatAsync absolutePath |> Async.AwaitPromise
+                                return Ok fileStats
+                            with error ->
+                                return Error(selectedFileStatFailure candidate error)
+                        }
 
-                        if fileStats.isFile () && fileStats.size >= thresholdBytes then
-                            oversizedPaths.Add candidate
-                    with error ->
-                        failure <- Some(selectedFileStatFailure candidate error)
+                    match fileStatsResult with
+                    | Error currentFailure -> failure <- Some currentFailure
+                    | Ok fileStats when fileStats.isFile () ->
+                        let pointerInfoResult =
+                            try
+                                let absolutePath = NodePath.join [| repoPath; candidate |]
+                                Ok(
+                                    readLfsPointerProbe absolutePath (Some fileStats)
+                                    |> Option.bind tryParseLfsPointer
+                                )
+                            with error ->
+                                Error(selectedFileStatFailure candidate error)
+
+                        match pointerInfoResult with
+                        | Error currentFailure -> failure <- Some currentFailure
+                        | Ok pointerInfo ->
+                            match RepositoryPath.tryCreate candidate with
+                            | Error message ->
+                                failure <-
+                                    Some(
+                                        OperationFailure.create Validation "invalid_path" message
+                                        |> fun currentFailure -> {
+                                            currentFailure with
+                                                AffectedPaths = [| candidate |]
+                                        }
+                                    )
+                            | Ok repositoryPath ->
+                                let sizeInBytes = pointerInfo |> Option.map _.SizeInBytes |> Option.defaultValue fileStats.size
+
+                                let policyResult =
+                                    try
+                                        Ok(
+                                            revisionPolicy.ResolvePathPolicy {
+                                                Path = repositoryPath
+                                                SizeInBytes = sizeInBytes
+                                            }
+                                        )
+                                    with error ->
+                                        Error(
+                                            OperationFailure.createRedacted
+                                                ProviderError
+                                                "revision_policy_failed"
+                                                error.Message
+                                            |> fun currentFailure -> {
+                                                currentFailure with
+                                                    AffectedPaths = [| candidate |]
+                                            }
+                                        )
+
+                                match policyResult with
+                                | Error currentFailure -> failure <- Some currentFailure
+                                | Ok policy ->
+                                    selectedPolicies.Add {
+                                        Path = candidate
+                                        SizeInBytes = sizeInBytes
+                                        IsLfsPointer = pointerInfo.IsSome
+                                        Policy = policy
+                                    }
+                    | Ok _ -> ()
 
         match failure with
         | Some currentFailure -> return Error currentFailure
-        | None -> return Ok(oversizedPaths.ToArray() |> Array.distinct)
+        | None ->
+            let inlinePointerPaths =
+                selectedPolicies
+                |> Seq.filter (fun selected ->
+                    selected.Policy = RevisionPathPolicy.Inline
+                    && selected.IsLfsPointer)
+                |> Seq.map _.Path
+                |> Seq.toArray
+
+            if inlinePointerPaths.Length > 0 then
+                return
+                    Error {
+                        OperationFailure.create
+                            Validation
+                            "inline_content_not_materialized"
+                            "Materialize the affected files before creating an inline revision." with
+                            AffectedPaths = inlinePointerPaths
+                            RecoveryAction =
+                                Some {
+                                    Code = "retry_materialization"
+                                    Instructions =
+                                        Some "Materialize the affected files, refresh the status and create the revision again."
+                                }
+                    }
+            else
+                return Ok(selectedPolicies.ToArray())
     }
 
 let private checkFilterAttributes
@@ -210,6 +401,7 @@ let private computeSelectedMetadata
     (repoPath: string)
     (paths: RepositoryPath[])
     (environment: (string * string)[])
+    (selectedPolicies: SelectedPathPolicy[])
     : Async<Result<SelectedLfsPlan, OperationFailure>> =
     async {
         let! thresholdOutput =
@@ -230,124 +422,153 @@ let private computeSelectedMetadata
         | Ok thresholdMb ->
             let thresholdBytes = float thresholdMb * 1024.0 * 1024.0
 
-            match! getOversizedSelectedPaths runGit barrier repoPath paths environment thresholdBytes with
+            let observedOversizedPaths =
+                selectedPolicies
+                |> Array.filter (fun selected ->
+                    selected.Policy <> RevisionPathPolicy.Inline
+                    && selected.SizeInBytes >= thresholdBytes)
+                |> Array.map _.Path
+
+            let potentialPointerPaths =
+                selectedPolicies
+                |> Array.choose (fun selected ->
+                    match selected.Policy with
+                    | RevisionPathPolicy.LargeObject -> Some selected.Path
+                    | RevisionPathPolicy.Automatic when selected.SizeInBytes >= thresholdBytes -> Some selected.Path
+                    | _ -> None)
+
+            let inlinePaths =
+                selectedPolicies
+                |> Array.filter (fun selected -> selected.Policy = RevisionPathPolicy.Inline)
+                |> Array.map _.Path
+
+            let pathsToCheck =
+                Array.append potentialPointerPaths inlinePaths
+                |> Array.distinct
+
+            let! filterResult =
+                if pathsToCheck.Length = 0 then
+                    async { return Ok Map.empty }
+                else
+                    checkFilterAttributes runGit environment pathsToCheck
+
+            match filterResult with
             | Error failure -> return Error failure
-            | Ok oversizedPaths when oversizedPaths.Length = 0 ->
-                return
-                    Ok {
-                        ThresholdBytes = thresholdBytes
-                        ObservedOversizedPaths = [||]
-                        OversizedPaths = [||]
-                        GeneratedAttributesContent = None
-                        AttributesOriginalIdentity = None
-                        AttributesOriginalContent = ""
-                    }
-            | Ok oversizedPaths ->
-                let! filterResult = checkFilterAttributes runGit environment oversizedPaths
+            | Ok filters ->
+                let filterValue path = Map.tryFind path filters |> Option.defaultValue "unspecified"
 
-                match filterResult with
-                | Error failure -> return Error failure
-                | Ok filters ->
-                    let filterValue path =
-                        Map.tryFind path filters |> Option.defaultValue "unspecified"
+                let pointerPaths =
+                    selectedPolicies
+                    |> Array.choose (fun selected ->
+                        match selected.Policy with
+                        | RevisionPathPolicy.LargeObject -> Some selected.Path
+                        | RevisionPathPolicy.Automatic when
+                            selected.SizeInBytes >= thresholdBytes
+                            && filterValue selected.Path <> "unset" ->
+                            Some selected.Path
+                        | _ -> None)
 
-                    let pointerPaths =
-                        oversizedPaths
-                        |> Array.filter (fun path -> filterValue path <> "unset")
+                let pathsNeedingTracking =
+                    pointerPaths |> Array.filter (fun path -> filterValue path <> "lfs")
 
-                    let pathsNeedingRules =
-                        pointerPaths
-                        |> Array.filter (fun path -> filterValue path <> "lfs")
+                let pathsNeedingUntracking =
+                    inlinePaths |> Array.filter (fun path -> filterValue path = "lfs")
 
+                let! lfsDependencyResult =
                     if pointerPaths.Length = 0 then
-                        return
-                            Ok {
-                                ThresholdBytes = thresholdBytes
-                                ObservedOversizedPaths = oversizedPaths
-                                OversizedPaths = [||]
-                                GeneratedAttributesContent = None
-                                AttributesOriginalIdentity = None
-                                AttributesOriginalContent = ""
-                            }
+                        async { return Ok() }
                     else
-                        let! lfsVersion = runGit [| "lfs"; "version" |] None [||]
+                        async {
+                            let! lfsVersion = runGit [| "lfs"; "version" |] None [||]
 
-                        match lfsVersion with
-                        | Error failure -> return Error(dependencyMissingFailure failure.Message)
-                        | Ok output when output.ExitCode <> 0 ->
-                            let detail =
-                                if String.IsNullOrWhiteSpace output.StdErr then output.StdOut else output.StdErr
+                            match lfsVersion with
+                            | Error failure -> return Error(dependencyMissingFailure failure.Message)
+                            | Ok output when output.ExitCode <> 0 ->
+                                let detail =
+                                    if String.IsNullOrWhiteSpace output.StdErr then output.StdOut else output.StdErr
 
-                            return Error(dependencyMissingFailure detail)
-                        | Ok _ when pathsNeedingRules.Length = 0 ->
+                                return Error(dependencyMissingFailure detail)
+                            | Ok _ -> return Ok()
+                        }
+
+                match lfsDependencyResult with
+                | Error failure -> return Error failure
+                | Ok() when pathsNeedingTracking.Length = 0 && pathsNeedingUntracking.Length = 0 ->
+                    return
+                        Ok {
+                            ThresholdBytes = thresholdBytes
+                            ObservedOversizedPaths = observedOversizedPaths
+                            OversizedPaths = pointerPaths
+                            InlinePaths = inlinePaths
+                            GeneratedAttributesContent = None
+                            AttributesOriginalIdentity = None
+                            AttributesOriginalContent = ""
+                        }
+                | Ok() ->
+                    let attributesSelected =
+                        paths
+                        |> Array.exists (fun path -> RepositoryPath.value path = ".gitattributes")
+
+                    let! attributesStatus =
+                        runGit [| "status"; "--porcelain"; "-z"; "--"; ".gitattributes" |] None [||]
+
+                    match attributesStatus with
+                    | Error failure -> return Error failure
+                    | Ok output when output.ExitCode <> 0 ->
+                        return Error(failedRun "git status -- .gitattributes" output)
+                    | Ok output when output.StdOut <> "" && not attributesSelected ->
+                        return
+                            Error {
+                                OperationFailure.create
+                                    Validation
+                                    "precondition_failed"
+                                    "Generated LFS rules cannot modify an unrelated dirty .gitattributes file." with
+                                    AffectedPaths = [| ".gitattributes" |]
+                            }
+                    | Ok _ ->
+                        let attributesPath = NodePath.join [| repoPath; ".gitattributes" |]
+
+                        let attributesReadResult =
+                            try
+                                Ok(GitLfsService.readAttributesNoFollow attributesPath)
+                            with error ->
+                                Error {
+                                    OperationFailure.createRedacted
+                                        ProviderError
+                                        "attributes_read_failed"
+                                        error.Message with
+                                        AffectedPaths = [| ".gitattributes" |]
+                                }
+
+                        match attributesReadResult with
+                        | Error failure -> return Error failure
+                        | Ok(attributesContent, originalIdentity) ->
+                            let trackedAttributes, trackingGenerated =
+                                GitLfsService.addLiteralTrackingRules attributesContent pathsNeedingTracking
+
+                            let updatedAttributes, untrackingGenerated =
+                                GitLfsService.addLiteralUntrackingRules trackedAttributes pathsNeedingUntracking
+
                             return
                                 Ok {
                                     ThresholdBytes = thresholdBytes
-                                    ObservedOversizedPaths = oversizedPaths
+                                    ObservedOversizedPaths = observedOversizedPaths
                                     OversizedPaths = pointerPaths
-                                    GeneratedAttributesContent = None
-                                    AttributesOriginalIdentity = None
-                                    AttributesOriginalContent = ""
+                                    InlinePaths = inlinePaths
+                                    GeneratedAttributesContent =
+                                        if trackingGenerated || untrackingGenerated then Some updatedAttributes else None
+                                    AttributesOriginalIdentity = originalIdentity
+                                    AttributesOriginalContent = attributesContent
                                 }
-                        | Ok _ ->
-                            let attributesSelected =
-                                paths
-                                |> Array.exists (fun path -> RepositoryPath.value path = ".gitattributes")
-
-                            let! attributesStatus =
-                                runGit [| "status"; "--porcelain"; "-z"; "--"; ".gitattributes" |] None [||]
-
-                            match attributesStatus with
-                            | Error failure -> return Error failure
-                            | Ok output when output.ExitCode <> 0 ->
-                                return Error(failedRun "git status -- .gitattributes" output)
-                            | Ok output when output.StdOut <> "" && not attributesSelected ->
-                                return
-                                    Error {
-                                        OperationFailure.create
-                                            Validation
-                                            "precondition_failed"
-                                            "Automatic LFS tracking cannot modify an unrelated dirty .gitattributes file." with
-                                            AffectedPaths = [| ".gitattributes" |]
-                                    }
-                            | Ok _ ->
-                                let attributesPath = NodePath.join [| repoPath; ".gitattributes" |]
-
-                                let attributesReadResult =
-                                    try
-                                        Ok(GitLfsService.readAttributesNoFollow attributesPath)
-                                    with error ->
-                                        Error {
-                                            OperationFailure.createRedacted
-                                                ProviderError
-                                                "attributes_read_failed"
-                                                error.Message with
-                                                AffectedPaths = [| ".gitattributes" |]
-                                        }
-
-                                match attributesReadResult with
-                                | Error failure -> return Error failure
-                                | Ok(attributesContent, originalIdentity) ->
-                                    let updatedAttributes, generated =
-                                        GitLfsService.addLiteralTrackingRules attributesContent pathsNeedingRules
-
-                                    return
-                                        Ok {
-                                            ThresholdBytes = thresholdBytes
-                                            ObservedOversizedPaths = oversizedPaths
-                                            OversizedPaths = pointerPaths
-                                            GeneratedAttributesContent = if generated then Some updatedAttributes else None
-                                            AttributesOriginalIdentity = originalIdentity
-                                            AttributesOriginalContent = attributesContent
-                                        }
     }
 
-let private checkSelectedMetadata
+let private checkSelectedMetadataWithPolicies
     (runGit: GitRunner)
     (barrier: TransactionBarrier)
     (repoPath: string)
     (paths: RepositoryPath[])
     (expectedHead: string option)
+    (selectedPolicies: SelectedPathPolicy[])
     : Async<Result<SelectedLfsPlan, OperationFailure>> =
     async {
         let! gitDirOutput = runGit [| "rev-parse"; "--absolute-git-dir" |] None [||]
@@ -409,20 +630,48 @@ let private checkSelectedMetadata
                                 repoPath
                                 paths
                                 environment
+                                selectedPolicies
             finally
                 cleanupTemporaryIndex ()
     }
 
-let private tryPointerOid (pointerText: string) =
-    pointerText.Replace("\r\n", "\n").Split '\n'
-    |> Array.tryPick (fun line ->
-        let prefix = "oid sha256:"
+let private checkSelectedMetadata
+    (runGit: GitRunner)
+    (barrier: TransactionBarrier)
+    (repoPath: string)
+    (paths: RepositoryPath[])
+    (expectedHead: string option)
+    (revisionPolicy: RevisionPolicyStrategy)
+    : Async<Result<SelectedLfsPlan, OperationFailure>> =
+    async {
+        let! selectedPoliciesResult =
+            resolveSelectedPathPolicies runGit barrier repoPath paths [||] revisionPolicy
 
-        if line.StartsWith(prefix, StringComparison.Ordinal) then
-            let oid = line.Substring(prefix.Length).Trim()
-            if oid.Length = 64 then Some oid else None
-        else
-            None)
+        match selectedPoliciesResult with
+        | Error failure -> return Error failure
+        | Ok selectedPolicies ->
+            return!
+                checkSelectedMetadataWithPolicies
+                    runGit
+                    barrier
+                    repoPath
+                    paths
+                    expectedHead
+                    selectedPolicies
+    }
+
+let private tryPointerOid (pointerText: string) =
+    tryParseLfsPointer pointerText |> Option.map _.Oid
+
+let private hashTextBlob (runGit: GitRunner) (content: string) =
+    async {
+        let! result = runGit [| "hash-object"; "-w"; "--stdin" |] (Some content) [||]
+
+        match result with
+        | Error failure -> return Error failure
+        | Ok output when output.ExitCode <> 0 -> return Error(failedRun "git hash-object" output)
+        | Ok output -> return Ok(output.StdOut.Trim())
+    }
 
 let private prepareLfsPointerBlob
     (runGit: GitRunner)
@@ -442,79 +691,85 @@ let private prepareLfsPointerBlob
                 ()
 
         try
-            return!
-                async {
-                    try
-                        NodeFileSystem.copyFileSync sourcePath snapshotPath
+            let sourceContentResult : Result<string option, OperationFailure> =
+                try
+                    Ok(readLfsPointerProbe sourcePath None)
+                with error ->
+                    Error(
+                        OperationFailure.createRedacted
+                            ProviderError
+                            "lfs_object_prepare_failed"
+                            error.Message
+                    )
 
-                        let! pointerResult =
-                            runGit [| "lfs"; "pointer"; $"--file={snapshotPath}" |] None [||]
+            match sourceContentResult with
+            | Error failure -> return Error failure
+            | Ok(Some sourceContent) when tryParseLfsPointer sourceContent |> Option.isSome ->
+                return! hashTextBlob runGit sourceContent
+            | Ok _ ->
+                    return!
+                        async {
+                            try
+                                NodeFileSystem.copyFileSync sourcePath snapshotPath
 
-                        match pointerResult with
-                        | Error failure -> return Error(dependencyMissingFailure failure.Message)
-                        | Ok output when output.ExitCode <> 0 ->
-                            let detail =
-                                if String.IsNullOrWhiteSpace output.StdErr then output.StdOut else output.StdErr
+                                let! pointerResult =
+                                    runGit [| "lfs"; "pointer"; $"--file={snapshotPath}" |] None [||]
 
-                            return Error(dependencyMissingFailure detail)
-                        | Ok output ->
-                            match tryPointerOid output.StdOut with
-                            | None ->
+                                match pointerResult with
+                                | Error failure -> return Error(dependencyMissingFailure failure.Message)
+                                | Ok output when output.ExitCode <> 0 ->
+                                    let detail =
+                                        if String.IsNullOrWhiteSpace output.StdErr then output.StdOut else output.StdErr
+
+                                    return Error(dependencyMissingFailure detail)
+                                | Ok output ->
+                                    match tryPointerOid output.StdOut with
+                                    | None ->
+                                        return
+                                            Error(
+                                                OperationFailure.create
+                                                    ProviderError
+                                                    "lfs_pointer_invalid"
+                                                    "Git LFS did not return a canonical pointer for an oversized selected file."
+                                            )
+                                    | Some oid ->
+                                        let objectDirectory =
+                                            NodePath.join
+                                                [|
+                                                    commonGitDir
+                                                    "lfs"
+                                                    "objects"
+                                                    oid.Substring(0, 2)
+                                                    oid.Substring(2, 2)
+                                                |]
+
+                                        let objectPath = NodePath.join [| objectDirectory; oid |]
+                                        NodeFileSystem.mkdirSync objectDirectory (NodeFileSystem.MkdirOptions(recursive = true))
+
+                                        if NodeFileSystem.existsSync objectPath then
+                                            cleanupSnapshot ()
+                                        else
+                                            NodeFileSystem.renameSync snapshotPath objectPath
+
+                                        let! pointerBlob =
+                                            runGit [| "hash-object"; "-w"; "--stdin" |] (Some output.StdOut) [||]
+
+                                        match pointerBlob with
+                                        | Error failure -> return Error failure
+                                        | Ok hashOutput when hashOutput.ExitCode <> 0 ->
+                                            return Error(failedRun "git hash-object (LFS pointer)" hashOutput)
+                                        | Ok hashOutput -> return Ok(hashOutput.StdOut.Trim())
+                            with error ->
                                 return
                                     Error(
-                                        OperationFailure.create
+                                        OperationFailure.createRedacted
                                             ProviderError
-                                            "lfs_pointer_invalid"
-                                            "Git LFS did not return a canonical pointer for an oversized selected file."
+                                            "lfs_object_prepare_failed"
+                                            error.Message
                                     )
-                            | Some oid ->
-                                let objectDirectory =
-                                    NodePath.join
-                                        [|
-                                            commonGitDir
-                                            "lfs"
-                                            "objects"
-                                            oid.Substring(0, 2)
-                                            oid.Substring(2, 2)
-                                        |]
-
-                                let objectPath = NodePath.join [| objectDirectory; oid |]
-                                NodeFileSystem.mkdirSync objectDirectory (NodeFileSystem.MkdirOptions(recursive = true))
-
-                                if NodeFileSystem.existsSync objectPath then
-                                    cleanupSnapshot ()
-                                else
-                                    NodeFileSystem.renameSync snapshotPath objectPath
-
-                                let! pointerBlob =
-                                    runGit [| "hash-object"; "-w"; "--stdin" |] (Some output.StdOut) [||]
-
-                                match pointerBlob with
-                                | Error failure -> return Error failure
-                                | Ok hashOutput when hashOutput.ExitCode <> 0 ->
-                                    return Error(failedRun "git hash-object (LFS pointer)" hashOutput)
-                                | Ok hashOutput -> return Ok(hashOutput.StdOut.Trim())
-                    with error ->
-                        return
-                            Error(
-                                OperationFailure.createRedacted
-                                    ProviderError
-                                    "lfs_object_prepare_failed"
-                                    error.Message
-                            )
-                }
+                        }
         finally
             cleanupSnapshot ()
-    }
-
-let private hashTextBlob (runGit: GitRunner) (content: string) =
-    async {
-        let! result = runGit [| "hash-object"; "-w"; "--stdin" |] (Some content) [||]
-
-        match result with
-        | Error failure -> return Error failure
-        | Ok output when output.ExitCode <> 0 -> return Error(failedRun "git hash-object" output)
-        | Ok output -> return Ok(output.StdOut.Trim())
     }
 
 let private updateTemporaryIndexEntry
@@ -611,7 +866,7 @@ let private temporaryIndexMode
                         OperationFailure.create
                             ProviderError
                             "temporary_index_entry_missing"
-                            "The oversized selected file was not present in the temporary index."
+                            "The selected file was not present in the temporary index."
                     )
     }
 
@@ -624,11 +879,13 @@ let private validateLfsPlanAgainstTemporaryIndex
     async {
         let mutable failure = None
         let plannedOversized = plan.ObservedOversizedPaths |> Set.ofArray
+        let inlinePaths = plan.InlinePaths |> Set.ofArray
         let mutable newlyOversized = Set.empty
 
         for path in paths |> Array.map RepositoryPath.value do
             match failure with
             | Some _ -> ()
+            | None when inlinePaths.Contains path -> ()
             | None ->
                 match! listTemporaryIndexEntries runGit environment path with
                 | Error currentFailure -> failure <- Some currentFailure
@@ -683,6 +940,36 @@ let private applyLfsPlanToTemporaryIndex
     async {
         let mutable failure = None
 
+        for relativePath in plan.InlinePaths do
+            match failure with
+            | Some _ -> ()
+            | None ->
+                match! temporaryIndexMode runGit environment relativePath with
+                | Error currentFailure -> failure <- Some currentFailure
+                | Ok mode ->
+                    let absolutePath = NodePath.resolve [| repoPath; relativePath |]
+                    let! blobResult =
+                        runGit
+                            [| "hash-object"; "-w"; "--no-filters"; "--"; absolutePath |]
+                            None
+                            [||]
+
+                    match blobResult with
+                    | Error currentFailure -> failure <- Some currentFailure
+                    | Ok output when output.ExitCode <> 0 ->
+                        failure <- Some(failedRun "git hash-object (inline file)" output)
+                    | Ok output ->
+                        match!
+                            updateTemporaryIndexEntry
+                                runGit
+                                environment
+                                mode
+                                (output.StdOut.Trim())
+                                relativePath
+                        with
+                        | Error currentFailure -> failure <- Some currentFailure
+                        | Ok() -> ()
+
         for relativePath in plan.OversizedPaths do
             match failure with
             | Some _ -> ()
@@ -735,6 +1022,7 @@ let createRevision
     (message: string)
     (paths: RepositoryPath[])
     (identityArguments: string[])
+    (revisionPolicy: RevisionPolicyStrategy)
     (context: OperationContext)
     : Async<OperationResult<RevisionId>> =
     async {
@@ -807,7 +1095,7 @@ let createRevision
                 | Error failure -> return Failed failure
                 | Ok() ->
                     let! metadataResult =
-                        checkSelectedMetadata runGit barrier repoPath paths expectedHead
+                        checkSelectedMetadata runGit barrier repoPath paths expectedHead revisionPolicy
 
                     match metadataResult with
                     | Error failure -> return Failed failure

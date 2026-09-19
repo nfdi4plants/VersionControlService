@@ -3281,8 +3281,27 @@ let createFactoryWithHooks
             Open = fun binding context -> openSession options hooks credentials binding context
     }
 
+/// Accepts a provider-neutral revision policy for factory composition. lakeFS has no
+/// large-object representation, so it ignores the strategy and never invokes it.
+let createFactoryWithHooksAndPolicy
+    (options: LakeFsProviderOptions.LakeFsProviderOptions)
+    (hooks: LakeFsSessionHooks)
+    (credentials: LakeFsCredentials.LakeFsCredentialStrategy)
+    (revisionPolicy: RevisionPolicyStrategy)
+    : ProviderFactory =
+    createFactoryWithHooks options hooks credentials
+
 let createFactory
     (options: LakeFsProviderOptions.LakeFsProviderOptions)
     (credentials: LakeFsCredentials.LakeFsCredentialStrategy)
     : ProviderFactory =
     createFactoryWithHooks options LakeFsSessionHooks.none credentials
+
+/// Accepts the strategy and delegates to the existing lakeFS factory. lakeFS never
+/// invokes the strategy because it has no large-object representation.
+let createFactoryWithPolicy
+    (options: LakeFsProviderOptions.LakeFsProviderOptions)
+    (credentials: LakeFsCredentials.LakeFsCredentialStrategy)
+    (revisionPolicy: RevisionPolicyStrategy)
+    : ProviderFactory =
+    createFactory options credentials

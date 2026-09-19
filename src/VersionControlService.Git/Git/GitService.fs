@@ -518,7 +518,7 @@ let private tryResolveArcRelativePath (arcPath: string) (requestedPath: string) 
             Ok(safeRelativePath, absolutePath)
 
 let private createTemporaryLfsBackupPath (absolutePath: string) =
-    $"{absolutePath}.vcs-lfs-backup-{Guid.NewGuid():N}"
+    absolutePath + ".vcs-lfs-backup-" + Guid.NewGuid().ToString("N")
 
 let private restoreTemporaryLfsBackup backupPath absolutePath =
     if existsSync backupPath then

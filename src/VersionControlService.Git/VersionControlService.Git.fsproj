@@ -10,6 +10,7 @@
     <Compile Include="Support\FileSystemIO.fs" />
     <Compile Include="Git\JsonDecoder.fs" />
     <Compile Include="Git\GitCommandResolver.fs" />
+    <Compile Include="GitExecution.fs" />
     <Compile Include="Git\GitAuthAdapter.fs" />
     <Compile Include="GitCredentialStrategy.fs" />
     <Compile Include="Git\GitLfsAdapter.fs" />

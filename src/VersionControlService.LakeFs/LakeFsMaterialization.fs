@@ -839,7 +839,7 @@ let private prepareInternal
                         failure <- Some(canceledFailure ())
                     else
                         let temporaryPath =
-                            NodePath.join [| transactionDirectory; $"object-{index:D8}.tmp" |]
+                            NodePath.join [| transactionDirectory; $"object-{index.ToString().PadLeft(8, '0')}.tmp" |]
 
                         let! downloaded = download preparedObject temporaryPath context
 

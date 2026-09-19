@@ -10,6 +10,7 @@ module GitService = VersionControlService.Git.GitService
 module GitRefs = VersionControlService.Git.GitRefs
 module GitConflictSession = VersionControlService.Git.GitConflictSession
 module GitCredentialStrategy = VersionControlService.Git.GitCredentialStrategy
+module GitExecution = VersionControlService.Git.GitExecution
 module GitLfsExtensions = VersionControlService.Git.GitLfsExtensions
 module GitProvisioningService = VersionControlService.Git.GitProvisioningService
 module NodeProcess = VersionControlService.Runtime.Node.Process
@@ -109,6 +110,14 @@ let private awaitGit (operation: JS.Promise<GitService.GitResult<'T>>) : Async<R
     }
 
 /// Direct git process invocation honoring the RunProcess hook.
+let private mergeGitEnvironment (requestEnvironment: (string * string)[]) =
+    let requestNames = requestEnvironment |> Array.map fst |> Set.ofArray
+
+    Array.append
+        (GitExecution.environmentOverrides ()
+         |> Array.filter (fun (name, _) -> not (Set.contains name requestNames)))
+        requestEnvironment
+
 let private runGitEnv
     (hooks: GitSessionHooks)
     (repoPath: string)
@@ -122,7 +131,7 @@ let private runGitEnv
             NodeProcess.ProcessRequest.create "git" arguments with
                 WorkingDirectory = Some repoPath
                 StdinData = stdinData
-                Environment = environment
+                Environment = mergeGitEnvironment environment
                 ProgressPhase = "git"
         }
 
@@ -225,6 +234,7 @@ type private SessionState = {
     /// Injected credential resolution; never global state.
     Credentials: GitCredentialStrategy.GitCredentialStrategy
     RevisionIdentity: GitCredentialStrategy.GitIdentityStrategy
+    RevisionPolicy: RevisionPolicyStrategy
     /// Active conflict-session identity and rotating handle version.
     mutable ConflictSession: (string * int) option
     /// Monotonic counter so re-opened merges never reuse a closed session ID.
@@ -1422,6 +1432,7 @@ let private readConflictStagePreview
                             let request = {
                                 NodeProcess.ProcessRequest.create "git" [| "cat-file"; "blob"; objectId |] with
                                     WorkingDirectory = Some state.RepoPath
+                                    Environment = mergeGitEnvironment [||]
                                     ProgressPhase = "git"
                             }
 
@@ -1615,7 +1626,7 @@ let private createRevision (state: SessionState) (request: CreateRevisionRequest
                             NodeProcess.ProcessRequest.create "git" arguments with
                                 WorkingDirectory = Some state.RepoPath
                                 StdinData = stdinData
-                                Environment = environment
+                                Environment = mergeGitEnvironment environment
                                 ProgressPhase = "git"
                         }
 
@@ -1643,6 +1654,7 @@ let private createRevision (state: SessionState) (request: CreateRevisionRequest
                         request.Message
                         request.Paths
                         identityArguments
+                        state.RevisionPolicy
                         context
     }
 
@@ -3994,6 +4006,7 @@ let private readBaseBlob
         let request = {
             NodeProcess.ProcessRequest.create "git" [| "cat-file"; "blob"; objectName |] with
                 WorkingDirectory = Some state.RepoPath
+                Environment = mergeGitEnvironment [||]
                 ProgressPhase = "git"
         }
 
@@ -4173,10 +4186,11 @@ let private createBrowser (state: SessionState) : RepositoryBrowserService = {
 // Session and factory
 // ---------------------------------------------------------------------------
 
-let createSessionWithCredentialsAndIdentity
+let createSessionWithCredentialsIdentityAndPolicy
     (hooks: GitSessionHooks)
     (credentials: GitCredentialStrategy.GitCredentialStrategy)
     (revisionIdentity: GitCredentialStrategy.GitIdentityStrategy)
+    (revisionPolicy: RevisionPolicyStrategy)
     (binding: WorkspaceBinding)
     : WorkspaceSession =
     let state = {
@@ -4187,6 +4201,7 @@ let createSessionWithCredentialsAndIdentity
         ConnectionProfileId = binding.ConnectionProfileId
         Credentials = credentials
         RevisionIdentity = revisionIdentity
+        RevisionPolicy = revisionPolicy
         ConflictSession = None
         ConflictGeneration = 0
     }
@@ -4257,6 +4272,19 @@ let createSessionWithCredentialsAndIdentity
                 )
             RepositoryBrowser = Some(createBrowser state)
     }
+
+let createSessionWithCredentialsAndIdentity
+    (hooks: GitSessionHooks)
+    (credentials: GitCredentialStrategy.GitCredentialStrategy)
+    (revisionIdentity: GitCredentialStrategy.GitIdentityStrategy)
+    (binding: WorkspaceBinding)
+    : WorkspaceSession =
+    createSessionWithCredentialsIdentityAndPolicy
+        hooks
+        credentials
+        revisionIdentity
+        RevisionPolicyStrategy.automatic
+        binding
 
 let createSessionWithCredentials
     (hooks: GitSessionHooks)
@@ -4344,10 +4372,11 @@ let private expandLocationUrl (hooks: GitSessionHooks) (location: string) (conte
         | _ -> return location
     }
 
-let createFactoryWithCredentialsAndIdentity
+let createFactoryWithCredentialsIdentityAndPolicy
     (hooks: GitSessionHooks)
     (credentials: GitCredentialStrategy.GitCredentialStrategy)
     (revisionIdentity: GitCredentialStrategy.GitIdentityStrategy)
+    (revisionPolicy: RevisionPolicyStrategy)
     : ProviderFactory =
     let checkDependencies (context: OperationContext) : Async<OperationResult<DependencyStatus[]>> =
         async {
@@ -4889,7 +4918,12 @@ let createFactoryWithCredentialsAndIdentity
         fun binding _ -> async {
             return
                 OperationResult.succeeded
-                    (createSessionWithCredentialsAndIdentity hooks credentials revisionIdentity binding)
+                    (createSessionWithCredentialsIdentityAndPolicy
+                        hooks
+                        credentials
+                        revisionIdentity
+                        revisionPolicy
+                        binding)
         }
     CheckDependencies = checkDependencies
     InstallDependency =
@@ -4963,6 +4997,17 @@ let createFactoryWithCredentialsAndIdentity
                         )
             }
     }
+
+let createFactoryWithCredentialsAndIdentity
+    (hooks: GitSessionHooks)
+    (credentials: GitCredentialStrategy.GitCredentialStrategy)
+    (revisionIdentity: GitCredentialStrategy.GitIdentityStrategy)
+    : ProviderFactory =
+    createFactoryWithCredentialsIdentityAndPolicy
+        hooks
+        credentials
+        revisionIdentity
+        RevisionPolicyStrategy.automatic
 
 let createFactoryWithCredentials
     (hooks: GitSessionHooks)

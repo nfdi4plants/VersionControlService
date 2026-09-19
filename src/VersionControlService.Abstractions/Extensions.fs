@@ -44,6 +44,38 @@ type StoragePolicyService = {
     SetSettings: StoragePolicySettings -> OperationContext -> Async<OperationResult<unit>>
 }
 
+/// How one selected regular file is stored in the revision being created. Only providers
+/// with a large-object representation (Git with Git LFS) act on it. Providers without one
+/// accept the strategy and never call it.
+[<RequireQualifiedAccess>]
+type RevisionPathPolicy =
+    /// The provider decides from its automatic threshold and its own rules.
+    | Automatic
+    /// The plain content, even above the threshold and even when a provider rule says large object.
+    | Inline
+    /// Large-object storage, even below the threshold.
+    | LargeObject
+
+/// What the strategy sees for each selected regular file. SizeInBytes is the size of the
+/// content that would be committed, so for a file that is a recognized large-object
+/// reference it is the declared payload size, not the length of the reference.
+type RevisionPathPolicyRequest = {
+    Path: RepositoryPath
+    SizeInBytes: float
+}
+
+/// Immutable configuration handed to a factory at creation. The function must be fast,
+/// deterministic and free of side effects. It must not touch the file system or the network.
+type RevisionPolicyStrategy = {
+    ResolvePathPolicy: RevisionPathPolicyRequest -> RevisionPathPolicy
+}
+
+module RevisionPolicyStrategy =
+
+    let automatic: RevisionPolicyStrategy = {
+        ResolvePathPolicy = fun _ -> RevisionPathPolicy.Automatic
+    }
+
 /// Optional local storage maintenance extension.
 type StorageMaintenanceService = {
     Prune: OperationContext -> Async<OperationResult<string>>

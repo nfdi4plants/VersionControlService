@@ -215,9 +215,37 @@ let literalTrackingRule relativePath =
 let private literalUntrackingRule relativePath =
     $"{literalAttributePattern relativePath} -filter -diff -merge"
 
+let private trimOneTrailingCarriageReturn (line: string) =
+    if line.Length > 0 && line.[line.Length - 1] = '\r' then
+        line.Substring(0, line.Length - 1)
+    else
+        line
+
+let private containsExactAttributeRule (content: string) (rule: string) =
+    content.Split([| '\n' |], StringSplitOptions.None)
+    |> Array.exists (fun line -> trimOneTrailingCarriageReturn line = rule)
+
 let private removeExactAttributeRule (rule: string) (content: string) =
-    let rulePattern = $"^{Regex.Escape(rule)}(?:\\r?\\n|$)"
-    Regex(rulePattern, RegexOptions.Multiline).Replace(content, String.Empty)
+    let endedWithNewline = content.EndsWith("\n", StringComparison.Ordinal)
+
+    let allLines = content.Split([| '\n' |], StringSplitOptions.None)
+
+    let lines =
+        if endedWithNewline then
+            Array.take (allLines.Length - 1) allLines
+        else
+            allLines
+
+    let remainingLines =
+        lines
+        |> Array.filter (fun line -> trimOneTrailingCarriageReturn line <> rule)
+
+    let updated = String.concat "\n" remainingLines
+
+    if endedWithNewline && remainingLines.Length > 0 then
+        updated + "\n"
+    else
+        updated
 
 let private sameFileIdentity (left: NodeFileSystem.Stats) (right: NodeFileSystem.Stats) =
     left.dev = right.dev && left.ino = right.ino
@@ -268,7 +296,7 @@ let replaceAttributesAtomically
     (originalContent: string)
     (content: string)
     =
-    let tempPath = attributesPath + $".vcs-{Guid.NewGuid():N}.tmp"
+    let tempPath = attributesPath + ".vcs-" + Guid.NewGuid().ToString("N") + ".tmp"
 
     try
         NodeFileSystem.writeUtf8FileExclusiveAndFlushSync tempPath content
@@ -390,7 +418,7 @@ let prepareAttributesReplacement
                 invalidOp "The generated Git attributes content did not preserve the validated original prefix."
             | None -> None
 
-        let tempPath = attributesPath + $".vcs-{Guid.NewGuid():N}.tmp"
+        let tempPath = attributesPath + ".vcs-" + Guid.NewGuid().ToString("N") + ".tmp"
         let mutable tempIdentity = None
 
         try
@@ -635,9 +663,8 @@ let addLiteralTrackingRules (content: string) (relativePaths: string[]) =
 
     for relativePath in relativePaths |> Array.distinct do
         let rule = literalTrackingRule relativePath
-        let rulePattern = $"^{Regex.Escape(rule)}(?:\r?$)"
 
-        if not (Regex.IsMatch(updated, rulePattern, RegexOptions.Multiline)) then
+        if not (containsExactAttributeRule updated rule) then
             updated <-
                 if String.IsNullOrEmpty updated then
                     rule + lineEnding
@@ -650,16 +677,15 @@ let addLiteralTrackingRules (content: string) (relativePaths: string[]) =
 
     updated, added
 
-let private addLiteralUntrackingRules (content: string) (relativePaths: string[]) =
+let addLiteralUntrackingRules (content: string) (relativePaths: string[]) =
     let lineEnding = if content.Contains("\r\n") then "\r\n" else "\n"
     let mutable updated = content
     let mutable added = false
 
     for relativePath in relativePaths |> Array.distinct do
         let rule = literalUntrackingRule relativePath
-        let rulePattern = $"^{Regex.Escape(rule)}(?:\r?$)"
 
-        if not (Regex.IsMatch(updated, rulePattern, RegexOptions.Multiline)) then
+        if not (containsExactAttributeRule updated rule) then
             updated <-
                 if String.IsNullOrEmpty updated then
                     rule + lineEnding

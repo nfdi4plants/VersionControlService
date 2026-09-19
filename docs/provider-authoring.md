@@ -2,6 +2,8 @@
 
 An external provider needs one project reference or package reference: `VersionControlService.Abstractions`. It should not depend on the Node runtime, Git, lakeFS, or the umbrella unless it uses those implementations directly. The sample in [`samples/ExternalProvider`](../samples/ExternalProvider/Provider.fs) is a compiling core-only factory.
 
+Hosts that spawn git beside the library can use `GitExecution.resolvedEnvironment` for a complete child-process environment or `GitExecution.environmentOverrides` for request records. Both use the library's Git tool-path resolution.
+
 ## Factory lifecycle
 
 `ProviderFactory` is the provider entry point. Register one factory per `ProviderId` in a host-created `ProviderCatalog`.
@@ -21,6 +23,30 @@ Factories receive credentials and provider settings through constructor argument
 The Git provider also accepts a `GitIdentityStrategy` extension point for host-supplied revision attribution. Its `ResolveIdentity` function receives a `RevisionIdentityRequest` and is called for each operation that may create a revision. The result is not cached when a session opens. The request carries the workspace root and the session's connection profile. Its `TargetHost` is the host of the effective push URL of the current branch's publish remote (pushurl over url, with `insteadOf` rewriting applied), or of the bound location when no remote is configured or HEAD is detached. It is `None` when the upstream configuration is invalid or when no host can be read from the value, which includes local paths and file URLs. The provider lowercases hosts and drops IPv6 brackets. It passes percent-encoded and internationalized names through as written. Credentials follow the URL git connects to for each command. Fetch, ls-remote, LFS downloads and the first fetch after Initialize use the remote's effective fetch URL. The push and LFS uploads use its effective push URL. Clone and location verification use the `insteadOf`-expanded location. The push credential and the identity therefore resolve against the same host, so an application that keeps accounts per host and connection profile can return the identity that matches where the revision will be published. Credential and identity strategies must return `None` when they have nothing to offer. An exception thrown by a strategy escapes the operation that called it. Returning `Some` supplies the author and committer name and email for that operation. Returning `None` uses the repository's configured `user.name` and `user.email`. If neither a strategy identity nor a complete repository identity is available, the operation fails before mutation with the stable validation code `identity_missing` and a recovery action describing how to configure Git or supply the strategy.
 
 A canceled Git `Update` reports what a killed `git merge` left behind and mutates nothing on its own except one case: when the merge wrote MERGE_HEAD, the provider runs `git merge --abort`, which is git's own rollback. Everything else comes back as a `Canceled` failure with a `RecoveryAction`. `remove_index_lock` means an `index.lock` is present (with `StateChanged` false when it already existed before the update). `abort_merge` means `git merge --abort` failed. `refresh_workspace` means the merge finished before the cancellation landed. `restore_workspace` means a fast-forward may have rewritten the paths in `AffectedPaths`, which the application reviews and restores or keeps. `inspect_workspace` means the workspace differs from its pre-merge state in a way the provider could not attribute, or git could not report it. On Windows a killed git process does not remove its lock, so `remove_index_lock` is the usual outcome of a mid-merge cancellation and the application needs a path for it.
+
+## Revision path policy
+
+`RevisionPolicyStrategy` is immutable, provider-neutral configuration that the host hands to every provider factory at creation. The default is `RevisionPolicyStrategy.automatic`, which preserves the provider's automatic behavior. `ResolvePathPolicy` must be pure, deterministic, fast, and free of side effects. It must not access the file system or the network.
+
+The function receives one `RevisionPathPolicyRequest` for each selected regular file. `Path` is the selected `RepositoryPath`. `SizeInBytes` is the size of the content that would be committed. For a recognized large-object reference, it is the declared payload size, not the length of the reference. In Git, this means the payload size declared by a Git LFS pointer. Deletions and symbolic links do not receive a request.
+
+Git implements the strategy when `Core.CreateRevision` creates a revision from selected paths. The policies have these effects:
+
+| Policy | Git behavior |
+|---|---|
+| `Automatic` | Git uses its configured automatic LFS threshold and effective filter attributes. An oversized selected regular file becomes a pointer when its effective filter is not `unset`. Git adds a literal tracking rule when the effective filter is not `lfs`. |
+| `Inline` | Git commits a plain blob at any size. The policy takes precedence over the threshold and an effective `filter=lfs` rule. Git adds a literal untracking rule when the effective filter is `lfs`. A working-tree LFS pointer is rejected until its content is materialized. |
+| `LargeObject` | Git stores the selected regular file as an LFS pointer even below the threshold. The policy takes precedence over the threshold. Git adds a literal tracking rule when the effective filter is not `lfs`. Existing recognized pointer content stays as the committed pointer. |
+
+Git owns the generated `.gitattributes` content and its literal tracking and untracking rules. When generated rules require a metadata change, a dirty unrelated `.gitattributes` file prevents that change and returns `precondition_failed` with `.gitattributes` in `AffectedPaths`. Hosts provide the strategy and do not implement Git attribute logic.
+
+An `Inline` request whose working-tree content is a recognized LFS pointer fails before mutation with category `Validation` and code `inline_content_not_materialized`. The failure has `StateChanged` set to `false`, `Retryable` set to `false`, the affected paths, and a recovery action with code `retry_materialization`. Its instructions are `Materialize the affected files, refresh the status and create the revision again.`
+
+If `ResolvePathPolicy` throws, Git fails before mutation with category `ProviderError` and code `revision_policy_failed`. The message is redacted, the affected path is reported, and Git does not fall back to `Automatic`. A change to selected content during revision planning returns `selected_content_changed`.
+
+lakeFS accepts the same strategy through its policy-aware factory constructor. It has no large-object representation, so it ignores the strategy and never calls `ResolvePathPolicy`. Its revision behavior remains unchanged. The policy applies only to `Core.CreateRevision`. Clone, update, merge, and conflict finalization are outside its scope.
+
+The Git policy-aware constructor is `GitWorkspaceSession.createFactoryWithCredentialsIdentityAndPolicy hooks credentials revisionIdentity revisionPolicy`. lakeFS exposes `LakeFsWorkspaceSession.createFactoryWithPolicy options credentials revisionPolicy` and `LakeFsWorkspaceSession.createFactoryWithHooksAndPolicy options hooks credentials revisionPolicy`. Existing constructors keep their signatures and behavior. Git uses `RevisionPolicyStrategy.automatic` when a strategy is omitted.
 
 ## Session contract
 
