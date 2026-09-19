@@ -543,10 +543,10 @@ let private computeSelectedMetadata
                         match attributesReadResult with
                         | Error failure -> return Error failure
                         | Ok(attributesContent, originalIdentity) ->
-                            let trackedAttributes, trackingGenerated =
+                            let trackedAttributes, _ =
                                 GitLfsService.addLiteralTrackingRules attributesContent pathsNeedingTracking
 
-                            let updatedAttributes, untrackingGenerated =
+                            let updatedAttributes, _ =
                                 GitLfsService.addLiteralUntrackingRules trackedAttributes pathsNeedingUntracking
 
                             return
@@ -556,7 +556,7 @@ let private computeSelectedMetadata
                                     OversizedPaths = pointerPaths
                                     InlinePaths = inlinePaths
                                     GeneratedAttributesContent =
-                                        if trackingGenerated || untrackingGenerated then Some updatedAttributes else None
+                                        if updatedAttributes <> attributesContent then Some updatedAttributes else None
                                     AttributesOriginalIdentity = originalIdentity
                                     AttributesOriginalContent = attributesContent
                                 }
@@ -878,14 +878,17 @@ let private validateLfsPlanAgainstTemporaryIndex
     =
     async {
         let mutable failure = None
+        // Entries the plan already decided are exempt, by entry path: a selected
+        // directory expands to entries, and inline or forced pointer entries may sit
+        // above the threshold by design.
         let plannedOversized = plan.ObservedOversizedPaths |> Set.ofArray
+        let plannedPointers = plan.OversizedPaths |> Set.ofArray
         let inlinePaths = plan.InlinePaths |> Set.ofArray
         let mutable newlyOversized = Set.empty
 
         for path in paths |> Array.map RepositoryPath.value do
             match failure with
             | Some _ -> ()
-            | None when inlinePaths.Contains path -> ()
             | None ->
                 match! listTemporaryIndexEntries runGit environment path with
                 | Error currentFailure -> failure <- Some currentFailure
@@ -893,7 +896,12 @@ let private validateLfsPlanAgainstTemporaryIndex
                     for entry in entries do
                         match failure with
                         | Some _ -> ()
-                        | None when plannedOversized.Contains entry.Path -> ()
+                        | None when
+                            plannedOversized.Contains entry.Path
+                            || plannedPointers.Contains entry.Path
+                            || inlinePaths.Contains entry.Path
+                            ->
+                            ()
                         | None when entry.Mode.StartsWith("100", StringComparison.Ordinal) ->
                             let! sizeResult = runGit [| "cat-file"; "-s"; entry.BlobId |] None [||]
 
@@ -948,9 +956,30 @@ let private applyLfsPlanToTemporaryIndex
                 | Error currentFailure -> failure <- Some currentFailure
                 | Ok mode ->
                     let absolutePath = NodePath.resolve [| repoPath; relativePath |]
+
+                    // Inline keeps git's own conversions for the path (text normalization,
+                    // other clean filters) and only neutralizes Git LFS, so the committed
+                    // blob is what git status compares against afterwards. The process
+                    // filter has to be cleared as well, because it takes precedence over
+                    // clean and smudge.
                     let! blobResult =
                         runGit
-                            [| "hash-object"; "-w"; "--no-filters"; "--"; absolutePath |]
+                            [|
+                                "-c"
+                                "filter.lfs.process="
+                                "-c"
+                                "filter.lfs.clean=cat"
+                                "-c"
+                                "filter.lfs.smudge=cat"
+                                "-c"
+                                "filter.lfs.required=false"
+                                "hash-object"
+                                "-w"
+                                "--path"
+                                relativePath
+                                "--"
+                                absolutePath
+                            |]
                             None
                             [||]
 

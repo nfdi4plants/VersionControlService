@@ -473,6 +473,103 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "switching a path from large object to inline and back leaves one effective rule",
+            TestOptions(timeout = 180000),
+            fun () ->
+                let policy = ref RevisionPathPolicy.LargeObject
+
+                let strategy: RevisionPolicyStrategy = {
+                    ResolvePathPolicy = fun request ->
+                        if RepositoryPath.value request.Path = "assets/flip.bin" then
+                            policy.Value
+                        else
+                            RevisionPathPolicy.Automatic
+                }
+
+                withGitFixture strategy None (fun fixture -> promise {
+                    let path = join [| fixture.WorkPath; "assets/flip.bin" |]
+                    do! writeUtf8FileAsync path "first\n"
+                    let! first = createRevision fixture "test: large object" [| "assets/flip.bin" |]
+                    expectSucceeded "large object revision" first |> ignore
+
+                    policy.Value <- RevisionPathPolicy.Inline
+                    do! writeUtf8FileAsync path "second\n"
+                    let! second = createRevision fixture "test: inline" [| "assets/flip.bin" |]
+                    expectSucceeded "inline revision" second |> ignore
+                    let! inlineContent = runGitOk fixture.WorkPath [| "cat-file"; "-p"; "HEAD:assets/flip.bin" |]
+                    Vitest.expect(inlineContent).toBe "second\n"
+
+                    policy.Value <- RevisionPathPolicy.LargeObject
+                    do! writeUtf8FileAsync path "third\n"
+                    let! third = createRevision fixture "test: large object again" [| "assets/flip.bin" |]
+                    expectSucceeded "second large object revision" third |> ignore
+
+                    let! content = runGitOk fixture.WorkPath [| "cat-file"; "-p"; "HEAD:assets/flip.bin" |]
+                    let! attributes = runGitOk fixture.WorkPath [| "cat-file"; "-p"; "HEAD:.gitattributes" |]
+                    let! filter = runGitOk fixture.WorkPath [| "check-attr"; "filter"; "--"; "assets/flip.bin" |]
+                    let! status = runGitOk fixture.WorkPath [| "status"; "--porcelain" |]
+                    // Attribute rules are only appended, so the earlier rule stays in the
+                    // file. Git applies the last matching line, so the new rule has to
+                    // come after it and the effective filter has to follow.
+                    let trackingIndex = attributes.LastIndexOf("\"/assets/flip.bin\" filter=lfs")
+                    let untrackingIndex = attributes.LastIndexOf("\"/assets/flip.bin\" -filter")
+                    Vitest.expect(content.StartsWith(lfsPointerPrefix)).toBe true
+                    Vitest.expect(trackingIndex > untrackingIndex).toBe true
+                    Vitest.expect(filter.Trim().EndsWith("lfs")).toBe true
+                    Vitest.expect(status.Trim()).toBe ""
+                })
+        )
+
+        Vitest.test (
+            "an inline text file keeps the line ending normalization git would apply",
+            TestOptions(timeout = 120000),
+            fun () ->
+                let strategy: RevisionPolicyStrategy = {
+                    ResolvePathPolicy = fun request ->
+                        if RepositoryPath.value request.Path = "notes.txt" then
+                            RevisionPathPolicy.Inline
+                        else
+                            RevisionPathPolicy.Automatic
+                }
+
+                withGitFixture strategy (Some "notes.txt text\n") (fun fixture -> promise {
+                    do! writeUtf8FileAsync (join [| fixture.WorkPath; "notes.txt" |]) "a\r\nb\r\n"
+                    let! revision = createRevision fixture "test: inline text" [| "notes.txt" |]
+                    expectSucceeded "inline text revision" revision |> ignore
+                    let! content = runGitOk fixture.WorkPath [| "cat-file"; "-p"; "HEAD:notes.txt" |]
+                    let! status = runGitOk fixture.WorkPath [| "status"; "--porcelain" |]
+                    Vitest.expect(content).toBe "a\nb\n"
+                    Vitest.expect(status.Trim()).toBe ""
+                })
+        )
+
+        Vitest.test (
+            "a directory selection with an inline file above the threshold is not reported as changed content",
+            TestOptions(timeout = 120000),
+            fun () ->
+                let strategy: RevisionPolicyStrategy = {
+                    ResolvePathPolicy = fun request ->
+                        if (RepositoryPath.value request.Path).StartsWith("meta/") then
+                            RevisionPathPolicy.Inline
+                        else
+                            RevisionPathPolicy.Automatic
+                }
+
+                withGitFixture strategy None (fun fixture -> promise {
+                    do!
+                        writeUtf8FileAsync
+                            (join [| fixture.WorkPath; "meta/isa.study.xlsx" |])
+                            (String.replicate (2 * 1024 * 1024) "m")
+
+                    do! writeUtf8FileAsync (join [| fixture.WorkPath; "meta/readme.md" |]) "notes\n"
+                    let! revision = createRevision fixture "test: directory selection" [| "meta" |]
+                    expectSucceeded "directory selection revision" revision |> ignore
+                    let! size = runGitOk fixture.WorkPath [| "cat-file"; "-s"; "HEAD:meta/isa.study.xlsx" |]
+                    Vitest.expect(size.Trim() |> int).toBe (2 * 1024 * 1024)
+                })
+        )
+
+        Vitest.test (
             "the lakeFS factory accepts a strategy and never calls it",
             fun () ->
                 let mutable called = false

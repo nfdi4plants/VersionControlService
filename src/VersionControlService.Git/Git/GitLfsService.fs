@@ -656,47 +656,48 @@ let completeAttributesReplacement (replacement: AttributesReplacement) =
         | None -> return ()
     }
 
-let addLiteralTrackingRules (content: string) (relativePaths: string[]) =
-    let lineEnding = if content.Contains("\r\n") then "\r\n" else "\n"
+/// Appends the rule when the last canonical rule for that path is a different one.
+/// Git applies the last matching line, so a path whose policy changed needs its new
+/// rule after the old one. The content is only appended to, which is what the
+/// attributes replacement transaction accepts.
+let private appendRuleAsLast (content: string) (rule: string) (opposite: string) =
+    let lastCanonical =
+        content.Split([| '\n' |], StringSplitOptions.None)
+        |> Array.map trimOneTrailingCarriageReturn
+        |> Array.filter (fun line -> line = rule || line = opposite)
+        |> Array.tryLast
+
+    if lastCanonical = Some rule then
+        content, false
+    else
+        let lineEnding = if content.Contains("\r\n") then "\r\n" else "\n"
+
+        let updated =
+            if String.IsNullOrEmpty content then
+                rule + lineEnding
+            elif content.EndsWith("\n") then
+                content + rule + lineEnding
+            else
+                content + lineEnding + rule + lineEnding
+
+        updated, true
+
+let private addLiteralRules (build: string -> string) (opposite: string -> string) (content: string) (relativePaths: string[]) =
     let mutable updated = content
     let mutable added = false
 
     for relativePath in relativePaths |> Array.distinct do
-        let rule = literalTrackingRule relativePath
-
-        if not (containsExactAttributeRule updated rule) then
-            updated <-
-                if String.IsNullOrEmpty updated then
-                    rule + lineEnding
-                elif updated.EndsWith("\n") then
-                    updated + rule + lineEnding
-                else
-                    updated + lineEnding + rule + lineEnding
-
-            added <- true
+        let next, appended = appendRuleAsLast updated (build relativePath) (opposite relativePath)
+        updated <- next
+        added <- added || appended
 
     updated, added
+
+let addLiteralTrackingRules (content: string) (relativePaths: string[]) =
+    addLiteralRules literalTrackingRule literalUntrackingRule content relativePaths
 
 let addLiteralUntrackingRules (content: string) (relativePaths: string[]) =
-    let lineEnding = if content.Contains("\r\n") then "\r\n" else "\n"
-    let mutable updated = content
-    let mutable added = false
-
-    for relativePath in relativePaths |> Array.distinct do
-        let rule = literalUntrackingRule relativePath
-
-        if not (containsExactAttributeRule updated rule) then
-            updated <-
-                if String.IsNullOrEmpty updated then
-                    rule + lineEnding
-                elif updated.EndsWith("\n") then
-                    updated + rule + lineEnding
-                else
-                    updated + lineEnding + rule + lineEnding
-
-            added <- true
-
-    updated, added
+    addLiteralRules literalUntrackingRule literalTrackingRule content relativePaths
 
 let private checkFilterAttribute repoPath relativePath : JS.Promise<Result<string, string>> = promise {
     let! result = GitLfsAdapter.checkFilterAttributes repoPath [| relativePath |]
