@@ -7,6 +7,8 @@ open VersionControlService.Git.GitEngineTypes
 open VersionControlService.Runtime.Node.Interop
 open VersionControlService.Git.GitAuthAdapter
 
+module GitExecution = VersionControlService.Git.GitExecution
+
 [<Literal>]
 let private repoValidationTimeoutMs = 5000
 
@@ -86,6 +88,7 @@ let private resolveGitEnvironment (environment: obj option) =
     environment
     |> Option.defaultWith createNonInteractiveEnv
     |> GitCommandResolver.ensureGitToolPath
+    |> GitExecution.forceEnglishDiagnostics
 
 let private runGitProcess
     (captureStdout: bool)

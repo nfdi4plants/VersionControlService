@@ -6,6 +6,8 @@ open Fable.Core
 open Fable.Core.JsInterop
 open VersionControlService.Bindings.SimpleGit
 
+module GitExecution = VersionControlService.Git.GitExecution
+
 type GitFactory = SimpleGitOptions -> ISimpleGit
 
 /// Auth material that can be applied either through simple-git config entries or spawned git commands.
@@ -39,6 +41,9 @@ let toConfigEntries (args: string[]) =
     |> Array.choose id
 
 /// Builds a git process environment that disables terminal prompts.
+/// The environment starts from a fresh copy of process.env. PATH resolution covers
+/// macOS and Linux desktop launches that miss the shell PATH. process.env itself is
+/// never modified. Git output receives LC_ALL=C.
 /// All Git entry points should use this so Git never blocks waiting for credentials.
 let createNonInteractiveEnv () : obj =
     // Keep existing env variables but drop unsafe git/editor overrides that simple-git rejects by default.
@@ -82,6 +87,7 @@ let createNonInteractiveEnv () : obj =
             """
 
     GitCommandResolver.ensureGitToolPath safeEnv
+    |> GitExecution.forceEnglishDiagnostics
 
 let applyNonInteractiveEnv (git: ISimpleGit) = git.env (createNonInteractiveEnv ())
 
