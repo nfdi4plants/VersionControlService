@@ -2656,6 +2656,394 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "a finalize whose ref update was canceled after it applied closes the session",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable cancelUpdateRef = false
+
+                let hooks = {
+                    GitWorkspaceSession.GitSessionHooks.none with
+                        RunProcess =
+                            Some(fun request processContext ->
+                                async {
+                                    if cancelUpdateRef && (request.Arguments |> Array.contains "update-ref") then
+                                        let! result = NodeProcess.run request processContext
+                                        cancelUpdateRef <- false
+
+                                        return
+                                            OperationResult.failed (
+                                                OperationFailure.create
+                                                    Canceled
+                                                    "operation_canceled"
+                                                    "simulated cancellation after the ref update"
+                                            )
+                                    else
+                                        return! NodeProcess.run request processContext
+                                })
+                }
+
+                let! root, workPath, session, conflicts, summary, _ = createUnmergedConflictFixtureWithHooks hooks
+
+                try
+                    cancelUpdateRef <- true
+                    let! status = sessionStatus session
+                    let! resolveResult =
+                        conflicts.Resolve
+                            {
+                                Handle = summary.Handle
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                Path = mkPath "base.txt"
+                                Resolution = PickCandidate "target"
+                            }
+                            (ctx "late-finalize-cancel-resolve")
+                        |> Async.StartAsPromise
+
+                    let resolution = expectValue "late finalize cancellation resolve" resolveResult
+                    let! finalizeStatus = sessionStatus session
+                    let! finalizeResult =
+                        conflicts.Finalize
+                            {
+                                Handle = resolution.RefreshedHandle
+                                ExpectedWorkspaceVersion = finalizeStatus.WorkspaceVersion
+                                Message = Some "late finalize cancellation"
+                            }
+                            (ctx "late-finalize-cancel")
+                        |> Async.StartAsPromise
+
+                    let mergedRevision = expectValue "late finalize cancellation" finalizeResult
+                    let! head = runGitIn workPath [| "rev-parse"; "HEAD" |]
+                    let! parents = runGitIn workPath [| "rev-list"; "--parents"; "-n"; "1"; "HEAD" |]
+                    let! mergeHeadPath = runGitIn workPath [| "rev-parse"; "--git-path"; "MERGE_HEAD" |]
+                    let! mergeHead = tryReadUtf8FileAsync (join [| workPath; mergeHeadPath.Trim() |])
+
+                    Vitest.expect(mergedRevision |> Option.map RevisionId.value).toEqual (Some(head.Trim()))
+                    Vitest.expect(parents.Trim().Split([| ' ' |], StringSplitOptions.RemoveEmptyEntries).Length).toBe (3)
+                    Vitest.expect(mergeHead).toEqual (None)
+
+                    let! activeResult = conflicts.GetActiveSession(ctx "late-finalize-cancel-closed") |> Async.StartAsPromise
+                    Vitest.expect((expectValue "late finalize cancellation session" activeResult).IsNone).toBe (true)
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "a finalize over an already committed merge cleans up instead of committing again",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, session, conflicts, summary, _ = createUnmergedConflictFixture ()
+
+                try
+                    let! mergeCountBefore = runGitIn workPath [| "rev-list"; "--count"; "--merges"; "HEAD" |]
+                    let! _ = runGitIn workPath [| "checkout"; "--theirs"; "base.txt" |]
+                    let! _ = runGitIn workPath [| "add"; "base.txt" |]
+                    let! tree = runGitIn workPath [| "write-tree" |]
+                    let! headBefore = runGitIn workPath [| "rev-parse"; "HEAD" |]
+                    let! mergeHeadPath = runGitIn workPath [| "rev-parse"; "--git-path"; "MERGE_HEAD" |]
+                    let! mergeHead = tryReadUtf8FileAsync (join [| workPath; mergeHeadPath.Trim() |])
+
+                    let mergeParent =
+                        mergeHead
+                        |> Option.map (fun value -> value.Trim())
+                        |> Option.defaultWith (fun () -> failwith "Expected MERGE_HEAD before the hand-written merge.")
+
+                    let! handCommitted =
+                        runGitIn
+                            workPath
+                            [|
+                                "commit-tree"
+                                tree.Trim()
+                                "-p"
+                                headBefore.Trim()
+                                "-p"
+                                mergeParent
+                                "-m"
+                                "hand-written conflict merge"
+                            |]
+
+                    let! _ = runGitIn workPath [| "update-ref"; "refs/heads/main"; handCommitted.Trim(); headBefore.Trim() |]
+                    let! finalizeStatus = sessionStatus session
+                    let! finalizeResult =
+                        conflicts.Finalize
+                            {
+                                Handle = summary.Handle
+                                ExpectedWorkspaceVersion = finalizeStatus.WorkspaceVersion
+                                Message = Some "cleanup committed merge"
+                            }
+                            (ctx "already-committed-finalize")
+                        |> Async.StartAsPromise
+
+                    let finalized = expectValue "already committed finalize" finalizeResult
+                    let! headAfter = runGitIn workPath [| "rev-parse"; "HEAD" |]
+                    let! mergeCountAfter = runGitIn workPath [| "rev-list"; "--count"; "--merges"; "HEAD" |]
+                    let! mergeHeadAfter = tryReadUtf8FileAsync (join [| workPath; mergeHeadPath.Trim() |])
+
+                    Vitest.expect(finalized |> Option.map RevisionId.value).toEqual (Some(handCommitted.Trim()))
+                    Vitest.expect(headAfter.Trim()).toBe (handCommitted.Trim())
+                    Vitest.expect(Int32.Parse(mergeCountAfter.Trim())).toBe (Int32.Parse(mergeCountBefore.Trim()) + 1)
+                    Vitest.expect(mergeHeadAfter).toEqual (None)
+
+                    let! activeResult = conflicts.GetActiveSession(ctx "already-committed-closed") |> Async.StartAsPromise
+                    Vitest.expect((expectValue "already committed session" activeResult).IsNone).toBe (true)
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "a cancel whose abort was canceled after it ran closes the session",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable cancelAbort = false
+
+                let hooks = {
+                    GitWorkspaceSession.GitSessionHooks.none with
+                        RunProcess =
+                            Some(fun request processContext ->
+                                async {
+                                    if cancelAbort && (request.Arguments |> Array.contains "--abort") then
+                                        let! result = NodeProcess.run request processContext
+                                        cancelAbort <- false
+
+                                        return
+                                            OperationResult.failed (
+                                                OperationFailure.create
+                                                    Canceled
+                                                    "operation_canceled"
+                                                    "simulated cancellation after merge abort"
+                                            )
+                                    else
+                                        return! NodeProcess.run request processContext
+                                })
+                }
+
+                let! root, workPath, session, conflicts, summary, _ = createUnmergedConflictFixtureWithHooks hooks
+
+                try
+                    cancelAbort <- true
+                    let! status = sessionStatus session
+                    let! cancelResult =
+                        conflicts.Cancel
+                            {
+                                Handle = summary.Handle
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (ctx "late-cancel-abort")
+                        |> Async.StartAsPromise
+
+                    expectValue "late cancel abort" cancelResult |> ignore
+                    let! mergeHeadPath = runGitIn workPath [| "rev-parse"; "--git-path"; "MERGE_HEAD" |]
+                    let! mergeHead = tryReadUtf8FileAsync (join [| workPath; mergeHeadPath.Trim() |])
+                    Vitest.expect(mergeHead).toEqual (None)
+
+                    let! activeResult = conflicts.GetActiveSession(ctx "late-cancel-abort-closed") |> Async.StartAsPromise
+                    Vitest.expect((expectValue "late cancel abort session" activeResult).IsNone).toBe (true)
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "a resolve that fails after the write reports the state as changed",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable failAdd = false
+
+                let hooks = {
+                    GitWorkspaceSession.GitSessionHooks.none with
+                        RunProcess =
+                            Some(fun request processContext ->
+                                async {
+                                    if failAdd && request.Arguments |> Array.contains "add" then
+                                        return
+                                            OperationResult.failed (
+                                                OperationFailure.create
+                                                    ProviderError
+                                                    "git_failure"
+                                                    "simulated staging failure"
+                                            )
+                                    else
+                                        return! NodeProcess.run request processContext
+                                })
+                }
+
+                let! root, workPath, session, conflicts, summary, _ = createUnmergedConflictFixtureWithHooks hooks
+
+                try
+                    failAdd <- true
+                    let! status = sessionStatus session
+                    let! resolveResult =
+                        conflicts.Resolve
+                            {
+                                Handle = summary.Handle
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                Path = mkPath "base.txt"
+                                Resolution = PickCandidate "target"
+                            }
+                            (ctx "resolve-stage-failure")
+                        |> Async.StartAsPromise
+
+                    let failure = expectProviderFailure "resolve stage failure" resolveResult
+                    Vitest.expect(failure.StateChanged).toBe (true)
+                    Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (
+                        Some ConflictRecovery.RefreshConflictSession
+                    )
+
+                    let! content = tryReadUtf8FileAsync (join [| workPath; "base.txt" |])
+                    Vitest.expect(content).toEqual (Some "target version\n")
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "the canceled-merge recovery leaves a foreign merge alone",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable foreignMergeWritten = false
+                let mutable canceledMerge = false
+                let mutable abortRan = false
+                let mutable foreignRevision = ""
+
+                let hooks = {
+                    GitWorkspaceSession.GitSessionHooks.none with
+                        RunProcess =
+                            Some(fun request processContext ->
+                                async {
+                                    if request.Arguments |> Array.contains "--abort" then
+                                        abortRan <- true
+                                        return! NodeProcess.run request processContext
+                                    elif
+                                        foreignMergeWritten
+                                        && not canceledMerge
+                                        && (request.Arguments |> Array.contains "merge")
+                                    then
+                                        canceledMerge <- true
+
+                                        return
+                                            OperationResult.failed (
+                                                OperationFailure.create
+                                                    Canceled
+                                                    "operation_canceled"
+                                                    "simulated canceled merge with foreign state"
+                                            )
+                                    else
+                                        return! NodeProcess.run request processContext
+                                })
+                        Barrier =
+                            Some(fun workspaceRoot point _ ->
+                                async {
+                                    if point = "update-merge" && not foreignMergeWritten then
+                                        foreignMergeWritten <- true
+                                        let! mergeHeadPath =
+                                            Async.AwaitPromise(
+                                                runGitIn workspaceRoot [| "rev-parse"; "--git-path"; "MERGE_HEAD" |]
+                                            )
+                                        do!
+                                            Async.AwaitPromise(
+                                                writeUtf8FileAsync
+                                                    (join [| workspaceRoot; mergeHeadPath.Trim() |])
+                                                    (foreignRevision + "\n")
+                                            )
+                                })
+                }
+
+                let! root, workPath, barePath, session = createSyncFixture hooks
+
+                try
+                    let! startHead = runGitIn workPath [| "rev-parse"; "HEAD" |]
+                    foreignRevision <- startHead.Trim()
+                    do! advanceTarget root barePath [ "foreign-merge-recovery.txt", "target content\n" ]
+                    let! beforeUpdate = sessionStatus session
+
+                    let! updateResult =
+                        (syncService session).Update
+                            { ExpectedWorkspaceVersion = beforeUpdate.WorkspaceVersion }
+                            (ctx "foreign-merge-recovery")
+                        |> Async.StartAsPromise
+
+                    let failure = expectProviderFailure "foreign merge recovery" updateResult
+                    Vitest.expect(failure.StateChanged).toBe (true)
+                    Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "inspect_workspace")
+                    Vitest.expect(abortRan).toBe (false)
+
+                    let! mergeHeadPath = runGitIn workPath [| "rev-parse"; "--git-path"; "MERGE_HEAD" |]
+                    let! mergeHead = tryReadUtf8FileAsync (join [| workPath; mergeHeadPath.Trim() |])
+                    Vitest.expect(mergeHead |> Option.map (fun value -> value.Trim())).toEqual (Some foreignRevision)
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "concurrent conflict mutations run one at a time",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable holdResolution = false
+
+                let hooks = {
+                    GitWorkspaceSession.GitSessionHooks.none with
+                        Barrier =
+                            Some(fun _ point _ ->
+                                async {
+                                    if holdResolution && point = "conflict-content-validated" then
+                                        do! Async.Sleep 50
+                                })
+                }
+
+                let! root, _, session, conflicts, summary, _ = createUnmergedConflictFixtureWithHooks hooks
+
+                try
+                    holdResolution <- true
+                    let! status = sessionStatus session
+                    let request = {
+                        Handle = summary.Handle
+                        ExpectedWorkspaceVersion = status.WorkspaceVersion
+                        Path = mkPath "base.txt"
+                        Resolution = PickCandidate "target"
+                    }
+
+                    let first = conflicts.Resolve request (ctx "concurrent-resolve-one") |> Async.StartAsPromise
+                    let second = conflicts.Resolve request (ctx "concurrent-resolve-two") |> Async.StartAsPromise
+                    let! firstResult = first
+                    let! secondResult = second
+                    let results = [| firstResult; secondResult |]
+                    let successes = results |> Array.filter (function | Succeeded _ -> true | _ -> false)
+                    let failures =
+                        results
+                        |> Array.choose (function
+                            | Failed failure -> Some failure
+                            | PartiallySucceeded(_, failure) -> Some failure
+                            | Succeeded _ -> None)
+
+                    Vitest.expect(successes.Length).toBe (1)
+                    Vitest.expect(failures.Length).toBe (1)
+                    Vitest.expect(failures[0].Category).toEqual (Concurrency)
+                    Vitest.expect(failures[0].Code).toBe ("precondition_failed")
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
             "cancellation stops refresh update publish and clone with structured canceled results",
             TestOptions(timeout = 120000),
             fun () -> promise {
