@@ -1420,8 +1420,21 @@ let private tryGetMergeHead (state: SessionState) (context: OperationContext) =
 
         match mergeHeadPathResult with
         | Error failure -> return Error failure
-        | Ok(Some path) when NodeFileSystem.existsSync path ->
-            return Ok(Some((NodeFileSystem.readFileSync path NodeFileSystem.TextEncoding.Utf8).Trim()))
+        | Ok(Some path) ->
+            try
+                if NodeFileSystem.existsSync path then
+                    let value = NodeFileSystem.readFileSync path NodeFileSystem.TextEncoding.Utf8
+                    return Ok(Some(value.Trim()))
+                else
+                    return Ok None
+            with error ->
+                return
+                    Error(
+                        OperationFailure.createRedacted
+                            ProviderError
+                            "git_failure"
+                            $"Could not read MERGE_HEAD: {error.Message}"
+                    )
         | Ok _ -> return Ok None
     }
 
@@ -2263,14 +2276,28 @@ let private getDiffSummary (state: SessionState) (context: OperationContext) =
 // Synchronization (shell: direct git commands over the configured origin)
 // ---------------------------------------------------------------------------
 
-let private revParse (state: SessionState) (reference: string) (context: OperationContext) =
+let private revParseResult
+    (state: SessionState)
+    (reference: string)
+    (context: OperationContext)
+    : Async<Result<string option, OperationFailure>> =
     async {
         let! result =
             runGit state.Hooks state.RepoPath [| "rev-parse"; "--verify"; "--quiet"; reference |] None context
 
         match result with
-        | Ok output when output.ExitCode = 0 -> return Some(output.StdOut.Trim())
-        | _ -> return None
+        | Error failure -> return Error failure
+        | Ok output when output.ExitCode = 0 -> return Ok(Some(output.StdOut.Trim()))
+        | Ok _ -> return Ok None
+    }
+
+let private revParse (state: SessionState) (reference: string) (context: OperationContext) =
+    async {
+        let! result = revParseResult state reference context
+
+        match result with
+        | Ok value -> return value
+        | Error _ -> return None
     }
 
 /// What update records right before it spawns git merge, so cleanup after a cancel
@@ -2503,70 +2530,87 @@ let private recoverCanceledMerge
             match mergeHeadPathResult with
             | Error lookupFailure -> return inspect lookupFailure.Message
             | Ok None -> return inspect "the MERGE_HEAD path could not be resolved"
-            | Ok(Some mergeHeadPath) ->
+            | Ok(Some _) ->
                 // Merge state that was already there before this merge started is
                 // someone else's work in progress and is left alone.
-                let abortRuns = NodeFileSystem.existsSync mergeHeadPath && not start.MergeHeadPresent
+                let! currentMergeHeadResult = tryGetMergeHead state cleanupContext
 
-                let! aborted =
-                    if abortRuns then
-                        async {
-                            let! result = runGit state.Hooks state.RepoPath [| "merge"; "--abort" |] None cleanupContext
-                            return gitOutcome result
-                        }
-                    else
-                        async { return Ok() }
-
-                match aborted with
-                | Error message ->
+                match currentMergeHeadResult with
+                | Error lookupFailure -> return inspect lookupFailure.Message
+                | Ok(Some currentMergeHead) when
+                    not start.MergeHeadPresent
+                    && currentMergeHead <> targetReference
+                    ->
                     return
-                        residue
-                            "abort_merge"
-                            $"Run git merge --abort in the workspace and refresh. Cleanup failed: {message}"
-                            [||]
-                | Ok() ->
-                    let! versionAfter = computeWorkspaceVersion state cleanupContext
+                        inspect
+                            "a merge state appeared after the update started with a different target"
+                | Ok currentMergeHead ->
+                    let abortRuns =
+                        not start.MergeHeadPresent
+                        && currentMergeHead = Some targetReference
 
-                    match versionAfter with
-                    | Error observeFailure -> return inspect observeFailure.Message
-                    | Ok version when version = start.WorkspaceVersion -> return failure
-                    | Ok _ when abortRuns ->
+                    let! aborted =
+                        if abortRuns then
+                            async {
+                                let! result = runGit state.Hooks state.RepoPath [| "merge"; "--abort" |] None cleanupContext
+                                return gitOutcome result
+                            }
+                        else
+                            async { return Ok() }
+
+                    match aborted with
+                    | Error message ->
                         return
                             residue
-                                "inspect_workspace"
-                                "git merge --abort completed, but the workspace differs from its pre-merge state. Review the status and refresh."
+                                "abort_merge"
+                                $"Run git merge --abort in the workspace and refresh. Cleanup failed: {message}"
                                 [||]
-                    | Ok _ ->
-                        let! headAfter = revParse state "HEAD" cleanupContext
+                    | Ok() ->
+                        let! versionAfter = computeWorkspaceVersion state cleanupContext
 
-                        if headAfter <> start.Head then
+                        match versionAfter with
+                        | Error observeFailure -> return inspect observeFailure.Message
+                        | Ok version when version = start.WorkspaceVersion -> return failure
+                        | Ok _ when abortRuns ->
                             return
                                 residue
-                                    "refresh_workspace"
-                                    "The merge finished before the cancellation took effect. Refresh to load the updated workspace."
+                                    "inspect_workspace"
+                                    "git merge --abort completed, but the workspace differs from its pre-merge state. Review the status and refresh."
                                     [||]
-                        else
-                            // HEAD did not move and no merge state remains, yet the workspace
-                            // differs. Either a fast-forward was killed while rewriting or
-                            // something outside the update changed files. Both are reported
-                            // as a possible change with the paths the fast-forward could have
-                            // touched, and the caller decides.
-                            let! rewritten = rewrittenTargetPaths state start targetReference cleanupContext
+                        | Ok _ ->
+                            let! headAfterResult = revParseResult state "HEAD" cleanupContext
 
-                            match rewritten with
-                            | Error message -> return inspect message
-                            | Ok [||] ->
+                            match headAfterResult with
+                            | Error readFailure -> return inspect readFailure.Message
+                            | Ok None -> return inspect "HEAD could not be resolved"
+                            | Ok(Some headAfter) when Some headAfter <> start.Head ->
                                 return
                                     residue
-                                        "inspect_workspace"
-                                        "The workspace differs from its pre-merge state, but no path the update could have rewritten has changed. Review the status and refresh."
+                                        "refresh_workspace"
+                                        "The merge finished before the cancellation took effect. Refresh to load the updated workspace."
                                         [||]
-                            | Ok affected ->
-                                return
-                                    residue
-                                        "restore_workspace"
-                                        "The update was canceled while git may have been rewriting files. Review the listed paths, restore or keep them, then refresh."
-                                        affected
+                            | Ok(Some _) ->
+                                // HEAD did not move and no merge state remains, yet the workspace
+                                // differs. Either a fast-forward was killed while rewriting or
+                                // something outside the update changed files. Both are reported
+                                // as a possible change with the paths the fast-forward could have
+                                // touched, and the caller decides.
+                                let! rewritten = rewrittenTargetPaths state start targetReference cleanupContext
+
+                                match rewritten with
+                                | Error message -> return inspect message
+                                | Ok [||] ->
+                                    return
+                                        residue
+                                            "inspect_workspace"
+                                            "The workspace differs from its pre-merge state, but no path the update could have rewritten has changed. Review the status and refresh."
+                                            [||]
+                                | Ok affected ->
+                                    return
+                                        residue
+                                            "restore_workspace"
+                                            "The update was canceled while git may have been rewriting files. Review the listed paths, restore or keep them, then refresh."
+                                            affected
     }
 
 let private synchronizationState (state: SessionState) (context: OperationContext) =
