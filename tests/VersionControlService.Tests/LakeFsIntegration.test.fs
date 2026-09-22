@@ -1574,6 +1574,64 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "lakeFS update preserves a local deletion outside the target diff",
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
+            fun () -> promise {
+                if not (integrationEnabled ()) then
+                    return failwith "lakeFS integration skipped: Docker not available"
+
+                let harness = createLakeFsHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let synchronization =
+                        workspace.Session.Synchronization
+                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization services.")
+
+                    do! workspace.RemoveFile "base.txt"
+
+                    do!
+                        harness.AdvanceTarget workspace [|
+                            { Path = "target-after-deletion.txt"; Content = Some "target after deletion\n" }
+                        |]
+
+                    let! statusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "update-local-deletion-status")
+                        |> Async.StartAsPromise
+
+                    let status = expectValue "local deletion status" statusResult
+                    let! updateResult =
+                        synchronization.Update
+                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                            (OperationContext.detached "update-local-deletion")
+                        |> Async.StartAsPromise
+
+                    expectValue "local deletion update" updateResult |> ignore
+
+                    let! deletedContent = workspace.ReadFile "base.txt"
+                    let! targetContent = workspace.ReadFile "target-after-deletion.txt"
+                    Vitest.expect(deletedContent).toEqual None
+                    Vitest.expect(targetContent).toEqual(Some "target after deletion\n")
+
+                    let! afterStatusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "update-local-deletion-after-status")
+                        |> Async.StartAsPromise
+
+                    let afterStatus = expectValue "local deletion after status" afterStatusResult
+                    let deletion =
+                        afterStatus.Changes
+                        |> Array.tryFind (fun change -> RepositoryPath.value change.Path = "base.txt")
+
+                    Vitest.expect(deletion |> Option.map _.Kind).toEqual (Some FileChangeKind.DeletedChange)
+
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
             "lakeFS update reports the merged head after post-merge materialization failure",
             TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
             fun () -> promise {

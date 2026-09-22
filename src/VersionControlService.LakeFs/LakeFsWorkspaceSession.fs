@@ -1219,12 +1219,11 @@ let private materializationRecoveryFailure
             |]
     }
 
-/// Downloads the objects of a ref (under the prefix) into the workspace and rebuilds the
-/// index entries. Open, switch and update use it. With a set of target changed paths,
-/// which the update passes after a merge, objects outside that set are skipped: after a
-/// merge only the paths the target changed differ from the workspace files, everything
-/// else on the merged ref is what the workspace already has, so those files and their
-/// index entries stay as they are.
+/// Downloads the objects of a ref under the prefix into the workspace and rebuilds the
+/// index entries. Open and switch call it without a target diff. Update passes a set
+/// after a merge, so objects outside that set are skipped when the index already tracks
+/// their paths. This preserves local deletions and keeps their index entries available
+/// to workspace classification.
 let private materializeRef
     (state: SessionState)
     (resolved: LakeFsConnection)
@@ -1277,7 +1276,6 @@ let private materializeRef
                                 | Some changed ->
                                     not (Set.contains (RepositoryPath.value repositoryPath) changed)
                                     && hasIndexEntry
-                                    && NodeFileSystem.existsSync targetPath
                                 | None -> false
 
                             if not skipObject then
