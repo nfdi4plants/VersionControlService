@@ -4187,7 +4187,7 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                 )
 
                                         match writeResult with
-                                        | Error failure -> return Failed failure
+                                        | Error failure -> return Failed(refreshConflictSessionFailure failure)
                                         | Ok() ->
                                             let! staged = stagePath request.Path context
 
@@ -4289,14 +4289,34 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                             "Git returned no current head revision."
                                                     )
                                             | Some headRevision ->
-                                                let alreadyCommitted =
+                                                let hasMergeParent =
                                                     headParts
                                                     |> Array.skip 1
                                                     |> Array.contains currentMergeHead
 
-                                                if alreadyCommitted then
-                                                    return! cleanupCommittedConflict state headRevision context
-                                                else
+                                                let! alreadyCommitted =
+                                                    if not hasMergeParent then
+                                                        async { return Ok false }
+                                                    else
+                                                        async {
+                                                            let! indexTreeResult =
+                                                                runGitChecked state.Hooks state.RepoPath [| "write-tree" |] None context
+
+                                                            match indexTreeResult with
+                                                            | Error failure -> return Error failure
+                                                            | Ok indexTreeOutput ->
+                                                                let! headTreeResult = revParseResult state "HEAD^{tree}" context
+
+                                                                match headTreeResult with
+                                                                | Error failure -> return Error failure
+                                                                | Ok headTree ->
+                                                                    return Ok(headTree = Some(indexTreeOutput.StdOut.Trim()))
+                                                        }
+
+                                                match alreadyCommitted with
+                                                | Error failure -> return Failed failure
+                                                | Ok true -> return! cleanupCommittedConflict state headRevision context
+                                                | Ok false ->
                                                     let! identityResult = resolveRevisionIdentity state context
 
                                                     match identityResult with
