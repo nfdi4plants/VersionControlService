@@ -39,6 +39,8 @@ type StoragePolicySettings = {
 
 /// Optional large-object storage-policy extension over literal repository paths.
 type StoragePolicyService = {
+    /// True marks the path as a large object. False records an explicit opt-out that
+    /// outranks the automatic policy of later revisions until the path is marked again.
     SetPathPolicy: RepositoryPath -> bool -> OperationContext -> Async<OperationResult<unit>>
     GetSettings: OperationContext -> Async<OperationResult<StoragePolicySettings>>
     SetSettings: StoragePolicySettings -> OperationContext -> Async<OperationResult<unit>>

@@ -743,27 +743,18 @@ let private rewriteLiteralTrackingRule repoPath relativePath enabled : JS.Promis
                 if withoutTracking <> content then
                     replaceAttributesAtomically attributesPath originalIdentity content withoutTracking
 
-                let! verifiedFilterResult = checkFilterAttribute repoPath relativePath
+                let currentContent, currentIdentity = readAttributesNoFollow attributesPath
+                let unsetContent, unsetAdded = addLiteralUntrackingRules currentContent [| relativePath |]
 
-                match verifiedFilterResult with
+                if unsetAdded then
+                    replaceAttributesAtomically attributesPath currentIdentity currentContent unsetContent
+
+                let! finalFilterResult = checkFilterAttribute repoPath relativePath
+
+                match finalFilterResult with
+                | Ok "unset" -> return Ok()
+                | Ok _ -> return Error "The Git LFS path policy does not resolve to unset after untracking."
                 | Error error -> return Error $"Could not verify the Git LFS path policy: {error}"
-                | Ok _ ->
-                    let currentContent, currentIdentity = readAttributesNoFollow attributesPath
-                    let unsetContent, unsetAdded = addLiteralUntrackingRules currentContent [| relativePath |]
-
-                    if unsetAdded then
-                        replaceAttributesAtomically
-                            attributesPath
-                            currentIdentity
-                            currentContent
-                            unsetContent
-
-                    let! finalFilterResult = checkFilterAttribute repoPath relativePath
-
-                    match finalFilterResult with
-                    | Ok "unset" -> return Ok()
-                    | Ok _ -> return Error "The Git LFS path policy does not resolve to unset after untracking."
-                    | Error error -> return Error $"Could not verify the Git LFS path policy: {error}"
         with error ->
             return Error $"Could not update the literal Git LFS path policy: {error.Message}"
     }
@@ -787,7 +778,8 @@ let track (repoPath: string) (relativePath: string) : JS.Promise<Result<unit, st
             | Error exn -> Error exn.Message
     }
 
-/// Removes the exact literal-filename rule emitted by `track`.
+/// Removes the exact literal-filename rule emitted by `track` and writes an unset rule
+/// for the path, so the opt-out outranks the automatic policy of the next revision.
 /// git-lfs has no corresponding literal-filename switch for `untrack`.
 let untrackLiteral (repoPath: string) (relativePath: string) : JS.Promise<Result<unit, string>> = promise {
     match! requireGitLfsForLiteralPolicy repoPath with
