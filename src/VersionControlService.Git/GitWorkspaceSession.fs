@@ -1345,10 +1345,42 @@ let private tryGetMergeHead (state: SessionState) (context: OperationContext) =
         | _ -> return None
     }
 
-let private hasActiveMergeSession (state: SessionState) (context: OperationContext) =
+let private activeOperationGuard (state: SessionState) (context: OperationContext) =
     async {
         let! mergeHead = tryGetMergeHead state context
-        return OperationResult.succeeded mergeHead.IsSome
+
+        match mergeHead with
+        | Some _ -> return OperationResult.succeeded true
+        | None ->
+            let! rebaseMergePath = resolveGitStatePath state "rebase-merge" context
+            let! rebaseApplyPath = resolveGitStatePath state "rebase-apply" context
+            let! cherryPickHeadPath = resolveGitStatePath state "CHERRY_PICK_HEAD" context
+            let! revertHeadPath = resolveGitStatePath state "REVERT_HEAD" context
+
+            let pathExists path =
+                path |> Option.exists NodeFileSystem.existsSync
+
+            let operationInProgress =
+                [| rebaseMergePath; rebaseApplyPath; cherryPickHeadPath; revertHeadPath |]
+                |> Array.exists pathExists
+
+            let inProgressFailure () =
+                OperationFailure.create
+                    Conflict
+                    "operation_in_progress"
+                    "A Git operation is in progress (rebase, cherry-pick, revert or unmerged paths). Finish or abort it before synchronizing."
+
+            if operationInProgress then
+                return Failed(inProgressFailure ())
+            else
+                let! unmergedResult =
+                    runGitChecked state.Hooks state.RepoPath [| "ls-files"; "-u" |] None context
+
+                match unmergedResult with
+                | Error failure -> return Failed failure
+                | Ok output when not (String.IsNullOrWhiteSpace output.StdOut) ->
+                    return Failed(inProgressFailure ())
+                | Ok _ -> return OperationResult.succeeded false
     }
 
 /// The synchronization target is `@{upstream}`, while publication targets the
@@ -4356,7 +4388,7 @@ let createSessionWithCredentialsIdentityAndPolicy
                             withValidatedMutation state request.ExpectedWorkspaceVersion context (fun () ->
                                 Synchronization.compose
                                     {
-                                        HasActiveConflictSession = fun context -> hasActiveMergeSession state context
+                                        HasActiveConflictSession = fun context -> activeOperationGuard state context
                                         Refresh = fun context -> refresh state context
                                         PreviewUpdate = fun syncState context -> previewFromState state syncState context
                                         Update = fun syncState context -> updateFromState state syncState context

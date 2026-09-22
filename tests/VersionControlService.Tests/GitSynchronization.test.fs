@@ -97,6 +97,20 @@ let private runGitIn (cwd: string) (arguments: string[]) : JS.Promise<string> = 
     | Failed _ -> return failwith "fixture git invocation failed"
 }
 
+let private runGitResultIn (cwd: string) (arguments: string[]) : JS.Promise<NodeProcess.ProcessOutput> = promise {
+    let request = {
+        NodeProcess.ProcessRequest.create "git" arguments with
+            WorkingDirectory = Some cwd
+    }
+
+    let! result = Async.StartAsPromise(NodeProcess.run request (OperationContext.detached "git-sync-fixture"))
+
+    match result with
+    | Succeeded outcome -> return outcome.Value
+    | PartiallySucceeded(_, failure)
+    | Failed failure -> return failwith $"fixture git invocation failed: {failure.Code}"
+}
+
 let private gitProviderId =
     match ProviderId.tryCreate "git" with
     | Ok providerId -> providerId
@@ -121,6 +135,14 @@ let private expectProviderFailure (operationName: string) (result: OperationResu
     | Failed failure -> failure
     | Succeeded _
     | PartiallySucceeded _ -> failwith $"Expected {operationName} to fail."
+
+let private expectOperationInProgress (operationName: string) (result: OperationResult<'T>) =
+    let failure = expectProviderFailure operationName result
+    Vitest.expect(failure.Category).toEqual (Conflict)
+    Vitest.expect(failure.Code).toBe ("operation_in_progress")
+    Vitest.expect(failure.StateChanged).toBe (false)
+    Vitest.expect(failure.RecoveryAction).toEqual (None)
+    failure
 
 let private expectSucceeded operationName result =
     expectValue operationName result
@@ -214,6 +236,45 @@ let private advanceTarget (root: string) (barePath: string) (mutations: (string 
     let! _ = runGitIn clonePath [| "commit"; "-m"; "external: advance" |]
     let! _ = runGitIn clonePath [| "push"; "origin"; "HEAD" |]
     return ()
+}
+
+let private createCherryPickConflictFixture () = promise {
+    let! root, workPath, barePath, session = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+    let! _ = runGitIn workPath [| "checkout"; "-b"; "cherry-source" |]
+    do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) "cherry-pick source\n"
+    let! _ = runGitIn workPath [| "add"; "base.txt" |]
+    let! _ = runGitIn workPath [| "commit"; "-m"; "cherry-pick source" |]
+    let! sourceRevision = runGitIn workPath [| "rev-parse"; "HEAD" |]
+    let! _ = runGitIn workPath [| "checkout"; "main" |]
+    do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) "main conflict\n"
+    let! _ = runGitIn workPath [| "add"; "base.txt" |]
+    let! _ = runGitIn workPath [| "commit"; "-m"; "main conflict" |]
+
+    let! cherryPick = runGitResultIn workPath [| "cherry-pick"; sourceRevision.Trim() |]
+
+    if cherryPick.ExitCode = 0 then
+        return failwith "Expected the cherry-pick fixture to stop with a conflict."
+    else
+        return root, workPath, barePath, session
+}
+
+let private createRebaseConflictFixture () = promise {
+    let! root, workPath, barePath, session = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+    let! _ = runGitIn workPath [| "checkout"; "-b"; "rebase-source" |]
+    do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) "rebase source\n"
+    let! _ = runGitIn workPath [| "add"; "base.txt" |]
+    let! _ = runGitIn workPath [| "commit"; "-m"; "rebase source" |]
+    let! _ = runGitIn workPath [| "checkout"; "main" |]
+    do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) "rebase main\n"
+    let! _ = runGitIn workPath [| "add"; "base.txt" |]
+    let! _ = runGitIn workPath [| "commit"; "-m"; "rebase main" |]
+
+    let! rebase = runGitResultIn workPath [| "rebase"; "rebase-source" |]
+
+    if rebase.ExitCode = 0 then
+        return failwith "Expected the rebase fixture to stop with a conflict."
+    else
+        return root, workPath, barePath, session
 }
 
 let private syncService (session: WorkspaceSession) =
@@ -4009,6 +4070,98 @@ Vitest.describe (
                     return raise error
 
                 do! removeDirectoryAsync root
+            }
+        )
+
+        Vitest.test (
+            "a cherry-pick conflict blocks synchronize before the remote can move",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, barePath, session = createCherryPickConflictFixture ()
+
+                try
+                    let! remoteBefore = runGitIn root [| "ls-remote"; barePath; "refs/heads/main" |]
+                    let! status = sessionStatus session
+
+                    let! synchronizeResult =
+                        (syncService session).Synchronize
+                            {
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                                AcceptUpdateRisks = false
+                                PublishLocalRevisions = true
+                            }
+                            (ctx "cherry-pick-conflict-guard")
+                        |> Async.StartAsPromise
+
+                    ignore (expectOperationInProgress "cherry-pick conflict synchronize" synchronizeResult)
+                    let! remoteAfter = runGitIn root [| "ls-remote"; barePath; "refs/heads/main" |]
+                    Vitest.expect(remoteAfter.Trim()).toBe (remoteBefore.Trim())
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "unmerged index entries block synchronize without an operation marker",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, _, session = createCherryPickConflictFixture ()
+
+                try
+                    let! cherryPickHeadPath = runGitIn workPath [| "rev-parse"; "--git-path"; "CHERRY_PICK_HEAD" |]
+                    do! removePathAsync (join [| workPath; cherryPickHeadPath.Trim() |])
+                    let! status = sessionStatus session
+
+                    let! synchronizeResult =
+                        (syncService session).Synchronize
+                            {
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                                AcceptUpdateRisks = false
+                                PublishLocalRevisions = false
+                            }
+                            (ctx "unmerged-index-guard")
+                        |> Async.StartAsPromise
+
+                    ignore (expectOperationInProgress "unmerged index synchronize" synchronizeResult)
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "a rebase conflict blocks synchronize before refresh",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, _, session = createRebaseConflictFixture ()
+
+                try
+                    let! status = sessionStatus session
+
+                    let! synchronizeResult =
+                        (syncService session).Synchronize
+                            {
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                                AcceptUpdateRisks = false
+                                PublishLocalRevisions = false
+                            }
+                            (ctx "rebase-conflict-guard")
+                        |> Async.StartAsPromise
+
+                    ignore (expectOperationInProgress "rebase conflict synchronize" synchronizeResult)
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
             }
         )
 
