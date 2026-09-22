@@ -212,6 +212,9 @@ let private literalAttributePattern (relativePath: string) =
 let literalTrackingRule relativePath =
     $"{literalAttributePattern relativePath} filter=lfs diff=lfs merge=lfs -text"
 
+// Untracking always writes this rule, so an explicit opt-out survives the automatic
+// policy of the next revision. On a file that was never tracked it only records the
+// opt-out in .gitattributes.
 let private literalUntrackingRule relativePath =
     $"{literalAttributePattern relativePath} -filter -diff -merge"
 
@@ -744,7 +747,7 @@ let private rewriteLiteralTrackingRule repoPath relativePath enabled : JS.Promis
 
                 match verifiedFilterResult with
                 | Error error -> return Error $"Could not verify the Git LFS path policy: {error}"
-                | Ok "lfs" ->
+                | Ok _ ->
                     let currentContent, currentIdentity = readAttributesNoFollow attributesPath
                     let unsetContent, unsetAdded = addLiteralUntrackingRules currentContent [| relativePath |]
 
@@ -758,10 +761,9 @@ let private rewriteLiteralTrackingRule repoPath relativePath enabled : JS.Promis
                     let! finalFilterResult = checkFilterAttribute repoPath relativePath
 
                     match finalFilterResult with
-                    | Ok "lfs" -> return Error "The Git LFS path policy still resolves to lfs after untracking."
-                    | Ok _ -> return Ok()
+                    | Ok "unset" -> return Ok()
+                    | Ok _ -> return Error "The Git LFS path policy does not resolve to unset after untracking."
                     | Error error -> return Error $"Could not verify the Git LFS path policy: {error}"
-                | Ok _ -> return Ok()
         with error ->
             return Error $"Could not update the literal Git LFS path policy: {error.Message}"
     }

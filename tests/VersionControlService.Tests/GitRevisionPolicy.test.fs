@@ -47,6 +47,11 @@ let private writeUtf8FileAsync (path: string) (content: string) : JS.Promise<uni
     return ()
 }
 
+let private readUtf8FileAsync (path: string) : JS.Promise<string> = promise {
+    let! content = fsPromisesDynamic?readFile (path, "utf8") |> unbox<JS.Promise<string>>
+    return content
+}
+
 let private runGit (cwd: string) (arguments: string[]) : JS.Promise<Result<string, string>> = promise {
     let request = {
         NodeProcess.ProcessRequest.create "git" arguments with
@@ -469,6 +474,121 @@ Vitest.describe (
 
                     Vitest.expect(largeContent.StartsWith(lfsPointerPrefix)).toBe true
                     Vitest.expect(smallSize.Trim() |> int).toBe 100
+                })
+        )
+
+        Vitest.test (
+            "untracking a path writes an unset rule that survives the next automatic revision",
+            TestOptions(timeout = 180000),
+            fun () ->
+                withGitFixture RevisionPolicyStrategy.automatic None (fun fixture -> promise {
+                    let path = "automatic/opt-out.bin"
+                    let absolutePath = join [| fixture.WorkPath; path |]
+                    do! writeUtf8FileAsync absolutePath (String.replicate (2 * 1024 * 1024) "a")
+
+                    let! first = createRevision fixture "test: track before automatic opt-out" [| path |]
+                    expectSucceeded "automatic tracking revision" first |> ignore
+
+                    let storagePolicy =
+                        fixture.Session.StoragePolicy
+                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
+
+                    let! unsetResult =
+                        storagePolicy.SetPathPolicy
+                            (repositoryPath path)
+                            false
+                            (context "automatic-opt-out")
+                        |> Async.StartAsPromise
+
+                    expectSucceeded "automatic opt-out" unsetResult |> ignore
+
+                    let! filter = runGitOk fixture.WorkPath [| "check-attr"; "filter"; "--"; path |]
+                    Vitest.expect(filter.Trim().EndsWith("unset")).toBe true
+
+                    do! writeUtf8FileAsync absolutePath (String.replicate (2 * 1024 * 1024) "b")
+                    let! second = createRevision fixture "test: preserve automatic opt-out" [| path; ".gitattributes" |]
+                    expectSucceeded "automatic opt-out revision" second |> ignore
+
+                    let! committed = runGitOk fixture.WorkPath [| "cat-file"; "-p"; $"HEAD:{path}" |]
+                    let! lfsFiles = runGitOk fixture.WorkPath [| "lfs"; "ls-files"; "--name-only" |]
+                    Vitest.expect(committed.StartsWith(lfsPointerPrefix)).toBe false
+                    Vitest.expect(lfsFiles.Trim()).toBe ""
+                })
+        )
+
+        Vitest.test (
+            "untracking a path that was never tracked records the opt-out only",
+            TestOptions(timeout = 120000),
+            fun () ->
+                withGitFixture RevisionPolicyStrategy.automatic (Some "\n") (fun fixture -> promise {
+                    let path = "manual/plain.txt"
+                    let absolutePath = join [| fixture.WorkPath; path |]
+                    let original = "plain content\n"
+                    do! writeUtf8FileAsync absolutePath original
+
+                    let! first = createRevision fixture "test: commit plain path" [| path |]
+                    expectSucceeded "plain path revision" first |> ignore
+
+                    let storagePolicy =
+                        fixture.Session.StoragePolicy
+                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
+
+                    let! unsetResult =
+                        storagePolicy.SetPathPolicy
+                            (repositoryPath path)
+                            false
+                            (context "plain-path-opt-out")
+                        |> Async.StartAsPromise
+
+                    expectSucceeded "plain path opt-out" unsetResult |> ignore
+
+                    let! attributes = readUtf8FileAsync (join [| fixture.WorkPath; ".gitattributes" |])
+                    let! workingContent = readUtf8FileAsync absolutePath
+                    let! status = runGitOk fixture.WorkPath [| "status"; "--porcelain" |]
+
+                    Vitest.expect(attributes.Contains("\"/manual/plain.txt\" -filter -diff -merge")).toBe true
+                    Vitest.expect(workingContent).toBe original
+                    Vitest.expect(status.Trim()).toBe "M .gitattributes"
+                })
+        )
+
+        Vitest.test (
+            "a LargeObject policy tracks a path after an explicit opt-out",
+            TestOptions(timeout = 120000),
+            fun () ->
+                let path = "forced/large.bin"
+
+                let strategy: RevisionPolicyStrategy = {
+                    ResolvePathPolicy = fun request ->
+                        if RepositoryPath.value request.Path = path then
+                            RevisionPathPolicy.LargeObject
+                        else
+                            RevisionPathPolicy.Automatic
+                }
+
+                withGitFixture strategy (Some "\n") (fun fixture -> promise {
+                    let absolutePath = join [| fixture.WorkPath; path |]
+                    let storagePolicy =
+                        fixture.Session.StoragePolicy
+                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
+
+                    let! unsetResult =
+                        storagePolicy.SetPathPolicy
+                            (repositoryPath path)
+                            false
+                            (context "large-object-opt-out")
+                        |> Async.StartAsPromise
+
+                    expectSucceeded "large object opt-out" unsetResult |> ignore
+                    do! writeUtf8FileAsync absolutePath (String.replicate 100 "f")
+
+                    let! revision = createRevision fixture "test: restore large object policy" [| path; ".gitattributes" |]
+                    expectSucceeded "large object revision after opt-out" revision |> ignore
+
+                    let! committed = runGitOk fixture.WorkPath [| "cat-file"; "-p"; $"HEAD:{path}" |]
+                    let! filter = runGitOk fixture.WorkPath [| "check-attr"; "filter"; "--"; path |]
+                    Vitest.expect(committed.StartsWith(lfsPointerPrefix)).toBe true
+                    Vitest.expect(filter.Trim().EndsWith("lfs")).toBe true
                 })
         )
 
