@@ -3294,7 +3294,24 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                 | Ok output when output.ExitCode <> 0 ->
                                     let combined = output.StdErr + output.StdOut
 
-                                    if combined.Contains "rejected" || combined.Contains "non-fast-forward" then
+                                    let lines =
+                                        combined.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
+                                        |> Array.map (fun line -> line.Trim())
+
+                                    let concurrencyRejection =
+                                        lines
+                                        |> Array.exists (fun line ->
+                                            line.Contains "[rejected]"
+                                            && (line.Contains "(fetch first)"
+                                                || line.Contains "(non-fast-forward)"
+                                                || line.Contains "(stale info)"))
+
+                                    let remoteRejection =
+                                        lines
+                                        |> Array.exists (fun line ->
+                                            line.Contains "[remote rejected]" || line.Contains "[rejected]")
+
+                                    if concurrencyRejection then
                                         Some {
                                             OperationFailure.createRedacted
                                                 Concurrency
@@ -3302,6 +3319,26 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                                 "The publication target advanced during publish." with
                                                 Retryable = true
                                         }
+                                    elif remoteRejection then
+                                        let remoteReason =
+                                            lines
+                                            |> Array.choose (fun line ->
+                                                if line.StartsWith "remote:" then
+                                                    Some(line.Substring("remote:".Length).Trim())
+                                                else
+                                                    None)
+                                            |> String.concat " "
+
+                                        let message =
+                                            if String.IsNullOrWhiteSpace remoteReason then
+                                                "The remote rejected the publication."
+                                            else
+                                                $"The remote rejected the publication. {remoteReason}"
+
+                                        Some(
+                                            OperationFailure.createRedacted ProviderError "publish_rejected" message
+                                            |> OperationFailure.withDetails lines
+                                        )
                                     else
                                         Some {
                                             OperationFailure.createRedacted

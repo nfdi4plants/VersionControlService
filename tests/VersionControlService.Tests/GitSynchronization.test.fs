@@ -4247,7 +4247,7 @@ Vitest.describe (
 
                     let localRevision = expectSucceeded "local revision before rejected publish" revisionResult
 
-                    do! writeUtf8FileAsync hookPath "#!/bin/sh\nexit 1\n"
+                    do! writeUtf8FileAsync hookPath "#!/bin/sh\necho \"protected branch\" >&2\nexit 1\n"
 
                     if (osDynamic?platform () |> unbox<string>) <> "win32" then
                         let! _ = fsPromisesDynamic?chmod (hookPath, 493) |> unbox<JS.Promise<obj>>
@@ -4268,7 +4268,10 @@ Vitest.describe (
                     match synchronizeResult with
                     | PartiallySucceeded(outcome, failure) ->
                         Vitest.expect(outcome.Publication).toEqual (LocalOnly)
+                        Vitest.expect(failure.Code).toBe ("publish_rejected")
                         Vitest.expect(failure.StateChanged).toBe true
+                        Vitest.expect(failure.Retryable).toBe (false)
+                        Vitest.expect(failure.Message).toContain ("protected branch")
                         Vitest
                             .expect(failure.RecoveryAction |> Option.map _.Code)
                             .toEqual (Some "retry_publish")
@@ -4322,6 +4325,69 @@ Vitest.describe (
                     return raise error
 
                 do! removeDirectoryAsync root
+            }
+        )
+
+        Vitest.test (
+            "a remote rejection from a local-ahead workspace stays a publish_rejected failure",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, barePath, session = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+                let hookPath = join [| barePath; "hooks"; "pre-receive" |]
+
+                try
+                    do! writeUtf8FileAsync (join [| workPath; "local-only.txt" |]) "local content\n"
+                    let! status = sessionStatus session
+
+                    let! revisionResult =
+                        session.Core.CreateRevision
+                            {
+                                Message = "local revision for rejected publish"
+                                Paths = [| mkPath "local-only.txt" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (ctx "local-ahead-rejected-publish-revision")
+                        |> Async.StartAsPromise
+
+                    let localRevision = expectSucceeded "local-ahead rejected publish revision" revisionResult
+                    let! remoteBefore = runGitIn root [| "ls-remote"; barePath; "refs/heads/main" |]
+                    do! writeUtf8FileAsync hookPath "#!/bin/sh\necho \"protected branch\" >&2\nexit 1\n"
+
+                    if (osDynamic?platform () |> unbox<string>) <> "win32" then
+                        let! _ = fsPromisesDynamic?chmod (hookPath, 493) |> unbox<JS.Promise<obj>>
+                        ()
+
+                    let! beforeSynchronize = sessionStatus session
+                    let! synchronizeResult =
+                        (syncService session).Synchronize
+                            {
+                                ExpectedWorkspaceVersion = beforeSynchronize.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                                AcceptUpdateRisks = false
+                                PublishLocalRevisions = true
+                            }
+                            (ctx "local-ahead-rejected-publish")
+                        |> Async.StartAsPromise
+
+                    match synchronizeResult with
+                    | Failed failure ->
+                        Vitest.expect(failure.Category).toEqual (ProviderError)
+                        Vitest.expect(failure.Code).toBe ("publish_rejected")
+                        Vitest.expect(failure.StateChanged).toBe (false)
+                        Vitest.expect(failure.Retryable).toBe (false)
+                        Vitest.expect(failure.Message).toContain ("protected branch")
+                    | Succeeded _ -> failwith "Expected the local-ahead publish to be rejected."
+                    | PartiallySucceeded(_, failure) ->
+                        failwith $"Expected a failed local-ahead publish, received partial {failure.Code}."
+
+                    let! remoteAfter = runGitIn root [| "ls-remote"; barePath; "refs/heads/main" |]
+                    Vitest.expect(remoteAfter.Trim()).toBe (remoteBefore.Trim())
+                    Vitest.expect(remoteAfter.Contains(RevisionId.value localRevision, StringComparison.Ordinal)).toBe false
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
             }
         )
 )
