@@ -2741,20 +2741,39 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                             | Some failure ->
                                                 return Failed { failure with StateChanged = true }
                                             | None ->
-                                                let! committed =
-                                                    LakeFsApi.commit
+                                                // Resolutions that pick the merged content leave nothing to
+                                                // commit, and lakeFS refuses an empty commit, so the merge
+                                                // commit is the result in that case.
+                                                let! pendingChanges =
+                                                    LakeFsApi.diffBranch
                                                         resolved
                                                         state.Index.Repository
                                                         state.Index.WorkspaceBranch
-                                                        (request.Message
-                                                         |> Option.defaultValue
-                                                             "merge: finalize conflict session")
                                                         context
+
+                                                let! committed =
+                                                    match pendingChanges with
+                                                    | Error failure -> async { return Error failure }
+                                                    | Ok [||] -> async { return Ok mergeResult.Reference }
+                                                    | Ok _ ->
+                                                        async {
+                                                            let! commit =
+                                                                LakeFsApi.commit
+                                                                    resolved
+                                                                    state.Index.Repository
+                                                                    state.Index.WorkspaceBranch
+                                                                    (request.Message
+                                                                     |> Option.defaultValue
+                                                                         "merge: finalize conflict session")
+                                                                    context
+
+                                                            return commit |> Result.map _.Id
+                                                        }
 
                                                 match committed with
                                                 | Error failure ->
                                                     return Failed { failure with StateChanged = true }
-                                                | Ok commit ->
+                                                | Ok commitId ->
                                                     let! branchAfter =
                                                         LakeFsApi.getBranch
                                                             resolved
@@ -2766,7 +2785,7 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                         LakeFsApi.getCommit
                                                             resolved
                                                             state.Index.Repository
-                                                            commit.Id
+                                                            commitId
                                                             context
 
                                                     let! targetAfter = getTargetHead state context
@@ -2774,8 +2793,8 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                     let resolutionVerified =
                                                         match branchAfter, commitAfter with
                                                         | Ok branch, Ok resultingCommit ->
-                                                            branch.CommitId = commit.Id
-                                                            && (commit.Id = mergeResult.Reference
+                                                            branch.CommitId = commitId
+                                                            && (commitId = mergeResult.Reference
                                                                 || resultingCommit.Parents
                                                                    |> Array.contains mergeResult.Reference)
                                                         | _ -> false
@@ -2797,7 +2816,7 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                                 state
                                                                 resolved
                                                                 observedTarget
-                                                                commit.Id
+                                                                commitId
                                                                 context
                                                     else
                                                         let observedTargetAfter =
@@ -2811,7 +2830,7 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                                 conflict
                                                                 expectedDestination
                                                                 observedDestination.CommitId
-                                                                commit.Id
+                                                                commitId
                                                                 observedTargetAfter
                                                                 canConfirmOnRetry
         })

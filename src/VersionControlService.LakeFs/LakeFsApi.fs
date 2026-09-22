@@ -439,6 +439,49 @@ let diffRefs
                 )
     }
 
+/// The uncommitted changes of a branch, so a caller can skip a commit lakeFS would refuse as empty.
+let diffBranch
+    (connection: LakeFsConnection)
+    (repository: string)
+    (branch: string)
+    (context: OperationContext)
+    : Async<Result<LakeFsDiffEntry[], OperationFailure>> =
+    async {
+        let fetchPage (after: string) =
+            async {
+                let afterQuery = if after = "" then "" else $"&after={encodeUriComponent after}"
+
+                let! result =
+                    requestChecked
+                        connection
+                        "GET"
+                        ($"/repositories/{encodeUriComponent repository}/branches/{encodeUriComponent branch}"
+                         + $"/diff?amount=100{afterQuery}")
+                        None
+                        context
+
+                match result with
+                | Error failure -> return Error failure
+                | Ok response ->
+                    let parsed = jsonParse response.BodyText
+                    return Ok(unbox<obj[]> parsed?results, parsePagination parsed)
+            }
+
+        let! pages = listAllPages fetchPage
+
+        match pages with
+        | Error failure -> return Error failure
+        | Ok items ->
+            return
+                Ok(
+                    items
+                    |> Array.map (fun item -> {
+                        Path = unbox<string> item?path
+                        DiffType = unbox<string> item?``type``
+                    })
+                )
+    }
+
 let commit
     (connection: LakeFsConnection)
     (repository: string)
