@@ -11,21 +11,27 @@ let private copyProcessEnvironment () : obj = jsNative
 [<Emit("$0?.PATH || $0?.Path || $0?.path || ''")>]
 let private environmentPath (_environment: obj) : string = jsNative
 
-/// The environment child processes that run git should receive. It is process.env with
-/// the PATH resolved the way the library resolves it for its own git and git-lfs runs
-/// (macOS and Linux desktop launches often miss the shell PATH). The result is a fresh
-/// object each call and process.env itself is never modified.
+[<Emit("Object.assign($0, { LC_ALL: 'C', LANGUAGE: 'C' })")>]
+let private forceEnglishDiagnostics (_environment: obj) : obj = jsNative
+
+/// Git output is parsed in English, so every child process receives fixed diagnostic locales.
 let resolvedEnvironment () : obj =
     copyProcessEnvironment ()
     |> GitCommandResolver.ensureGitToolPath
+    |> forceEnglishDiagnostics
 
-/// The same resolution as name and value pairs, empty when PATH needs no change. Suited
-/// to request records that carry an environment override list.
+/// The same resolution as name and value pairs, suited to request records that carry
+/// environment overrides.
 let environmentOverrides () : (string * string)[] =
     let inherited = copyProcessEnvironment ()
-    let resolved = GitCommandResolver.ensureGitToolPath inherited
+    let resolved =
+        GitCommandResolver.ensureGitToolPath inherited
+        |> forceEnglishDiagnostics
 
-    if String.Equals(environmentPath inherited, environmentPath resolved, StringComparison.Ordinal) then
-        [||]
-    else
-        [| "PATH", environmentPath resolved |]
+    [|
+        "LC_ALL", "C"
+        "LANGUAGE", "C"
+
+        if not (String.Equals(environmentPath inherited, environmentPath resolved, StringComparison.Ordinal)) then
+            "PATH", environmentPath resolved
+    |]
