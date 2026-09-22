@@ -3389,6 +3389,82 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "a cancellation after a conflicting merge returns the conflict session",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let cancellation = OperationCancellation.Source()
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request processContext ->
+                            async {
+                                let! result = NodeProcess.run request processContext
+
+                                if request.Arguments |> Array.contains "merge" then
+                                    cancellation.Cancel()
+
+                                return result
+                            })
+                    Barrier = None
+                }
+
+                let! root, workPath, barePath, session = createSyncFixture hooks
+
+                try
+                    do! advanceTarget root barePath [ "base.txt", "target version\n" ]
+                    do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) "workspace version\n"
+
+                    let! saveStatus = sessionStatus session
+
+                    let! saveResult =
+                        session.Core.CreateRevision
+                            {
+                                Message = "local conflicting change after cancellation"
+                                Paths = [| mkPath "base.txt" |]
+                                ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+                            }
+                            (ctx "conflict-after-cancellation-save")
+                        |> Async.StartAsPromise
+
+                    expectValue "conflict after cancellation local revision" saveResult |> ignore
+                    let! updateStatus = sessionStatus session
+
+                    let! updateResult =
+                        (syncService session).Update
+                            { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
+                            (OperationContext.create "conflict-after-cancellation-update" cancellation.Cancellation ignore)
+                        |> Async.StartAsPromise
+
+                    let outcome, failure =
+                        match updateResult with
+                        | PartiallySucceeded(outcome, failure) -> outcome, failure
+                        | Failed failure -> failwith $"Expected a conflict partial, received {failure.Code}."
+                        | Succeeded _ -> failwith "Expected the conflicting update to return a partial result."
+
+                    Vitest.expect(outcome.Value.Relationship).toEqual (Diverged)
+                    Vitest.expect(failure.Code).toBe ("conflicts_detected")
+                    Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "resolve_conflict_session")
+
+                    let! mergeHeadPath = runGitIn workPath [| "rev-parse"; "--git-path"; "MERGE_HEAD" |]
+                    let! mergeHead = tryReadUtf8FileAsync (join [| workPath; mergeHeadPath.Trim() |])
+                    Vitest.expect(mergeHead.IsSome).toBe (true)
+
+                    let conflicts = conflictService session
+                    let! activeResult =
+                        conflicts.GetActiveSession(OperationContext.detached "conflict-after-cancellation-session")
+                        |> Async.StartAsPromise
+                    let active = expectValue "conflict after cancellation session" activeResult
+                    Vitest.expect(active.IsSome).toBe (true)
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
             "a cancellation after fetch returns a canceled refresh failure",
             TestOptions(timeout = 120000),
             fun () -> promise {
@@ -4275,6 +4351,39 @@ Vitest.describe (
                         |> Async.StartAsPromise
 
                     ignore (expectOperationInProgress "rebase conflict synchronize" synchronizeResult)
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "a sequencer marker blocks synchronize before refresh",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, _, session = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+
+                try
+                    let! sequencerPath = runGitIn workPath [| "rev-parse"; "--git-path"; "sequencer" |]
+                    let sequencerDirectory = join [| workPath; sequencerPath.Trim() |]
+                    do! ensureDirectoryAsync sequencerDirectory
+                    do! writeUtf8FileAsync (join [| sequencerDirectory; "todo" |]) "pick abc123 commit\n"
+
+                    let! status = sessionStatus session
+                    let! synchronizeResult =
+                        (syncService session).Synchronize
+                            {
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                                AcceptUpdateRisks = false
+                                PublishLocalRevisions = false
+                            }
+                            (ctx "sequencer-guard")
+                        |> Async.StartAsPromise
+
+                    ignore (expectOperationInProgress "sequencer synchronize" synchronizeResult)
 
                     do! removeDirectoryAsync root
                 with error ->

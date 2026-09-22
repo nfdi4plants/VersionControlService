@@ -1323,66 +1323,106 @@ let private resolveGitStatePath (state: SessionState) (name: string) (context: O
         let! output = runGit state.Hooks state.RepoPath [| "rev-parse"; "--git-path"; name |] None context
 
         match output with
+        | Error failure -> return Error failure
         | Ok result when result.ExitCode = 0 ->
             let rawPath = result.StdOut.Trim()
 
-            let absolutePath =
-                if rawPath.StartsWith "/" || (rawPath.Length >= 2 && rawPath[1] = ':') then
-                    rawPath
-                else
-                    NodePath.join [| state.RepoPath; rawPath |]
+            if String.IsNullOrWhiteSpace rawPath then
+                return Ok None
+            else
+                let absolutePath =
+                    if rawPath.StartsWith "/" || (rawPath.Length >= 2 && rawPath[1] = ':') then
+                        rawPath
+                    else
+                        NodePath.join [| state.RepoPath; rawPath |]
 
-            return Some absolutePath
-        | _ -> return None
+                return Ok(Some absolutePath)
+        | Ok result ->
+            let detail = result.StdErr + result.StdOut
+            let missingRepository =
+                detail.IndexOf("not a git repository", StringComparison.OrdinalIgnoreCase) >= 0
+
+            if missingRepository then
+                return Ok None
+            else
+                return
+                    Error(
+                        OperationFailure.createRedacted
+                            ProviderError
+                            "git_failure"
+                            $"git rev-parse --git-path {name} failed: {detail}"
+                    )
     }
+
+let private resolveGitStatePaths
+    (state: SessionState)
+    (names: string[])
+    (context: OperationContext)
+    : Async<Result<string option[], OperationFailure>> =
+    let rec resolve index resolved =
+        async {
+            if index = names.Length then
+                return Ok(List.rev resolved |> List.toArray)
+            else
+                let! result = resolveGitStatePath state names[index] context
+
+                match result with
+                | Error failure -> return Error failure
+                | Ok path -> return! resolve (index + 1) (path :: resolved)
+        }
+
+    resolve 0 []
 
 /// The active merge target revision, resolved through Git state paths.
 let private tryGetMergeHead (state: SessionState) (context: OperationContext) =
     async {
-        let! mergeHeadPath = resolveGitStatePath state "MERGE_HEAD" context
+        let! mergeHeadPathResult = resolveGitStatePath state "MERGE_HEAD" context
 
-        match mergeHeadPath with
-        | Some path when NodeFileSystem.existsSync path ->
-            return Some((NodeFileSystem.readFileSync path NodeFileSystem.TextEncoding.Utf8).Trim())
-        | _ -> return None
+        match mergeHeadPathResult with
+        | Error failure -> return Error failure
+        | Ok(Some path) when NodeFileSystem.existsSync path ->
+            return Ok(Some((NodeFileSystem.readFileSync path NodeFileSystem.TextEncoding.Utf8).Trim()))
+        | Ok _ -> return Ok None
     }
 
 let private activeOperationGuard (state: SessionState) (context: OperationContext) =
     async {
-        let! mergeHead = tryGetMergeHead state context
+        let! mergeHeadResult = tryGetMergeHead state context
 
-        match mergeHead with
-        | Some _ -> return OperationResult.succeeded true
-        | None ->
-            let! rebaseMergePath = resolveGitStatePath state "rebase-merge" context
-            let! rebaseApplyPath = resolveGitStatePath state "rebase-apply" context
-            let! cherryPickHeadPath = resolveGitStatePath state "CHERRY_PICK_HEAD" context
-            let! revertHeadPath = resolveGitStatePath state "REVERT_HEAD" context
+        match mergeHeadResult with
+        | Error failure -> return Failed failure
+        | Ok(Some _) -> return OperationResult.succeeded true
+        | Ok None ->
+            let! statePathsResult =
+                resolveGitStatePaths
+                    state
+                    [| "rebase-merge"; "rebase-apply"; "CHERRY_PICK_HEAD"; "REVERT_HEAD"; "sequencer" |]
+                    context
 
-            let pathExists path =
-                path |> Option.exists NodeFileSystem.existsSync
+            match statePathsResult with
+            | Error failure -> return Failed failure
+            | Ok statePaths ->
+                let pathExists path = path |> Option.exists NodeFileSystem.existsSync
 
-            let operationInProgress =
-                [| rebaseMergePath; rebaseApplyPath; cherryPickHeadPath; revertHeadPath |]
-                |> Array.exists pathExists
+                let operationInProgress = statePaths |> Array.exists pathExists
 
-            let inProgressFailure () =
-                OperationFailure.create
-                    Conflict
-                    "operation_in_progress"
-                    "A Git operation is in progress (rebase, cherry-pick, revert or unmerged paths). Finish or abort it before synchronizing."
+                let inProgressFailure () =
+                    OperationFailure.create
+                        Conflict
+                        "operation_in_progress"
+                        "A Git operation is in progress (rebase, cherry-pick, revert or unmerged paths). Finish or abort it before synchronizing."
 
-            if operationInProgress then
-                return Failed(inProgressFailure ())
-            else
-                let! unmergedResult =
-                    runGitChecked state.Hooks state.RepoPath [| "ls-files"; "-u" |] None context
-
-                match unmergedResult with
-                | Error failure -> return Failed failure
-                | Ok output when not (String.IsNullOrWhiteSpace output.StdOut) ->
+                if operationInProgress then
                     return Failed(inProgressFailure ())
-                | Ok _ -> return OperationResult.succeeded false
+                else
+                    let! unmergedResult =
+                        runGitChecked state.Hooks state.RepoPath [| "ls-files"; "-u" |] None context
+
+                    match unmergedResult with
+                    | Error failure -> return Failed failure
+                    | Ok output when not (String.IsNullOrWhiteSpace output.StdOut) ->
+                        return Failed(inProgressFailure ())
+                    | Ok _ -> return OperationResult.succeeded false
     }
 
 /// The synchronization target is `@{upstream}`, while publication targets the
@@ -1561,13 +1601,14 @@ let private readConflictCombinedPreview
 /// changes when a merge is reopened after finalize/cancel.
 let private getMergeConflictSummary (state: SessionState) (context: OperationContext) =
     async {
-        let! mergeHead = tryGetMergeHead state context
+        let! mergeHeadResult = tryGetMergeHead state context
 
-        match mergeHead with
-        | None ->
+        match mergeHeadResult with
+        | Error failure -> return Error failure
+        | Ok None ->
             state.ConflictSession <- None
             return Ok None
-        | Some mergeHeadValue ->
+        | Ok(Some mergeHeadValue) ->
             let sessionId, version =
                 match state.ConflictSession with
                 | Some(sessionId, version) -> sessionId, version
@@ -2232,41 +2273,45 @@ let private captureMergeStart
         | Error failure -> return Error failure
         | Ok version ->
             let! head = revParse state "HEAD" context
-            let! mergeHead = tryGetMergeHead state context
-            let! lockPath = resolveGitStatePath state "index.lock" context
+            let! mergeHeadResult = tryGetMergeHead state context
+            let! lockPathResult = resolveGitStatePath state "index.lock" context
 
-            let lockPresent =
-                match lockPath with
-                | Some path -> NodeFileSystem.existsSync path
-                | None -> false
+            match mergeHeadResult, lockPathResult with
+            | Error failure, _
+            | _, Error failure -> return Error failure
+            | Ok mergeHead, Ok lockPath ->
+                let lockPresent =
+                    match lockPath with
+                    | Some path -> NodeFileSystem.existsSync path
+                    | None -> false
 
-            let! status =
-                runGit
-                    state.Hooks
-                    state.RepoPath
-                    [| "status"; "--porcelain"; "-z"; "--untracked-files=all" |]
-                    None
-                    context
+                let! status =
+                    runGit
+                        state.Hooks
+                        state.RepoPath
+                        [| "status"; "--porcelain"; "-z"; "--untracked-files=all" |]
+                        None
+                        context
 
-            match status with
-            | Error failure -> return Error failure
-            | Ok output when output.ExitCode <> 0 ->
-                return
-                    Error(
-                        OperationFailure.createRedacted
-                            ProviderError
-                            "git_failure"
-                            $"git status failed before the merge: {output.StdErr}"
-                    )
-            | Ok output ->
-                return
-                    Ok {
-                        WorkspaceVersion = version
-                        Head = head
-                        MergeHeadPresent = mergeHead.IsSome
-                        IndexLockPresent = lockPresent
-                        PreexistingPaths = statusPaths output.StdOut
-                    }
+                match status with
+                | Error failure -> return Error failure
+                | Ok output when output.ExitCode <> 0 ->
+                    return
+                        Error(
+                            OperationFailure.createRedacted
+                                ProviderError
+                                "git_failure"
+                                $"git status failed before the merge: {output.StdErr}"
+                        )
+                | Ok output ->
+                    return
+                        Ok {
+                            WorkspaceVersion = version
+                            Head = head
+                            MergeHeadPresent = mergeHead.IsSome
+                            IndexLockPresent = lockPresent
+                            PreexistingPaths = statusPaths output.StdOut
+                        }
     }
 
 let private gitOutcome (result: Result<NodeProcess.ProcessOutput, OperationFailure>) =
@@ -2370,11 +2415,12 @@ let private recoverCanceledMerge
         // A lock blocks git merge --abort and every later mutation. Its mtime says
         // nothing about ownership, and a live writer whose lock disappears can commit
         // its index over another process's lock, so the lock is reported, never removed.
-        let! lockPath = resolveGitStatePath state "index.lock" cleanupContext
+        let! lockPathResult = resolveGitStatePath state "index.lock" cleanupContext
 
-        match lockPath with
-        | None -> return inspect "the index.lock path could not be resolved"
-        | Some lockPath when NodeFileSystem.existsSync lockPath && start.IndexLockPresent ->
+        match lockPathResult with
+        | Error lookupFailure -> return inspect lookupFailure.Message
+        | Ok None -> return inspect "the index.lock path could not be resolved"
+        | Ok(Some lockPath) when NodeFileSystem.existsSync lockPath && start.IndexLockPresent ->
             // The lock predates this update. Usually git merge refused to start and the
             // repository is as it was, but the other process may have released its lock in
             // the window before the spawn, so the workspace version decides the report.
@@ -2398,18 +2444,19 @@ let private recoverCanceledMerge
                         "remove_index_lock"
                         "A stale .git/index.lock is present. Make sure no git process is still running on the repository, remove the lock, run git merge --abort if MERGE_HEAD exists, then refresh."
                         [||]
-        | Some lockPath when NodeFileSystem.existsSync lockPath ->
+        | Ok(Some lockPath) when NodeFileSystem.existsSync lockPath ->
             return
                 residue
                     "remove_index_lock"
                     "A stale .git/index.lock is present. Make sure no git process is still running on the repository, remove the lock, run git merge --abort if MERGE_HEAD exists, then refresh."
                     [||]
-        | Some _ ->
-            let! mergeHeadPath = resolveGitStatePath state "MERGE_HEAD" cleanupContext
+        | Ok(Some _) ->
+            let! mergeHeadPathResult = resolveGitStatePath state "MERGE_HEAD" cleanupContext
 
-            match mergeHeadPath with
-            | None -> return inspect "the MERGE_HEAD path could not be resolved"
-            | Some mergeHeadPath ->
+            match mergeHeadPathResult with
+            | Error lookupFailure -> return inspect lookupFailure.Message
+            | Ok None -> return inspect "the MERGE_HEAD path could not be resolved"
+            | Ok(Some mergeHeadPath) ->
                 // Merge state that was already there before this merge started is
                 // someone else's work in progress and is left alone.
                 let abortRuns = NodeFileSystem.existsSync mergeHeadPath && not start.MergeHeadPresent
@@ -3077,22 +3124,43 @@ let private updateFromState
                                         Code = "hydration_failed"
                                 }
             | Ok output, Ok start ->
-                let! mergeHead = tryGetMergeHead state context
+                let! mergeHeadResult = tryGetMergeHead state inspectionContext
 
-                match mergeHead with
-                | Some _ ->
+                match mergeHeadResult with
+                | Error failure ->
+                    inspectionCompleted <- true
+                    return
+                        Failed {
+                            failure with
+                                StateChanged = true
+                                RecoveryAction =
+                                    Some {
+                                        Code = "inspect_workspace"
+                                        Instructions =
+                                            Some
+                                                "The state after the update could not be read. Inspect the workspace before retrying."
+                                    }
+                        }
+                | Ok(Some _) ->
                     // Conflicting merge: the conflict-session cycle turns this into a
                     // provider-managed session; the shell reports the structured code.
                     let! updatedState = synchronizationState state inspectionContext
+                    inspectionCompleted <- true
 
-                    let stateValue =
+                    let stateValue, warnings =
                         match updatedState with
-                        | Ok value -> value
-                        | Error _ -> syncState
+                        | Ok value -> value, [||]
+                        | Error failure ->
+                            let reportedFailure = inspectionFailure failure
+                            syncState,
+                            [| {
+                                   Code = "state_inspection_failed"
+                                   Message = reportedFailure.Message
+                               } |]
 
                     return
                         OperationResult.partiallySucceeded
-                            (OperationOutcome.performed stateValue)
+                            ({ OperationOutcome.performed stateValue with Warnings = warnings })
                             (OperationFailure.create
                                 Conflict
                                 "conflicts_detected"
@@ -3101,8 +3169,9 @@ let private updateFromState
                                 Code = "resolve_conflict_session"
                                 Instructions = Some "Resolve every conflict item, then finalize."
                             }
-                | None ->
-                    let! workspaceVersionAfter = computeWorkspaceVersion state context
+                | Ok None ->
+                    let! workspaceVersionAfter = computeWorkspaceVersion state inspectionContext
+                    inspectionCompleted <- true
 
                     let stateChanged, recoveryAction =
                         match workspaceVersionAfter with
@@ -3699,10 +3768,11 @@ let private validateConflictHandle
     (context: OperationContext)
     : Async<Result<string, OperationFailure>> =
     async {
-        let! mergeHead = tryGetMergeHead state context
+        let! mergeHeadResult = tryGetMergeHead state context
 
-        match mergeHead, state.ConflictSession with
-        | Some mergeHeadValue, Some(sessionId, version) when
+        match mergeHeadResult, state.ConflictSession with
+        | Error failure, _ -> return Error failure
+        | Ok(Some mergeHeadValue), Some(sessionId, version) when
             sessionId = handle.SessionId && string version = handle.Version
             ->
             let! currentVersionResult = computeWorkspaceVersion state context
@@ -3714,7 +3784,7 @@ let private validateConflictHandle
                     return Error(GitConflictSession.handleRejection ())
                 else
                     return Ok mergeHeadValue
-        | _ -> return Error(GitConflictSession.handleRejection ())
+        | Ok _, _ -> return Error(GitConflictSession.handleRejection ())
     }
 
 let private rotateConflictHandle (state: SessionState) : ConflictSessionHandle =
@@ -4031,19 +4101,26 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                 }
                                         | Ok _ ->
                                             // Close the merge state and the session.
+                                            let mutable cleanupFailure = None
+
                                             for stateFile in [ "MERGE_HEAD"; "MERGE_MSG"; "MERGE_MODE" ] do
-                                                let! statePath = resolveGitStatePath state stateFile context
+                                                if cleanupFailure.IsNone then
+                                                    let! statePathResult = resolveGitStatePath state stateFile context
 
-                                                match statePath with
-                                                | Some path when NodeFileSystem.existsSync path ->
-                                                    try
-                                                        NodeFileSystem.unlinkSync path
-                                                    with _ ->
-                                                        ()
-                                                | _ -> ()
+                                                    match statePathResult with
+                                                    | Error failure -> cleanupFailure <- Some failure
+                                                    | Ok(Some path) when NodeFileSystem.existsSync path ->
+                                                        try
+                                                            NodeFileSystem.unlinkSync path
+                                                        with _ ->
+                                                            ()
+                                                    | Ok _ -> ()
 
-                                            state.ConflictSession <- None
-                                            return OperationResult.succeeded (Some(mkRevisionId newCommit))
+                                            match cleanupFailure with
+                                            | Some failure -> return Failed failure
+                                            | None ->
+                                                state.ConflictSession <- None
+                                                return OperationResult.succeeded (Some(mkRevisionId newCommit))
             }
         Cancel =
             fun request context -> async {
