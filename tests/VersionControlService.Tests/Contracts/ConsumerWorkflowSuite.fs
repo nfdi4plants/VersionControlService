@@ -381,6 +381,70 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 Vitest.expect(objectControlsVisible).toBe (expectedVisible)
             }
+
+            profileTest "a save is one revision and one synchronize"
+            <| fun () -> promise {
+                let! workspace = harness.CreateWorkspace()
+                do! workspace.WriteFile "saved.txt" "saved content\n"
+                let! status = getStatus workspace
+
+                let! revisionResult =
+                    run (
+                        workspace.Session.Core.CreateRevision
+                            {
+                                Message = "save once"
+                                Paths = [| mkPath "saved.txt" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (ctx "consumer-save-once")
+                    )
+
+                expectPerformed "save revision" revisionResult |> ignore
+                let! afterSave = getStatus workspace
+                let! synchronizeResult =
+                    run (
+                        (syncService workspace.Session).Synchronize
+                            {
+                                ExpectedWorkspaceVersion = afterSave.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                                AcceptUpdateRisks = false
+                                PublishLocalRevisions = true
+                            }
+                            (ctx "consumer-save-synchronize")
+                    )
+
+                let firstOutcome = expectPerformed "save synchronize" synchronizeResult
+                Vitest.expect(firstOutcome.Publication).toEqual (Published)
+                let! linked = harness.CreateLinkedWorkspace workspace
+                let! saved = linked.ReadFile "saved.txt"
+                Vitest.expect(saved).toEqual (Some "saved content\n")
+
+                do!
+                    harness.AdvanceTarget workspace [|
+                        { Path = "remote.txt"; Content = Some "remote content\n" }
+                    |]
+                let! beforeUpdate = getStatus workspace
+                let! updateResult =
+                    run (
+                        (syncService workspace.Session).Synchronize
+                            {
+                                ExpectedWorkspaceVersion = beforeUpdate.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                                AcceptUpdateRisks = false
+                                PublishLocalRevisions = true
+                            }
+                            (ctx "consumer-save-follow-up")
+                    )
+
+                expectPerformed "follow-up synchronize" updateResult |> ignore
+                let! remote = workspace.ReadFile "remote.txt"
+                Vitest.expect(remote).toEqual (Some "remote content\n")
+                let! finalStatus = getStatus workspace
+
+                match finalStatus.Synchronization with
+                | Some synchronization -> Vitest.expect(synchronization.Relationship).toEqual (UpToDate)
+                | None -> failwith "Expected synchronization state."
+            }
     )
 
     // Vitest defers describe callbacks to the collection phase, so expose the

@@ -75,6 +75,7 @@ let private createFakeSynchronization () : SynchronizationService = {
     PreviewUpdate = fun _ -> async { return unsupported "Synchronization preview" }
     Update = fun _ _ -> async { return unsupported "Synchronization update" }
     Publish = fun _ _ -> async { return unsupported "Synchronization publish" }
+    Synchronize = fun _ _ -> async { return unsupported "Synchronization synchronize" }
 }
 
 let private createFakeConflictResolution () : ConflictResolutionService = {

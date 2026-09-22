@@ -807,233 +807,267 @@ module FakeHarness =
                 |> Set.filter (fun path -> baseFiles.TryFind path <> targetFiles.TryFind path)
             | _ -> Set.empty
 
-        {
-            Refresh = fun _ -> async { return OperationResult.succeeded (synchronizationState workspace) }
-            PreviewUpdate =
-                fun _ -> async {
-                    let changed = targetChanges ()
-                    let localChanged = localDirtyPaths ()
+        let refresh _ = async { return OperationResult.succeeded (synchronizationState workspace) }
+        let previewUpdate _ = async {
+            let changed = targetChanges ()
+            let localChanged = localDirtyPaths ()
 
-                    // Paths the local side changed in commits since base also count as local.
-                    let localCommitted =
-                        let baseFiles = revisionFiles workspace.Target workspace.BaseRevisionId
-                        let headFiles = revisionFiles workspace.Target (headRevisionId workspace)
+            // Paths the local side changed in commits since base also count as local.
+            let localCommitted =
+                let baseFiles = revisionFiles workspace.Target workspace.BaseRevisionId
+                let headFiles = revisionFiles workspace.Target (headRevisionId workspace)
 
-                        Set.union (Set.ofSeq (Map.keys baseFiles)) (Set.ofSeq (Map.keys headFiles))
-                        |> Set.filter (fun path -> baseFiles.TryFind path <> headFiles.TryFind path)
+                Set.union (Set.ofSeq (Map.keys baseFiles)) (Set.ofSeq (Map.keys headFiles))
+                |> Set.filter (fun path -> baseFiles.TryFind path <> headFiles.TryFind path)
 
-                    let overlapping = Set.intersect changed (Set.union localChanged localCommitted)
+            let overlapping = Set.intersect changed (Set.union localChanged localCommitted)
 
-                    return
-                        OperationResult.succeeded {
-                            ChangedPaths = changed |> Set.toArray |> Array.map mkPath
-                            OverlappingPaths = overlapping |> Set.toArray |> Array.map mkPath
-                            HasDataLossRisk = not (Set.isEmpty (Set.intersect changed localChanged))
-                            WouldCreateConflictSession = not (Set.isEmpty overlapping)
-                        }
-                }
-            Update =
-                fun request context -> async {
-                    let! canceled = slowTransferGate workspace context
-
-                    if canceled then
-                        return OperationResult.canceled "The update transfer was canceled."
-                    elif request.ExpectedWorkspaceVersion <> versionToken workspace then
-                        return OperationResult.failed (staleFailure ())
-                    elif workspace.ActiveConflict.IsSome then
-                        return
-                            OperationResult.failed (
-                                OperationFailure.create
-                                    Conflict
-                                    "conflict_session_active"
-                                    "Resolve or cancel the active conflict session first."
-                            )
-                    else
-                        match workspace.Target.Refs.TryFind workspace.CurrentRef with
-                        | None ->
-                            return
-                                OperationResult.noOp (Some "No target is configured.") (synchronizationState workspace)
-                        | Some targetRevision when targetRevision = workspace.BaseRevisionId ->
-                            return
-                                OperationResult.noOp
-                                    (Some "The workspace is already up to date.")
-                                    (synchronizationState workspace)
-                        | Some targetRevision ->
-                            let baseFiles = revisionFiles workspace.Target workspace.BaseRevisionId
-                            let targetFiles = revisionFiles workspace.Target targetRevision
-                            let headFiles = revisionFiles workspace.Target (headRevisionId workspace)
-
-                            let changedOnTarget =
-                                Set.union (Set.ofSeq (Map.keys baseFiles)) (Set.ofSeq (Map.keys targetFiles))
-                                |> Set.filter (fun path -> baseFiles.TryFind path <> targetFiles.TryFind path)
-
-                            let oursContent path =
-                                workspace.LocalFiles.TryFind path
-                                |> Option.orElse (headFiles.TryFind path)
-
-                            let conflicts =
-                                changedOnTarget
-                                |> Set.filter (fun path ->
-                                    let ours = oursContent path
-                                    let baseContent = baseFiles.TryFind path
-                                    let theirs = targetFiles.TryFind path
-                                    ours <> baseContent && ours <> theirs)
-                                |> Set.toList
-
-                            let preUpdateFiles = workspace.LocalFiles
-                            let preUpdateBase = workspace.BaseRevisionId
-
-                            // Apply non-conflicting target changes.
-                            for path in Set.toList changedOnTarget do
-                                if not (List.contains path conflicts) then
-                                    match targetFiles.TryFind path with
-                                    | Some content ->
-                                        workspace.LocalFiles <- workspace.LocalFiles |> Map.add path content
-                                    | None -> workspace.LocalFiles <- workspace.LocalFiles |> Map.remove path
-
-                            if conflicts.IsEmpty then
-                                // Fast-forward or clean merge.
-                                let mergedFiles =
-                                    workspace.LocalFiles
-
-                                let localHead = headRevisionId workspace
-
-                                let newHead =
-                                    if localHead = workspace.BaseRevisionId then
-                                        targetRevision
-                                    else
-                                        addRevision
-                                            workspace.Target
-                                            [ localHead; targetRevision ]
-                                            mergedFiles
-                                            "merge: update from target"
-
-                                workspace.LocalRefs <- workspace.LocalRefs |> Map.add workspace.CurrentRef newHead
-                                workspace.BaseRevisionId <- targetRevision
-                                bump workspace
-                                return OperationResult.succeeded (synchronizationState workspace)
-                            else
-                                workspace.ActiveConflict <-
-                                    Some {
-                                        SessionId = $"conflict-{workspace.MutationCounter}-{targetRevision}"
-                                        HandleVersion = 1
-                                        ConflictItems =
-                                            conflicts
-                                            |> List.map (fun path -> {
-                                                ItemPath = path
-                                                BaseContent = baseFiles.TryFind path
-                                                OursContent = oursContent path |> Option.defaultValue ""
-                                                TheirsContent = targetFiles.TryFind path |> Option.defaultValue ""
-                                                ResolvedContent = None
-                                            })
-                                        TheirRevisionId = targetRevision
-                                        PreUpdateFiles = preUpdateFiles
-                                        PreUpdateBase = preUpdateBase
-                                    }
-
-                                bump workspace
-
-                                return
-                                    OperationResult.partiallySucceeded
-                                        {
-                                            OperationOutcome.performed (synchronizationState workspace) with
-                                                AffectedPaths = conflicts |> List.toArray
-                                                ResultingWorkspaceVersion = Some(versionToken workspace)
-                                        }
-                                        (OperationFailure.create
-                                            Conflict
-                                            ConformanceCodes.ConflictsDetected
-                                            "The update produced conflicts that need resolution.")
-                                        {
-                                            Code = "resolve_conflict_session"
-                                            Instructions = Some "Resolve every conflict item, then finalize."
-                                        }
-                }
-            Publish =
-                fun request context -> async {
-                    let! canceled = slowTransferGate workspace context
-
-                    if canceled then
-                        return OperationResult.canceled "The publish transfer was canceled."
-                    elif request.ExpectedWorkspaceVersion <> versionToken workspace then
-                        return OperationResult.failed (staleFailure ())
-                    elif workspace.Target.PublishBroken then
-                        return
-                            OperationResult.failed {
-                                OperationFailure.create
-                                    Network
-                                    "target_unreachable"
-                                    "The publication target is unreachable; local revisions are preserved for retry." with
-                                    Retryable = true
-                            }
-                    else
-                        let localHead = headRevisionId workspace
-                        let observedTarget = workspace.Target.Refs.TryFind workspace.CurrentRef
-
-                        // Client-side pre-check against the consumer-observed target revision.
-                        let expectedMatchesObserved =
-                            match request.ExpectedTargetRevision, observedTarget with
-                            | None, _ -> true
-                            | Some expected, Some observed -> RevisionId.value expected = observed
-                            | Some _, None -> false
-
-                        if not expectedMatchesObserved then
-                            return
-                                OperationResult.failed {
-                                    staleFailure () with
-                                        RevisionEvidence = [|
-                                            yield!
-                                                request.ExpectedTargetRevision
-                                                |> Option.map (fun r -> "expected_target", r)
-                                                |> Option.toList
-                                            yield!
-                                                observedTarget
-                                                |> Option.map (fun o -> "observed_target", mkRevisionId o)
-                                                |> Option.toList
-                                        |]
-                                }
-                        else
-                            match observedTarget with
-                            | Some target when target = localHead ->
-                                return
-                                    OperationResult.noOp
-                                        (Some "The target already has every local revision.")
-                                        (synchronizationState workspace)
-                            | _ ->
-                                // Simulated race window between pre-check and verification.
-                                match applyArmedRace workspace with
-                                | Some raceRevision ->
-                                    return
-                                        OperationResult.partiallySucceeded
-                                            (OperationOutcome.performed (synchronizationState workspace))
-                                            {
-                                                OperationFailure.create
-                                                    Concurrency
-                                                    ConformanceCodes.PreconditionFailed
-                                                    "The target advanced during publish verification." with
-                                                    RevisionEvidence =
-                                                        raceEvidence
-                                                            (observedTarget |> Option.defaultValue localHead)
-                                                            raceRevision
-                                            }
-                                            {
-                                                Code = "review_and_retry"
-                                                Instructions =
-                                                    Some "Review the observed target revision, refresh, and retry."
-                                            }
-                                | None ->
-                                    workspace.Target.Refs <- workspace.Target.Refs |> Map.add workspace.CurrentRef localHead
-                                    bump workspace
-
-                                    return
-                                        Succeeded {
-                                            OperationOutcome.performed (synchronizationState workspace) with
-                                                Publication = Published
-                                                ResultingRevision = Some(mkRevisionId localHead)
-                                                ResultingWorkspaceVersion = Some(versionToken workspace)
-                                        }
+            return
+                OperationResult.succeeded {
+                    ChangedPaths = changed |> Set.toArray |> Array.map mkPath
+                    OverlappingPaths = overlapping |> Set.toArray |> Array.map mkPath
+                    HasDataLossRisk = not (Set.isEmpty (Set.intersect changed localChanged))
+                    WouldCreateConflictSession = not (Set.isEmpty overlapping)
                 }
         }
+        let update (request: UpdateRequest) (context: OperationContext) = async {
+            let! canceled = slowTransferGate workspace context
+
+            if canceled then
+                return OperationResult.canceled "The update transfer was canceled."
+            elif request.ExpectedWorkspaceVersion <> versionToken workspace then
+                return OperationResult.failed (staleFailure ())
+            elif workspace.ActiveConflict.IsSome then
+                return
+                    OperationResult.failed (
+                        OperationFailure.create
+                            Conflict
+                            "conflict_session_active"
+                            "Resolve or cancel the active conflict session first."
+                    )
+            else
+                match workspace.Target.Refs.TryFind workspace.CurrentRef with
+                | None ->
+                    return
+                        OperationResult.noOp (Some "No target is configured.") (synchronizationState workspace)
+                | Some targetRevision when targetRevision = workspace.BaseRevisionId ->
+                    return
+                        OperationResult.noOp
+                            (Some "The workspace is already up to date.")
+                            (synchronizationState workspace)
+                | Some targetRevision ->
+                    let baseFiles = revisionFiles workspace.Target workspace.BaseRevisionId
+                    let targetFiles = revisionFiles workspace.Target targetRevision
+                    let headFiles = revisionFiles workspace.Target (headRevisionId workspace)
+
+                    let changedOnTarget =
+                        Set.union (Set.ofSeq (Map.keys baseFiles)) (Set.ofSeq (Map.keys targetFiles))
+                        |> Set.filter (fun path -> baseFiles.TryFind path <> targetFiles.TryFind path)
+
+                    let oursContent path =
+                        workspace.LocalFiles.TryFind path
+                        |> Option.orElse (headFiles.TryFind path)
+
+                    let conflicts =
+                        changedOnTarget
+                        |> Set.filter (fun path ->
+                            let ours = oursContent path
+                            let baseContent = baseFiles.TryFind path
+                            let theirs = targetFiles.TryFind path
+                            ours <> baseContent && ours <> theirs)
+                        |> Set.toList
+
+                    let preUpdateFiles = workspace.LocalFiles
+                    let preUpdateBase = workspace.BaseRevisionId
+
+                    // Apply non-conflicting target changes.
+                    for path in Set.toList changedOnTarget do
+                        if not (List.contains path conflicts) then
+                            match targetFiles.TryFind path with
+                            | Some content ->
+                                workspace.LocalFiles <- workspace.LocalFiles |> Map.add path content
+                            | None -> workspace.LocalFiles <- workspace.LocalFiles |> Map.remove path
+
+                    if conflicts.IsEmpty then
+                        // Fast-forward or clean merge.
+                        let mergedFiles =
+                            workspace.LocalFiles
+
+                        let localHead = headRevisionId workspace
+
+                        let newHead =
+                            if localHead = workspace.BaseRevisionId then
+                                targetRevision
+                            else
+                                addRevision
+                                    workspace.Target
+                                    [ localHead; targetRevision ]
+                                    mergedFiles
+                                    "merge: update from target"
+
+                        workspace.LocalRefs <- workspace.LocalRefs |> Map.add workspace.CurrentRef newHead
+                        workspace.BaseRevisionId <- targetRevision
+                        bump workspace
+                        return OperationResult.succeeded (synchronizationState workspace)
+                    else
+                        workspace.ActiveConflict <-
+                            Some {
+                                SessionId = $"conflict-{workspace.MutationCounter}-{targetRevision}"
+                                HandleVersion = 1
+                                ConflictItems =
+                                    conflicts
+                                    |> List.map (fun path -> {
+                                        ItemPath = path
+                                        BaseContent = baseFiles.TryFind path
+                                        OursContent = oursContent path |> Option.defaultValue ""
+                                        TheirsContent = targetFiles.TryFind path |> Option.defaultValue ""
+                                        ResolvedContent = None
+                                    })
+                                TheirRevisionId = targetRevision
+                                PreUpdateFiles = preUpdateFiles
+                                PreUpdateBase = preUpdateBase
+                            }
+
+                        bump workspace
+
+                        return
+                            OperationResult.partiallySucceeded
+                                {
+                                    OperationOutcome.performed (synchronizationState workspace) with
+                                        AffectedPaths = conflicts |> List.toArray
+                                        ResultingWorkspaceVersion = Some(versionToken workspace)
+                                }
+                                (OperationFailure.create
+                                    Conflict
+                                    ConformanceCodes.ConflictsDetected
+                                    "The update produced conflicts that need resolution.")
+                                {
+                                    Code = "resolve_conflict_session"
+                                    Instructions = Some "Resolve every conflict item, then finalize."
+                                }
+        }
+        let publish (request: PublishRequest) (context: OperationContext) = async {
+            let! canceled = slowTransferGate workspace context
+
+            if canceled then
+                return OperationResult.canceled "The publish transfer was canceled."
+            elif request.ExpectedWorkspaceVersion <> versionToken workspace then
+                return OperationResult.failed (staleFailure ())
+            elif workspace.Target.PublishBroken then
+                return
+                    OperationResult.failed {
+                        OperationFailure.create
+                            Network
+                            "target_unreachable"
+                            "The publication target is unreachable; local revisions are preserved for retry." with
+                            Retryable = true
+                    }
+            else
+                let localHead = headRevisionId workspace
+                let observedTarget = workspace.Target.Refs.TryFind workspace.CurrentRef
+
+                // Client-side pre-check against the consumer-observed target revision.
+                let expectedMatchesObserved =
+                    match request.ExpectedTargetRevision, observedTarget with
+                    | None, _ -> true
+                    | Some expected, Some observed -> RevisionId.value expected = observed
+                    | Some _, None -> false
+
+                if not expectedMatchesObserved then
+                    return
+                        OperationResult.failed {
+                            staleFailure () with
+                                RevisionEvidence = [|
+                                    yield!
+                                        request.ExpectedTargetRevision
+                                        |> Option.map (fun r -> "expected_target", r)
+                                        |> Option.toList
+                                    yield!
+                                        observedTarget
+                                        |> Option.map (fun o -> "observed_target", mkRevisionId o)
+                                        |> Option.toList
+                                |]
+                        }
+                else
+                    match observedTarget with
+                    | Some target when target = localHead ->
+                        return
+                            OperationResult.noOp
+                                (Some "The target already has every local revision.")
+                                (synchronizationState workspace)
+                    | _ ->
+                        // Simulated race window between pre-check and verification.
+                        match applyArmedRace workspace with
+                        | Some raceRevision ->
+                            return
+                                OperationResult.partiallySucceeded
+                                    (OperationOutcome.performed (synchronizationState workspace))
+                                    {
+                                        OperationFailure.create
+                                            Concurrency
+                                            ConformanceCodes.PreconditionFailed
+                                            "The target advanced during publish verification." with
+                                            RevisionEvidence =
+                                                raceEvidence
+                                                    (observedTarget |> Option.defaultValue localHead)
+                                                    raceRevision
+                                    }
+                                    {
+                                        Code = "review_and_retry"
+                                        Instructions =
+                                            Some "Review the observed target revision, refresh, and retry."
+                                    }
+                        | None ->
+                            workspace.BaseRevisionId <- localHead
+                            workspace.Target.Refs <- workspace.Target.Refs |> Map.add workspace.CurrentRef localHead
+                            bump workspace
+
+                            return
+                                Succeeded {
+                                    OperationOutcome.performed (synchronizationState workspace) with
+                                        Publication = Published
+                                        ResultingRevision = Some(mkRevisionId localHead)
+                                        ResultingWorkspaceVersion = Some(versionToken workspace)
+                                }
+        }
+        let baseService : SynchronizationService = {
+            Refresh = refresh
+            PreviewUpdate = previewUpdate
+            Update = update
+            Publish = publish
+            Synchronize =
+                fun request context ->
+                    async {
+                        if request.ExpectedWorkspaceVersion <> versionToken workspace then
+                            return OperationResult.failed (staleFailure ())
+                        else
+                            return!
+                                Synchronization.compose
+                                    {
+                                        HasActiveConflictSession =
+                                            fun _ -> async { return OperationResult.succeeded workspace.ActiveConflict.IsSome }
+                                        Refresh = refresh
+                                        PreviewUpdate = fun _ context -> previewUpdate context
+                                        Update =
+                                            fun _ context ->
+                                                update
+                                                    { ExpectedWorkspaceVersion = versionToken workspace }
+                                                    context
+                                        Publish =
+                                            fun syncState context ->
+                                                publish
+                                                    {
+                                                        ExpectedWorkspaceVersion = versionToken workspace
+                                                        ExpectedTargetRevision = syncState.TargetRevision
+                                                    }
+                                                    context
+                                    }
+                                    request
+                                    context
+                    }
+        }
+
+        baseService
 
     let private createConflictService (workspace: FakeWorkspace) : ConflictResolutionService =
         let handleRejection () =

@@ -3735,3 +3735,202 @@ Vitest.describe (
             }
         )
 )
+
+Vitest.describe (
+    "Git synchronize composition",
+    fun () ->
+        Vitest.test (
+            "synchronize publishes a branch that tracks a differently named upstream",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, barePath, session = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+
+                try
+                    let! _ = runGitIn workPath [| "checkout"; "-b"; "feature" |]
+                    let! _ = runGitIn workPath [| "branch"; "--set-upstream-to=origin/main"; "feature" |]
+                    do! writeUtf8FileAsync (join [| workPath; "feature.txt" |]) "feature content\n"
+                    let! status = sessionStatus session
+
+                    let! revisionResult =
+                        session.Core.CreateRevision
+                            {
+                                Message = "feature revision"
+                                Paths = [| mkPath "feature.txt" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (ctx "feature-revision")
+                        |> Async.StartAsPromise
+
+                    let revision = expectSucceeded "feature revision" revisionResult
+                    let! afterRevision = sessionStatus session
+                    let! synchronizeResult =
+                        (syncService session).Synchronize
+                            {
+                                ExpectedWorkspaceVersion = afterRevision.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                                AcceptUpdateRisks = false
+                                PublishLocalRevisions = true
+                            }
+                            (ctx "feature-synchronize")
+                        |> Async.StartAsPromise
+
+                    match synchronizeResult with
+                    | Succeeded outcome ->
+                        Vitest.expect(outcome.Publication).toEqual (Published)
+                        Vitest.expect(outcome.Value.TargetRevision).toEqual (Some revision)
+                    | Failed failure ->
+                        Vitest.expect(failure.Code).not.toBe ("precondition_failed")
+                        failwith $"Expected feature synchronize to succeed, received {failure.Code}."
+                    | PartiallySucceeded(_, failure) ->
+                        failwith $"Expected feature synchronize to succeed, received partial {failure.Code}."
+
+                    let! remoteFeature = runGitIn root [| "ls-remote"; barePath; "refs/heads/feature" |]
+                    let remoteRevision = remoteFeature.Trim().Split([| '\t'; ' ' |], StringSplitOptions.RemoveEmptyEntries).[0]
+                    Vitest.expect(remoteRevision).toEqual (RevisionId.value revision)
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+
+                do! removeDirectoryAsync root
+            }
+        )
+
+        Vitest.test (
+            "a rejected non-conflicting merge reports update_rejected without a conflict session",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, barePath, session = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+
+                try
+                    do! advanceTarget root barePath [ "base.txt", "target version\n" ]
+                    do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) "dirty workspace version\n"
+                    let! status = sessionStatus session
+
+                    let! updateResult =
+                        (syncService session).Update
+                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                            (ctx "rejected-update")
+                        |> Async.StartAsPromise
+
+                    let failure = expectProviderFailure "rejected update" updateResult
+                    Vitest.expect(failure.Category).toEqual (ProviderError)
+                    Vitest.expect(failure.Code).toBe "update_rejected"
+                    Vitest.expect(failure.StateChanged).toBe (false)
+                    Vitest.expect(failure.Retryable).toBe (false)
+                    Vitest.expect(failure.Message).toBe "Git rejected the update."
+                    Vitest.expect(failure.Details.Length > 0).toBe (true)
+                    let! mergeHeadPath = runGitIn workPath [| "rev-parse"; "--git-path"; "MERGE_HEAD" |]
+                    let! mergeHeadExists = pathExistsAsync (join [| workPath; mergeHeadPath.Trim() |])
+                    Vitest.expect(mergeHeadExists).toBe (false)
+                    let! dirty = tryReadUtf8FileAsync (join [| workPath; "base.txt" |])
+                    Vitest.expect(dirty).toEqual (Some "dirty workspace version\n")
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+
+                do! removeDirectoryAsync root
+            }
+        )
+
+        Vitest.test (
+            "a publish rejected by the remote after an applied update is partial with retry_publish and a later synchronize publishes",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, barePath, session = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+                let hookPath = join [| barePath; "hooks"; "pre-receive" |]
+
+                try
+                    do! advanceTarget root barePath [ "target-only.txt", "target content\n" ]
+                    do! writeUtf8FileAsync (join [| workPath; "local-only.txt" |]) "local content\n"
+                    let! status = sessionStatus session
+
+                    let! revisionResult =
+                        session.Core.CreateRevision
+                            {
+                                Message = "local revision before rejected publish"
+                                Paths = [| mkPath "local-only.txt" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (ctx "rejected-publish-revision")
+                        |> Async.StartAsPromise
+
+                    let localRevision = expectSucceeded "local revision before rejected publish" revisionResult
+
+                    do! writeUtf8FileAsync hookPath "#!/bin/sh\nexit 1\n"
+
+                    if (osDynamic?platform () |> unbox<string>) <> "win32" then
+                        let! _ = fsPromisesDynamic?chmod (hookPath, 493) |> unbox<JS.Promise<obj>>
+                        ()
+
+                    let! beforeSynchronize = sessionStatus session
+                    let! synchronizeResult =
+                        (syncService session).Synchronize
+                            {
+                                ExpectedWorkspaceVersion = beforeSynchronize.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                                AcceptUpdateRisks = false
+                                PublishLocalRevisions = true
+                            }
+                            (ctx "rejected-publish-synchronize")
+                        |> Async.StartAsPromise
+
+                    match synchronizeResult with
+                    | PartiallySucceeded(outcome, failure) ->
+                        Vitest.expect(outcome.Publication).toEqual (LocalOnly)
+                        Vitest.expect(failure.StateChanged).toBe true
+                        Vitest
+                            .expect(failure.RecoveryAction |> Option.map _.Code)
+                            .toEqual (Some "retry_publish")
+
+                        let! targetFile = tryReadUtf8FileAsync (join [| workPath; "target-only.txt" |])
+                        Vitest.expect(targetFile).toEqual (Some "target content\n")
+
+                        let! remoteRefs = runGitIn root [| "ls-remote"; barePath |]
+                        Vitest
+                            .expect(remoteRefs.Contains(RevisionId.value localRevision, StringComparison.Ordinal))
+                            .toBe false
+                    | Failed failure ->
+                        let recoveryCode = failure.RecoveryAction |> Option.map _.Code |> Option.defaultValue "<none>"
+                        failwith
+                            $"Expected PartiallySucceeded after rejected publish, received Failed {failure.Category}/{failure.Code}, StateChanged={failure.StateChanged}, RecoveryAction={recoveryCode}."
+                    | Succeeded _ -> failwith "Expected the rejected publish to return partial success."
+
+                    do! removePathAsync hookPath
+                    let! retryStatus = sessionStatus session
+                    let! retryResult =
+                        (syncService session).Synchronize
+                            {
+                                ExpectedWorkspaceVersion = retryStatus.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                                AcceptUpdateRisks = false
+                                PublishLocalRevisions = true
+                            }
+                            (ctx "retry-rejected-publish-synchronize")
+                        |> Async.StartAsPromise
+
+                    match retryResult with
+                    | Succeeded outcome ->
+                        Vitest.expect(outcome.Publication).toEqual (Published)
+
+                        let workspaceRevision =
+                            outcome.Value.WorkspaceRevision
+                            |> Option.map RevisionId.value
+                            |> Option.defaultWith (fun () -> failwith "Expected the synchronized workspace revision.")
+
+                        let! remoteMain = runGitIn root [| "ls-remote"; barePath; "refs/heads/main" |]
+                        let remoteRevision =
+                            remoteMain.Trim().Split([| '\t'; ' ' |], StringSplitOptions.RemoveEmptyEntries).[0]
+
+                        Vitest.expect(remoteRevision).toEqual workspaceRevision
+                    | Failed failure ->
+                        failwith $"Expected retry synchronize to succeed, received {failure.Category}/{failure.Code}."
+                    | PartiallySucceeded(_, failure) ->
+                        failwith $"Expected retry synchronize to succeed, received partial {failure.Code}."
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+
+                do! removeDirectoryAsync root
+            }
+        )
+)

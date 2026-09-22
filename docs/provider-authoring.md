@@ -56,7 +56,7 @@ Optional services advertise real capability:
 
 | Service | Purpose |
 |---|---|
-| `Synchronization` | refresh, preview update, update, and publish |
+| `Synchronization` | refresh, preview update, update, publish, and synchronize |
 | `TextDiff` | text, word, and committed-base content |
 | `ConflictResolution` | provider-owned conflict sessions and stale-handle checks |
 | `ObjectMaterialization` | list, hydrate, and dematerialize large or lazy objects |
@@ -75,6 +75,21 @@ Return `OperationResult<'T>` from every operation:
 - `Failed` carries a stable category and provider-extensible code. Set `StateChanged` when mutation may have happened, even if verification was inconclusive.
 
 Workspace versions are opaque optimistic-concurrency tokens. Conflict handles have a separate lifetime and rotate after each successful nonterminal resolution. Validate both tokens where the request carries both. A stale request must fail before further mutation.
+
+## Synchronize
+
+`Synchronization.compose` implements the shared synchronize operation. It refreshes the target and pins the observed state. When the workspace is behind, it previews the pinned target before applying an update. It can then publish local revisions.
+
+Providers call `Synchronization.compose` inside their mutation lock. The provider steps consume the refreshed state, so the update applies the revision that the preview described. The provider validates the workspace version once in its mutation wrapper.
+
+The composition produces these decision codes:
+
+- `update_would_overwrite_local_changes`
+- `update_would_create_conflict_session`
+- `acceptance_target_required`
+- `conflict_session_active`
+
+A decision failure has category `Conflict` and the recovery code `accept_update_risks`. Its `AffectedPaths` are the overlapping paths and its `RevisionEvidence` carries the target revision the preview used under `observed_target`. The consumer shows the preview data, then synchronizes again with `AcceptUpdateRisks` and that revision as `ExpectedTargetRevision`, which the composition compares with the fresh target before it mutates anything. A publish failure after an applied update becomes `PartiallySucceeded` with `Publication = LocalOnly` when the failure reports no state change. The composition keeps a provider recovery action when one exists and supplies `retry_publish` otherwise. A publish failure that reports a state change is returned as it is, because the publication may have happened.
 
 ## Cancellation, progress, and redaction
 

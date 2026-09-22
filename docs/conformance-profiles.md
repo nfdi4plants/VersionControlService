@@ -7,7 +7,7 @@ The shared Vitest profiles exercise behavior through `ProviderFactory` and `Work
 | Profile | What it checks |
 |---|---|
 | Core | selected-path revisions, exact restore, refs, workspace versions, path identity, and structured failures |
-| Synchronization | refresh, preview, update, publish, no-op behavior, retry, stale targets, and conflict creation |
+| Synchronization | refresh, preview, update, publish, synchronize composition, acceptance, pinned target, no-op behavior, retry, stale targets, and conflict creation |
 | Conflict | rotating handles, candidate and supplied-content resolution, finalize/cancel, and destination races |
 | Provisioning | access verification, initialize, clone, bind, destination rules, and dependency reporting |
 | Operational | progress, cancellation, independent sessions, interrupted-mutation cleanup, and redaction |

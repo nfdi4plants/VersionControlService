@@ -96,6 +96,7 @@ module FakeProvider =
             PreviewUpdate = fun _ -> async { return unsupported "Synchronization preview" }
             Update = fun _ _ -> async { return unsupported "Synchronization update" }
             Publish = fun _ _ -> async { return unsupported "Synchronization publish" }
+            Synchronize = fun _ _ -> async { return unsupported "Synchronization synchronize" }
         }
 
     let createFinalConflictResolution () : ConflictResolutionService = {
@@ -216,6 +217,7 @@ module FakeProvider =
                 }
             Update = fun _ _ -> async { return OperationResult.noOp (Some "no target configured") state }
             Publish = fun _ _ -> async { return OperationResult.noOp (Some "no target configured") state }
+            Synchronize = fun _ _ -> async { return OperationResult.noOp (Some "no target configured") state }
         }
 
     let createBrowser () : RepositoryBrowserService = {

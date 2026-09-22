@@ -46,6 +46,24 @@ type PublishRequest = {
     ExpectedTargetRevision: RevisionId option
 }
 
+/// One synchronization: observe the target, incorporate it when the workspace is
+/// behind, publish local revisions. The consumer decides only where the provider
+/// cannot: an update that would touch local changes or open a conflict session, and
+/// a target that has to be bound first.
+type SynchronizeRequest = {
+    ExpectedWorkspaceVersion: string
+    /// The target revision the consumer observed when it made its decision. A target
+    /// that has moved since fails with precondition_failed before any mutation.
+    /// Required when AcceptUpdateRisks is set, so an acceptance never applies to a
+    /// target the user did not see.
+    ExpectedTargetRevision: RevisionId option
+    /// The consumer showed the update preview and the user accepted overwritten
+    /// local changes and a conflict session.
+    AcceptUpdateRisks: bool
+    /// False updates only and leaves local revisions unpublished.
+    PublishLocalRevisions: bool
+}
+
 /// Synchronization expressed as intent; providers own the mechanics.
 type SynchronizationService = {
     /// Observe target state without changing workspace content.
@@ -56,4 +74,338 @@ type SynchronizationService = {
     Update: UpdateRequest -> OperationContext -> Async<OperationResult<SynchronizationState>>
     /// Make workspace revisions visible on the configured target.
     Publish: PublishRequest -> OperationContext -> Async<OperationResult<SynchronizationState>>
+    /// Refresh, update when the target is ahead, publish, as one operation under the
+    /// provider's mutation lock. See Synchronization.compose for the contract.
+    Synchronize: SynchronizeRequest -> OperationContext -> Async<OperationResult<SynchronizationState>>
 }
+
+/// Codes the composition produces. Providers keep their own codes for their steps.
+module SynchronizationCodes =
+    /// The update would change files that carry local changes. AffectedPaths names them.
+    [<Literal>]
+    let UpdateWouldOverwriteLocalChanges = "update_would_overwrite_local_changes"
+
+    /// The update would open a conflict session without touching local changes.
+    [<Literal>]
+    let UpdateWouldCreateConflictSession = "update_would_create_conflict_session"
+
+    /// AcceptUpdateRisks was set without ExpectedTargetRevision.
+    [<Literal>]
+    let AcceptanceTargetRequired = "acceptance_target_required"
+
+    /// A conflict session is open. Resolve or cancel it first.
+    [<Literal>]
+    let ConflictSessionActive = "conflict_session_active"
+
+    /// Recovery: show the preview data of the failure, then retry with AcceptUpdateRisks
+    /// and the observed target revision from the failure's RevisionEvidence.
+    [<Literal>]
+    let AcceptUpdateRisksRecovery = "accept_update_risks"
+
+    /// Recovery: the update was applied and the publish did not happen. Synchronize again.
+    [<Literal>]
+    let RetryPublishRecovery = "retry_publish"
+
+/// The provider primitives the composition runs. They run inside the provider's
+/// mutation lock with the workspace version validated once, so none of them validates
+/// it again. Refresh observes the target once and every later step consumes that
+/// observation instead of reading the target again, so the update applies exactly the
+/// revision the preview described and the decision evidence names that revision.
+type SynchronizationSteps = {
+    /// True when a conflict session is open. The composition refuses before any step.
+    HasActiveConflictSession: OperationContext -> Async<OperationResult<bool>>
+    /// Observes the target and returns the pinned state.
+    Refresh: OperationContext -> Async<OperationResult<SynchronizationState>>
+    /// Previews an update to the pinned target without reading the target again.
+    PreviewUpdate: SynchronizationState -> OperationContext -> Async<OperationResult<UpdatePreview>>
+    /// Applies exactly the pinned target revision. NoOp when there is nothing to apply.
+    Update: SynchronizationState -> OperationContext -> Async<OperationResult<SynchronizationState>>
+    /// Publishes the workspace. The provider derives the expected publication target
+    /// from the pinned state when its publication target is the synchronization
+    /// target, and checks nothing otherwise.
+    Publish: SynchronizationState -> OperationContext -> Async<OperationResult<SynchronizationState>>
+}
+
+module Synchronization =
+    let private withObservedEvidence (state: SynchronizationState) (failure: OperationFailure) =
+        match state.TargetRevision with
+        | Some revision ->
+            { failure with
+                RevisionEvidence = Array.append failure.RevisionEvidence [| "observed_target", revision |] }
+        | None -> failure
+
+    let private mergeWarnings (refreshWarnings: OperationWarning[]) (outcomeWarnings: OperationWarning[]) =
+        Array.append refreshWarnings outcomeWarnings
+
+    let private mergeAffectedPaths (first: string[]) (second: string[]) =
+        Array.append first second |> Array.distinct
+
+    let compose
+        (steps: SynchronizationSteps)
+        (request: SynchronizeRequest)
+        (context: OperationContext)
+        : Async<OperationResult<SynchronizationState>> =
+        async {
+            if request.AcceptUpdateRisks && request.ExpectedTargetRevision.IsNone then
+                return
+                    Failed(
+                        OperationFailure.create
+                            Validation
+                            SynchronizationCodes.AcceptanceTargetRequired
+                            "An accepted update needs the target revision the preview was computed for."
+                    )
+            else
+                let! activeConflictResult = steps.HasActiveConflictSession context
+
+                match activeConflictResult with
+                | Failed failure
+                | PartiallySucceeded(_, failure) -> return Failed failure
+                | Succeeded active when active.Value ->
+                    return
+                        Failed(
+                            OperationFailure.create
+                                Conflict
+                                SynchronizationCodes.ConflictSessionActive
+                                "Resolve or cancel the active conflict session first."
+                        )
+                | Succeeded _ ->
+                    let! refreshResult = steps.Refresh context
+
+                    match refreshResult with
+                    | Failed failure
+                    | PartiallySucceeded(_, failure) -> return Failed failure
+                    | Succeeded refreshOutcome ->
+                        let state0 = refreshOutcome.Value
+                        let refreshWarnings = refreshOutcome.Warnings
+
+                        let expectedTargetFailure =
+                            match request.ExpectedTargetRevision with
+                            | Some expected when state0.TargetRevision <> Some expected ->
+                                Some {
+                                    OperationFailure.create
+                                        Concurrency
+                                        "precondition_failed"
+                                        "The target advanced past the revision the decision was made for." with
+                                            RevisionEvidence = [|
+                                                "expected_target", expected
+
+                                                yield!
+                                                    state0.TargetRevision
+                                                    |> Option.map (fun observed -> "observed_target", observed)
+                                                    |> Option.toList
+                                            |]
+                                }
+                            | _ -> None
+
+                        match expectedTargetFailure with
+                        | Some failure -> return Failed failure
+                        | None ->
+                            let needsUpdate =
+                                match state0.Relationship with
+                                | UpToDate
+                                | LocalAhead
+                                | NoTarget -> false
+                                | TargetAhead
+                                | Diverged
+                                | UnknownRelationship -> true
+
+                            let! updateDecision =
+                                if needsUpdate && not request.AcceptUpdateRisks then
+                                    async {
+                                        let! previewResult = steps.PreviewUpdate state0 context
+
+                                        match previewResult with
+                                        | Failed failure
+                                        | PartiallySucceeded(_, failure) ->
+                                            return Error(withObservedEvidence state0 failure)
+                                        | Succeeded previewOutcome when previewOutcome.Value.HasDataLossRisk ->
+                                            return
+                                                Error {
+                                                    OperationFailure.create
+                                                        Conflict
+                                                        SynchronizationCodes.UpdateWouldOverwriteLocalChanges
+                                                        "Updating from the target would change files with local changes." with
+                                                            AffectedPaths =
+                                                                previewOutcome.Value.OverlappingPaths
+                                                                |> Array.map RepositoryPath.value
+                                                            RevisionEvidence =
+                                                                state0.TargetRevision
+                                                                |> Option.map (fun revision -> [| "observed_target", revision |])
+                                                                |> Option.defaultValue [||]
+                                                            RecoveryAction =
+                                                                Some {
+                                                                    Code = SynchronizationCodes.AcceptUpdateRisksRecovery
+                                                                    Instructions =
+                                                                        Some
+                                                                            "Show the affected paths, then synchronize again with AcceptUpdateRisks and the observed target revision."
+                                                                }
+                                                }
+                                        | Succeeded previewOutcome when previewOutcome.Value.WouldCreateConflictSession ->
+                                            return
+                                                Error {
+                                                    OperationFailure.create
+                                                        Conflict
+                                                        SynchronizationCodes.UpdateWouldCreateConflictSession
+                                                        "Updating from the target needs conflict resolution." with
+                                                            AffectedPaths =
+                                                                previewOutcome.Value.OverlappingPaths
+                                                                |> Array.map RepositoryPath.value
+                                                            RevisionEvidence =
+                                                                state0.TargetRevision
+                                                                |> Option.map (fun revision -> [| "observed_target", revision |])
+                                                                |> Option.defaultValue [||]
+                                                            RecoveryAction =
+                                                                Some {
+                                                                    Code = SynchronizationCodes.AcceptUpdateRisksRecovery
+                                                                    Instructions =
+                                                                        Some
+                                                                            "Show the affected paths, then synchronize again with AcceptUpdateRisks and the observed target revision."
+                                                                }
+                                                }
+                                        | Succeeded _ -> return Ok()
+                                    }
+                                else
+                                    async { return Ok() }
+
+                            match updateDecision with
+                            | Error failure -> return Failed failure
+                            | Ok() when needsUpdate && context.Cancellation.IsCancellationRequested() ->
+                                return OperationResult.canceled "The synchronization was canceled before the update."
+                            | Ok() ->
+                                let finish
+                                    (state1: SynchronizationState)
+                                    (updateOutcome: OperationOutcome<SynchronizationState> option)
+                                    =
+                                    async {
+                                        let updated = updateOutcome |> Option.exists (fun outcome -> outcome.Effect = Performed)
+                                        let updateWarnings =
+                                            updateOutcome
+                                            |> Option.map (fun outcome -> outcome.Warnings)
+                                            |> Option.defaultValue [||]
+                                        let updateAffectedPaths =
+                                            updateOutcome
+                                            |> Option.map (fun outcome -> outcome.AffectedPaths)
+                                            |> Option.defaultValue [||]
+
+                                        if not request.PublishLocalRevisions then
+                                            match updateOutcome with
+                                            | Some updateOutcome when updated ->
+                                                return
+                                                    Succeeded {
+                                                        updateOutcome with
+                                                            Warnings = mergeWarnings refreshWarnings updateWarnings
+                                                    }
+                                            | _ ->
+                                                return
+                                                    OperationResult.noOp
+                                                        (Some "The workspace already has every target revision.")
+                                                        state1
+                                        elif context.Cancellation.IsCancellationRequested() then
+                                            if updated then
+                                                let failure =
+                                                    OperationFailure.create
+                                                        Canceled
+                                                        "operation_canceled"
+                                                        "The synchronization was canceled before the publish."
+
+                                                let recovery = {
+                                                    Code = SynchronizationCodes.RetryPublishRecovery
+                                                    Instructions = Some "The update was applied. Synchronize again to publish."
+                                                }
+
+                                                let updateOutcome = updateOutcome |> Option.get
+
+                                                return
+                                                    PartiallySucceeded(
+                                                        {
+                                                            updateOutcome with
+                                                                Value = state1
+                                                                Effect = Performed
+                                                                Publication = LocalOnly
+                                                                Warnings = mergeWarnings refreshWarnings updateWarnings
+                                                        },
+                                                        { failure with
+                                                            StateChanged = true
+                                                            RecoveryAction = Some recovery }
+                                                    )
+                                            else
+                                                return OperationResult.canceled "The synchronization was canceled before the publish."
+                                        else
+                                            let! publishResult = steps.Publish state1 context
+
+                                            match publishResult with
+                                            | Succeeded publishOutcome ->
+                                                return
+                                                    Succeeded {
+                                                        publishOutcome with
+                                                            Effect =
+                                                                if updated || publishOutcome.Effect = Performed then
+                                                                    Performed
+                                                                else
+                                                                    NoOp(Some "The workspace and the target are already synchronized.")
+                                                            Warnings =
+                                                                mergeWarnings
+                                                                    (mergeWarnings refreshWarnings updateWarnings)
+                                                                    publishOutcome.Warnings
+                                                            AffectedPaths =
+                                                                mergeAffectedPaths updateAffectedPaths publishOutcome.AffectedPaths
+                                                    }
+                                            | PartiallySucceeded(publishOutcome, failure) ->
+                                                return
+                                                    PartiallySucceeded(
+                                                        { publishOutcome with
+                                                            Effect = Performed
+                                                            Warnings =
+                                                                mergeWarnings
+                                                                    (mergeWarnings refreshWarnings updateWarnings)
+                                                                    publishOutcome.Warnings
+                                                            AffectedPaths =
+                                                                mergeAffectedPaths updateAffectedPaths publishOutcome.AffectedPaths },
+                                                        failure
+                                                    )
+                                            | Failed failure when updated && not failure.StateChanged ->
+                                                let recovery =
+                                                    failure.RecoveryAction
+                                                    |> Option.defaultValue {
+                                                        Code = SynchronizationCodes.RetryPublishRecovery
+                                                        Instructions = Some "The update was applied. Synchronize again to publish."
+                                                    }
+
+                                                let updateOutcome = updateOutcome |> Option.get
+
+                                                return
+                                                    PartiallySucceeded(
+                                                        {
+                                                            updateOutcome with
+                                                                Value = state1
+                                                                Effect = Performed
+                                                                Publication = LocalOnly
+                                                                Warnings = mergeWarnings refreshWarnings updateWarnings
+                                                        },
+                                                        { failure with
+                                                            StateChanged = true
+                                                            RecoveryAction = Some recovery }
+                                                    )
+                                            | Failed failure -> return Failed failure
+
+                                    }
+
+                                let! updateResult =
+                                    if needsUpdate then
+                                        async { return Some(steps.Update state0 context) }
+                                    else
+                                        async { return None }
+
+                                match updateResult with
+                                | Some updateOperation ->
+                                    let! result = updateOperation
+
+                                    match result with
+                                    | Failed failure -> return Failed failure
+                                    | PartiallySucceeded(outcome, failure) ->
+                                        return PartiallySucceeded(outcome, failure)
+                                    | Succeeded updateOutcome ->
+                                        return! finish updateOutcome.Value (Some updateOutcome)
+                                | None ->
+                                    return! finish state0 None
+                }

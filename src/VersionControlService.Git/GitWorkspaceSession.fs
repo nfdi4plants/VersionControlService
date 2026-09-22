@@ -1345,6 +1345,38 @@ let private tryGetMergeHead (state: SessionState) (context: OperationContext) =
         | _ -> return None
     }
 
+let private hasActiveMergeSession (state: SessionState) (context: OperationContext) =
+    async {
+        let! mergeHead = tryGetMergeHead state context
+        return OperationResult.succeeded mergeHead.IsSome
+    }
+
+/// The synchronization target is `@{upstream}`, while publication targets the
+/// current branch on the publish remote. A differently named tracked branch has
+/// separate target revisions for those two operations.
+let private publicationTargetRevision
+    (state: SessionState)
+    (syncState: SynchronizationState)
+    (context: OperationContext)
+    : Async<Result<RevisionId option, OperationFailure>> =
+    async {
+        let! branchResult = currentBranchName state context
+
+        match branchResult with
+        | Error failure -> return Error failure
+        | Ok branch ->
+            let! remoteResult = resolvePublishRemote state branch context
+
+            match remoteResult with
+            | Error failure -> return Error failure
+            | Ok(Some remote) ->
+                match syncState.TargetRef with
+                | Some target when target.Kind = RemoteRef && target.Name = $"{remote.Name}/{branch}" ->
+                    return Ok syncState.TargetRevision
+                | _ -> return Ok None
+            | Ok None -> return Ok None
+    }
+
 let private conflictRunner (state: SessionState) (context: OperationContext) : GitConflictSession.GitRunner =
     fun arguments stdinData -> runGit state.Hooks state.RepoPath arguments stdinData context
 
@@ -2739,6 +2771,23 @@ let private previewRefreshedState (state: SessionState) (context: OperationConte
                     }
     }
 
+let private previewFromState
+    (state: SessionState)
+    (syncState: SynchronizationState)
+    (context: OperationContext)
+    =
+    async {
+        match syncState.Relationship, syncState.TargetRevision with
+        | UnknownRelationship, Some _ ->
+            return
+                Failed(
+                    previewIndeterminate
+                        "synchronization state"
+                        "The workspace and target histories do not share a merge base."
+                )
+        | _ -> return! previewRefreshedState state context syncState
+    }
+
 let private previewUpdate (state: SessionState) (context: OperationContext) =
     async {
         let! refreshResult = refresh state context
@@ -2746,211 +2795,197 @@ let private previewUpdate (state: SessionState) (context: OperationContext) =
         match refreshResult with
         | Failed failure -> return Failed failure
         | PartiallySucceeded(_, failure) -> return Failed failure
-        | Succeeded outcome ->
-            let syncState = outcome.Value
-
-            match syncState.Relationship, syncState.TargetRevision with
-            | UnknownRelationship, Some _ ->
-                return
-                    Failed(
-                        previewIndeterminate
-                            "synchronization state"
-                            "The workspace and target histories do not share a merge base."
-                    )
-            | _ -> return! previewRefreshedState state context syncState
+        | Succeeded outcome -> return! previewFromState state outcome.Value context
     }
 
-let private updateWithIdentity
+let private updateFromState
     (state: SessionState)
-    (request: UpdateRequest)
+    (syncState: SynchronizationState)
     (context: OperationContext)
     =
     async {
-        let! refreshResult = refresh state context
+        match syncState.Relationship with
+        | UpToDate
+        | LocalAhead
+        | NoTarget -> return OperationResult.noOp (Some "The workspace is already up to date.") syncState
+        | _ ->
+            let targetReference =
+                syncState.TargetRevision |> Option.map RevisionId.value |> Option.get
 
-        match refreshResult with
-        | Failed failure -> return Failed failure
-        | PartiallySucceeded(_, failure) -> return Failed failure
-        | Succeeded refreshOutcome ->
-            let syncState = refreshOutcome.Value
+            let! identityResult = resolveRevisionIdentity state context
+            let! startResult = captureMergeStart state context
 
-            match syncState.Relationship with
-            | UpToDate
-            | LocalAhead
-            | NoTarget -> return OperationResult.noOp (Some "The workspace is already up to date.") syncState
-            | _ ->
-                let targetReference =
-                    syncState.TargetRevision |> Option.map RevisionId.value |> Option.get
+            // The failure carries whether git merge was spawned. Recovery only makes
+            // sense after a spawn attempt: an identity failure or a cancellation that
+            // was already pending never touched the repository.
+            let! mergeResult =
+                match identityResult, startResult with
+                | Error failure, _
+                | _, Error failure -> async { return Error(failure, false) }
+                | Ok identityArguments, Ok _ ->
+                    async {
+                        do! barrier state.Hooks state.RepoPath "update-merge" context
 
-                let! identityResult = resolveRevisionIdentity state context
-                let! startResult = captureMergeStart state context
+                        if context.Cancellation.IsCancellationRequested() then
+                            return
+                                Error(
+                                    OperationFailure.create
+                                        Canceled
+                                        "operation_canceled"
+                                        "The update was canceled before the merge started.",
+                                    false
+                                )
+                        else
+                            let! result =
+                                runGitEnv
+                                    state.Hooks
+                                    state.RepoPath
+                                    // Ignored files are not part of the overwrite check by
+                                    // default, and an implicit autostash moves files outside
+                                    // the target diff. Both would defeat a truthful report of
+                                    // what a killed merge may have touched.
+                                    [|
+                                        yield! identityArguments
+                                        "merge"
+                                        "--no-edit"
+                                        "--no-overwrite-ignore"
+                                        "--no-autostash"
+                                        targetReference
+                                    |]
+                                    None
+                                    [| "GIT_LFS_SKIP_SMUDGE", "1" |]
+                                    context
 
-                // The failure carries whether git merge was spawned. Recovery only makes
-                // sense after a spawn attempt: an identity failure or a cancellation that
-                // was already pending never touched the repository.
-                let! mergeResult =
-                    match identityResult, startResult with
-                    | Error failure, _
-                    | _, Error failure -> async { return Error(failure, false) }
-                    | Ok identityArguments, Ok _ ->
-                        async {
-                            do! barrier state.Hooks state.RepoPath "update-merge" context
+                            return result |> Result.mapError (fun failure -> failure, true)
+                    }
 
-                            if context.Cancellation.IsCancellationRequested() then
-                                return
-                                    Error(
-                                        OperationFailure.create
-                                            Canceled
-                                            "operation_canceled"
-                                            "The update was canceled before the merge started.",
-                                        false
-                                    )
-                            else
-                                let! result =
-                                    runGitEnv
-                                        state.Hooks
-                                        state.RepoPath
-                                        // Ignored files are not part of the overwrite check by
-                                        // default, and an implicit autostash moves files outside
-                                        // the target diff. Both would defeat a truthful report of
-                                        // what a killed merge may have touched.
-                                        [|
-                                            yield! identityArguments
-                                            "merge"
-                                            "--no-edit"
-                                            "--no-overwrite-ignore"
-                                            "--no-autostash"
-                                            targetReference
-                                        |]
-                                        None
-                                        [| "GIT_LFS_SKIP_SMUDGE", "1" |]
-                                        context
+            match mergeResult, startResult with
+            | Error(failure, true), Ok start when failure.Category = Canceled ->
+                let! recovered = recoverCanceledMerge state start targetReference failure context
+                return Failed recovered
+            | Error(failure, _), _ -> return Failed failure
+            | Ok _, Error failure -> return Failed failure
+            | Ok output, Ok start when output.ExitCode = 0 ->
+                let! updatedState = synchronizationState state context
 
-                                return result |> Result.mapError (fun failure -> failure, true)
+                match updatedState with
+                | Error failure -> return Failed { failure with StateChanged = true }
+                | Ok newState ->
+                    let! materializationSetting =
+                        runGit
+                            state.Hooks
+                            state.RepoPath
+                            [| "config"; "--get"; GitService.MaterializeLargeObjectsKey |]
+                            None
+                            context
+
+                    let materializeLargeObjects =
+                        match materializationSetting with
+                        | Ok setting when setting.ExitCode = 0 ->
+                            match setting.StdOut.Trim().ToLowerInvariant() with
+                            | "true"
+                            | "1"
+                            | "yes"
+                            | "on" -> true
+                            | _ -> false
+                        | _ -> false
+
+                    if not materializeLargeObjects then
+                        return OperationResult.succeeded newState
+                    else
+                        let! remoteResult =
+                            match syncState.TargetRef with
+                            | Some target -> configuredUpstreamRemote state target.Name context
+                            | None -> async { return Ok None }
+
+                        let! hydration =
+                            match remoteResult with
+                            | Error failure -> async { return Error failure }
+                            | Ok None ->
+                                async {
+                                    return
+                                        Error(
+                                            OperationFailure.create
+                                                Validation
+                                                "configured_target_invalid"
+                                                "The configured Git upstream does not identify a remote."
+                                        )
+                                }
+                            | Ok(Some remote) ->
+                                async {
+                                    let! authentication = fetchAuthenticationForRemote state remote context
+
+                                    let hydrationRef =
+                                        syncState.TargetRef
+                                        |> Option.bind (fun target ->
+                                            let prefix = remote + "/"
+
+                                            if target.Name.StartsWith(prefix, StringComparison.Ordinal) then
+                                                Some(target.Name.Substring prefix.Length)
+                                            else
+                                                None)
+
+                                    match authentication with
+                                    | Error failure -> return Error failure
+                                    | Ok authentication ->
+                                        return!
+                                            runGitEnv
+                                                state.Hooks
+                                                state.RepoPath
+                                                [|
+                                                    yield! authentication.ConfigArgs
+                                                    "lfs"
+                                                    "pull"
+                                                    remote
+                                                    yield! hydrationRef |> Option.toArray
+                                                |]
+                                                None
+                                                [| "GIT_TERMINAL_PROMPT", "0" |]
+                                                context
+                                }
+
+                        let affectedPaths =
+                            syncState.RemoteChangedPaths
+                            |> Option.defaultValue [||]
+                            |> Array.map RepositoryPath.value
+
+                        let outcome = {
+                            OperationOutcome.performed newState with
+                                AffectedPaths = affectedPaths
+                                ResultingRevision = newState.WorkspaceRevision
                         }
 
-                match mergeResult, startResult with
-                | Error(failure, true), Ok start when failure.Category = Canceled ->
-                    let! recovered = recoverCanceledMerge state start targetReference failure context
-                    return Failed recovered
-                | Error(failure, _), _ -> return Failed failure
-                | Ok output, _ when output.ExitCode = 0 ->
-                    let! updatedState = synchronizationState state context
+                        let partial failure =
+                            OperationResult.partiallySucceeded
+                                outcome
+                                {
+                                    failure with
+                                        AffectedPaths = affectedPaths
+                                }
+                                (materializationRecovery failure)
 
-                    match updatedState with
-                    | Error failure -> return Failed failure
-                    | Ok newState ->
-                        let! materializationSetting =
-                            runGit
-                                state.Hooks
-                                state.RepoPath
-                                [| "config"; "--get"; GitService.MaterializeLargeObjectsKey |]
-                                None
-                                context
+                        match hydration with
+                        | Ok hydrationOutput when hydrationOutput.ExitCode = 0 -> return Succeeded outcome
+                        | Ok hydrationOutput ->
+                            let detail =
+                                if String.IsNullOrWhiteSpace hydrationOutput.StdErr then
+                                    hydrationOutput.StdOut
+                                else
+                                    hydrationOutput.StdErr
 
-                        let materializeLargeObjects =
-                            match materializationSetting with
-                            | Ok setting when setting.ExitCode = 0 ->
-                                match setting.StdOut.Trim().ToLowerInvariant() with
-                                | "true"
-                                | "1"
-                                | "yes"
-                                | "on" -> true
-                                | _ -> false
-                            | _ -> false
+                            return
+                                partial (hydrationFailure "update" detail)
+                        | Error hydrationFailure ->
+                            return
+                                partial {
+                                    hydrationFailure with
+                                        Code = "hydration_failed"
+                                }
+            | Ok output, Ok start ->
+                let! mergeHead = tryGetMergeHead state context
 
-                        if not materializeLargeObjects then
-                            return OperationResult.succeeded newState
-                        else
-                            let! remoteResult =
-                                match syncState.TargetRef with
-                                | Some target -> configuredUpstreamRemote state target.Name context
-                                | None -> async { return Ok None }
-
-                            let! hydration =
-                                match remoteResult with
-                                | Error failure -> async { return Error failure }
-                                | Ok None ->
-                                    async {
-                                        return
-                                            Error(
-                                                OperationFailure.create
-                                                    Validation
-                                                    "configured_target_invalid"
-                                                    "The configured Git upstream does not identify a remote."
-                                            )
-                                    }
-                                | Ok(Some remote) ->
-                                    async {
-                                        let! authentication = fetchAuthenticationForRemote state remote context
-
-                                        let hydrationRef =
-                                            syncState.TargetRef
-                                            |> Option.bind (fun target ->
-                                                let prefix = remote + "/"
-
-                                                if target.Name.StartsWith(prefix, StringComparison.Ordinal) then
-                                                    Some(target.Name.Substring prefix.Length)
-                                                else
-                                                    None)
-
-                                        match authentication with
-                                        | Error failure -> return Error failure
-                                        | Ok authentication ->
-                                            return!
-                                                runGitEnv
-                                                    state.Hooks
-                                                    state.RepoPath
-                                                    [|
-                                                        yield! authentication.ConfigArgs
-                                                        "lfs"
-                                                        "pull"
-                                                        remote
-                                                        yield! hydrationRef |> Option.toArray
-                                                    |]
-                                                    None
-                                                    [| "GIT_TERMINAL_PROMPT", "0" |]
-                                                    context
-                                    }
-
-                            let affectedPaths =
-                                syncState.RemoteChangedPaths
-                                |> Option.defaultValue [||]
-                                |> Array.map RepositoryPath.value
-
-                            let outcome = {
-                                OperationOutcome.performed newState with
-                                    AffectedPaths = affectedPaths
-                                    ResultingRevision = newState.WorkspaceRevision
-                            }
-
-                            let partial failure =
-                                OperationResult.partiallySucceeded
-                                    outcome
-                                    {
-                                        failure with
-                                            AffectedPaths = affectedPaths
-                                    }
-                                    (materializationRecovery failure)
-
-                            match hydration with
-                            | Ok hydrationOutput when hydrationOutput.ExitCode = 0 -> return Succeeded outcome
-                            | Ok hydrationOutput ->
-                                let detail =
-                                    if String.IsNullOrWhiteSpace hydrationOutput.StdErr then
-                                        hydrationOutput.StdOut
-                                    else
-                                        hydrationOutput.StdErr
-
-                                return
-                                    partial (hydrationFailure "update" detail)
-                            | Error hydrationFailure ->
-                                return
-                                    partial {
-                                        hydrationFailure with
-                                            Code = "hydration_failed"
-                                    }
-                | Ok _, _ ->
+                match mergeHead with
+                | Some _ ->
                     // Conflicting merge: the conflict-session cycle turns this into a
                     // provider-managed session; the shell reports the structured code.
                     let! updatedState = synchronizationState state context
@@ -2971,12 +3006,35 @@ let private updateWithIdentity
                                 Code = "resolve_conflict_session"
                                 Instructions = Some "Resolve every conflict item, then finalize."
                             }
+                | None ->
+                    let! headAfter = revParse state "HEAD" context
+
+                    let details =
+                        output.StdErr.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
+
+                    let rejected =
+                        OperationFailure.createRedacted ProviderError "update_rejected" "Git rejected the update."
+                        |> OperationFailure.withDetails details
+
+                    return
+                        Failed {
+                            rejected with
+                                StateChanged = start.Head <> headAfter
+                                Retryable = false
+                        }
     }
 
 let private update (state: SessionState) (request: UpdateRequest) (context: OperationContext) =
-    updateWithIdentity state request context
+    async {
+        let! refreshResult = refresh state context
 
-let private publish (state: SessionState) (request: PublishRequest) (context: OperationContext) =
+        match refreshResult with
+        | Failed failure -> return Failed failure
+        | PartiallySucceeded(_, failure) -> return Failed failure
+        | Succeeded outcome -> return! updateFromState state outcome.Value context
+    }
+
+let private publish (state: SessionState) (expectedTarget: RevisionId option) (context: OperationContext) =
     async {
         let! branchResult = currentBranchName state context
 
@@ -3031,7 +3089,7 @@ let private publish (state: SessionState) (request: PublishRequest) (context: Op
                 let remoteName = targetRemote.Name
 
                 let expectedMatches =
-                    match request.ExpectedTargetRevision, observedTarget with
+                    match expectedTarget, observedTarget with
                     | None, _ -> true
                     | Some expected, Some observed -> RevisionId.value expected = observed
                     | Some _, None -> false
@@ -3045,7 +3103,7 @@ let private publish (state: SessionState) (request: PublishRequest) (context: Op
                                 "The publication target advanced past the expected revision." with
                                 RevisionEvidence = [|
                                     yield!
-                                        request.ExpectedTargetRevision
+                                        expectedTarget
                                         |> Option.map (fun revision -> "expected_target", revision)
                                         |> Option.toList
                                     yield!
@@ -4248,7 +4306,28 @@ let createSessionWithCredentialsIdentityAndPolicy
                     Publish =
                         fun request context ->
                             withValidatedMutation state request.ExpectedWorkspaceVersion context (fun () ->
-                                publish state request context)
+                                publish state request.ExpectedTargetRevision context)
+                    Synchronize =
+                        fun request context ->
+                            withValidatedMutation state request.ExpectedWorkspaceVersion context (fun () ->
+                                Synchronization.compose
+                                    {
+                                        HasActiveConflictSession = fun context -> hasActiveMergeSession state context
+                                        Refresh = fun context -> refresh state context
+                                        PreviewUpdate = fun syncState context -> previewFromState state syncState context
+                                        Update = fun syncState context -> updateFromState state syncState context
+                                        Publish =
+                                            fun syncState context ->
+                                                async {
+                                                    let! expected = publicationTargetRevision state syncState context
+
+                                                    match expected with
+                                                    | Error failure -> return Failed failure
+                                                    | Ok expected -> return! publish state expected context
+                                                }
+                                    }
+                                    request
+                                    context)
                 }
             ConflictResolution = Some(createConflictService state)
             TextDiff = Some(createTextDiff state)
