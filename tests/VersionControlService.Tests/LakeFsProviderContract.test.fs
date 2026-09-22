@@ -2435,8 +2435,17 @@ Vitest.describe (
                         (repositoryPath "binary.dat")
                         (SupplyResolvedContent "text would corrupt bytes")
                 with
-                | Error failure -> Vitest.expect(failure.Code).toBe "binary_resolution_required"
+                | Error failure -> Vitest.expect(failure.Code).toBe "manual_resolution_required"
                 | Ok() -> failwith "Expected supplied text to be rejected for a binary conflict."
+
+                match
+                    LakeFsConflictSession.resolve
+                        conflict
+                        (repositoryPath "binary.dat")
+                        (PickCandidate "bogus")
+                with
+                | Error failure -> Vitest.expect(failure.Code).toBe "unknown_candidate"
+                | Ok() -> failwith "Expected an unknown candidate to be rejected for a binary conflict."
 
                 match
                     LakeFsConflictSession.resolve

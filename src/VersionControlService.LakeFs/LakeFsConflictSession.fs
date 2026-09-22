@@ -173,20 +173,24 @@ let resolve (conflict: State) (path: RepositoryPath) (resolution: ConflictResolu
 
         match resolvedContent with
         | None ->
-            let code, message =
-                match resolution with
-                | PickCandidate candidateId ->
-                    "unknown_candidate", $"Candidate '{candidateId}' is not advertised for this conflict item."
-                | _ ->
-                    "binary_resolution_required",
-                    "Binary conflicts must be resolved by selecting an original candidate or editing the file manually."
-
-            Error(
-                OperationFailure.create
-                    Validation
-                    code
-                    message
-            )
+            match resolution with
+            | PickCandidate candidateId ->
+                Error(
+                    OperationFailure.create
+                        Validation
+                        "unknown_candidate"
+                        $"Candidate '{candidateId}' is not advertised for this conflict item."
+                )
+            | _ ->
+                // The same code and category as the Git provider: the item holds
+                // binary or non-text content, so supplied text cannot resolve it.
+                Error {
+                    OperationFailure.create
+                        Unsupported
+                        "manual_resolution_required"
+                        $"The conflict at '{pathValue}' contains binary or non-text content and must be resolved by selecting an original candidate or editing the file manually." with
+                        AffectedPaths = [| pathValue |]
+                }
         | Some content ->
             item.ResolvedContent <- Some content
             conflict.HandleVersion <- conflict.HandleVersion + 1
