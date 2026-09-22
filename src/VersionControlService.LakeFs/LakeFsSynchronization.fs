@@ -18,6 +18,15 @@ let previewIndeterminate (classification: string) (failure: OperationFailure) =
             Retryable = true
     }
 
+let missingBaseRevisionFailure () =
+    {
+        OperationFailure.createRedacted
+            ProviderError
+            "preview_indeterminate"
+            "The workspace has no synchronized base revision. Reconcile the workspace before updating." with
+            Retryable = true
+    }
+
 /// Adds a provider-neutral, object-level remote diff to a live synchronization
 /// snapshot. Revision counts remain absent because lakeFS does not expose Git
 /// ahead/behind semantics.

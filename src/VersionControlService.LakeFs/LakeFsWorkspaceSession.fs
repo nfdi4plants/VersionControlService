@@ -1713,9 +1713,15 @@ let private refresh (state: SessionState) (context: OperationContext) =
 
 let private previewAgainst (state: SessionState) (head: string) (context: OperationContext) =
     async {
-        let! changed = targetChangedPathsAgainst state head context
+        let noSynchronizedBase = state.Index.BaseRevision.IsNone
+
+        let! changed =
+            match state.Index.BaseRevision with
+            | None -> async { return Error(LakeFsSynchronization.missingBaseRevisionFailure ()) }
+            | Some _ -> targetChangedPathsAgainst state head context
 
         match changed with
+        | Error failure when noSynchronizedBase -> return Failed failure
         | Error failure ->
             return
                 Failed(
@@ -1855,7 +1861,7 @@ let private buildConflictItems
         return List.ofSeq items
     }
 
-let private updateAgainst (state: SessionState) (head: string) (context: OperationContext) =
+let private updateAgainstCore (state: SessionState) (head: string) (context: OperationContext) =
     async {
         if Some head = state.Index.BaseRevision then
             return
@@ -2045,7 +2051,7 @@ let private updateAgainst (state: SessionState) (head: string) (context: Operati
                                             if canFastForwardToTarget then
                                                 head
                                             else
-                                                state.Index.WorkspaceBranch
+                                                mergeResult.Reference
 
                                         let resultingWorkspace =
                                             if canFastForwardToTarget then
@@ -2059,17 +2065,22 @@ let private updateAgainst (state: SessionState) (head: string) (context: Operati
                                                 WorkspaceRevision = Some resultingWorkspace
                                         }
 
+                                        // updateAgainst refuses an index without a base, so the preview's
+                                        // target diff is always the exact write set here.
+                                        let targetChangedPaths =
+                                            Some(
+                                                previewOutcome.Value.ChangedPaths
+                                                |> Array.map RepositoryPath.value
+                                                |> Set.ofArray
+                                            )
+
                                         let! materialized =
                                             materializeRef
                                                 state
                                                 resolved
                                                 materializationRef
                                                 false
-                                                (Some(
-                                                    previewOutcome.Value.ChangedPaths
-                                                    |> Array.map RepositoryPath.value
-                                                    |> Set.ofArray
-                                                ))
+                                                targetChangedPaths
                                                 finalizeIndex
                                                 context
 
@@ -2106,6 +2117,13 @@ let private updateAgainst (state: SessionState) (head: string) (context: Operati
                                             return
                                                 synchronizationState state (Some head)
                                                 |> OperationResult.succeeded
+    }
+
+let private updateAgainst (state: SessionState) (head: string) (context: OperationContext) =
+    async {
+        match state.Index.BaseRevision with
+        | None -> return Failed(LakeFsSynchronization.missingBaseRevisionFailure ())
+        | Some _ -> return! updateAgainstCore state head context
     }
 
 let private update (state: SessionState) (_request: UpdateRequest) (context: OperationContext) =
