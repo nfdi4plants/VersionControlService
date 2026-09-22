@@ -3213,7 +3213,7 @@ let private updateFromState
                     }
 
                     // The conflict is certain (MERGE_HEAD exists), so a failed or timed-out inspection
-                    // keeps conflicts_detected and reports itself as a warning; the message says which.
+                    // keeps conflicts_detected and reports itself as a warning. The message says which.
                     let stateValue, warnings =
                         match updatedState with
                         | Ok value -> value, [||]
