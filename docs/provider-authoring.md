@@ -64,7 +64,9 @@ Optional services advertise real capability:
 | `Maintenance` | prune and deduplicate local storage |
 | `RepositoryBrowser` | a credential-free repository URL |
 
-Leave an unsupported service as `None`. Do not add a service whose methods are required stubs that always return `Unsupported`.
+Providers leave an unsupported service as `None`. Do not add a service whose methods are required stubs that always return `Unsupported`.
+
+Filling the gaps is the consumer's choice, not the provider's. `WorkspaceSession.withFallbackServices` returns a session with every service present, and `ProviderFactory.withFallbackServices` wraps a factory so `Open` returns such sessions. A fallback read succeeds as a no-op and carries a `service_unavailable` warning. A fallback mutation, and every synchronization operation, fails with that code. `WorkspaceSession.availability` reports what the provider really supplies and has to be read before the fallback is applied, because a filled session reports every service as present. The fallback covers an opened session only; provisioning, repository locations and credentials stay provider-specific at the composition root. `operation_not_supported` remains the provider's own code for an operation it implements but cannot perform for the given input.
 
 ## Conflict sessions
 

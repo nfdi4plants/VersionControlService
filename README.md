@@ -45,6 +45,10 @@ The host persists `WorkspaceBinding` values. An explicit binding wins over probi
 
 Every opened session has `CoreVersionControl`. Optional services are present only when the provider supports them, so feature discovery is an `Option.isSome` check. Operations return `Succeeded`, `PartiallySucceeded`, or `Failed` with structured state-change, recovery, affected-path, and revision evidence.
 
+A consumer that wants one code path for every provider fills the gaps itself. `WorkspaceSession.withFallbackServices` returns a session with every service present, and `ProviderFactory.withFallbackServices` wraps a factory so that every session it opens is complete; a composition root wraps its factories before `ProviderResolver.tryCreateCatalog`. A fallback read succeeds as a no-op with a `service_unavailable` warning. A fallback mutation, and every synchronization operation, fails with the same code. `WorkspaceSession.availability` reports which services the provider really supplies; read it before filling, because a filled session reports every service as present.
+
+The fallback covers an opened session only. Provisioning (`Initialize`, `Clone`, `Adopt`), repository locations and credentials stay provider-specific at the composition root. A consumer that prefers failing reads, as Swate does, does not apply the fallback, so two consumers may behave differently against the same provider by design.
+
 See:
 
 - [Provider authoring](docs/provider-authoring.md)
