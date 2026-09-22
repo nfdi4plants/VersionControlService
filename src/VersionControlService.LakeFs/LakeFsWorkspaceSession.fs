@@ -432,14 +432,16 @@ let private getTargetHead (state: SessionState) (context: OperationContext) =
     }
 
 /// Target-vs-base changed keys under the prefix, as repo-relative paths.
+/// The paths the target changed since the synchronized base. None when the index has no
+/// base to diff from, so each caller decides what a missing base means for it.
 let private targetChangedPathsAgainst
     (state: SessionState)
     (head: string)
     (context: OperationContext)
-    =
+    : Async<Result<string list option, OperationFailure>> =
     async {
         match state.Index.BaseRevision with
-        | None -> return Ok []
+        | None -> return Ok None
         | Some baseRevision ->
             let! connection = connect state
 
@@ -454,20 +456,26 @@ let private targetChangedPathsAgainst
                 | Ok entries ->
                     return
                         Ok(
-                            entries
-                            |> Array.toList
-                            |> List.choose (fun entry -> repositoryPathOfKey state entry.Path)
-                            |> List.map RepositoryPath.value
+                            Some(
+                                entries
+                                |> Array.toList
+                                |> List.choose (fun entry -> repositoryPathOfKey state entry.Path)
+                                |> List.map RepositoryPath.value
+                            )
                         )
     }
 
-let private targetChangedPaths (state: SessionState) (context: OperationContext) =
+let private targetChangedPaths
+    (state: SessionState)
+    (context: OperationContext)
+    : Async<Result<string list option, OperationFailure>> =
     async {
         let! targetHead = getTargetHead state context
 
         match targetHead with
         | Error failure -> return Error failure
-        | Ok head -> return! targetChangedPathsAgainst state head context
+        | Ok head ->
+            return! targetChangedPathsAgainst state head context
     }
 
 // ---------------------------------------------------------------------------
@@ -1702,7 +1710,10 @@ let private refresh (state: SessionState) (context: OperationContext) =
 
                 match changed with
                 | Error failure -> return Failed failure
-                | Ok paths ->
+                | Ok None ->
+                    // Without a base there is no diff to report, so the remote paths stay unknown.
+                    return synchronizationState state (Some head) |> OperationResult.succeeded
+                | Ok(Some paths) ->
                     return
                         synchronizationState state (Some head)
                         |> LakeFsSynchronization.withRemoteChangedPaths paths
@@ -1711,15 +1722,10 @@ let private refresh (state: SessionState) (context: OperationContext) =
 
 let private previewAgainst (state: SessionState) (head: string) (context: OperationContext) =
     async {
-        let noSynchronizedBase = state.Index.BaseRevision.IsNone
-
-        let! changed =
-            match state.Index.BaseRevision with
-            | None -> async { return Error(LakeFsSynchronization.missingBaseRevisionFailure ()) }
-            | Some _ -> targetChangedPathsAgainst state head context
+        let! changed = targetChangedPathsAgainst state head context
 
         match changed with
-        | Error failure when noSynchronizedBase -> return Failed failure
+        | Ok None -> return Failed(LakeFsSynchronization.missingBaseRevisionFailure ())
         | Error failure ->
             return
                 Failed(
@@ -1727,7 +1733,7 @@ let private previewAgainst (state: SessionState) (head: string) (context: Operat
                         "target changed paths"
                         failure
                 )
-        | Ok changedPaths ->
+        | Ok(Some changedPaths) ->
             let dirtyPaths = classifyWorkspace state |> List.map _.ChangePath |> Set.ofList
 
             // Locally committed changes since base: workspace branch vs base diff.
@@ -1859,7 +1865,7 @@ let private buildConflictItems
         return List.ofSeq items
     }
 
-let private updateAgainstCore (state: SessionState) (head: string) (context: OperationContext) =
+let private updateAgainst (state: SessionState) (head: string) (context: OperationContext) =
     async {
         if Some head = state.Index.BaseRevision then
             return
@@ -2063,8 +2069,8 @@ let private updateAgainstCore (state: SessionState) (head: string) (context: Ope
                                                 WorkspaceRevision = Some resultingWorkspace
                                         }
 
-                                        // updateAgainst refuses an index without a base, so the preview's
-                                        // target diff is always the exact write set here.
+                                        // The preview's target diff is the exact write set used for
+                                        // materialization after the merge.
                                         let targetChangedPaths =
                                             Some(
                                                 previewOutcome.Value.ChangedPaths
@@ -2115,13 +2121,6 @@ let private updateAgainstCore (state: SessionState) (head: string) (context: Ope
                                             return
                                                 synchronizationState state (Some head)
                                                 |> OperationResult.succeeded
-    }
-
-let private updateAgainst (state: SessionState) (head: string) (context: OperationContext) =
-    async {
-        match state.Index.BaseRevision with
-        | None -> return Failed(LakeFsSynchronization.missingBaseRevisionFailure ())
-        | Some _ -> return! updateAgainstCore state head context
     }
 
 let private update (state: SessionState) (_request: UpdateRequest) (context: OperationContext) =
@@ -2380,31 +2379,32 @@ let private completeConflictFinalize
             |> Option.defaultValue targetRevision
 
         let! targetChangedResult = targetChangedPathsAgainst state targetHead context
-        let mutable selectedPaths = Set.empty
-        let mutable targetChangedFailure = None
 
         match targetChangedResult with
-        | Error failure -> targetChangedFailure <- Some failure
-        | Ok paths -> selectedPaths <- Set.ofList paths
+        | Ok None -> return Failed(LakeFsSynchronization.missingBaseRevisionFailure ())
+        | Error failure ->
+            return
+                Failed(
+                    LakeFsSynchronization.previewIndeterminate
+                        "target changed paths"
+                        failure
+                )
+        | Ok(Some targetChangedPaths) ->
+            let selectedPaths =
+                let conflictPaths =
+                    state.Conflict
+                    |> Option.map (fun conflict -> conflict.Items |> List.map _.ItemPath |> Set.ofList)
+                    |> Option.defaultValue Set.empty
 
-        match state.Conflict with
-        | Some conflict ->
-            selectedPaths <-
-                Set.union
-                    selectedPaths
-                    (conflict.Items |> List.map _.ItemPath |> Set.ofList)
-        | None -> ()
+                Set.union (Set.ofList targetChangedPaths) conflictPaths
 
-        let finalizeIndex (index: LakeFsIndex.WorkspaceIndex) = {
-            index with
-                BaseRevision = Some targetRevision
-                WorkspaceRevision = Some resultingRevision
-        }
+            let finalizeIndex (index: LakeFsIndex.WorkspaceIndex) = {
+                index with
+                    BaseRevision = Some targetRevision
+                    WorkspaceRevision = Some resultingRevision
+            }
 
-        let! materialized =
-            match targetChangedFailure with
-            | Some failure -> async { return Failed failure }
-            | None ->
+            let! materialized =
                 materializeRef
                     state
                     resolved
@@ -2414,28 +2414,28 @@ let private completeConflictFinalize
                     finalizeIndex
                     context
 
-        match materialized with
-        | Failed failure ->
-            return
-                PartiallySucceeded(
-                    OperationOutcome.performed (Some(mkRevisionId resultingRevision)),
-                    materializationRecoveryFailure
-                        state.RecoveryDirectory
-                        state.Index.WorkspaceRevision
-                        resultingRevision
-                        [||]
+            match materialized with
+            | Failed failure ->
+                return
+                    PartiallySucceeded(
+                        OperationOutcome.performed (Some(mkRevisionId resultingRevision)),
+                        materializationRecoveryFailure
+                            state.RecoveryDirectory
+                            state.Index.WorkspaceRevision
+                            resultingRevision
+                            [||]
+                            failure
+                    )
+            | PartiallySucceeded(outcome, failure) ->
+                return
+                    PartiallySucceeded(
+                        mapOutcomeValue (Some(mkRevisionId resultingRevision)) outcome,
                         failure
-                )
-        | PartiallySucceeded(outcome, failure) ->
-            return
-                PartiallySucceeded(
-                    mapOutcomeValue (Some(mkRevisionId resultingRevision)) outcome,
-                    failure
-                )
-        | Succeeded outcome ->
-            cleanupConflictCandidates state
-            state.Conflict <- None
-            return Succeeded(mapOutcomeValue (Some(mkRevisionId resultingRevision)) outcome)
+                    )
+            | Succeeded outcome ->
+                cleanupConflictCandidates state
+                state.Conflict <- None
+                return Succeeded(mapOutcomeValue (Some(mkRevisionId resultingRevision)) outcome)
     }
 
 let private partialConflictFinalize
