@@ -4180,25 +4180,44 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                             }
                                                 }
                                         | Ok _ ->
-                                            // Close the merge state and the session.
-                                            let mutable cleanupFailure = None
+                                            // The merge commit exists now. The cleanup reads state paths only, so
+                                            // it runs on a detached context: a cancellation that lands here must
+                                            // not turn a committed merge into a plain failure.
+                                            let cleanupContext = {
+                                                context with
+                                                    Cancellation = OperationCancellation.none
+                                            }
 
-                                            for stateFile in [ "MERGE_HEAD"; "MERGE_MSG"; "MERGE_MODE" ] do
-                                                if cleanupFailure.IsNone then
-                                                    let! statePathResult = resolveGitStatePath state stateFile context
+                                            let! statePathsResult =
+                                                resolveGitStatePaths
+                                                    state
+                                                    [| "MERGE_HEAD"; "MERGE_MSG"; "MERGE_MODE" |]
+                                                    cleanupContext
 
-                                                    match statePathResult with
-                                                    | Error failure -> cleanupFailure <- Some failure
-                                                    | Ok(Some path) when NodeFileSystem.existsSync path ->
+                                            match statePathsResult with
+                                            | Error failure ->
+                                                return
+                                                    Failed {
+                                                        failure with
+                                                            StateChanged = true
+                                                            RecoveryAction =
+                                                                Some {
+                                                                    Code = "inspect_workspace"
+                                                                    Instructions =
+                                                                        Some
+                                                                            "The merge was committed but its state files could not be located. Inspect the workspace and remove MERGE_HEAD, MERGE_MSG and MERGE_MODE before continuing."
+                                                                }
+                                                    }
+                                            | Ok statePaths ->
+                                                for statePath in statePaths do
+                                                    match statePath with
+                                                    | Some path when NodeFileSystem.existsSync path ->
                                                         try
                                                             NodeFileSystem.unlinkSync path
                                                         with _ ->
                                                             ()
-                                                    | Ok _ -> ()
+                                                    | _ -> ()
 
-                                            match cleanupFailure with
-                                            | Some failure -> return Failed failure
-                                            | None ->
                                                 state.ConflictSession <- None
                                                 return OperationResult.succeeded (Some(mkRevisionId newCommit))
             }
