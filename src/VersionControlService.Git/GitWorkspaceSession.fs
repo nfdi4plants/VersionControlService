@@ -3008,6 +3008,12 @@ let private updateFromState
                             }
                 | None ->
                     let! headAfter = revParse state "HEAD" context
+                    let! workspaceVersionAfter = computeWorkspaceVersion state context
+
+                    let stateChanged =
+                        match workspaceVersionAfter with
+                        | Ok version -> version <> start.WorkspaceVersion
+                        | Error _ -> start.Head <> headAfter
 
                     let details =
                         output.StdErr.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
@@ -3019,7 +3025,7 @@ let private updateFromState
                     return
                         Failed {
                             rejected with
-                                StateChanged = start.Head <> headAfter
+                                StateChanged = stateChanged
                                 Retryable = false
                         }
     }
@@ -3466,17 +3472,28 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                         | Error failure ->
                                             fallbackState verifiedRevision UnknownRelationship, Some failure
 
-                                    let exactState = {
-                                        syncState with
-                                            BaseRevision = workspaceRevision |> Option.map mkRevisionId
-                                            WorkspaceRevision = workspaceRevision |> Option.map mkRevisionId
-                                            TargetRevision = verifiedRevision |> Option.map mkRevisionId
-                                            RemoteChangedPaths = None
-                                            Relationship = UpToDate
-                                    }
+                                    let publishedRefIsSynchronizationTarget =
+                                        match syncState.TargetRef with
+                                        | Some target when
+                                            target.Kind = RemoteRef
+                                            && target.Name = $"{remoteName}/{branch}" -> true
+                                        | _ -> false
+
+                                    let resultingState =
+                                        if publishedRefIsSynchronizationTarget then
+                                            {
+                                                syncState with
+                                                    BaseRevision = workspaceRevision |> Option.map mkRevisionId
+                                                    WorkspaceRevision = workspaceRevision |> Option.map mkRevisionId
+                                                    TargetRevision = verifiedRevision |> Option.map mkRevisionId
+                                                    RemoteChangedPaths = None
+                                                    Relationship = UpToDate
+                                            }
+                                        else
+                                            syncState
 
                                     let outcome = {
-                                        OperationOutcome.performed exactState with
+                                        OperationOutcome.performed resultingState with
                                             AffectedPaths = affectedPaths
                                             Publication = Published
                                             ResultingRevision = workspaceRevision |> Option.map mkRevisionId

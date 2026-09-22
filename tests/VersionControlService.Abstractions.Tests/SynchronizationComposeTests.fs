@@ -157,6 +157,29 @@ let synchronizationComposeTests =
             Expect.equal failure.Code SynchronizationCodes.ConflictSessionActive "Active conflict code."
             assertSequence log [| "active" |]
 
+        testCase "active conflict step failures are returned as failed"
+        <| fun () ->
+            for activeResult in [
+                Failed(failure ProviderError "active_failed")
+                OperationResult.partiallySucceeded
+                    (OperationOutcome.performed true)
+                    (failure ProviderError "active_partial")
+                    { Code = "retry_active"; Instructions = None }
+            ] do
+                let log = ResizeArray<string>()
+                let steps, _, _ =
+                    recordingSteps
+                        log
+                        activeResult
+                        (OperationResult.succeeded (state UpToDate None))
+                        (fun _ -> OperationResult.succeeded (preview false false [||]))
+                        (fun value -> OperationResult.succeeded value)
+                        (fun value -> OperationResult.succeeded value)
+
+                let observedFailure = expectFailure (run steps (request false false None) None)
+                Expect.equal observedFailure.Category ProviderError "Active-step category is preserved."
+                assertSequence log [| "active" |]
+
         testCase "a failed refresh is returned without later steps"
         <| fun () ->
             let log = ResizeArray<string>()
@@ -214,6 +237,24 @@ let synchronizationComposeTests =
                 Expect.equal outcome.Effect (NoOp(Some "The workspace already has every target revision.")) "No update effect."
                 assertSequence log [| "active"; "refresh" |]
 
+        testCase "diverged and unknown relationships reach preview and update"
+        <| fun () ->
+            for relationship in [ Diverged; UnknownRelationship ] do
+                let log = ResizeArray<string>()
+                let target = revision "target"
+                let steps, _, _ =
+                    recordingSteps
+                        log
+                        (OperationResult.succeeded false)
+                        (OperationResult.succeeded (state relationship (Some target)))
+                        (fun _ -> OperationResult.succeeded (preview false false [||]))
+                        (fun value -> OperationResult.succeeded value)
+                        (fun value -> OperationResult.succeeded value)
+
+                let outcome = expectSucceeded (run steps (request false false None) None)
+                Expect.equal outcome.Effect Performed "A state needing update reaches update."
+                assertSequence log [| "active"; "refresh"; "preview"; "update" |]
+
         testCase "data loss and conflict-only previews produce distinct decisions"
         <| fun () ->
             for hasDataLoss, expectedCode in [ true, SynchronizationCodes.UpdateWouldOverwriteLocalChanges; false, SynchronizationCodes.UpdateWouldCreateConflictSession ] do
@@ -229,12 +270,37 @@ let synchronizationComposeTests =
                         (fun value -> OperationResult.succeeded value)
 
                 let observedFailure = expectFailure (run steps (request false false None) None)
+                let expectedRecovery =
+                    if hasDataLoss then
+                        SynchronizationCodes.ResolveLocalChangesRecovery
+                    else
+                        SynchronizationCodes.AcceptUpdateRisksRecovery
+
                 Expect.equal observedFailure.Code expectedCode "Decision code is stable."
                 Expect.equal observedFailure.Category Conflict "Decision is a conflict."
+                Expect.isFalse observedFailure.StateChanged "The preview failure did not change state."
                 Expect.equal observedFailure.AffectedPaths [| "overlap.txt" |] "Overlapping path is carried."
                 Expect.equal (observedFailure.RevisionEvidence |> Array.map fst) [| "observed_target" |] "Observed target evidence."
-                Expect.equal (observedFailure.RecoveryAction |> Option.map _.Code) (Some SynchronizationCodes.AcceptUpdateRisksRecovery) "Acceptance recovery."
+                Expect.equal (observedFailure.RecoveryAction |> Option.map _.Code) (Some expectedRecovery) "Decision recovery."
                 assertSequence log [| "active"; "refresh"; "preview" |]
+
+        testCase "data loss still fails when accepted and does not update"
+        <| fun () ->
+            let log = ResizeArray<string>()
+            let target = revision "target"
+            let steps, _, _ =
+                recordingSteps
+                    log
+                    (OperationResult.succeeded false)
+                    (OperationResult.succeeded (state TargetAhead (Some target)))
+                    (fun _ -> OperationResult.succeeded (preview true true [| "overlap.txt" |]))
+                    (fun _ -> failwith "Data-loss acceptance must not update.")
+                    (fun value -> OperationResult.succeeded value)
+
+            let observedFailure = expectFailure (run steps (request true false (Some target)) None)
+            Expect.equal observedFailure.Code SynchronizationCodes.UpdateWouldOverwriteLocalChanges "Data-loss code."
+            Expect.equal observedFailure.RecoveryAction.Value.Code SynchronizationCodes.ResolveLocalChangesRecovery "Local-change recovery."
+            assertSequence log [| "active"; "refresh"; "preview" |]
 
         testCase "a clean preview updates the same pinned state"
         <| fun () ->
@@ -269,11 +335,11 @@ let synchronizationComposeTests =
                     (fun value -> OperationResult.succeeded value)
                     (fun value -> OperationResult.succeeded value)
 
-            let observedFailure = expectFailure (run steps (request false false None) None)
+            let observedFailure = expectFailure (run steps (request true false (Some target)) None)
             Expect.equal (observedFailure.RevisionEvidence |> Array.map fst) [| "observed_target" |] "Preview evidence is appended."
             assertSequence log [| "active"; "refresh"; "preview" |]
 
-        testCase "acceptance with a matching target skips preview"
+        testCase "accepted conflict-only preview reaches update"
         <| fun () ->
             let log = ResizeArray<string>()
             let target = revision "target"
@@ -282,13 +348,13 @@ let synchronizationComposeTests =
                     log
                     (OperationResult.succeeded false)
                     (OperationResult.succeeded (state TargetAhead (Some target)))
-                    (fun _ -> failwith "Preview must not run.")
+                    (fun _ -> OperationResult.succeeded (preview false true [| "overlap.txt" |]))
                     (fun value -> OperationResult.succeeded value)
                     (fun value -> OperationResult.succeeded value)
 
             let outcome = expectSucceeded (run steps (request true false (Some target)) None)
             Expect.equal outcome.Effect Performed "Accepted update runs."
-            assertSequence log [| "active"; "refresh"; "update" |]
+            assertSequence log [| "active"; "refresh"; "preview"; "update" |]
 
         testCase "a partial update is returned without publish"
         <| fun () ->
@@ -298,18 +364,19 @@ let synchronizationComposeTests =
                 recordingSteps
                     log
                     (OperationResult.succeeded false)
-                    (OperationResult.succeeded target)
+                    (Succeeded(performed target [| warning "refresh" |] [||] PublicationNotApplicable))
                     (fun _ -> OperationResult.succeeded (preview false false [||]))
                     (fun value ->
                         OperationResult.partiallySucceeded
-                            (OperationOutcome.performed value)
+                            (performed value [| warning "update" |] [||] PublicationNotApplicable)
                             (failure Conflict "conflicts_detected")
                             { Code = "resolve"; Instructions = None })
                     (fun _ -> failwith "Publish must not run.")
 
-            let _, observedFailure = expectPartial (run steps (request true true target.TargetRevision) None)
+            let outcome, observedFailure = expectPartial (run steps (request true true target.TargetRevision) None)
             Expect.equal observedFailure.Code "conflicts_detected" "Update failure is preserved."
-            assertSequence log [| "active"; "refresh"; "update" |]
+            Expect.equal (outcome.Warnings |> Array.map _.Code) [| "refresh"; "update" |] "Refresh warnings reach partial update."
+            assertSequence log [| "active"; "refresh"; "preview"; "update" |]
 
         testCase "cancellation before update returns canceled without update"
         <| fun () ->
@@ -322,13 +389,35 @@ let synchronizationComposeTests =
                     log
                     (OperationResult.succeeded false)
                     (OperationResult.succeeded (state TargetAhead (Some target)))
-                    (fun _ -> failwith "Acceptance skips preview.")
+                    (fun _ -> OperationResult.succeeded (preview false false [||]))
                     (fun _ -> failwith "Update must not run.")
                     (fun value -> OperationResult.succeeded value)
 
             let observedFailure = expectFailure (run steps (request true false (Some target)) (Some cancellation))
             Expect.equal observedFailure.Category Canceled "Cancellation category."
             Expect.isFalse observedFailure.StateChanged "No update happened."
+            assertSequence log [| "active"; "refresh" |]
+
+        testCase "cancellation after refresh with nothing to do skips publication"
+        <| fun () ->
+            let cancellation = OperationCancellation.Source()
+            let log = ResizeArray<string>()
+            let steps: SynchronizationSteps = {
+                HasActiveConflictSession = fun _ -> async { log.Add "active"; return OperationResult.succeeded false }
+                Refresh = fun _ ->
+                    async {
+                        log.Add "refresh"
+                        cancellation.Cancel()
+                        return OperationResult.succeeded (state UpToDate None)
+                    }
+                PreviewUpdate = fun _ _ -> async { return failwith "No-op cancellation must skip preview." }
+                Update = fun _ _ -> async { return failwith "No-op cancellation must skip update." }
+                Publish = fun _ _ -> async { return failwith "No-op cancellation must skip publish." }
+            }
+
+            let observedFailure = expectFailure (run steps (request false false None) (Some cancellation))
+            Expect.equal observedFailure.Category Canceled "Cancellation category."
+            Expect.isFalse observedFailure.StateChanged "No state changed."
             assertSequence log [| "active"; "refresh" |]
 
         testCase "publish disabled returns the update and never publishes"
@@ -340,14 +429,14 @@ let synchronizationComposeTests =
                     log
                     (OperationResult.succeeded false)
                     (OperationResult.succeeded target)
-                    (fun _ -> failwith "Acceptance skips preview.")
+                    (fun _ -> OperationResult.succeeded (preview false false [||]))
                     (fun value -> Succeeded(performed value [| warning "update" |] [||] PublicationNotApplicable))
                     (fun _ -> failwith "Publish must not run.")
 
             let outcome = expectSucceeded (run steps (request true false target.TargetRevision) None)
             Expect.equal outcome.Effect Performed "Update is performed."
             Expect.equal (outcome.Warnings |> Array.map _.Code) [| "update" |] "Update warning is preserved."
-            assertSequence log [| "active"; "refresh"; "update" |]
+            assertSequence log [| "active"; "refresh"; "preview"; "update" |]
 
         testCase "publish disabled with no update is a no-op"
         <| fun () ->
@@ -356,13 +445,32 @@ let synchronizationComposeTests =
                 recordingSteps
                     log
                     (OperationResult.succeeded false)
-                    (OperationResult.succeeded (state UpToDate None))
+                    (Succeeded(performed (state UpToDate None) [| warning "refresh" |] [||] PublicationNotApplicable))
                     (fun _ -> failwith "Preview must not run.")
                     (fun _ -> failwith "Update must not run.")
                     (fun _ -> failwith "Publish must not run.")
 
             let outcome = expectSucceeded (run steps (request false false None) None)
             Expect.isTrue (match outcome.Effect with NoOp _ -> true | Performed -> false) "No update is a no-op."
+            Expect.equal (outcome.Warnings |> Array.map _.Code) [| "refresh" |] "Refresh warning reaches the no-op."
+            Expect.equal outcome.Publication PublicationNotApplicable "Up-to-date no-op has no publication."
+            assertSequence log [| "active"; "refresh" |]
+
+        testCase "update-only local-ahead no-op reports local-only publication"
+        <| fun () ->
+            let log = ResizeArray<string>()
+            let target = state LocalAhead (Some(revision "target"))
+            let steps, _, _ =
+                recordingSteps
+                    log
+                    (OperationResult.succeeded false)
+                    (OperationResult.succeeded target)
+                    (fun _ -> failwith "Preview must not run.")
+                    (fun _ -> failwith "Update must not run.")
+                    (fun _ -> failwith "Publish must not run.")
+
+            let outcome = expectSucceeded (run steps (request false false None) None)
+            Expect.equal outcome.Publication LocalOnly "Local-ahead update-only state is local-only."
             assertSequence log [| "active"; "refresh" |]
 
         testCase "publish merges warnings and affected paths"
@@ -373,17 +481,17 @@ let synchronizationComposeTests =
                 recordingSteps
                     log
                     (OperationResult.succeeded false)
-                    (OperationResult.succeeded target)
-                    (fun _ -> failwith "Acceptance skips preview.")
+                    (Succeeded(performed target [| warning "refresh" |] [||] PublicationNotApplicable))
+                    (fun _ -> OperationResult.succeeded (preview false false [||]))
                     (fun value -> Succeeded(performed value [| warning "update" |] [| "same.txt"; "update.txt" |] PublicationNotApplicable))
                     (fun value -> Succeeded(performed value [| warning "publish" |] [| "same.txt"; "publish.txt" |] Published))
 
             let outcome = expectSucceeded (run steps (request true true target.TargetRevision) None)
             Expect.equal outcome.Effect Performed "Synchronization was performed."
             Expect.equal outcome.Publication Published "Publication comes from publish."
-            Expect.equal (outcome.Warnings |> Array.map _.Code) [| "update"; "publish" |] "Warnings are ordered."
+            Expect.equal (outcome.Warnings |> Array.map _.Code) [| "refresh"; "update"; "publish" |] "Warnings are ordered."
             Expect.equal outcome.AffectedPaths [| "same.txt"; "update.txt"; "publish.txt" |] "Affected paths are distinct and ordered."
-            assertSequence log [| "active"; "refresh"; "update"; "publish" |]
+            assertSequence log [| "active"; "refresh"; "preview"; "update"; "publish" |]
 
         testCase "publish no-op with no update remains a no-op"
         <| fun () ->
@@ -411,7 +519,7 @@ let synchronizationComposeTests =
                     log
                     (OperationResult.succeeded false)
                     (OperationResult.succeeded target)
-                    (fun _ -> failwith "Acceptance skips preview.")
+                    (fun _ -> OperationResult.succeeded (preview false false [||]))
                     (fun value -> Succeeded(performed value [||] [| "updated.txt" |] PublicationNotApplicable))
                     (fun _ -> Failed(failure Network "publish_failed"))
 
@@ -419,7 +527,7 @@ let synchronizationComposeTests =
             Expect.equal outcome.Publication LocalOnly "Update is local-only."
             Expect.isTrue observedFailure.StateChanged "The update changed state."
             Expect.equal (observedFailure.RecoveryAction |> Option.map _.Code) (Some SynchronizationCodes.RetryPublishRecovery) "Retry recovery."
-            assertSequence log [| "active"; "refresh"; "update"; "publish" |]
+            assertSequence log [| "active"; "refresh"; "preview"; "update"; "publish" |]
 
         testCase "a publish failure with its own recovery keeps that recovery"
         <| fun () ->
@@ -432,7 +540,7 @@ let synchronizationComposeTests =
                     log
                     (OperationResult.succeeded false)
                     (OperationResult.succeeded target)
-                    (fun _ -> failwith "Acceptance skips preview.")
+                    (fun _ -> OperationResult.succeeded (preview false false [||]))
                     (fun value -> Succeeded(performed value [||] [||] PublicationNotApplicable))
                     (fun _ -> Failed publishFailure)
 
@@ -449,12 +557,17 @@ let synchronizationComposeTests =
                     log
                     (OperationResult.succeeded false)
                     (OperationResult.succeeded target)
-                    (fun _ -> failwith "Acceptance skips preview.")
+                    (fun _ -> OperationResult.succeeded (preview false false [||]))
                     (fun value -> Succeeded(performed value [||] [||] PublicationNotApplicable))
                     (fun _ -> Failed publishFailure)
 
             match run steps (request true true target.TargetRevision) None with
-            | Failed observed -> Expect.isTrue observed.StateChanged "Provider failure is unchanged."
+            | Failed observed ->
+                Expect.isTrue observed.StateChanged "Provider failure is still state-changing."
+                Expect.equal
+                    (observed.RecoveryAction |> Option.map _.Code)
+                    (Some SynchronizationCodes.RetryPublishRecovery)
+                    "Retry recovery is added."
             | Succeeded _
             | PartiallySucceeded _ -> failtest "Expected failed publish."
 
@@ -486,7 +599,7 @@ let synchronizationComposeTests =
                     log
                     (OperationResult.succeeded false)
                     (OperationResult.succeeded target)
-                    (fun _ -> failwith "Acceptance skips preview.")
+                    (fun _ -> OperationResult.succeeded (preview false false [||]))
                     (fun value -> Succeeded(performed value [| warning "update" |] [| "update.txt" |] PublicationNotApplicable))
                     (fun value -> OperationResult.partiallySucceeded (performed value [| warning "publish" |] [| "publish.txt" |] LocalOnly) publishFailure { Code = "publish-recovery"; Instructions = None })
 
@@ -505,7 +618,7 @@ let synchronizationComposeTests =
                     log
                     (OperationResult.succeeded false)
                     (OperationResult.succeeded target)
-                    (fun _ -> failwith "Acceptance skips preview.")
+                    (fun _ -> OperationResult.succeeded (preview false false [||]))
                     (fun value ->
                         cancellation.Cancel()
                         Succeeded(performed value [||] [||] PublicationNotApplicable))
@@ -514,7 +627,7 @@ let synchronizationComposeTests =
             let outcome, observedFailure = expectPartial (run steps (request true true target.TargetRevision) (Some cancellation))
             Expect.equal outcome.Publication LocalOnly "Canceled publish leaves local state."
             Expect.equal observedFailure.Category Canceled "Cancellation category."
-            assertSequence log [| "active"; "refresh"; "update" |]
+            assertSequence log [| "active"; "refresh"; "preview"; "update" |]
 
         testCase "publish receives the state returned by update"
         <| fun () ->
@@ -526,11 +639,11 @@ let synchronizationComposeTests =
                     log
                     (OperationResult.succeeded false)
                     (OperationResult.succeeded refreshed)
-                    (fun _ -> failwith "Acceptance skips preview.")
+                    (fun _ -> OperationResult.succeeded (preview false false [||]))
                     (fun _ -> Succeeded(performed updated [||] [||] PublicationNotApplicable))
                     (fun value -> Succeeded(performed value [||] [||] Published))
 
             ignore (expectSucceeded (run steps (request true true refreshed.TargetRevision) None))
             Expect.isTrue (System.Object.ReferenceEquals(updated, publishedState.Value.Value)) "Publish receives the updated state."
-            assertSequence log [| "active"; "refresh"; "update"; "publish" |]
+            assertSequence log [| "active"; "refresh"; "preview"; "update"; "publish" |]
     ]

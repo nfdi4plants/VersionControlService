@@ -3762,6 +3762,15 @@ Vitest.describe (
                         |> Async.StartAsPromise
 
                     let revision = expectSucceeded "feature revision" revisionResult
+                    let! refreshResult =
+                        (syncService session).Refresh(ctx "feature-refresh")
+                        |> Async.StartAsPromise
+
+                    let refreshed = expectSucceeded "feature refresh" refreshResult
+                    let originMainRevision =
+                        refreshed.TargetRevision
+                        |> Option.defaultWith (fun () -> failwith "Expected origin/main revision.")
+
                     let! afterRevision = sessionStatus session
                     let! synchronizeResult =
                         (syncService session).Synchronize
@@ -3777,7 +3786,10 @@ Vitest.describe (
                     match synchronizeResult with
                     | Succeeded outcome ->
                         Vitest.expect(outcome.Publication).toEqual (Published)
-                        Vitest.expect(outcome.Value.TargetRevision).toEqual (Some revision)
+                        Vitest.expect(outcome.ResultingRevision).toEqual (Some revision)
+                        Vitest.expect(outcome.Value.TargetRef |> Option.map _.Name).toEqual (Some "origin/main")
+                        Vitest.expect(outcome.Value.TargetRevision).toEqual (Some originMainRevision)
+                        Vitest.expect(outcome.Value.Relationship).toEqual (LocalAhead)
                     | Failed failure ->
                         Vitest.expect(failure.Code).not.toBe ("precondition_failed")
                         failwith $"Expected feature synchronize to succeed, received {failure.Code}."
@@ -3787,6 +3799,77 @@ Vitest.describe (
                     let! remoteFeature = runGitIn root [| "ls-remote"; barePath; "refs/heads/feature" |]
                     let remoteRevision = remoteFeature.Trim().Split([| '\t'; ' ' |], StringSplitOptions.RemoveEmptyEntries).[0]
                     Vitest.expect(remoteRevision).toEqual (RevisionId.value revision)
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+
+                do! removeDirectoryAsync root
+            }
+        )
+
+        Vitest.test (
+            "synchronize applies the previewed target when the target moves during update",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable raceApplied = false
+
+                let hooks = {
+                    GitWorkspaceSession.GitSessionHooks.none with
+                        Barrier =
+                            Some(fun workspaceRoot point _ ->
+                                async {
+                                    if point = "update-merge" && not raceApplied then
+                                        raceApplied <- true
+                                        let fixtureRoot = dirname workspaceRoot
+                                        let barePath = join [| fixtureRoot; "origin.git" |]
+
+                                        do!
+                                            Async.AwaitPromise(
+                                                advanceTarget
+                                                    fixtureRoot
+                                                    barePath
+                                                    [ "two.txt", "two\n" ]
+                                            )
+                                })
+                }
+
+                let! root, workPath, barePath, session = createSyncFixture hooks
+
+                try
+                    do! advanceTarget root barePath [ "one.txt", "one\n" ]
+                    let! status = sessionStatus session
+
+                    let! synchronizeResult =
+                        (syncService session).Synchronize
+                            {
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                                AcceptUpdateRisks = false
+                                PublishLocalRevisions = false
+                            }
+                            (ctx "synchronize-target-race")
+                        |> Async.StartAsPromise
+
+                    let outcome =
+                        match synchronizeResult with
+                        | Succeeded outcome -> outcome
+                        | Failed failure ->
+                            failwith $"Expected target race synchronize to succeed, received {failure.Code}."
+                        | PartiallySucceeded(_, failure) ->
+                            failwith $"Expected target race synchronize to succeed, received partial {failure.Code}."
+
+                    ignore outcome
+                    let! first = tryReadUtf8FileAsync (join [| workPath; "one.txt" |])
+                    let! second = tryReadUtf8FileAsync (join [| workPath; "two.txt" |])
+                    Vitest.expect(first).toEqual (Some "one\n")
+                    Vitest.expect(second).toEqual (None)
+
+                    let! refreshResult =
+                        (syncService session).Refresh(ctx "synchronize-target-race-refresh")
+                        |> Async.StartAsPromise
+
+                    let refreshed = expectSucceeded "synchronize target race refresh" refreshResult
+                    Vitest.expect(refreshed.Relationship).toEqual (TargetAhead)
                 with error ->
                     do! removeDirectoryAsync root
                     return raise error

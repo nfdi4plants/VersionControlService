@@ -797,8 +797,8 @@ module FakeHarness =
         let localDirtyPaths () =
             changesAgainstHead workspace |> List.map fst |> Set.ofList
 
-        let targetChanges () =
-            match workspace.Target.Refs.TryFind workspace.CurrentRef with
+        let targetChanges (targetRevision: RevisionId option) =
+            match targetRevision |> Option.map RevisionId.value with
             | Some targetRevision when targetRevision <> workspace.BaseRevisionId ->
                 let baseFiles = revisionFiles workspace.Target workspace.BaseRevisionId
                 let targetFiles = revisionFiles workspace.Target targetRevision
@@ -808,8 +808,9 @@ module FakeHarness =
             | _ -> Set.empty
 
         let refresh _ = async { return OperationResult.succeeded (synchronizationState workspace) }
-        let previewUpdate _ = async {
-            let changed = targetChanges ()
+
+        let previewAgainst (target: RevisionId option) _ = async {
+            let changed = targetChanges target
             let localChanged = localDirtyPaths ()
 
             // Paths the local side changed in commits since base also count as local.
@@ -830,7 +831,13 @@ module FakeHarness =
                     WouldCreateConflictSession = not (Set.isEmpty overlapping)
                 }
         }
-        let update (request: UpdateRequest) (context: OperationContext) = async {
+
+        let previewUpdate context =
+            previewAgainst
+                (workspace.Target.Refs.TryFind workspace.CurrentRef |> Option.map mkRevisionId)
+                context
+
+        let updateAgainst (target: RevisionId option) (request: UpdateRequest) (context: OperationContext) = async {
             let! canceled = slowTransferGate workspace context
 
             if canceled then
@@ -846,7 +853,9 @@ module FakeHarness =
                             "Resolve or cancel the active conflict session first."
                     )
             else
-                match workspace.Target.Refs.TryFind workspace.CurrentRef with
+                applyArmedRace workspace |> ignore
+
+                match target |> Option.map RevisionId.value with
                 | None ->
                     return
                         OperationResult.noOp (Some "No target is configured.") (synchronizationState workspace)
@@ -946,6 +955,13 @@ module FakeHarness =
                                     Instructions = Some "Resolve every conflict item, then finalize."
                                 }
         }
+
+        let update (request: UpdateRequest) (context: OperationContext) =
+            updateAgainst
+                (workspace.Target.Refs.TryFind workspace.CurrentRef |> Option.map mkRevisionId)
+                request
+                context
+
         let publish (request: PublishRequest) (context: OperationContext) = async {
             let! canceled = slowTransferGate workspace context
 
@@ -1047,10 +1063,11 @@ module FakeHarness =
                                         HasActiveConflictSession =
                                             fun _ -> async { return OperationResult.succeeded workspace.ActiveConflict.IsSome }
                                         Refresh = refresh
-                                        PreviewUpdate = fun _ context -> previewUpdate context
+                                        PreviewUpdate = fun syncState context -> previewAgainst syncState.TargetRevision context
                                         Update =
-                                            fun _ context ->
-                                                update
+                                            fun syncState context ->
+                                                updateAgainst
+                                                    syncState.TargetRevision
                                                     { ExpectedWorkspaceVersion = versionToken workspace }
                                                     context
                                         Publish =

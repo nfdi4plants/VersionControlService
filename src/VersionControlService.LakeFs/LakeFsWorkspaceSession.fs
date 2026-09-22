@@ -2824,6 +2824,7 @@ let private createSessionFromState (state: SessionState) : WorkspaceSession =
                         fun request context ->
                             withValidatedMutation state request.ExpectedWorkspaceVersion false (fun () ->
                                 publish state request.ExpectedTargetRevision context)
+                            |> LakeFsPathSafety.guard
                     Synchronize =
                         fun request context ->
                             withValidatedMutation state request.ExpectedWorkspaceVersion false (fun () ->

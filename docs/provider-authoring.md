@@ -82,14 +82,22 @@ Workspace versions are opaque optimistic-concurrency tokens. Conflict handles ha
 
 Providers call `Synchronization.compose` inside their mutation lock. The provider steps consume the refreshed state, so the update applies the revision that the preview described. The provider validates the workspace version once in its mutation wrapper.
 
-The composition produces these decision codes:
+The consumer can accept an update that opens a conflict session. It has no acceptance choice for local changes on affected paths. The user must save or discard those changes first. A preview that cannot be computed is retried after the provider reports the failure.
 
-- `update_would_overwrite_local_changes`
-- `update_would_create_conflict_session`
-- `acceptance_target_required`
-- `conflict_session_active`
+The composition produces these decision codes and evidence:
 
-A decision failure has category `Conflict` and the recovery code `accept_update_risks`. Its `AffectedPaths` are the overlapping paths and its `RevisionEvidence` carries the target revision the preview used under `observed_target`. The consumer shows the preview data, then synchronizes again with `AcceptUpdateRisks` and that revision as `ExpectedTargetRevision`, which the composition compares with the fresh target before it mutates anything. A publish failure after an applied update becomes `PartiallySucceeded` with `Publication = LocalOnly` when the failure reports no state change. The composition keeps a provider recovery action when one exists and supplies `retry_publish` otherwise. A publish failure that reports a state change is returned as it is, because the publication may have happened.
+| Code | Category | Recovery | Paths and evidence |
+| --- | --- | --- | --- |
+| `update_would_overwrite_local_changes` | `Conflict` | `resolve_local_changes` | Overlapping paths and `observed_target` |
+| `update_would_create_conflict_session` | `Conflict` | `accept_update_risks` | Overlapping paths when any exist and `observed_target` |
+| `preview_indeterminate` | Provider-defined | Provider-defined | `observed_target` is added by the composition |
+| `acceptance_target_required` | `Validation` | None | The consumer must supply `ExpectedTargetRevision` |
+| `conflict_session_active` | `Conflict` | None | Resolve or cancel the active session |
+| `precondition_failed` | `Concurrency` | None | `StateChanged = false`, with `expected_target` and `observed_target` evidence |
+
+For `update_would_overwrite_local_changes`, `AcceptUpdateRisks` does not bypass the failure. The consumer retries with `AcceptUpdateRisks` and the observed target revision only for `update_would_create_conflict_session`. The composition checks that revision against the fresh target before it mutates anything.
+
+A publish failure after an applied update becomes `PartiallySucceeded` with `Publication = LocalOnly` when the failure reports no state change. The composition keeps a provider recovery action when one exists and supplies `retry_publish` otherwise. A publish failure that reports `StateChanged = true` after an applied update keeps its failure classification and carries `retry_publish` when it has no recovery action of its own.
 
 ## Cancellation, progress, and redaction
 

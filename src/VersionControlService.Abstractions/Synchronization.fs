@@ -46,10 +46,11 @@ type PublishRequest = {
     ExpectedTargetRevision: RevisionId option
 }
 
-/// One synchronization: observe the target, incorporate it when the workspace is
-/// behind, publish local revisions. The consumer decides only where the provider
-/// cannot: an update that would touch local changes or open a conflict session, and
-/// a target that has to be bound first.
+/// One synchronization: observe the target, incorporate its changes when the
+/// workspace is behind, publish local revisions. The consumer decides only where the
+/// provider cannot: it accepts a conflict session, saves or discards local changes an
+/// update would touch, retries a preview that could not be computed, and binds a
+/// publication target the provider reports as missing.
 type SynchronizeRequest = {
     ExpectedWorkspaceVersion: string
     /// The target revision the consumer observed when it made its decision. A target
@@ -57,10 +58,10 @@ type SynchronizeRequest = {
     /// Required when AcceptUpdateRisks is set, so an acceptance never applies to a
     /// target the user did not see.
     ExpectedTargetRevision: RevisionId option
-    /// The consumer showed the update preview and the user accepted overwritten
-    /// local changes and a conflict session.
+    /// The consumer showed the update preview and the user accepted that the update
+    /// opens a conflict session.
     AcceptUpdateRisks: bool
-    /// False updates only and leaves local revisions unpublished.
+    /// When false, the operation updates the workspace and leaves local revisions unpublished.
     PublishLocalRevisions: bool
 }
 
@@ -74,8 +75,8 @@ type SynchronizationService = {
     Update: UpdateRequest -> OperationContext -> Async<OperationResult<SynchronizationState>>
     /// Make workspace revisions visible on the configured target.
     Publish: PublishRequest -> OperationContext -> Async<OperationResult<SynchronizationState>>
-    /// Refresh, update when the target is ahead, publish, as one operation under the
-    /// provider's mutation lock. See Synchronization.compose for the contract.
+    /// Refresh, update when the target is ahead and publish, as one operation under
+    /// the provider's mutation lock. See Synchronization.compose for the contract.
     Synchronize: SynchronizeRequest -> OperationContext -> Async<OperationResult<SynchronizationState>>
 }
 
@@ -97,8 +98,16 @@ module SynchronizationCodes =
     [<Literal>]
     let ConflictSessionActive = "conflict_session_active"
 
+    /// Local changes on affected paths must be saved or discarded before updating.
+    [<Literal>]
+    let ResolveLocalChangesRecovery = "resolve_local_changes"
+
+    /// The consumer's expected target revision no longer matches the refreshed target.
+    [<Literal>]
+    let PreconditionFailed = "precondition_failed"
+
     /// Recovery: show the preview data of the failure, then retry with AcceptUpdateRisks
-    /// and the observed target revision from the failure's RevisionEvidence.
+    /// and the observed target revision.
     [<Literal>]
     let AcceptUpdateRisksRecovery = "accept_update_risks"
 
@@ -112,7 +121,7 @@ module SynchronizationCodes =
 /// observation instead of reading the target again, so the update applies exactly the
 /// revision the preview described and the decision evidence names that revision.
 type SynchronizationSteps = {
-    /// True when a conflict session is open. The composition refuses before any step.
+    /// True when a conflict session is open. The composition refuses before the refresh.
     HasActiveConflictSession: OperationContext -> Async<OperationResult<bool>>
     /// Observes the target and returns the pinned state.
     Refresh: OperationContext -> Async<OperationResult<SynchronizationState>>
@@ -133,9 +142,6 @@ module Synchronization =
             { failure with
                 RevisionEvidence = Array.append failure.RevisionEvidence [| "observed_target", revision |] }
         | None -> failure
-
-    let private mergeWarnings (refreshWarnings: OperationWarning[]) (outcomeWarnings: OperationWarning[]) =
-        Array.append refreshWarnings outcomeWarnings
 
     let private mergeAffectedPaths (first: string[]) (second: string[]) =
         Array.append first second |> Array.distinct
@@ -184,7 +190,7 @@ module Synchronization =
                                 Some {
                                     OperationFailure.create
                                         Concurrency
-                                        "precondition_failed"
+                                        SynchronizationCodes.PreconditionFailed
                                         "The target advanced past the revision the decision was made for." with
                                             RevisionEvidence = [|
                                                 "expected_target", expected
@@ -199,6 +205,8 @@ module Synchronization =
 
                         match expectedTargetFailure with
                         | Some failure -> return Failed failure
+                        | None when context.Cancellation.IsCancellationRequested() ->
+                            return OperationResult.canceled "The synchronization was canceled."
                         | None ->
                             let needsUpdate =
                                 match state0.Relationship with
@@ -210,7 +218,7 @@ module Synchronization =
                                 | UnknownRelationship -> true
 
                             let! updateDecision =
-                                if needsUpdate && not request.AcceptUpdateRisks then
+                                if needsUpdate then
                                     async {
                                         let! previewResult = steps.PreviewUpdate state0 context
 
@@ -225,6 +233,7 @@ module Synchronization =
                                                         Conflict
                                                         SynchronizationCodes.UpdateWouldOverwriteLocalChanges
                                                         "Updating from the target would change files with local changes." with
+                                                            StateChanged = false
                                                             AffectedPaths =
                                                                 previewOutcome.Value.OverlappingPaths
                                                                 |> Array.map RepositoryPath.value
@@ -234,13 +243,15 @@ module Synchronization =
                                                                 |> Option.defaultValue [||]
                                                             RecoveryAction =
                                                                 Some {
-                                                                    Code = SynchronizationCodes.AcceptUpdateRisksRecovery
+                                                                    Code = SynchronizationCodes.ResolveLocalChangesRecovery
                                                                     Instructions =
                                                                         Some
-                                                                            "Show the affected paths, then synchronize again with AcceptUpdateRisks and the observed target revision."
+                                                                            "Save or discard the local changes on the affected paths, then synchronize again."
                                                                 }
                                                 }
-                                        | Succeeded previewOutcome when previewOutcome.Value.WouldCreateConflictSession ->
+                                        | Succeeded previewOutcome when
+                                            previewOutcome.Value.WouldCreateConflictSession
+                                            && not request.AcceptUpdateRisks ->
                                             return
                                                 Error {
                                                     OperationFailure.create
@@ -287,19 +298,30 @@ module Synchronization =
                                             |> Option.map (fun outcome -> outcome.AffectedPaths)
                                             |> Option.defaultValue [||]
 
+                                        let publicationForUpdateOnly =
+                                            match state1.Relationship with
+                                            | LocalAhead
+                                            | Diverged -> LocalOnly
+                                            | _ -> PublicationNotApplicable
+
                                         if not request.PublishLocalRevisions then
                                             match updateOutcome with
                                             | Some updateOutcome when updated ->
                                                 return
                                                     Succeeded {
                                                         updateOutcome with
-                                                            Warnings = mergeWarnings refreshWarnings updateWarnings
+                                                            Warnings = Array.append refreshWarnings updateWarnings
+                                                            Publication = publicationForUpdateOnly
                                                     }
                                             | _ ->
                                                 return
-                                                    OperationResult.noOp
-                                                        (Some "The workspace already has every target revision.")
-                                                        state1
+                                                    Succeeded {
+                                                        OperationOutcome.noOp
+                                                            (Some "The workspace already has every target revision.")
+                                                            state1 with
+                                                                Warnings = refreshWarnings
+                                                                Publication = publicationForUpdateOnly
+                                                    }
                                         elif context.Cancellation.IsCancellationRequested() then
                                             if updated then
                                                 let failure =
@@ -322,7 +344,7 @@ module Synchronization =
                                                                 Value = state1
                                                                 Effect = Performed
                                                                 Publication = LocalOnly
-                                                                Warnings = mergeWarnings refreshWarnings updateWarnings
+                                                                Warnings = Array.append refreshWarnings updateWarnings
                                                         },
                                                         { failure with
                                                             StateChanged = true
@@ -344,9 +366,9 @@ module Synchronization =
                                                                 else
                                                                     NoOp(Some "The workspace and the target are already synchronized.")
                                                             Warnings =
-                                                                mergeWarnings
-                                                                    (mergeWarnings refreshWarnings updateWarnings)
-                                                                    publishOutcome.Warnings
+                                                                Array.append
+                                                                    refreshWarnings
+                                                                    (Array.append updateWarnings publishOutcome.Warnings)
                                                             AffectedPaths =
                                                                 mergeAffectedPaths updateAffectedPaths publishOutcome.AffectedPaths
                                                     }
@@ -356,14 +378,25 @@ module Synchronization =
                                                         { publishOutcome with
                                                             Effect = Performed
                                                             Warnings =
-                                                                mergeWarnings
-                                                                    (mergeWarnings refreshWarnings updateWarnings)
-                                                                    publishOutcome.Warnings
+                                                                Array.append
+                                                                    refreshWarnings
+                                                                    (Array.append updateWarnings publishOutcome.Warnings)
                                                             AffectedPaths =
                                                                 mergeAffectedPaths updateAffectedPaths publishOutcome.AffectedPaths },
                                                         failure
                                                     )
-                                            | Failed failure when updated && not failure.StateChanged ->
+                                            | Failed failure when updated && failure.StateChanged ->
+                                                let recoveryAction =
+                                                    match failure.RecoveryAction with
+                                                    | Some recovery -> Some recovery
+                                                    | None ->
+                                                        Some {
+                                                            Code = SynchronizationCodes.RetryPublishRecovery
+                                                            Instructions = Some "The update was applied. Synchronize again to publish."
+                                                        }
+
+                                                return Failed { failure with RecoveryAction = recoveryAction }
+                                            | Failed failure when updated ->
                                                 let recovery =
                                                     failure.RecoveryAction
                                                     |> Option.defaultValue {
@@ -380,7 +413,7 @@ module Synchronization =
                                                                 Value = state1
                                                                 Effect = Performed
                                                                 Publication = LocalOnly
-                                                                Warnings = mergeWarnings refreshWarnings updateWarnings
+                                                                Warnings = Array.append refreshWarnings updateWarnings
                                                         },
                                                         { failure with
                                                             StateChanged = true
@@ -403,7 +436,12 @@ module Synchronization =
                                     match result with
                                     | Failed failure -> return Failed failure
                                     | PartiallySucceeded(outcome, failure) ->
-                                        return PartiallySucceeded(outcome, failure)
+                                        return
+                                            PartiallySucceeded(
+                                                { outcome with
+                                                    Warnings = Array.append refreshWarnings outcome.Warnings },
+                                                failure
+                                            )
                                     | Succeeded updateOutcome ->
                                         return! finish updateOutcome.Value (Some updateOutcome)
                                 | None ->

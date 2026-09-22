@@ -385,7 +385,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 | None -> failwith "Expected synchronization state."
             }
 
-            profileTest "synchronize stops with an acceptance failure and applies the accepted update afterwards"
+            profileTest "synchronize refuses an update over local changes and does not accept it"
             <| fun () -> promise {
                 let! workspace = harness.CreateWorkspace()
                 do!
@@ -402,7 +402,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                                 ExpectedWorkspaceVersion = status.WorkspaceVersion
                                 ExpectedTargetRevision = None
                                 AcceptUpdateRisks = false
-                                PublishLocalRevisions = true
+                                PublishLocalRevisions = false
                             }
                             (ctx "synchronize-risk")
                     )
@@ -410,9 +410,10 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 let firstFailure = expectFailure "synchronize risk" firstResult
                 Vitest.expect(firstFailure.Code).toBe (SynchronizationCodes.UpdateWouldOverwriteLocalChanges)
                 Vitest.expect(firstFailure.Category).toEqual (Conflict)
+                Vitest.expect(firstFailure.StateChanged).toBe (false)
                 Vitest.expect(firstFailure.AffectedPaths).toEqual ([| "base.txt" |])
                 Vitest.expect(firstFailure.RevisionEvidence |> Array.map fst).toEqual ([| "observed_target" |])
-                Vitest.expect(firstFailure.RecoveryAction |> Option.map _.Code).toEqual (Some SynchronizationCodes.AcceptUpdateRisksRecovery)
+                Vitest.expect(firstFailure.RecoveryAction |> Option.map _.Code).toEqual (Some SynchronizationCodes.ResolveLocalChangesRecovery)
                 let! untouched = workspace.ReadFile "base.txt"
                 Vitest.expect(untouched).toEqual (Some "local edit\n")
 
@@ -429,18 +430,87 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                                 ExpectedWorkspaceVersion = acceptedStatus.WorkspaceVersion
                                 ExpectedTargetRevision = observedTarget
                                 AcceptUpdateRisks = true
-                                PublishLocalRevisions = true
+                                PublishLocalRevisions = false
                             }
                             (ctx "synchronize-risk-accepted")
                     )
 
-                let acceptedFailure = carriedFailure "accepted synchronize" acceptedResult
-                Vitest.expect([| "conflicts_detected"; "update_rejected" |] |> Array.contains acceptedFailure.Code).toBe (true)
+                let acceptedFailure = expectFailure "accepted synchronize" acceptedResult
+                Vitest.expect(acceptedFailure.Code).toBe (SynchronizationCodes.UpdateWouldOverwriteLocalChanges)
+                Vitest.expect(acceptedFailure.Category).toEqual (Conflict)
+                Vitest.expect(acceptedFailure.StateChanged).toBe (false)
+                Vitest.expect(acceptedFailure.RecoveryAction |> Option.map _.Code).toEqual (Some SynchronizationCodes.ResolveLocalChangesRecovery)
                 let! afterAccepted = workspace.ReadFile "base.txt"
+                Vitest.expect(afterAccepted).toEqual (Some "local edit\n")
                 let! acceptedWorkspaceStatus = getStatus workspace
-                let activeConflict = acceptedWorkspaceStatus.ActiveConflictSession.IsSome
-                Vitest.expect(afterAccepted = Some "local edit\n" || activeConflict).toBe (true)
-                // Git reports update_rejected for the dirty-file rejection. lakeFS opens a conflict session.
+                Vitest.expect(acceptedWorkspaceStatus.ActiveConflictSession.IsNone).toBe (true)
+            }
+
+            profileTest "synchronize needs acceptance for a conflict session and opens it once accepted"
+            <| fun () -> promise {
+                let! workspace = harness.CreateWorkspace()
+                do!
+                    harness.AdvanceTarget workspace [|
+                        { Path = "base.txt"; Content = Some "remote base\n" }
+                    |]
+                do! workspace.WriteFile "base.txt" "local edit\n"
+                let! status = getStatus workspace
+
+                let! revisionResult =
+                    run (
+                        workspace.Session.Core.CreateRevision
+                            {
+                                Message = "commit local divergence"
+                                Paths = [| mkPath "base.txt" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (ctx "synchronize-conflict-revision")
+                    )
+
+                expectPerformed "local divergent revision" revisionResult |> ignore
+                let! divergentStatus = getStatus workspace
+
+                let! firstResult =
+                    run (
+                        (syncService workspace.Session).Synchronize
+                            {
+                                ExpectedWorkspaceVersion = divergentStatus.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                                AcceptUpdateRisks = false
+                                PublishLocalRevisions = false
+                            }
+                            (ctx "synchronize-conflict-preview")
+                    )
+
+                let firstFailure = expectFailure "synchronize conflict preview" firstResult
+                Vitest.expect(firstFailure.Code).toBe (SynchronizationCodes.UpdateWouldCreateConflictSession)
+                Vitest.expect(firstFailure.Category).toEqual (Conflict)
+                Vitest.expect(firstFailure.RevisionEvidence |> Array.map fst).toEqual ([| "observed_target" |])
+                Vitest.expect(firstFailure.RecoveryAction |> Option.map _.Code).toEqual (Some SynchronizationCodes.AcceptUpdateRisksRecovery)
+
+                let observedTarget = firstFailure.RevisionEvidence |> Array.find (fun (role, _) -> role = "observed_target") |> snd
+                let! acceptedStatus = getStatus workspace
+                let! acceptedResult =
+                    run (
+                        (syncService workspace.Session).Synchronize
+                            {
+                                ExpectedWorkspaceVersion = acceptedStatus.WorkspaceVersion
+                                ExpectedTargetRevision = Some observedTarget
+                                AcceptUpdateRisks = true
+                                PublishLocalRevisions = false
+                            }
+                            (ctx "synchronize-conflict-accepted")
+                    )
+
+                let acceptedFailure = carriedFailure "accepted synchronize conflict" acceptedResult
+                match acceptedResult with
+                | PartiallySucceeded _ -> ()
+                | Failed _
+                | Succeeded _ -> failwith "Expected accepted synchronize conflict to be partial."
+                Vitest.expect(acceptedFailure.Code).toBe (ConformanceCodes.ConflictsDetected)
+                Vitest.expect(acceptedFailure.RecoveryAction |> Option.map _.Code).toEqual (Some "resolve_conflict_session")
+                let! conflictStatus = getStatus workspace
+                Vitest.expect(conflictStatus.ActiveConflictSession.IsSome).toBe (true)
             }
 
             profileTest "synchronize refuses an accepted target that moved"
@@ -549,7 +619,8 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                             (ctx "synchronize-local-only")
                     )
 
-                expectPerformed "synchronize without publish" result |> ignore
+                let outcome = expectPerformed "synchronize without publish" result
+                Vitest.expect(outcome.Publication).toEqual (LocalOnly)
                 let! remoteFile = workspace.ReadFile "remote-only.txt"
                 Vitest.expect(remoteFile).toEqual (Some "remote only\n")
                 let! linked = harness.CreateLinkedWorkspace workspace
