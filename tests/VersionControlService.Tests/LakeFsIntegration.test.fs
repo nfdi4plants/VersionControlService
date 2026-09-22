@@ -1425,6 +1425,155 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "lakeFS update preserves an unrelated dirty tracked file",
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
+            fun () -> promise {
+                if not (integrationEnabled ()) then
+                    return failwith "lakeFS integration skipped: Docker not available"
+
+                let harness = createLakeFsHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let synchronization =
+                        workspace.Session.Synchronization
+                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization services.")
+
+                    do!
+                        harness.AdvanceTarget workspace [|
+                            { Path = "target-update.txt"; Content = Some "target update content\n" }
+                        |]
+
+                    do! workspace.WriteFile "base.txt" "local base content\n"
+
+                    let! previewResult =
+                        synchronization.PreviewUpdate(OperationContext.detached "update-preserve-preview")
+                        |> Async.StartAsPromise
+
+                    let preview = expectValue "update preserve preview" previewResult
+                    Vitest.expect(preview.HasDataLossRisk).toBe false
+                    Vitest.expect(preview.WouldCreateConflictSession).toBe false
+
+                    let! statusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "update-preserve-status")
+                        |> Async.StartAsPromise
+
+                    let status = expectValue "update preserve status" statusResult
+                    let! updateResult =
+                        synchronization.Update
+                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                            (OperationContext.detached "update-preserve")
+                        |> Async.StartAsPromise
+
+                    expectValue "update preserve" updateResult |> ignore
+
+                    let! targetContent = workspace.ReadFile "target-update.txt"
+                    let! localContent = workspace.ReadFile "base.txt"
+                    Vitest.expect(targetContent).toEqual(Some "target update content\n")
+                    Vitest.expect(localContent).toEqual(Some "local base content\n")
+
+                    let! afterStatusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "update-preserve-after-status")
+                        |> Async.StartAsPromise
+
+                    let afterStatus = expectValue "update preserve after status" afterStatusResult
+                    Vitest.expect(
+                        afterStatus.Changes
+                        |> Array.exists (fun change -> RepositoryPath.value change.Path = "base.txt")
+                    ).toBe true
+
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "lakeFS update preserves a dirty file after a local commit",
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
+            fun () -> promise {
+                if not (integrationEnabled ()) then
+                    return failwith "lakeFS integration skipped: Docker not available"
+
+                let harness = createLakeFsHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let synchronization =
+                        workspace.Session.Synchronization
+                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization services.")
+
+                    do! workspace.WriteFile "committed-local.txt" "committed local content\n"
+
+                    let! beforeRevisionStatusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "update-preserve-local-commit-status")
+                        |> Async.StartAsPromise
+
+                    let beforeRevisionStatus =
+                        expectValue "update preserve local commit status" beforeRevisionStatusResult
+
+                    let! revisionResult =
+                        workspace.Session.Core.CreateRevision
+                            {
+                                Message = "test: commit local file before update"
+                                Paths = [| repositoryPath "committed-local.txt" |]
+                                ExpectedWorkspaceVersion = beforeRevisionStatus.WorkspaceVersion
+                            }
+                            (OperationContext.detached "update-preserve-local-commit-revision")
+                        |> Async.StartAsPromise
+
+                    expectValue "update preserve local commit revision" revisionResult |> ignore
+
+                    do! workspace.WriteFile "committed-local.txt" "uncommitted local content\n"
+
+                    do!
+                        harness.AdvanceTarget workspace [|
+                            { Path = "target-after-local-commit.txt"; Content = Some "target after local commit\n" }
+                        |]
+
+                    let! previewResult =
+                        synchronization.PreviewUpdate(OperationContext.detached "update-preserve-local-commit-preview")
+                        |> Async.StartAsPromise
+
+                    let preview = expectValue "update preserve local commit preview" previewResult
+                    Vitest.expect(preview.HasDataLossRisk).toBe false
+                    Vitest.expect(preview.WouldCreateConflictSession).toBe false
+
+                    let! statusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "update-preserve-local-commit-update-status")
+                        |> Async.StartAsPromise
+
+                    let status = expectValue "update preserve local commit update status" statusResult
+                    let! updateResult =
+                        synchronization.Update
+                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                            (OperationContext.detached "update-preserve-local-commit-update")
+                        |> Async.StartAsPromise
+
+                    expectValue "update preserve local commit" updateResult |> ignore
+
+                    let! localContent = workspace.ReadFile "committed-local.txt"
+                    Vitest.expect(localContent).toEqual(Some "uncommitted local content\n")
+
+                    let! afterStatusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "update-preserve-local-commit-after-status")
+                        |> Async.StartAsPromise
+
+                    let afterStatus = expectValue "update preserve local commit after status" afterStatusResult
+                    Vitest.expect(
+                        afterStatus.Changes
+                        |> Array.exists (fun change -> RepositoryPath.value change.Path = "committed-local.txt")
+                    ).toBe true
+
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
             "lakeFS publish verifies target head and merge parentage after a race",
             TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
             fun () -> promise {

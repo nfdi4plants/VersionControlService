@@ -1221,11 +1221,18 @@ let private materializationRecoveryFailure
             |]
     }
 
+/// Downloads the objects of a ref (under the prefix) into the workspace and rebuilds the
+/// index entries. Open, switch and update use it. With a set of target changed paths,
+/// which the update passes after a merge, objects outside that set are skipped: after a
+/// merge only the paths the target changed differ from the workspace files, everything
+/// else on the merged ref is what the workspace already has, so those files and their
+/// index entries stay as they are.
 let private materializeRef
     (state: SessionState)
     (resolved: LakeFsConnection)
     (reference: string)
     (preserveExistingFiles: bool)
+    (targetChangedPaths: Set<string> option)
     (finalizeIndex: LakeFsIndex.WorkspaceIndex -> LakeFsIndex.WorkspaceIndex)
     (context: OperationContext)
     : Async<OperationResult<unit>> =
@@ -1262,13 +1269,27 @@ let private materializeRef
                         with
                         | Error pathFailure -> validationFailure <- Some pathFailure
                         | Ok targetPath ->
-                            materializationObjects.Add {
-                                Path = repositoryPath
-                                ObjectKey = stat.Path
-                                TargetPath = targetPath
-                                BaseChecksum = stat.Checksum
-                                Mtime = stat.Mtime
-                            }
+                            let hasIndexEntry =
+                                state.Index.Entries
+                                |> Array.exists (fun entry ->
+                                    entry.Path = RepositoryPath.value repositoryPath)
+
+                            let skipObject =
+                                match targetChangedPaths with
+                                | Some changed ->
+                                    not (Set.contains (RepositoryPath.value repositoryPath) changed)
+                                    && hasIndexEntry
+                                    && NodeFileSystem.existsSync targetPath
+                                | None -> false
+
+                            if not skipObject then
+                                materializationObjects.Add {
+                                    Path = repositoryPath
+                                    ObjectKey = stat.Path
+                                    TargetPath = targetPath
+                                    BaseChecksum = stat.Checksum
+                                    Mtime = stat.Mtime
+                                }
 
                 for entry in state.Index.Entries do
                     if
@@ -1303,8 +1324,13 @@ let private materializeRef
                     let transactionsDirectory =
                         NodePath.join [| state.StateDirectory; "transactions" |]
 
+                    let prepare =
+                        match targetChangedPaths with
+                        | Some _ -> LakeFsMaterialization.prepareSelected
+                        | None -> LakeFsMaterialization.prepare
+
                     let! prepared =
-                        LakeFsMaterialization.prepare
+                        prepare
                             transactionsDirectory
                             state.Index
                             preserveExistingFiles
@@ -1456,7 +1482,7 @@ let private switchWorkspaceToRef
         }
 
         let! materialized =
-            materializeRef state resolved targetRevision false finalizeIndex context
+            materializeRef state resolved targetRevision false None finalizeIndex context
 
         match materialized with
         | Failed failure -> return Failed failure
@@ -2041,6 +2067,11 @@ let private updateAgainst (state: SessionState) (head: string) (context: Operati
                                                 resolved
                                                 materializationRef
                                                 false
+                                                (Some(
+                                                    previewOutcome.Value.ChangedPaths
+                                                    |> Array.map RepositoryPath.value
+                                                    |> Set.ofArray
+                                                ))
                                                 finalizeIndex
                                                 context
 
@@ -2337,6 +2368,7 @@ let private completeConflictFinalize
                 resolved
                 state.Index.WorkspaceBranch
                 false
+                None
                 finalizeIndex
                 context
 
@@ -2938,6 +2970,7 @@ let private openSessionFromStateDirectory
                                     resolved
                                     workspaceBranch
                                     preserveExistingFiles
+                                    None
                                     id
                                     context
 

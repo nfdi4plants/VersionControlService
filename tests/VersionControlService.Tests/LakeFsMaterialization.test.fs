@@ -124,4 +124,92 @@ Vitest.describe (
                     return raise error
             }
         )
+
+        Vitest.test (
+            "selected materialization retains unselected index entries",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root = createTempDirectoryAsync ()
+                let transactionsDirectory = join [| root; "transactions" |]
+                let! _ = fsPromisesDynamic?mkdir transactionsDirectory |> unbox<JS.Promise<obj>>
+
+                try
+                    let retainedEntry: LakeFsIndex.IndexEntry = {
+                        Path = "retained.bin"
+                        BaseChecksum = "base-retained"
+                        LocalHash = "hash-retained"
+                        LocalSize = 15.0
+                        LocalMtimeMs = 3.0
+                    }
+
+                    let currentIndex = {
+                        emptyIndex with
+                            Entries = [| retainedEntry |]
+                    }
+
+                    let objects: LakeFsMaterialization.MaterializationObject[] =
+                        [| {
+                               Path = repositoryPath "selected.bin"
+                               ObjectKey = "selected"
+                               TargetPath = join [| root; "selected.bin" |]
+                               BaseChecksum = "base-selected"
+                               Mtime = 4.0
+                           } |]
+
+                    let download
+                        (prepared: LakeFsMaterialization.MaterializationObject)
+                        (temporaryPath: string)
+                        (_: OperationContext)
+                        : Async<Result<NodeBinaryIO.StreamCopyResult, OperationFailure>> =
+                        async {
+                            NodeFileSystem.writeUtf8FileExclusiveAndFlushSync
+                                temporaryPath
+                                $"body-{prepared.ObjectKey}"
+
+                            return
+                                Ok {
+                                    BytesCopied = 1.0
+                                    Sha256 = $"hash-{prepared.ObjectKey}"
+                                }
+                        }
+
+                    let barrier (_: string) (_: OperationContext) = async { return () }
+
+                    let! preparedResult =
+                        LakeFsMaterialization.prepareSelected
+                            transactionsDirectory
+                            currentIndex
+                            false
+                            objects
+                            [||]
+                            download
+                            barrier
+                            (OperationContext.detached "lakefs-materialization-retained-index-entry")
+                        |> Async.StartAsPromise
+
+                    match preparedResult with
+                    | Error failure -> failwith $"Materialization preparation failed: {failure.Code}"
+                    | Ok plan ->
+                        let selectedEntry: LakeFsIndex.IndexEntry = {
+                            Path = "selected.bin"
+                            BaseChecksum = "base-selected"
+                            LocalHash = "hash-selected"
+                            LocalSize = 1.0
+                            LocalMtimeMs = 4.0
+                        }
+
+                        Vitest.expect(plan.NextIndex.Entries).toEqual [| retainedEntry; selectedEntry |]
+
+                        let! cleaned = LakeFsMaterialization.cleanup plan |> Async.StartAsPromise
+
+                        match cleaned with
+                        | Ok() -> ()
+                        | Error failure -> failwith $"Materialization cleanup failed: {failure.Code}"
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
 )
