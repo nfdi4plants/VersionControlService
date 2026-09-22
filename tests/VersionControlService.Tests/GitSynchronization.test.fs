@@ -4074,6 +4074,64 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "a rejected update reports inspect_workspace when post-attempt status cannot be read",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable statusFailureArmed = false
+
+                let hooks = {
+                    GitWorkspaceSession.GitSessionHooks.none with
+                        RunProcess =
+                            Some(fun request processContext ->
+                                async {
+                                    let statusRead =
+                                        request.Arguments |> Array.contains "--porcelain=v2"
+
+                                    if statusRead && statusFailureArmed then
+                                        return
+                                            OperationResult.failed (
+                                                OperationFailure.create
+                                                    ProviderError
+                                                    "status_read_failed"
+                                                    "simulated post-attempt status failure"
+                                            )
+                                    else
+                                        let! result = NodeProcess.run request processContext
+
+                                        if request.Arguments |> Array.contains "merge" then
+                                            statusFailureArmed <- true
+
+                                        return result
+                                })
+                }
+
+                let! root, workPath, barePath, session = createSyncFixture hooks
+
+                try
+                    do! advanceTarget root barePath [ "base.txt", "target version\n" ]
+                    do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) "dirty workspace version\n"
+                    let! status = sessionStatus session
+
+                    let! updateResult =
+                        (syncService session).Update
+                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                            (ctx "rejected-update-status-failure")
+                        |> Async.StartAsPromise
+
+                    let failure = expectProviderFailure "rejected update with unreadable status" updateResult
+                    Vitest.expect(failure.Category).toEqual (ProviderError)
+                    Vitest.expect(failure.Code).toBe ("update_rejected")
+                    Vitest.expect(failure.StateChanged).toBe (true)
+                    Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "inspect_workspace")
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
             "a cherry-pick conflict blocks synchronize before the remote can move",
             TestOptions(timeout = 120000),
             fun () -> promise {

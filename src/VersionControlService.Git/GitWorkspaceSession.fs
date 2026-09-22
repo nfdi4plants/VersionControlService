@@ -3060,13 +3060,17 @@ let private updateFromState
                                 Instructions = Some "Resolve every conflict item, then finalize."
                             }
                 | None ->
-                    let! headAfter = revParse state "HEAD" context
                     let! workspaceVersionAfter = computeWorkspaceVersion state context
 
-                    let stateChanged =
+                    let stateChanged, recoveryAction =
                         match workspaceVersionAfter with
-                        | Ok version -> version <> start.WorkspaceVersion
-                        | Error _ -> start.Head <> headAfter
+                        | Ok version -> version <> start.WorkspaceVersion, None
+                        | Error _ ->
+                            true,
+                            Some {
+                                Code = "inspect_workspace"
+                                Instructions = Some "The state after the rejected update could not be read. Inspect the workspace before retrying."
+                            }
 
                     let details =
                         output.StdErr.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
@@ -3080,6 +3084,7 @@ let private updateFromState
                             rejected with
                                 StateChanged = stateChanged
                                 Retryable = false
+                                RecoveryAction = recoveryAction
                         }
     }
 
