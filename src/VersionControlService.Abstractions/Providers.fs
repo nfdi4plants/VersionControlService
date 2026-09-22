@@ -1,12 +1,16 @@
 namespace VersionControlService.Abstractions
 
-/// One opened per-workspace session. Service presence — not Boolean capability
-/// flags — controls feature discovery: a consumer checks presence once and enables
+/// One opened per-workspace session. Service presence, not Boolean capability
+/// flags, controls feature discovery: a consumer checks presence once and enables
 /// matching UI; it never calls a required stub that returns Unsupported.
 ///
 /// After prerelease stabilization this record and its service records are frozen: new
 /// capabilities are added as new optional service records, never as new members
 /// on already-published records.
+///
+/// A consumer that wants one code path for every provider fills the absent services
+/// with WorkspaceSession.withFallbackServices and reads WorkspaceSession.availability
+/// beforehand to learn what the provider really supplies.
 type WorkspaceSession = {
     Descriptor: WorkspaceDescriptor
     Core: CoreVersionControl
@@ -42,14 +46,14 @@ module FallbackServiceCodes =
 
 module WorkspaceSession =
 
-    let private unsupportedFailure reason =
-        OperationFailure.create Unsupported FallbackServiceCodes.ServiceUnavailable reason
-
     let private unsupported reason =
-        OperationResult.failed (unsupportedFailure reason)
+        OperationResult.failed (
+            OperationFailure.create Unsupported FallbackServiceCodes.ServiceUnavailable reason
+        )
 
-    /// A fallback read: a no-op with its reason, plus the same code as a warning so a
-    /// consumer recognizes a fallback answer without inspecting the effect.
+    /// A fallback answer that changes nothing: a no-op with its reason, plus the same
+    /// code as a warning so a consumer recognizes a fallback answer without inspecting
+    /// the effect.
     let private noOp (reason: string) (value: 'T) : OperationResult<'T> =
         Succeeded {
             OperationOutcome.noOp (Some reason) value with
@@ -178,11 +182,17 @@ type ProviderFactory = {
 
 module ProviderFactory =
 
-    /// The factory with Open wrapped so that every session it returns has every
-    /// optional service. A composition root wraps its factories before
-    /// ProviderResolver.tryCreateCatalog and never checks presence again. A host that
-    /// wants to show what the provider supplies reads WorkspaceSession.availability
-    /// from an unwrapped session, because a filled one reports every service as present.
+    /// Returns a factory whose Open member fills successful and partial sessions
+    /// with fallback services. Failed opens pass through unchanged. A composition root
+    /// wraps its factories before ProviderResolver.tryCreateCatalog and then never
+    /// checks optional service presence again.
+    ///
+    /// A wrapped factory never yields an unfilled session, and a filled session reports
+    /// every service as present. A host that needs the availability report keeps the
+    /// unwrapped factory, or applies WorkspaceSession.withFallbackServices itself after
+    /// reading WorkspaceSession.availability.
+    ///
+    /// Only Open is wrapped. A future member that returns a session has to be added here.
     let withFallbackServices (factory: ProviderFactory) : ProviderFactory = {
         factory with
             Open =
