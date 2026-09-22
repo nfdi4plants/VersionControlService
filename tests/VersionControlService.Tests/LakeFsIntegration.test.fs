@@ -1574,6 +1574,103 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "lakeFS update reports the merged head after post-merge materialization failure",
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
+            fun () -> promise {
+                if not (integrationEnabled ()) then
+                    return failwith "lakeFS integration skipped: Docker not available"
+
+                let harness = createLakeFsHarness ()
+                let mutable preparedObjects = 0
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    do!
+                        harness.AdvanceTarget workspace [|
+                            { Path = "post-merge-update.txt"; Content = Some "post-merge update content\n" }
+                        |]
+
+                    let parsed =
+                        LakeFsTypes.LakeFsLocation.tryParse workspace.Binding.Location.ProviderLocation
+                        |> Result.defaultWith failwith
+
+                    let! targetResult =
+                        LakeFsApi.getBranch
+                            (connection ())
+                            parsed.Repository
+                            parsed.TargetRef
+                            (OperationContext.detached "post-merge-materialization-target")
+                        |> Async.StartAsPromise
+
+                    let target = targetResult |> Result.defaultWith (fun failure -> failwith failure.Message)
+                    let hooks: LakeFsWorkspaceSession.LakeFsSessionHooks = {
+                        Barrier =
+                            Some(fun _ point _ -> async {
+                                if point = "materialization-prepare-object" then
+                                    preparedObjects <- preparedObjects + 1
+
+                                    if preparedObjects = 1 then
+                                        failwith "injected post-merge materialization failure"
+                            })
+                    }
+
+                    let factory =
+                        LakeFsWorkspaceSession.createFactoryWithHooks
+                            lakeFsProviderOptions
+                            hooks
+                            (LakeFsCredentials.fixedConnection (connection ()))
+
+                    let! opened =
+                        factory.Open
+                            workspace.Binding
+                            (OperationContext.detached "post-merge-materialization-open")
+                        |> Async.StartAsPromise
+
+                    let session = expectValue "post-merge materialization open" opened
+                    let synchronization =
+                        session.Synchronization
+                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization services.")
+
+                    let! previewResult =
+                        synchronization.PreviewUpdate(OperationContext.detached "post-merge-materialization-preview")
+                        |> Async.StartAsPromise
+
+                    let preview = expectValue "post-merge materialization preview" previewResult
+                    Vitest.expect(preview.HasDataLossRisk).toBe false
+                    Vitest.expect(preview.WouldCreateConflictSession).toBe false
+
+                    let! statusResult =
+                        session.Core.GetStatus(OperationContext.detached "post-merge-materialization-status")
+                        |> Async.StartAsPromise
+
+                    let status = expectValue "post-merge materialization status" statusResult
+                    let! updateResult =
+                        synchronization.Update
+                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                            (OperationContext.detached "post-merge-materialization-update")
+                        |> Async.StartAsPromise
+
+                    let outcome, failure =
+                        match updateResult with
+                        | PartiallySucceeded(outcome, failure) -> outcome, failure
+                        | Failed failure ->
+                            failwith $"Post-merge materialization failure was reported as Failed: {failure.Code}"
+                        | Succeeded _ -> failwith "Post-merge materialization failure unexpectedly succeeded."
+
+                    Vitest.expect(preparedObjects).toBe 1
+                    Vitest.expect(failure.StateChanged).toBe true
+                    Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "reconcile_materialization")
+                    Vitest.expect(outcome.Value.WorkspaceRevision |> Option.map RevisionId.value).toEqual (Some target.CommitId)
+                    Vitest.expect(outcome.Value.Relationship).toEqual RevisionRelationship.UpToDate
+
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
             "lakeFS publish verifies target head and merge parentage after a race",
             TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
             fun () -> promise {

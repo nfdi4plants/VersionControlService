@@ -1195,8 +1195,6 @@ let private listRefs (state: SessionState) (context: OperationContext) =
                     |> OperationResult.succeeded
     }
 
-/// Downloads the given ref's objects (under the prefix) into the workspace and
-/// rebuilds the index entries. Used by open, switch, and update.
 let private materializationRecoveryFailure
     (recoveryDirectory: string)
     (expectedRevision: string option)
@@ -2079,7 +2077,9 @@ let private updateAgainst (state: SessionState) (head: string) (context: Operati
                                         | Failed failure ->
                                             let outcome =
                                                 OperationOutcome.performed (
-                                                    synchronizationState state (Some head)
+                                                    synchronizationState
+                                                        { state with Index = finalizeIndex state.Index }
+                                                        (Some head)
                                                 )
 
                                             return
@@ -2096,7 +2096,9 @@ let private updateAgainst (state: SessionState) (head: string) (context: Operati
                                             return
                                                 PartiallySucceeded(
                                                     mapOutcomeValue
-                                                        (synchronizationState state (Some head))
+                                                        (synchronizationState
+                                                            { state with Index = finalizeIndex state.Index }
+                                                            (Some head))
                                                         outcome,
                                                     failure
                                                 )
