@@ -1311,6 +1311,11 @@ let private materializeRef
                             keyedPaths
                             |> List.exists (fun (path, _) -> RepositoryPath.value path = entry.Path)
                         )
+                        && (
+                            match targetChangedPaths with
+                            | Some changed -> Set.contains entry.Path changed
+                            | None -> true
+                        )
                     then
                         match RepositoryPath.tryCreate entry.Path with
                         | Error message ->
