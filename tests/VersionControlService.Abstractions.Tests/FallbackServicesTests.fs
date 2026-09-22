@@ -1,6 +1,5 @@
 module VersionControlService.Abstractions.Tests.FallbackServicesTests
 
-open System
 open Expecto
 open VersionControlService.Abstractions
 open VersionControlService.Abstractions.Tests.ContractShapeTests
@@ -87,8 +86,8 @@ let fallbackServicesTests =
             Expect.isSome filled.Maintenance "Storage maintenance is present."
             Expect.isSome filled.RepositoryBrowser "Repository browser is present."
             Expect.equal filled.Descriptor session.Descriptor "The descriptor is unchanged."
-            Expect.isTrue (Object.ReferenceEquals(box filled.Core, box session.Core)) "The core instance is unchanged."
-            Expect.isTrue (Object.ReferenceEquals(box filled.Close, box session.Close)) "The close function is unchanged."
+            Expect.isTrue (System.Object.ReferenceEquals(box filled.Core, box session.Core)) "The core instance is unchanged."
+            Expect.isTrue (System.Object.ReferenceEquals(box filled.Close, box session.Close)) "The close function is unchanged."
 
         testCase "availability reports provider services before and after filling"
         <| fun () ->
@@ -142,9 +141,9 @@ let fallbackServicesTests =
             let filled = WorkspaceSession.withFallbackServices session
             let kept = require "text diff" filled.TextDiff
 
-            Expect.isTrue (Object.ReferenceEquals(box original, box kept)) "The provider service instance is retained."
+            Expect.isTrue (System.Object.ReferenceEquals(box original, box kept)) "The provider service instance is retained."
 
-        testCaseAsync "fallback reads return their values, reasons, and warning codes"
+        testCaseAsync "fallback services return their values, reasons, and warning codes"
         <| async {
             let session = WorkspaceSession.withFallbackServices (WorkspaceSession.createCoreOnly descriptor (FakeProvider.createCore ()))
             let textDiff = require "text diff" session.TextDiff
@@ -171,7 +170,7 @@ let fallbackServicesTests =
             Expect.equal
                 (expectNoOp policyReason settingsResult)
                 { AutoPolicyThresholdMb = None; MaterializeLargeObjects = true }
-                "GetSettings reports all large objects as present."
+                "GetSettings reports no threshold and default materialization."
 
             let maintenanceReason = "The provider has no storage maintenance service."
             let! pruneResult = maintenance.Prune context
@@ -193,7 +192,6 @@ let fallbackServicesTests =
             let session = WorkspaceSession.withFallbackServices (WorkspaceSession.createCoreOnly descriptor (FakeProvider.createCore ()))
             let objectMaterialization = require "object materialization" session.ObjectMaterialization
             let storagePolicy = require "storage policy" session.StoragePolicy
-            let maintenance = require "maintenance" session.Maintenance
 
             let objectReason = "The provider has no object materialization service."
             let! materializeResult = objectMaterialization.Materialize path context
@@ -207,12 +205,6 @@ let fallbackServicesTests =
             let! setSettingsResult = storagePolicy.SetSettings settings context
             expectNoOp policyReason setPathPolicyResult |> ignore
             expectNoOp policyReason setSettingsResult |> ignore
-
-            let maintenanceReason = "The provider has no storage maintenance service."
-            let! pruneResult = maintenance.Prune context
-            let! deduplicateResult = maintenance.Deduplicate context
-            expectNoOp maintenanceReason pruneResult |> ignore
-            expectNoOp maintenanceReason deduplicateResult |> ignore
         }
 
         testCaseAsync "synchronization operations and conflict mutations fail as unsupported"
@@ -265,15 +257,29 @@ let fallbackServicesTests =
 
         testCaseAsync "factory fallback fills successful opens and preserves outcome fields"
         <| async {
-            let coreOnly = WorkspaceSession.createCoreOnly descriptor (FakeProvider.createCore ())
+            let originalTextDiff: TextDiffService = {
+                GetDiff = fun _ _ -> async { return OperationResult.succeeded (TextContent "original") }
+                GetWordDiff = fun _ _ -> async { return OperationResult.succeeded (TextContent "original word diff") }
+                GetBaseContent = fun _ _ -> async { return OperationResult.succeeded (TextContent "original base") }
+            }
+            let coreOnly = {
+                WorkspaceSession.createCoreOnly descriptor (FakeProvider.createCore ()) with
+                    TextDiff = Some originalTextDiff
+            }
             let originalOutcome = {
                 OperationOutcome.noOp (Some "open returned without changes") coreOnly with
                     Warnings = [| { Code = "provider_notice"; Message = "Open completed with a notice." } |]
                     ResultingWorkspaceVersion = Some "workspace-version-7"
             }
-            let factory =
+            let originalFactory =
                 minimalFactory (fun _ _ -> async { return Succeeded originalOutcome })
-                |> ProviderFactory.withFallbackServices
+            let factory = ProviderFactory.withFallbackServices originalFactory
+
+            let! originalProbe = originalFactory.Probe "/test/workspace"
+            let! wrappedProbe = factory.Probe "/test/workspace"
+            Expect.equal factory.Id originalFactory.Id "The wrapped factory keeps its id."
+            Expect.equal wrappedProbe originalProbe "The wrapped probe returns the original answer."
+            Expect.equal wrappedProbe NotDetected "The original probe answer is NotDetected."
 
             let! result = factory.Open binding context
 
@@ -294,12 +300,51 @@ let fallbackServicesTests =
                 Expect.equal outcome.Value.Descriptor originalOutcome.Value.Descriptor "The session descriptor is unchanged."
                 Expect.equal outcome.Effect originalOutcome.Effect "The outcome effect is unchanged."
                 Expect.equal outcome.Warnings originalOutcome.Warnings "The outcome warnings are unchanged."
+                let keptTextDiff = require "text diff" outcome.Value.TextDiff
+                Expect.isTrue
+                    (System.Object.ReferenceEquals(box originalTextDiff, box keptTextDiff))
+                    "The factory keeps the provider text-diff instance."
                 Expect.equal
                     outcome.ResultingWorkspaceVersion
                     originalOutcome.ResultingWorkspaceVersion
                     "The resulting workspace version is unchanged."
             | PartiallySucceeded _
             | Failed _ -> failtest "Expected the successful open outcome to pass through."
+        }
+
+        testCaseAsync "factory fallback fills a partial open and keeps its failure"
+        <| async {
+            let coreOnly = WorkspaceSession.createCoreOnly descriptor (FakeProvider.createCore ())
+            let originalOutcome = {
+                OperationOutcome.noOp (Some "open returned with partial results") coreOnly with
+                    Warnings = [| { Code = "provider_notice"; Message = "Open completed with a notice." } |]
+            }
+            let originalFailure = OperationFailure.create Network "open_partial" "The provider could not finish opening."
+            let factory =
+                minimalFactory (fun _ _ -> async { return PartiallySucceeded(originalOutcome, originalFailure) })
+                |> ProviderFactory.withFallbackServices
+
+            let! result = factory.Open binding context
+
+            match result with
+            | PartiallySucceeded(outcome, failure) ->
+                Expect.equal
+                    (WorkspaceSession.availability outcome.Value)
+                    {
+                        Synchronization = true
+                        TextDiff = true
+                        ConflictResolution = true
+                        ObjectMaterialization = true
+                        StoragePolicy = true
+                        Maintenance = true
+                        RepositoryBrowser = true
+                    }
+                    "The factory fills each optional service on a partial open."
+                Expect.equal outcome.Effect originalOutcome.Effect "The partial outcome effect is unchanged."
+                Expect.equal outcome.Warnings originalOutcome.Warnings "The partial outcome warnings are unchanged."
+                Expect.equal failure originalFailure "The original open failure is unchanged."
+            | Succeeded _
+            | Failed _ -> failtest "Expected the partial open result to pass through."
         }
 
         testCaseAsync "factory fallback passes failed opens through unchanged"
