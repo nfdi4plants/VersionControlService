@@ -2374,6 +2374,27 @@ let private completeConflictFinalize
     (context: OperationContext)
     =
     async {
+        let targetHead =
+            state.Conflict
+            |> Option.map _.TargetRevisionAtOpen
+            |> Option.defaultValue targetRevision
+
+        let! targetChangedResult = targetChangedPathsAgainst state targetHead context
+        let mutable selectedPaths = Set.empty
+        let mutable targetChangedFailure = None
+
+        match targetChangedResult with
+        | Error failure -> targetChangedFailure <- Some failure
+        | Ok paths -> selectedPaths <- Set.ofList paths
+
+        match state.Conflict with
+        | Some conflict ->
+            selectedPaths <-
+                Set.union
+                    selectedPaths
+                    (conflict.Items |> List.map _.ItemPath |> Set.ofList)
+        | None -> ()
+
         let finalizeIndex (index: LakeFsIndex.WorkspaceIndex) = {
             index with
                 BaseRevision = Some targetRevision
@@ -2381,14 +2402,17 @@ let private completeConflictFinalize
         }
 
         let! materialized =
-            materializeRef
-                state
-                resolved
-                state.Index.WorkspaceBranch
-                false
-                None
-                finalizeIndex
-                context
+            match targetChangedFailure with
+            | Some failure -> async { return Failed failure }
+            | None ->
+                materializeRef
+                    state
+                    resolved
+                    state.Index.WorkspaceBranch
+                    false
+                    (Some selectedPaths)
+                    finalizeIndex
+                    context
 
         match materialized with
         | Failed failure ->
