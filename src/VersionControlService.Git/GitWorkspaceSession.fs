@@ -2557,6 +2557,9 @@ let private synchronizationState (state: SessionState) (context: OperationContex
                 | Some _, Some _, Some _ -> Diverged
                 | _ -> UnknownRelationship
 
+            let canceledInspectionFailure () =
+                OperationFailure.create Canceled "operation_canceled" "The workspace state inspection was canceled."
+
             let! remoteChangedResult =
                 match baseRevision, targetRevision with
                 | Some mergeBase, Some target when mergeBase <> target ->
@@ -2603,9 +2606,15 @@ let private synchronizationState (state: SessionState) (context: OperationContex
                                 else
                                     output.StdErr
 
-                            return Error(previewIndeterminate "target changed paths" detail)
+                            if context.Cancellation.IsCancellationRequested() then
+                                return Error(canceledInspectionFailure ())
+                            else
+                                return Error(previewIndeterminate "target changed paths" detail)
                         | Error failure ->
-                            return Error(previewIndeterminate "target changed paths" failure.Message)
+                            if context.Cancellation.IsCancellationRequested() then
+                                return Error(canceledInspectionFailure ())
+                            else
+                                return Error(previewIndeterminate "target changed paths" failure.Message)
                     }
                 | _ -> async { return Ok None }
 
@@ -2613,13 +2622,7 @@ let private synchronizationState (state: SessionState) (context: OperationContex
             | Error failure -> return Error failure
             | Ok remoteChanged ->
                 if context.Cancellation.IsCancellationRequested() then
-                    return
-                        Error(
-                            OperationFailure.create
-                                Canceled
-                                "operation_canceled"
-                                "The workspace state inspection was canceled."
-                        )
+                    return Error(canceledInspectionFailure ())
                 else
                     return
                         Ok {
