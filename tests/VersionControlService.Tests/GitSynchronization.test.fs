@@ -144,6 +144,15 @@ let private expectOperationInProgress (operationName: string) (result: Operation
     Vitest.expect(failure.RecoveryAction).toEqual (None)
     failure
 
+let private expectActiveConflictSession (operationName: string) (result: OperationResult<'T>) =
+    let failure = expectProviderFailure operationName result
+    Vitest.expect(failure.Category).toEqual (Conflict)
+    Vitest.expect(failure.Code).toBe ("conflict_session_active")
+    Vitest.expect(failure.StateChanged).toBe (false)
+    Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "resolve_conflict_session")
+    Vitest.expect(failure.Message).toBe ("A conflict session is active. Resolve or cancel it first.")
+    failure
+
 let private expectSucceeded operationName result =
     expectValue operationName result
 
@@ -309,6 +318,31 @@ let private conflictService (session: WorkspaceSession) =
 let private sessionStatus (session: WorkspaceSession) = promise {
     let! result = Async.StartAsPromise(session.Core.GetStatus(ctx "sync-status"))
     return expectValue "status" result
+}
+
+let private createMergeHeadConflictFixture () = promise {
+    let! root, workPath, barePath, session = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+    do! advanceTarget root barePath [ "base.txt", "target merge conflict\n" ]
+    let! targetHash = runGitIn barePath [| "rev-parse"; "main" |]
+    do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) "workspace merge conflict\n"
+
+    let! saveStatus = sessionStatus session
+
+    let! saveResult =
+        session.Core.CreateRevision
+            {
+                Message = "local merge conflict"
+                Paths = [| mkPath "base.txt" |]
+                ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+            }
+            (ctx "merge-head-conflict-save")
+        |> Async.StartAsPromise
+
+    expectValue "merge-head conflict local revision" saveResult |> ignore
+
+    let! mergeHeadPath = runGitIn workPath [| "rev-parse"; "--git-path"; "MERGE_HEAD" |]
+    do! writeUtf8FileAsync (join [| workPath; mergeHeadPath.Trim() |]) (targetHash.Trim() + "\n")
+    return root, workPath, barePath, session
 }
 
 let private createUnmergedConflictFixtureWithHooks (hooks: GitWorkspaceSession.GitSessionHooks) = promise {
@@ -4291,6 +4325,79 @@ Vitest.describe (
                     ignore (expectOperationInProgress "cherry-pick conflict synchronize" synchronizeResult)
                     let! remoteAfter = runGitIn root [| "ls-remote"; barePath; "refs/heads/main" |]
                     Vitest.expect(remoteAfter.Trim()).toBe (remoteBefore.Trim())
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "a direct update blocks a cherry-pick in progress",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, _, _, session = createCherryPickConflictFixture ()
+
+                try
+                    let! status = sessionStatus session
+
+                    let! updateResult =
+                        (syncService session).Update
+                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                            (ctx "cherry-pick-conflict-update")
+                        |> Async.StartAsPromise
+
+                    ignore (expectOperationInProgress "cherry-pick conflict update" updateResult)
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "a direct update blocks an active merge conflict session",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, _, _, session = createMergeHeadConflictFixture ()
+
+                try
+                    let! status = sessionStatus session
+                    let! updateResult =
+                        (syncService session).Update
+                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                            (ctx "merge-head-conflict-update")
+                        |> Async.StartAsPromise
+
+                    ignore (expectActiveConflictSession "merge-head conflict update" updateResult)
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "a direct publish blocks an active merge conflict session",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, _, _, session = createMergeHeadConflictFixture ()
+
+                try
+                    let! status = sessionStatus session
+                    let! publishResult =
+                        (syncService session).Publish
+                            {
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                            }
+                            (ctx "merge-head-conflict-publish")
+                        |> Async.StartAsPromise
+
+                    ignore (expectActiveConflictSession "merge-head conflict publish" publishResult)
 
                     do! removeDirectoryAsync root
                 with error ->

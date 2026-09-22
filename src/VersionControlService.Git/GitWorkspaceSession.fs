@@ -4534,6 +4534,20 @@ let createSessionWithCredentialsIdentityAndPolicy
         Location = Some binding.Location
     }
 
+    let activeConflictFailure () =
+        {
+            OperationFailure.create
+                Conflict
+                "conflict_session_active"
+                "A conflict session is active. Resolve or cancel it first." with
+                StateChanged = false
+                RecoveryAction =
+                    Some {
+                        Code = "resolve_conflict_session"
+                        Instructions = Some "Resolve every conflict item, then finalize, or cancel the session."
+                    }
+        }
+
     {
         WorkspaceSession.createCoreOnly descriptor core with
             Synchronization =
@@ -4543,11 +4557,28 @@ let createSessionWithCredentialsIdentityAndPolicy
                     Update =
                         fun request context ->
                             withValidatedMutation state request.ExpectedWorkspaceVersion context (fun () ->
-                                update state request context)
+                                async {
+                                    let! guardResult = activeOperationGuard state context
+
+                                    match guardResult with
+                                    | Failed failure -> return Failed failure
+                                    | Succeeded active when active.Value -> return Failed(activeConflictFailure ())
+                                    | Succeeded _ -> return! update state request context
+                                    | PartiallySucceeded(_, failure) -> return Failed failure
+                                })
                     Publish =
                         fun request context ->
                             withValidatedMutation state request.ExpectedWorkspaceVersion context (fun () ->
-                                publish state request.ExpectedTargetRevision context)
+                                async {
+                                    let! guardResult = activeOperationGuard state context
+
+                                    match guardResult with
+                                    | Failed failure -> return Failed failure
+                                    | Succeeded active when active.Value -> return Failed(activeConflictFailure ())
+                                    | Succeeded _ ->
+                                        return! publish state request.ExpectedTargetRevision context
+                                    | PartiallySucceeded(_, failure) -> return Failed failure
+                                })
                     Synchronize =
                         fun request context ->
                             withValidatedMutation state request.ExpectedWorkspaceVersion context (fun () ->
