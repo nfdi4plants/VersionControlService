@@ -3275,6 +3275,66 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "a successful merge with a failed post-merge inspection reports refresh_workspace",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable failInspection = false
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request processContext ->
+                            async {
+                                if request.Arguments |> Array.contains "merge" then
+                                    let! result = NodeProcess.run request processContext
+                                    failInspection <- true
+                                    return result
+                                elif
+                                    failInspection
+                                    && request.Arguments
+                                       = [| "rev-parse"; "--symbolic-full-name"; "@{upstream}" |]
+                                then
+                                    return
+                                        OperationResult.failed (
+                                            OperationFailure.create
+                                                ProviderError
+                                                "git_failure"
+                                                "simulated post-merge inspection failure"
+                                        )
+                                else
+                                    return! NodeProcess.run request processContext
+                            })
+                    Barrier = None
+                }
+
+                let! root, workPath, barePath, session = createSyncFixture hooks
+
+                try
+                    do! advanceTarget root barePath [ "post-merge-inspection.txt", "content\n" ]
+                    let! targetHash = runGitIn barePath [| "rev-parse"; "main" |]
+                    let! beforeUpdate = sessionStatus session
+
+                    let! updateResult =
+                        (syncService session).Update
+                            { ExpectedWorkspaceVersion = beforeUpdate.WorkspaceVersion }
+                            (ctx "post-merge-inspection-failure")
+                        |> Async.StartAsPromise
+
+                    let failure = expectProviderFailure "post-merge inspection failure" updateResult
+                    Vitest.expect(failure.StateChanged).toBe (true)
+                    Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "refresh_workspace")
+
+                    let! headAfter = runGitIn workPath [| "rev-parse"; "HEAD" |]
+                    Vitest.expect(headAfter.Trim()).toBe (targetHash.Trim())
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
             "a cancellation after a successful merge returns truthful synchronization state",
             TestOptions(timeout = 120000),
             fun () -> promise {

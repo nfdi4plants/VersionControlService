@@ -35,6 +35,8 @@ module GitSessionHooks =
     }
 
 let private publicationVerificationTimeoutMilliseconds = 30_000
+/// This is a cancellation deadline, not a wall-clock bound. The runner resolves after the process closes.
+let private postMergeInspectionTimeoutMilliseconds = 30_000
 
 let private gitProviderId =
     match ProviderId.tryCreate "git" with
@@ -2900,7 +2902,50 @@ let private updateFromState
                             return result |> Result.mapError (fun failure -> failure, true)
                     }
 
-            let inspectionContext = { context with Cancellation = OperationCancellation.none }
+            // The merge has already changed the repository. The follow-up reads state only, so
+            // caller cancellation would fabricate a state instead of reporting the merge result.
+            // The detached read has a deadline so a provider read cannot wait forever.
+            let inspectionCancellation = OperationCancellation.Source()
+            let mutable inspectionCompleted = false
+            let mutable inspectionTimedOut = false
+
+            Async.StartImmediate(
+                async {
+                    do! Async.Sleep postMergeInspectionTimeoutMilliseconds
+
+                    if not inspectionCompleted then
+                        inspectionTimedOut <- true
+                        inspectionCancellation.Cancel()
+                }
+            )
+
+            let inspectionContext = {
+                context with
+                    Cancellation = inspectionCancellation.Cancellation
+            }
+
+            let refreshWorkspaceRecovery = {
+                Code = "refresh_workspace"
+                Instructions = Some "The update was applied. Refresh the workspace to read its state."
+            }
+
+            let inspectionFailure (failure: OperationFailure) : OperationFailure =
+                if inspectionTimedOut then
+                    {
+                        OperationFailure.create
+                            Timeout
+                            "inspection_timeout"
+                            "Reading the workspace state after the update exceeded the inspection deadline." with
+                            StateChanged = true
+                            RecoveryAction = Some refreshWorkspaceRecovery
+                    }
+                else
+                    let recoveryAction =
+                        failure.RecoveryAction |> Option.defaultValue refreshWorkspaceRecovery
+
+                    { failure with
+                        StateChanged = true
+                        RecoveryAction = Some recoveryAction }
 
             match mergeResult, startResult with
             | Error(failure, true), Ok start when failure.Category = Canceled ->
@@ -2913,16 +2958,8 @@ let private updateFromState
 
                 match updatedState with
                 | Error failure ->
-                    let recoveryAction =
-                        match failure.RecoveryAction with
-                        | Some recovery -> Some recovery
-                        | None ->
-                            Some {
-                                Code = "refresh_workspace"
-                                Instructions = Some "The update was applied. Refresh the workspace to read its state."
-                            }
-
-                    return Failed { failure with StateChanged = true; RecoveryAction = recoveryAction }
+                    inspectionCompleted <- true
+                    return Failed(inspectionFailure failure)
                 | Ok newState ->
                     let! materializationSetting =
                         runGit
@@ -2931,19 +2968,24 @@ let private updateFromState
                             [| "config"; "--get"; GitService.MaterializeLargeObjectsKey |]
                             None
                             inspectionContext
+                    inspectionCompleted <- true
 
-                    let materializeLargeObjects =
+                    let materializationFailure, materializeLargeObjects =
                         match materializationSetting with
                         | Ok setting when setting.ExitCode = 0 ->
+                            None,
                             match setting.StdOut.Trim().ToLowerInvariant() with
                             | "true"
                             | "1"
                             | "yes"
                             | "on" -> true
                             | _ -> false
-                        | _ -> false
+                        | Ok _ -> None, false
+                        | Error failure -> Some failure, false
 
-                    if not materializeLargeObjects then
+                    if materializationFailure.IsSome then
+                        return Failed(inspectionFailure materializationFailure.Value)
+                    elif not materializeLargeObjects then
                         return OperationResult.succeeded newState
                     else
                         let! remoteResult =
