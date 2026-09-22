@@ -84,7 +84,7 @@ Providers call `Synchronization.compose` inside their mutation lock. The provide
 
 The consumer can accept an update that opens a conflict session. It has no acceptance choice for local changes on affected paths. The user must save or discard those changes first. When the provider cannot compute the preview, the consumer retries the synchronization later.
 
-The composition produces these decision codes and evidence:
+The synchronize result uses these decision codes and evidence:
 
 | Code | Category | Recovery | Paths and evidence |
 | --- | --- | --- | --- |
@@ -93,15 +93,19 @@ The composition produces these decision codes and evidence:
 | `preview_indeterminate` | Provider-defined | Provider-defined | `observed_target` is added by the composition |
 | `acceptance_target_required` | `Validation` | None | The consumer must supply `ExpectedTargetRevision` |
 | `conflict_session_active` | `Conflict` | None | Resolve or cancel the active session |
-| `operation_in_progress` | Provider-defined | Provider-defined | Finish or abort the Git operation in progress |
-| `publish_rejected` | Provider-defined | Provider-defined | The remote refused the push, the message carries the reason the remote printed |
+| `operation_in_progress` | `Conflict` | None | Finish or abort the Git operation in progress |
+| `publish_rejected` | `ProviderError` | None | The remote refused the push. The message carries the reason the remote printed. |
 | `precondition_failed` | `Concurrency` | None | `StateChanged = false`, with `expected_target` and `observed_target` evidence |
+
+The `operation_in_progress` and `publish_rejected` codes pass through from the provider. Another provider may classify them differently.
 
 For `update_would_overwrite_local_changes`, `AcceptUpdateRisks` does not bypass the failure. The consumer retries with `AcceptUpdateRisks` and the observed target revision only for `update_would_create_conflict_session`. The composition checks that revision against the fresh target before it mutates anything.
 
 A publish failure after an applied update becomes `PartiallySucceeded` with `Publication = LocalOnly` when the failure reports no state change. The composition keeps a provider recovery action when one exists and supplies `retry_publish` otherwise. A publish failure that reports `StateChanged = true` after an applied update keeps its failure classification and carries `retry_publish` when it has no recovery action of its own.
 
-When an update applied successfully but its post-merge inspection failed, the provider returns the provider-defined `refresh_workspace` recovery.
+When an update applied successfully but its post-merge inspection failed, the provider returns the `refresh_workspace` recovery. The provider keeps a failure's own recovery action when it has one. A deadline trip reports `inspection_timeout`.
+
+Cancellation that reaches the runner after the merge finishes has two truthful outcomes. When the runner observed the cancellation, it returns `Canceled` with `operation_canceled`. The failure has `StateChanged = true` and a `refresh_workspace` recovery. When the runner did not observe the cancellation, it returns `Succeeded`. The workspace state is correct in both cases.
 
 ## Cancellation, progress, and redaction
 
