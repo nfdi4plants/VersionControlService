@@ -3406,25 +3406,32 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                 match pushResult with
                                 | Error failure -> Some failure
                                 | Ok output when output.ExitCode <> 0 ->
-                                    let combined = output.StdErr + output.StdOut
+                                    let combined = output.StdErr + "\n" + output.StdOut
 
                                     let lines =
                                         combined.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
                                         |> Array.map (fun line -> line.Trim())
 
-                                    let concurrencyRejection =
+                                    let statusLines =
                                         lines
-                                        |> Array.exists (fun line ->
-                                            line.Contains "[rejected]"
-                                            && (line.Contains "(fetch first)"
-                                                || line.Contains "(non-fast-forward)"
-                                                || line.Contains "(stale info)"
-                                                || line.Contains "(cannot lock ref"))
+                                        |> Array.filter (fun line ->
+                                            line.Contains "[rejected]" || line.Contains "[remote rejected]")
 
-                                    let remoteRejection =
+                                    let remoteLines =
                                         lines
+                                        |> Array.filter (fun line ->
+                                            line.StartsWith("remote:", StringComparison.Ordinal))
+
+                                    let concurrencyRejection =
+                                        statusLines
                                         |> Array.exists (fun line ->
-                                            line.Contains "[remote rejected]" || line.Contains "[rejected]")
+                                            line.Contains "(fetch first)"
+                                            || line.Contains "(non-fast-forward)"
+                                            || line.Contains "(stale info)"
+                                            || line.Contains "(remote ref updated since checkout)"
+                                            || (line.Contains "(failed to update refs)"
+                                                && remoteLines
+                                                   |> Array.exists (fun remoteLine -> remoteLine.Contains "cannot lock ref")))
 
                                     if concurrencyRejection then
                                         Some {
@@ -3434,7 +3441,7 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                                 "The publication target advanced during publish." with
                                                 Retryable = true
                                         }
-                                    elif remoteRejection then
+                                    elif statusLines.Length > 0 then
                                         let remoteReason =
                                             lines
                                             |> Array.choose (fun line ->

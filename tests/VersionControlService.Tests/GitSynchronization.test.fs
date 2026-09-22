@@ -4666,4 +4666,63 @@ Vitest.describe (
                     return raise error
             }
         )
+
+        Vitest.test (
+            "a locked remote ref is a retryable concurrency failure",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, barePath, session = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+                let lockPath = join [| barePath; "refs"; "heads"; "main.lock" |]
+
+                try
+                    do! writeUtf8FileAsync (join [| workPath; "locked-publish.txt" |]) "local content\n"
+                    let! status = sessionStatus session
+
+                    let! revisionResult =
+                        session.Core.CreateRevision
+                            {
+                                Message = "local revision for locked publish"
+                                Paths = [| mkPath "locked-publish.txt" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (ctx "locked-publish-revision")
+                        |> Async.StartAsPromise
+
+                    expectSucceeded "local revision for locked publish" revisionResult |> ignore
+                    do! writeUtf8FileAsync lockPath ""
+
+                    let! beforePublish = sessionStatus session
+                    let! publishResult =
+                        (syncService session).Publish
+                            {
+                                ExpectedWorkspaceVersion = beforePublish.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                            }
+                            (ctx "locked-publish")
+                        |> Async.StartAsPromise
+
+                    let failure = expectProviderFailure "locked publish" publishResult
+                    Vitest.expect(failure.Category).toEqual (Concurrency)
+                    Vitest.expect(failure.Code).toBe ("precondition_failed")
+                    Vitest.expect(failure.Retryable).toBe (true)
+                    Vitest.expect(failure.StateChanged).toBe (false)
+
+                    do! removePathAsync lockPath
+                    let! retryStatus = sessionStatus session
+                    let! retryResult =
+                        (syncService session).Publish
+                            {
+                                ExpectedWorkspaceVersion = retryStatus.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                            }
+                            (ctx "retry-locked-publish")
+                        |> Async.StartAsPromise
+
+                    expectSucceeded "retry locked publish" retryResult |> ignore
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
 )
