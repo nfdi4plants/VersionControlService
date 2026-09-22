@@ -76,12 +76,12 @@ Codes the conflict service reports, shared by the providers unless a provider is
 | --- | --- | --- | --- |
 | `conflict_item_not_found` | `NotFound` | None | The path has no unresolved item (Git also reports it when no session is open). |
 | `unknown_candidate` | `Validation` | None | The candidate id is not one the item advertises. |
-| `manual_resolution_required` | `Unsupported` | None | The item holds binary or non-text content; pick an original candidate or edit the file. |
+| `manual_resolution_required` | `Unsupported` | None | The item holds binary or non-text content. Pick an original candidate or edit the file. |
 | `candidate_content_unavailable` | `Validation` | None | The picked candidate has no content for the path (Git). |
 | `workspace_file_missing` | `NotFound` | None | The workspace candidate was picked but its file is gone (lakeFS). |
-| `file_write_failed` | `ProviderError` | `refresh_conflict_session` | The resolved content could not be written; the file may be truncated (Git). |
-| `symlink_not_supported` | `Validation` | None | A candidate or workspace file is not a regular file (lakeFS). |
-| `conflicts_unresolved` | `Validation` | None | Finalize was called while items remain unresolved; the affected paths name them. |
+| `file_write_failed` | `ProviderError` | `refresh_conflict_session` | The resolved content could not be written. The file may be truncated (Git). |
+| `symlink_not_supported` | `Validation` | None | A candidate or workspace file is not a regular file, or the path changed while it was being read (lakeFS). |
+| `conflicts_unresolved` | `Validation` | None | Finalize was called while items remain unresolved. The affected paths name them. |
 | `detached_head` | `Validation` | None | Finalize needs a current branch (Git). |
 
 Finalize checks whether the current merge commit already has the recorded merge target as a parent. It cleans up the Git merge state and closes the session when that commit exists. A ref-update failure is inspected on the branch ref before the provider reports it. A cleanup failure keeps the session open and returns `inspect_workspace` with the state-file path.
