@@ -3213,6 +3213,103 @@ Vitest.describe (
             }
         )
 
+        Vitest.test (
+            "a cancellation after a successful merge returns truthful synchronization state",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let cancellation = OperationCancellation.Source()
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request processContext ->
+                            async {
+                                let! result = NodeProcess.run request processContext
+
+                                if request.Arguments |> Array.contains "merge" then
+                                    cancellation.Cancel()
+
+                                return result
+                            })
+                    Barrier = None
+                }
+
+                let! root, workPath, barePath, session = createSyncFixture hooks
+
+                try
+                    do! advanceTarget root barePath [ "late-success.txt", "content\n" ]
+                    let! targetHash = runGitIn barePath [| "rev-parse"; "main" |]
+                    let! beforeUpdate = sessionStatus session
+                    let updateContext = OperationContext.create "late-successful-merge" cancellation.Cancellation ignore
+
+                    let! updateResult =
+                        (syncService session).Update
+                            { ExpectedWorkspaceVersion = beforeUpdate.WorkspaceVersion }
+                            updateContext
+                        |> Async.StartAsPromise
+
+                    match updateResult with
+                    | Succeeded outcome ->
+                        Vitest.expect(outcome.Value.WorkspaceRevision |> Option.map RevisionId.value).toEqual (
+                            Some(targetHash.Trim())
+                        )
+                        Vitest.expect(outcome.Value.Relationship).toEqual (UpToDate)
+                        Vitest.expect(outcome.Value.Relationship).not.toEqual (NoTarget)
+                    | Failed failure ->
+                        failwith $"Expected the late-canceled merge to succeed, received {failure.Category}/{failure.Code}."
+                    | PartiallySucceeded(_, failure) ->
+                        failwith $"Expected the late-canceled merge to succeed, received partial {failure.Code}."
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "a cancellation after fetch returns a canceled refresh failure",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let cancellation = OperationCancellation.Source()
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request processContext ->
+                            async {
+                                let! result = NodeProcess.run request processContext
+
+                                if request.Arguments |> Array.contains "fetch" then
+                                    cancellation.Cancel()
+
+                                return result
+                            })
+                    Barrier = None
+                }
+
+                let! root, workPath, barePath, session = createSyncFixture hooks
+
+                try
+                    do! advanceTarget root barePath [ "refresh-cancel-after-fetch.txt", "content\n" ]
+                    let refreshContext = OperationContext.create "refresh-after-fetch" cancellation.Cancellation ignore
+
+                    let! refreshResult =
+                        (syncService session).Refresh refreshContext
+                        |> Async.StartAsPromise
+
+                    let failure = expectProviderFailure "canceled refresh" refreshResult
+                    Vitest.expect(failure.Category).toEqual (Canceled)
+                    Vitest.expect(failure.Code).toBe ("operation_canceled")
+                    Vitest.expect(failure.Message).not.toContain ("NoTarget")
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
         // git writes the index before it moves HEAD, so a kill in that window leaves the
         // target's new file staged. It is reported like any other rewritten path.
         Vitest.test (

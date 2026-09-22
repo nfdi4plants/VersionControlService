@@ -2531,17 +2531,26 @@ let private synchronizationState (state: SessionState) (context: OperationContex
             match remoteChangedResult with
             | Error failure -> return Error failure
             | Ok remoteChanged ->
-                return
-                    Ok {
-                        BaseRevision = baseRevision |> Option.map mkRevisionId
-                        WorkspaceRevision = workspaceRevision |> Option.map mkRevisionId
-                        TargetRevision = targetRevision |> Option.map mkRevisionId
-                        TargetRef = upstream |> Option.map _.LogicalRef
-                        LocalRevisionCount = None
-                        TargetRevisionCount = None
-                        RemoteChangedPaths = remoteChanged
-                        Relationship = relationship
-                    }
+                if context.Cancellation.IsCancellationRequested() then
+                    return
+                        Error(
+                            OperationFailure.create
+                                Canceled
+                                "operation_canceled"
+                                "The workspace state inspection was canceled."
+                        )
+                else
+                    return
+                        Ok {
+                            BaseRevision = baseRevision |> Option.map mkRevisionId
+                            WorkspaceRevision = workspaceRevision |> Option.map mkRevisionId
+                            TargetRevision = targetRevision |> Option.map mkRevisionId
+                            TargetRef = upstream |> Option.map _.LogicalRef
+                            LocalRevisionCount = None
+                            TargetRevisionCount = None
+                            RemoteChangedPaths = remoteChanged
+                            Relationship = relationship
+                        }
     }
 
 let private readRemoteBranchRevision
@@ -2859,6 +2868,8 @@ let private updateFromState
                             return result |> Result.mapError (fun failure -> failure, true)
                     }
 
+            let inspectionContext = { context with Cancellation = OperationCancellation.none }
+
             match mergeResult, startResult with
             | Error(failure, true), Ok start when failure.Category = Canceled ->
                 let! recovered = recoverCanceledMerge state start targetReference failure context
@@ -2866,10 +2877,20 @@ let private updateFromState
             | Error(failure, _), _ -> return Failed failure
             | Ok _, Error failure -> return Failed failure
             | Ok output, Ok start when output.ExitCode = 0 ->
-                let! updatedState = synchronizationState state context
+                let! updatedState = synchronizationState state inspectionContext
 
                 match updatedState with
-                | Error failure -> return Failed { failure with StateChanged = true }
+                | Error failure ->
+                    let recoveryAction =
+                        match failure.RecoveryAction with
+                        | Some recovery -> Some recovery
+                        | None ->
+                            Some {
+                                Code = "refresh_workspace"
+                                Instructions = Some "The update was applied. Refresh the workspace to read its state."
+                            }
+
+                    return Failed { failure with StateChanged = true; RecoveryAction = recoveryAction }
                 | Ok newState ->
                     let! materializationSetting =
                         runGit
@@ -2877,7 +2898,7 @@ let private updateFromState
                             state.RepoPath
                             [| "config"; "--get"; GitService.MaterializeLargeObjectsKey |]
                             None
-                            context
+                            inspectionContext
 
                     let materializeLargeObjects =
                         match materializationSetting with
@@ -2988,7 +3009,7 @@ let private updateFromState
                 | Some _ ->
                     // Conflicting merge: the conflict-session cycle turns this into a
                     // provider-managed session; the shell reports the structured code.
-                    let! updatedState = synchronizationState state context
+                    let! updatedState = synchronizationState state inspectionContext
 
                     let stateValue =
                         match updatedState with
