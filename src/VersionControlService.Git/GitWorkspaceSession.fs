@@ -3498,7 +3498,7 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                             || line.Contains "(non-fast-forward)"
                                             || line.Contains "(stale info)"
                                             || line.Contains "(remote ref updated since checkout)"
-                                            || (line.Contains "(failed to update refs)"
+                                            || (line.Contains "(failed to update ref"
                                                 && remoteLines
                                                    |> Array.exists (fun remoteLine -> remoteLine.Contains "cannot lock ref")))
 
