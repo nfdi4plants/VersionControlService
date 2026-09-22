@@ -3418,7 +3418,8 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                             line.Contains "[rejected]"
                                             && (line.Contains "(fetch first)"
                                                 || line.Contains "(non-fast-forward)"
-                                                || line.Contains "(stale info)"))
+                                                || line.Contains "(stale info)"
+                                                || line.Contains "(cannot lock ref"))
 
                                     let remoteRejection =
                                         lines
@@ -3437,7 +3438,7 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                         let remoteReason =
                                             lines
                                             |> Array.choose (fun line ->
-                                                if line.StartsWith "remote:" then
+                                                if line.StartsWith("remote:", StringComparison.Ordinal) then
                                                     Some(line.Substring("remote:".Length).Trim())
                                                 else
                                                     None)
