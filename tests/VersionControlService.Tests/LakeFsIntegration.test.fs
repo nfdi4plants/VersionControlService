@@ -1851,6 +1851,180 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "lakeFS conflict finalize without a changed resolution takes the merge commit",
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
+            fun () -> promise {
+                if not (integrationEnabled ()) then
+                    return failwith "lakeFS integration skipped: Docker not available"
+
+                let harness = createLakeFsHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let synchronization =
+                        workspace.Session.Synchronization
+                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization services.")
+
+                    do!
+                        harness.AdvanceTarget workspace [|
+                            { Path = "conflict.txt"; Content = Some "target conflict content\n" }
+                            { Path = "target-unrelated.txt"; Content = Some "target unrelated content\n" }
+                        |]
+
+                    do! workspace.WriteFile "conflict.txt" "local conflict content\n"
+                    do! workspace.WriteFile "dirty-unrelated.txt" "dirty local content\n"
+
+                    // The local edit is committed, so the destination-wins merge already holds it and the
+                    // workspace pick changes nothing on the branch.
+                    let! revisionStatusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "finalize-merge-commit-revision-status")
+                        |> Async.StartAsPromise
+
+                    let revisionStatus = expectValue "finalize merge commit revision status" revisionStatusResult
+
+                    let! revisionResult =
+                        workspace.Session.Core.CreateRevision
+                            {
+                                Message = "test: local conflict content"
+                                Paths = [| repositoryPath "conflict.txt" |]
+                                ExpectedWorkspaceVersion = revisionStatus.WorkspaceVersion
+                            }
+                            (OperationContext.detached "finalize-merge-commit-revision")
+                        |> Async.StartAsPromise
+
+                    expectValue "finalize merge commit revision" revisionResult |> ignore
+
+                    let parsed =
+                        LakeFsTypes.LakeFsLocation.tryParse workspace.Binding.Location.ProviderLocation
+                        |> Result.defaultWith failwith
+
+                    let! targetResult =
+                        LakeFsApi.getBranch
+                            (connection ())
+                            parsed.Repository
+                            parsed.TargetRef
+                            (OperationContext.detached "finalize-merge-commit-target")
+                        |> Async.StartAsPromise
+
+                    let target = targetResult |> Result.defaultWith (fun failure -> failwith failure.Message)
+                    let! previewResult =
+                        synchronization.PreviewUpdate(OperationContext.detached "finalize-merge-commit-preview")
+                        |> Async.StartAsPromise
+
+                    let preview = expectValue "finalize merge commit preview" previewResult
+                    Vitest.expect(preview.WouldCreateConflictSession).toBe true
+
+                    let! updateStatusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "finalize-merge-commit-update-status")
+                        |> Async.StartAsPromise
+
+                    let updateStatus = expectValue "finalize merge commit update status" updateStatusResult
+                    let! updateResult =
+                        synchronization.Update
+                            { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
+                            (OperationContext.detached "finalize-merge-commit-update")
+                        |> Async.StartAsPromise
+
+                    let updateFailure = expectFailure "finalize merge commit update" updateResult
+                    Vitest.expect(updateFailure.Category).toEqual FailureCategory.Conflict
+
+                    let conflicts =
+                        workspace.Session.ConflictResolution
+                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS conflict-resolution services.")
+
+                    let! sessionResult =
+                        conflicts.GetActiveSession(OperationContext.detached "finalize-merge-commit-session")
+                        |> Async.StartAsPromise
+
+                    let summary =
+                        expectValue "finalize merge commit session" sessionResult
+                        |> Option.defaultWith (fun () -> failwith "Expected an active conflict session.")
+
+                    let! resolutionStatusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "finalize-merge-commit-resolution-status")
+                        |> Async.StartAsPromise
+
+                    let resolutionStatus = expectValue "finalize merge commit resolution status" resolutionStatusResult
+                    let! resolutionResult =
+                        conflicts.Resolve
+                            {
+                                Handle = summary.Handle
+                                ExpectedWorkspaceVersion = resolutionStatus.WorkspaceVersion
+                                Path = repositoryPath "conflict.txt"
+                                Resolution = PickCandidate "workspace"
+                            }
+                            (OperationContext.detached "finalize-merge-commit-resolution")
+                        |> Async.StartAsPromise
+
+                    let resolution = expectValue "finalize merge commit resolution" resolutionResult
+                    let! finalizeStatusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "finalize-merge-commit-finalize-status")
+                        |> Async.StartAsPromise
+
+                    let finalizeStatus = expectValue "finalize merge commit finalize status" finalizeStatusResult
+                    let! finalizeResult =
+                        conflicts.Finalize
+                            {
+                                Handle = resolution.RefreshedHandle
+                                ExpectedWorkspaceVersion = finalizeStatus.WorkspaceVersion
+                                Message = Some "finalize unchanged resolution"
+                            }
+                            (OperationContext.detached "finalize-merge-commit-finalize")
+                        |> Async.StartAsPromise
+
+                    let finalizedRevision =
+                        match finalizeResult with
+                        | Succeeded outcome ->
+                            outcome.Value
+                            |> Option.defaultWith (fun () -> failwith "Expected finalize to return a revision.")
+                        | PartiallySucceeded(_, failure)
+                        | Failed failure ->
+                            failwith $"Finalize did not succeed ({failure.Category}/{failure.Code}): {failure.Message}"
+
+                    let! conflictContent = workspace.ReadFile "conflict.txt"
+                    let! unrelatedTarget = workspace.ReadFile "target-unrelated.txt"
+                    Vitest.expect(conflictContent).toEqual(Some "local conflict content\n")
+                    Vitest.expect(unrelatedTarget).toEqual(Some "target unrelated content\n")
+
+                    let afterIndex =
+                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        | LakeFsWorkspaceIndex.Loaded index -> index
+                        | _ -> failwith "Expected an index after the conflict finalize."
+
+                    let! workspaceBranchResult =
+                        LakeFsApi.getBranch
+                            (connection ())
+                            parsed.Repository
+                            afterIndex.WorkspaceBranch
+                            (OperationContext.detached "finalize-merge-commit-workspace-head")
+                        |> Async.StartAsPromise
+
+                    let workspaceBranch =
+                        workspaceBranchResult |> Result.defaultWith (fun failure -> failwith failure.Message)
+
+                    Vitest.expect(workspaceBranch.CommitId).toBe (RevisionId.value finalizedRevision)
+
+                    let! finalizedCommitResult =
+                        LakeFsApi.getCommit
+                            (connection ())
+                            parsed.Repository
+                            (RevisionId.value finalizedRevision)
+                            (OperationContext.detached "finalize-merge-commit-commit")
+                        |> Async.StartAsPromise
+
+                    let finalizedCommit =
+                        finalizedCommitResult |> Result.defaultWith (fun failure -> failwith failure.Message)
+
+                    Vitest.expect(finalizedCommit.Parents).toContain target.CommitId
+                    Vitest.expect(afterIndex.BaseRevision).toEqual(Some target.CommitId)
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
             "lakeFS synchronization reports missing base state without inventing remote paths",
             TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
             fun () -> promise {
