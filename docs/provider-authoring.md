@@ -103,7 +103,7 @@ For `update_would_overwrite_local_changes`, `AcceptUpdateRisks` does not bypass 
 
 A publish failure after an applied update becomes `PartiallySucceeded` with `Publication = LocalOnly` when the failure reports no state change. The composition keeps a provider recovery action when one exists and supplies `retry_publish` otherwise. A publish failure that reports `StateChanged = true` after an applied update keeps its failure classification and carries `retry_publish` when it has no recovery action of its own.
 
-When an update applied successfully but its post-merge inspection failed, the provider returns the `refresh_workspace` recovery. The provider keeps a failure's own recovery action when it has one. A deadline trip reports `inspection_timeout`.
+When an update applied successfully but its post-merge inspection failed, the provider returns the `refresh_workspace` recovery. The provider keeps a failure's own recovery action when it has one. A deadline trip reports `inspection_timeout` when the merge applied cleanly. When the merge outcome is already certain, a conflict session or a rejection, the failure keeps `conflicts_detected` or `update_rejected` and carries the deadline as a `state_inspection_failed` warning or in its details.
 
 Cancellation that reaches the runner after the merge finishes has two truthful outcomes. When the runner observed the cancellation, it returns `Canceled` with `operation_canceled`. The failure has `StateChanged = true` and a `refresh_workspace` recovery. When the runner did not observe the cancellation, it returns `Succeeded`. The workspace state is correct in both cases.
 

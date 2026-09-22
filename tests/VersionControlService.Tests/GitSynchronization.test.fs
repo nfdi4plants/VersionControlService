@@ -3396,10 +3396,10 @@ Vitest.describe (
                     Barrier = None
                 }
 
-                GitWorkspaceSession.GitSessionHooks.postMergeInspectionTimeoutOverride <- Some 1
                 let! root, workPath, barePath, session = createSyncFixture hooks
 
                 try
+                    GitWorkspaceSession.GitSessionHooks.postMergeInspectionTimeoutOverride <- Some 1
                     do! advanceTarget root barePath [ "inspection-timeout.txt", "content\n" ]
                     let! beforeUpdate = sessionStatus session
 

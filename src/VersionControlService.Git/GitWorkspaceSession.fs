@@ -3212,34 +3212,28 @@ let private updateFromState
                         Instructions = Some "Resolve every conflict item, then finalize."
                     }
 
-                    let stateValue, warnings, inspectionFailureResult =
+                    // The conflict is certain (MERGE_HEAD exists), so a failed or timed-out inspection
+                    // keeps conflicts_detected and reports itself as a warning; the message says which.
+                    let stateValue, warnings =
                         match updatedState with
-                        | Ok value -> value, [||], None
+                        | Ok value -> value, [||]
                         | Error failure ->
                             let reportedFailure = inspectionFailure (Some conflictRecovery) failure
+
                             syncState,
                             [| {
                                    Code = "state_inspection_failed"
                                    Message = reportedFailure.Message
-                               } |],
-                            if inspectionTimedOut then Some reportedFailure else None
+                               } |]
 
-                    match inspectionFailureResult with
-                    | Some failure ->
-                        return
-                            OperationResult.partiallySucceeded
-                                (OperationOutcome.performed stateValue)
-                                failure
-                                conflictRecovery
-                    | None ->
-                        return
-                            OperationResult.partiallySucceeded
-                                ({ OperationOutcome.performed stateValue with Warnings = warnings })
-                                (OperationFailure.create
-                                    Conflict
-                                    "conflicts_detected"
-                                    "The update produced conflicts that need resolution.")
-                                conflictRecovery
+                    return
+                        OperationResult.partiallySucceeded
+                            ({ OperationOutcome.performed stateValue with Warnings = warnings })
+                            (OperationFailure.create
+                                Conflict
+                                "conflicts_detected"
+                                "The update produced conflicts that need resolution.")
+                            conflictRecovery
                 | Ok None ->
                     let! workspaceVersionAfter = computeWorkspaceVersion state inspectionContext
                     inspectionCompleted <- true
@@ -3254,23 +3248,27 @@ let private updateFromState
                                 Instructions = Some "The state after the rejected update could not be read. Inspect the workspace before retrying."
                             }
 
+                    // The rejection is certain (nonzero exit, no MERGE_HEAD), so a timed-out version
+                    // read keeps update_rejected and adds the deadline to the details.
                     let details =
-                        output.StdErr.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
+                        Array.append
+                            (output.StdErr.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries))
+                            (if inspectionTimedOut then
+                                 [| (inspectionTimeoutFailure recoveryAction).Message |]
+                             else
+                                 [||])
 
                     let rejected =
                         OperationFailure.createRedacted ProviderError "update_rejected" "Git rejected the update."
                         |> OperationFailure.withDetails details
 
-                    if inspectionTimedOut then
-                        return Failed(inspectionTimeoutFailure recoveryAction)
-                    else
-                        return
-                            Failed {
-                                rejected with
-                                    StateChanged = stateChanged
-                                    Retryable = false
-                                    RecoveryAction = recoveryAction
-                            }
+                    return
+                        Failed {
+                            rejected with
+                                StateChanged = stateChanged
+                                Retryable = false
+                                RecoveryAction = recoveryAction
+                        }
     }
 
 let private update (state: SessionState) (request: UpdateRequest) (context: OperationContext) =
