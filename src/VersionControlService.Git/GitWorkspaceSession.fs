@@ -34,6 +34,10 @@ module GitSessionHooks =
         Barrier = None
     }
 
+    /// A test seam for the post-merge inspection deadline, in milliseconds. Production
+    /// leaves it None and the built-in deadline applies.
+    let mutable postMergeInspectionTimeoutOverride: int option = None
+
 let private publicationVerificationTimeoutMilliseconds = 30_000
 /// This is a cancellation deadline, not a wall-clock bound. The runner resolves after the process closes.
 let private postMergeInspectionTimeoutMilliseconds = 30_000
@@ -2954,48 +2958,59 @@ let private updateFromState
 
             // The merge has already changed the repository. The follow-up reads state only, so
             // caller cancellation would fabricate a state instead of reporting the merge result.
-            // The detached read has a deadline so a provider read cannot wait forever.
             let inspectionCancellation = OperationCancellation.Source()
             let mutable inspectionCompleted = false
             let mutable inspectionTimedOut = false
+            let inspectionTimeoutMilliseconds =
+                GitSessionHooks.postMergeInspectionTimeoutOverride
+                |> Option.defaultValue postMergeInspectionTimeoutMilliseconds
 
-            Async.StartImmediate(
-                async {
-                    do! Async.Sleep postMergeInspectionTimeoutMilliseconds
+            let startInspection () =
+                // Start the deadline only in an arm that performs an inspection. Early
+                // merge and setup failures must not leave a timer pending.
+                Async.StartImmediate(
+                    async {
+                        do! Async.Sleep inspectionTimeoutMilliseconds
 
-                    if not inspectionCompleted then
-                        inspectionTimedOut <- true
-                        inspectionCancellation.Cancel()
+                        if not inspectionCompleted then
+                            inspectionTimedOut <- true
+                            inspectionCancellation.Cancel()
+                    }
+                )
+
+                {
+                    context with
+                        Cancellation = inspectionCancellation.Cancellation
                 }
-            )
-
-            let inspectionContext = {
-                context with
-                    Cancellation = inspectionCancellation.Cancellation
-            }
 
             let refreshWorkspaceRecovery = {
                 Code = "refresh_workspace"
                 Instructions = Some "The update was applied. Refresh the workspace to read its state."
             }
 
-            let inspectionFailure (failure: OperationFailure) : OperationFailure =
+            let inspectionTimeoutFailure (recoveryAction: RecoveryAction option) =
+                {
+                    OperationFailure.create
+                        Timeout
+                        "inspection_timeout"
+                        "Reading the workspace state after the update exceeded the inspection deadline." with
+                        StateChanged = true
+                        RecoveryAction = recoveryAction
+                }
+
+            let inspectionFailure
+                (defaultRecoveryAction: RecoveryAction option)
+                (failure: OperationFailure)
+                : OperationFailure =
                 if inspectionTimedOut then
-                    {
-                        OperationFailure.create
-                            Timeout
-                            "inspection_timeout"
-                            "Reading the workspace state after the update exceeded the inspection deadline." with
-                            StateChanged = true
-                            RecoveryAction = Some refreshWorkspaceRecovery
-                    }
+                    inspectionTimeoutFailure defaultRecoveryAction
                 else
                     let recoveryAction =
-                        failure.RecoveryAction |> Option.defaultValue refreshWorkspaceRecovery
+                        failure.RecoveryAction |> Option.orElse defaultRecoveryAction
 
                     { failure with
                         StateChanged = true
-                        RecoveryAction = Some recoveryAction }
+                        RecoveryAction = recoveryAction }
 
             match mergeResult, startResult with
             | Error(failure, true), Ok start when failure.Category = Canceled ->
@@ -3004,12 +3019,13 @@ let private updateFromState
             | Error(failure, _), _ -> return Failed failure
             | Ok _, Error failure -> return Failed failure
             | Ok output, Ok start when output.ExitCode = 0 ->
+                let inspectionContext = startInspection ()
                 let! updatedState = synchronizationState state inspectionContext
 
                 match updatedState with
                 | Error failure ->
                     inspectionCompleted <- true
-                    return Failed(inspectionFailure failure)
+                    return Failed(inspectionFailure (Some refreshWorkspaceRecovery) failure)
                 | Ok newState ->
                     let! materializationSetting =
                         runGit
@@ -3034,7 +3050,7 @@ let private updateFromState
                         | Error failure -> Some failure, false
 
                     if materializationFailure.IsSome then
-                        return Failed(inspectionFailure materializationFailure.Value)
+                        return Failed(inspectionFailure (Some refreshWorkspaceRecovery) materializationFailure.Value)
                     elif not materializeLargeObjects then
                         return OperationResult.succeeded newState
                     else
@@ -3127,51 +3143,60 @@ let private updateFromState
                                         Code = "hydration_failed"
                                 }
             | Ok output, Ok start ->
+                let inspectionContext = startInspection ()
                 let! mergeHeadResult = tryGetMergeHead state inspectionContext
 
                 match mergeHeadResult with
                 | Error failure ->
                     inspectionCompleted <- true
-                    return
-                        Failed {
-                            failure with
-                                StateChanged = true
-                                RecoveryAction =
-                                    Some {
-                                        Code = "inspect_workspace"
-                                        Instructions =
-                                            Some
-                                                "The state after the update could not be read. Inspect the workspace before retrying."
-                                    }
+                    let recoveryAction =
+                        Some {
+                            Code = "inspect_workspace"
+                            Instructions =
+                                Some
+                                    "The state after the update could not be read. Inspect the workspace before retrying."
                         }
+
+                    return Failed(inspectionFailure recoveryAction failure)
                 | Ok(Some _) ->
                     // Conflicting merge: the conflict-session cycle turns this into a
                     // provider-managed session; the shell reports the structured code.
                     let! updatedState = synchronizationState state inspectionContext
                     inspectionCompleted <- true
 
-                    let stateValue, warnings =
+                    let conflictRecovery = {
+                        Code = "resolve_conflict_session"
+                        Instructions = Some "Resolve every conflict item, then finalize."
+                    }
+
+                    let stateValue, warnings, inspectionFailureResult =
                         match updatedState with
-                        | Ok value -> value, [||]
+                        | Ok value -> value, [||], None
                         | Error failure ->
-                            let reportedFailure = inspectionFailure failure
+                            let reportedFailure = inspectionFailure (Some conflictRecovery) failure
                             syncState,
                             [| {
                                    Code = "state_inspection_failed"
                                    Message = reportedFailure.Message
-                               } |]
+                               } |],
+                            if inspectionTimedOut then Some reportedFailure else None
 
-                    return
-                        OperationResult.partiallySucceeded
-                            ({ OperationOutcome.performed stateValue with Warnings = warnings })
-                            (OperationFailure.create
-                                Conflict
-                                "conflicts_detected"
-                                "The update produced conflicts that need resolution.")
-                            {
-                                Code = "resolve_conflict_session"
-                                Instructions = Some "Resolve every conflict item, then finalize."
-                            }
+                    match inspectionFailureResult with
+                    | Some failure ->
+                        return
+                            OperationResult.partiallySucceeded
+                                (OperationOutcome.performed stateValue)
+                                failure
+                                conflictRecovery
+                    | None ->
+                        return
+                            OperationResult.partiallySucceeded
+                                ({ OperationOutcome.performed stateValue with Warnings = warnings })
+                                (OperationFailure.create
+                                    Conflict
+                                    "conflicts_detected"
+                                    "The update produced conflicts that need resolution.")
+                                conflictRecovery
                 | Ok None ->
                     let! workspaceVersionAfter = computeWorkspaceVersion state inspectionContext
                     inspectionCompleted <- true
@@ -3193,13 +3218,16 @@ let private updateFromState
                         OperationFailure.createRedacted ProviderError "update_rejected" "Git rejected the update."
                         |> OperationFailure.withDetails details
 
-                    return
-                        Failed {
-                            rejected with
-                                StateChanged = stateChanged
-                                Retryable = false
-                                RecoveryAction = recoveryAction
-                        }
+                    if inspectionTimedOut then
+                        return Failed(inspectionTimeoutFailure recoveryAction)
+                    else
+                        return
+                            Failed {
+                                rejected with
+                                    StateChanged = stateChanged
+                                    Retryable = false
+                                    RecoveryAction = recoveryAction
+                            }
     }
 
 let private update (state: SessionState) (request: UpdateRequest) (context: OperationContext) =

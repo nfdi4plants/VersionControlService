@@ -3369,6 +3369,62 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "a delayed post-merge inspection reports inspection_timeout",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable mergeFinished = false
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request processContext ->
+                            async {
+                                if request.Arguments |> Array.contains "merge" then
+                                    let! result = NodeProcess.run request processContext
+                                    mergeFinished <- true
+                                    return result
+                                elif
+                                    mergeFinished
+                                    && request.Arguments
+                                       = [| "rev-parse"; "--symbolic-full-name"; "@{upstream}" |]
+                                then
+                                    do! Async.Sleep 10
+                                    return! NodeProcess.run request processContext
+                                else
+                                    return! NodeProcess.run request processContext
+                            })
+                    Barrier = None
+                }
+
+                GitWorkspaceSession.GitSessionHooks.postMergeInspectionTimeoutOverride <- Some 1
+                let! root, workPath, barePath, session = createSyncFixture hooks
+
+                try
+                    do! advanceTarget root barePath [ "inspection-timeout.txt", "content\n" ]
+                    let! beforeUpdate = sessionStatus session
+
+                    let! updateResult =
+                        (syncService session).Update
+                            { ExpectedWorkspaceVersion = beforeUpdate.WorkspaceVersion }
+                            (ctx "post-merge-inspection-timeout")
+                        |> Async.StartAsPromise
+
+                    let failure = expectProviderFailure "post-merge inspection timeout" updateResult
+                    Vitest.expect(failure.Category).toEqual (Timeout)
+                    Vitest.expect(failure.Code).toBe ("inspection_timeout")
+                    Vitest.expect(failure.StateChanged).toBe (true)
+                    Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "refresh_workspace")
+
+                    GitWorkspaceSession.GitSessionHooks.postMergeInspectionTimeoutOverride <- None
+                    do! removeDirectoryAsync root
+                with error ->
+                    GitWorkspaceSession.GitSessionHooks.postMergeInspectionTimeoutOverride <- None
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
             "a cancellation after a successful merge returns truthful synchronization state",
             TestOptions(timeout = 120000),
             fun () -> promise {
