@@ -70,9 +70,18 @@ Leave an unsupported service as `None`. Do not add a service whose methods are r
 
 The conflict service keeps handle validation and each mutation under the session lock. Read operations leave the lock available for status and session inspection. A successful resolution writes the worktree content and stages it before the handle rotates. The service reads the refreshed summary after rotation. A failure after the worktree write reports `StateChanged = true` with `refresh_conflict_session`. A write failure reports `file_write_failed` with `StateChanged = true` and `refresh_conflict_session` because the write can truncate the file before it fails.
 
+Codes the conflict service reports, shared by the providers unless a provider is named:
+
 | Code | Category | Recovery | Meaning |
 | --- | --- | --- | --- |
-| `unknown_candidate` | `Validation` | None | the candidate id is not one the item advertises |
+| `conflict_item_not_found` | `NotFound` | None | No session is open, or the path has no unresolved item. |
+| `unknown_candidate` | `Validation` | None | The candidate id is not one the item advertises. |
+| `manual_resolution_required` | `Unsupported` | None | The item holds binary or non-text content; pick an original candidate or edit the file. |
+| `candidate_content_unavailable` | `Validation` | None | The picked candidate has no content for the path (Git). |
+| `workspace_file_missing` | `NotFound` | None | The workspace candidate was picked but its file is gone (lakeFS). |
+| `file_write_failed` | `ProviderError` | `refresh_conflict_session` | The resolved content could not be written; the file may be truncated. |
+| `conflicts_unresolved` | `Validation` | None | Finalize was called while items remain unresolved; the affected paths name them. |
+| `detached_head` | `Validation` | None | Finalize needs a current branch (Git). |
 
 Finalize checks whether the current merge commit already has the recorded merge target as a parent. It cleans up the Git merge state and closes the session when that commit exists. A ref-update failure is inspected on the branch ref before the provider reports it. A cleanup failure keeps the session open and returns `inspect_workspace` with the state-file path.
 
