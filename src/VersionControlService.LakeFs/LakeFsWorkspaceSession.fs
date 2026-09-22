@@ -2393,8 +2393,57 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
 let private handleRejection () =
     LakeFsConflictSession.rejection ()
 
+let private conflictStateChangedFailure (failure: OperationFailure) =
+    { failure with
+        StateChanged = true
+        RecoveryAction = (handleRejection ()).RecoveryAction }
+
 let private validateHandle (state: SessionState) (handle: ConflictSessionHandle) (expectedVersion: string) =
     LakeFsConflictSession.validate state.Conflict handle (workspaceVersion state) expectedVersion
+
+let private removeResolvedDeletionFiles
+    (state: SessionState)
+    (conflict: LakeFsConflictSession.State)
+    : Result<unit, OperationFailure> =
+    let deletionPaths =
+        conflict.Items
+        |> List.choose (fun item ->
+            match item.ResolvedContent with
+            | Some None -> Some item.ItemPath
+            | _ -> None)
+        |> Set.ofList
+
+    let mutable failure: OperationFailure option = None
+
+    for pathValue in deletionPaths do
+        if failure.IsNone then
+            match RepositoryPath.tryCreate pathValue with
+            | Error message ->
+                failure <-
+                    Some {
+                        OperationFailure.create Validation "unsafe_repository_path" message with
+                            AffectedPaths = [| pathValue |]
+                    }
+            | Ok path ->
+                match LakeFsPathSafety.removeFile state.Binding.WorkspaceRoot path with
+                | Ok() -> ()
+                | Error deletionFailure -> failure <- Some deletionFailure
+
+    match failure with
+    | Some deletionFailure -> Error deletionFailure
+    | None ->
+        let nextIndex = {
+            state.Index with
+                Entries =
+                    state.Index.Entries
+                    |> Array.filter (fun entry -> not (Set.contains entry.Path deletionPaths))
+        }
+
+        if nextIndex.Entries = state.Index.Entries then
+            Ok()
+        else
+            state.Index <- nextIndex
+            saveIndex state
 
 let private completeConflictFinalize
     (state: SessionState)
@@ -2439,7 +2488,7 @@ let private completeConflictFinalize
                 materializeRef
                     state
                     resolved
-                    state.Index.WorkspaceBranch
+                    resultingRevision
                     false
                     (Some selectedPaths)
                     finalizeIndex
@@ -2464,9 +2513,29 @@ let private completeConflictFinalize
                         failure
                     )
             | Succeeded outcome ->
-                cleanupConflictCandidates state
-                state.Conflict <- None
-                return Succeeded(mapOutcomeValue (Some(mkRevisionId resultingRevision)) outcome)
+                match removeResolvedDeletionFiles state (state.Conflict |> Option.get) with
+                | Error failure ->
+                    return
+                        PartiallySucceeded(
+                            mapOutcomeValue (Some(mkRevisionId resultingRevision)) outcome,
+                            materializationRecoveryFailure
+                                state.RecoveryDirectory
+                                state.Index.WorkspaceRevision
+                                resultingRevision
+                                failure.AffectedPaths
+                                failure
+                        )
+                | Ok() ->
+                    cleanupConflictCandidates state
+                    state.Conflict <- None
+                    let finalizedOutcome =
+                        mapOutcomeValue (Some(mkRevisionId resultingRevision)) outcome
+
+                    return
+                        Succeeded {
+                            finalizedOutcome with
+                                ResultingWorkspaceVersion = Some(workspaceVersion state)
+                        }
     }
 
 let private partialConflictFinalize
@@ -2477,6 +2546,7 @@ let private partialConflictFinalize
     (resultingRevision: string)
     (observedTarget: string option)
     (canConfirmOnRetry: bool)
+    (refreshConflictSession: bool)
     =
     if canConfirmOnRetry then
         conflict.PendingFinalizeRevision <- Some resultingRevision
@@ -2510,6 +2580,8 @@ let private partialConflictFinalize
         {
             Code =
                 if canConfirmOnRetry then
+                    ConflictRecovery.RefreshConflictSession
+                elif refreshConflictSession then
                     ConflictRecovery.RefreshConflictSession
                 else
                     "review_and_retry"
@@ -2623,14 +2695,15 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                         LakeFsApi.mergeWithStrategy
                                             resolved
                                             state.Index.Repository
-                                            state.Index.TargetRef
+                                            observedTarget
                                             state.Index.WorkspaceBranch
                                             "merge: finalize conflict session"
                                             (Some "dest-wins")
                                             context
 
                                     match merged with
-                                    | Error failure -> return Failed failure
+                                    | Error failure ->
+                                        return Failed(conflictStateChangedFailure failure)
                                     | Ok mergeResult ->
                                         let! mergeBranch =
                                             LakeFsApi.getBranch
@@ -2646,225 +2719,290 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                 mergeResult.Reference
                                                 context
 
-                                        let mergeVerified =
+                                        let verificationReadFailure =
                                             match mergeBranch, mergeCommit with
-                                            | Ok branch, Ok commit ->
-                                                let sourceVerified =
-                                                    mergeResult.Reference = observedTarget
-                                                    || commit.Parents |> Array.contains observedTarget
+                                            | Error failure, _ -> Some(failure, None)
+                                            | Ok branch, Error failure -> Some(failure, Some branch.CommitId)
+                                            | Ok _, Ok _ -> None
 
-                                                let destinationVerified =
-                                                    mergeResult.Reference = observedDestination.CommitId
-                                                    || commit.Parents
-                                                       |> Array.contains observedDestination.CommitId
+                                        match verificationReadFailure with
+                                        | Some(failure, observedDestinationAfter) ->
 
-                                                branch.CommitId = mergeResult.Reference
-                                                && sourceVerified
-                                                && destinationVerified
-                                            | _ -> false
+                                            let evidence =
+                                                [|
+                                                    "expected_destination", mkRevisionId expectedDestination
+                                                    yield!
+                                                        observedDestinationAfter
+                                                        |> Option.map (fun revision ->
+                                                            "observed_destination", mkRevisionId revision)
+                                                        |> Option.toList
+                                                |]
 
-                                        if not mergeVerified then
                                             return
-                                                partialConflictFinalize
-                                                    state
-                                                    conflict
-                                                    expectedDestination
-                                                    observedDestination.CommitId
-                                                    mergeResult.Reference
-                                                    (Some observedTarget)
-                                                    false
-                                        else
-                                            let mutable resolutionFailure: OperationFailure option = None
+                                                Failed {
+                                                    conflictStateChangedFailure failure with
+                                                        RevisionEvidence =
+                                                            Array.append failure.RevisionEvidence evidence
+                                                }
 
-                                            for item in conflict.Items do
-                                                if resolutionFailure.IsNone then
-                                                    match item.ResolvedContent with
-                                                    | Some(Some content) ->
-                                                        let sourceAndValidation =
-                                                            match content with
-                                                            | LakeFsConflictSession.WorkspaceFile path ->
-                                                                match
-                                                                    LakeFsPathSafety.resolveWorkspacePath
-                                                                        state.Binding.WorkspaceRoot
-                                                                        path
-                                                                with
-                                                                | Error failure -> Error failure
-                                                                | Ok _ ->
-                                                                    match
-                                                                        LakeFsPathSafety.inspectFile
-                                                                            state.Binding.WorkspaceRoot
-                                                                            path
-                                                                    with
-                                                                    | Error failure -> Error failure
-                                                                    | Ok None ->
-                                                                        Error {
-                                                                            OperationFailure.create
-                                                                                NotFound
-                                                                                "workspace_file_missing"
-                                                                                "The selected workspace conflict candidate is no longer present." with
-                                                                                AffectedPaths = [| RepositoryPath.value path |]
-                                                                        }
-                                                                    | Ok(Some inspected) ->
-                                                                        Ok(
-                                                                            inspected.AbsolutePath,
-                                                                            LakeFsPathSafety.validateOpenedFile
-                                                                                state.Binding.WorkspaceRoot
-                                                                                path
-                                                                                inspected.Identity
-                                                                        )
-                                                            | LakeFsConflictSession.ExistingFile path ->
-                                                                Ok(path, fun stats ->
-                                                                    if stats.isSymbolicLink() || not (stats.isFile()) then
-                                                                        Error(
-                                                                            OperationFailure.create
-                                                                                Validation
-                                                                                "symlink_not_supported"
-                                                                                "The conflict candidate is not a regular file."
-                                                                        )
-                                                                    else
-                                                                        Ok())
-                                                            | LakeFsConflictSession.SuppliedText text ->
-                                                                let path = temporaryPath state "conflict-resolution"
-                                                                NodeFileSystem.writeUtf8FileExclusiveAndFlushSync path text
-                                                                Ok(path, fun stats ->
-                                                                    if stats.isSymbolicLink() || not (stats.isFile()) then
-                                                                        Error(
-                                                                            OperationFailure.create
-                                                                                Validation
-                                                                                "symlink_not_supported"
-                                                                                "The conflict candidate is not a regular file."
-                                                                        )
-                                                                    else
-                                                                        Ok())
+                                        | None ->
+                                            let mergeVerified =
+                                                match mergeBranch, mergeCommit with
+                                                | Ok branch, Ok commit ->
+                                                    let sourceVerified =
+                                                        mergeResult.Reference = observedTarget
+                                                        || commit.Parents |> Array.contains observedTarget
 
-                                                        match sourceAndValidation with
-                                                        | Error failure -> resolutionFailure <- Some failure
-                                                        | Ok(sourcePath, validateSource) ->
-                                                            let! upload =
-                                                                LakeFsApi.uploadObjectFromFileChecked
-                                                                    resolved
-                                                                    state.Index.Repository
-                                                                    state.Index.WorkspaceBranch
-                                                                    (objectKey state item.ItemPath)
-                                                                    sourcePath
-                                                                    validateSource
-                                                                    context
+                                                    let destinationVerified =
+                                                        mergeResult.Reference = observedDestination.CommitId
+                                                        || commit.Parents
+                                                           |> Array.contains observedDestination.CommitId
 
-                                                            match upload with
-                                                            | Error failure -> resolutionFailure <- Some failure
-                                                            | Ok _ -> ()
-                                                    | Some None ->
-                                                        let! deletion =
-                                                            LakeFsApi.deleteObject
-                                                                resolved
-                                                                state.Index.Repository
-                                                                state.Index.WorkspaceBranch
-                                                                (objectKey state item.ItemPath)
-                                                                context
+                                                    branch.CommitId = mergeResult.Reference
+                                                    && sourceVerified
+                                                    && destinationVerified
+                                                | _ -> false
 
-                                                        match deletion with
-                                                        | Error failure when failure.Category = NotFound -> ()
-                                                        | Error failure -> resolutionFailure <- Some failure
-                                                        | Ok() -> ()
-                                                    | None -> ()
-
-                                            match resolutionFailure with
-                                            | Some failure ->
-                                                return Failed { failure with StateChanged = true }
-                                            | None ->
-                                                // Resolutions that pick the merged content leave nothing to
-                                                // commit, and lakeFS refuses an empty commit, so the merge
-                                                // commit is the result in that case.
-                                                let! pendingChanges =
-                                                    LakeFsApi.diffBranch
+                                            if not mergeVerified then
+                                                return
+                                                    partialConflictFinalize
+                                                        state
+                                                        conflict
+                                                        expectedDestination
+                                                        observedDestination.CommitId
+                                                        mergeResult.Reference
+                                                        (Some observedTarget)
+                                                        false
+                                                        false
+                                            else
+                                                let! destinationAfterMerge =
+                                                    LakeFsApi.getBranch
                                                         resolved
                                                         state.Index.Repository
                                                         state.Index.WorkspaceBranch
                                                         context
 
-                                                let! committed =
-                                                    match pendingChanges with
-                                                    | Error failure -> async { return Error failure }
-                                                    | Ok [||] -> async { return Ok mergeResult.Reference }
-                                                    | Ok _ ->
-                                                        async {
-                                                            let! commit =
-                                                                LakeFsApi.commit
-                                                                    resolved
-                                                                    state.Index.Repository
-                                                                    state.Index.WorkspaceBranch
-                                                                    (request.Message
-                                                                     |> Option.defaultValue
-                                                                         "merge: finalize conflict session")
-                                                                    context
-
-                                                            return commit |> Result.map _.Id
-                                                        }
-
-                                                match committed with
-                                                | Error failure ->
-                                                    return Failed { failure with StateChanged = true }
-                                                | Ok commitId ->
-                                                    let! branchAfter =
-                                                        LakeFsApi.getBranch
-                                                            resolved
-                                                            state.Index.Repository
-                                                            state.Index.WorkspaceBranch
-                                                            context
-
-                                                    let! commitAfter =
-                                                        LakeFsApi.getCommit
-                                                            resolved
-                                                            state.Index.Repository
-                                                            commitId
-                                                            context
-
-                                                    let! targetAfter = getTargetHead state context
-
-                                                    let resolutionVerified =
-                                                        match branchAfter, commitAfter with
-                                                        | Ok branch, Ok resultingCommit ->
-                                                            branch.CommitId = commitId
-                                                            && (commitId = mergeResult.Reference
-                                                                || resultingCommit.Parents
-                                                                   |> Array.contains mergeResult.Reference)
-                                                        | _ -> false
-
-                                                    let targetVerified =
-                                                        match targetAfter with
-                                                        | Ok target -> target = observedTarget
-                                                        | Error _ -> false
-
-                                                    let canConfirmOnRetry =
-                                                        resolutionVerified && targetVerified
-
-                                                    if
-                                                        expectedDestination = observedDestination.CommitId
-                                                        && canConfirmOnRetry
-                                                    then
-                                                        return!
-                                                            completeConflictFinalize
-                                                                state
-                                                                resolved
-                                                                observedTarget
-                                                                commitId
-                                                                context
-                                                    else
-                                                        let observedTargetAfter =
-                                                            match targetAfter with
-                                                            | Ok target -> Some target
-                                                            | Error _ -> None
-
-                                                        return
+                                                let destinationMoved =
+                                                    match destinationAfterMerge with
+                                                    | Error failure -> Some(Failed(conflictStateChangedFailure failure))
+                                                    | Ok branch when branch.CommitId <> mergeResult.Reference ->
+                                                        Some(
                                                             partialConflictFinalize
                                                                 state
                                                                 conflict
                                                                 expectedDestination
-                                                                observedDestination.CommitId
-                                                                commitId
-                                                                observedTargetAfter
-                                                                canConfirmOnRetry
-        })
+                                                                branch.CommitId
+                                                                mergeResult.Reference
+                                                                (Some observedTarget)
+                                                                false
+                                                                true
+                                                        )
+                                                    | Ok _ -> None
+
+                                                match destinationMoved with
+                                                | Some result -> return result
+                                                | None ->
+                                                    do! barrier state "finalize-merge-verified" context
+
+                                                    let mutable resolutionFailure: OperationFailure option = None
+
+                                                    for item in conflict.Items do
+                                                        if resolutionFailure.IsNone then
+                                                            match item.ResolvedContent with
+                                                            | Some(Some content) ->
+                                                                let sourceAndValidation =
+                                                                    match content with
+                                                                    | LakeFsConflictSession.WorkspaceFile path ->
+                                                                        match
+                                                                            LakeFsPathSafety.resolveWorkspacePath
+                                                                                state.Binding.WorkspaceRoot
+                                                                                path
+                                                                        with
+                                                                        | Error failure -> Error failure
+                                                                        | Ok _ ->
+                                                                            match
+                                                                                LakeFsPathSafety.inspectFile
+                                                                                    state.Binding.WorkspaceRoot
+                                                                                    path
+                                                                            with
+                                                                            | Error failure -> Error failure
+                                                                            | Ok None ->
+                                                                                Error {
+                                                                                    OperationFailure.create
+                                                                                        NotFound
+                                                                                        "workspace_file_missing"
+                                                                                        "The selected workspace conflict candidate is no longer present." with
+                                                                                        AffectedPaths = [| RepositoryPath.value path |]
+                                                                                }
+                                                                            | Ok(Some inspected) ->
+                                                                                Ok(
+                                                                                    inspected.AbsolutePath,
+                                                                                    LakeFsPathSafety.validateOpenedFile
+                                                                                        state.Binding.WorkspaceRoot
+                                                                                        path
+                                                                                        inspected.Identity
+                                                                                )
+                                                                    | LakeFsConflictSession.ExistingFile path ->
+                                                                        Ok(path, fun stats ->
+                                                                            if stats.isSymbolicLink() || not (stats.isFile()) then
+                                                                                Error(
+                                                                                    OperationFailure.create
+                                                                                        Validation
+                                                                                        "symlink_not_supported"
+                                                                                        "The conflict candidate is not a regular file."
+                                                                                )
+                                                                            else
+                                                                                Ok())
+                                                                    | LakeFsConflictSession.SuppliedText text ->
+                                                                        let path = temporaryPath state "conflict-resolution"
+                                                                        NodeFileSystem.writeUtf8FileExclusiveAndFlushSync path text
+                                                                        Ok(path, fun stats ->
+                                                                            if stats.isSymbolicLink() || not (stats.isFile()) then
+                                                                                Error(
+                                                                                    OperationFailure.create
+                                                                                        Validation
+                                                                                        "symlink_not_supported"
+                                                                                        "The conflict candidate is not a regular file."
+                                                                                )
+                                                                            else
+                                                                                Ok())
+
+                                                                match sourceAndValidation with
+                                                                | Error failure -> resolutionFailure <- Some failure
+                                                                | Ok(sourcePath, validateSource) ->
+                                                                    let! upload =
+                                                                        LakeFsApi.uploadObjectFromFileChecked
+                                                                            resolved
+                                                                            state.Index.Repository
+                                                                            state.Index.WorkspaceBranch
+                                                                            (objectKey state item.ItemPath)
+                                                                            sourcePath
+                                                                            validateSource
+                                                                            context
+
+                                                                    match upload with
+                                                                    | Error failure -> resolutionFailure <- Some failure
+                                                                    | Ok _ -> ()
+                                                            | Some None ->
+                                                                let! deletion =
+                                                                    LakeFsApi.deleteObject
+                                                                        resolved
+                                                                        state.Index.Repository
+                                                                        state.Index.WorkspaceBranch
+                                                                        (objectKey state item.ItemPath)
+                                                                        context
+
+                                                                match deletion with
+                                                                | Error failure when failure.Category = NotFound -> ()
+                                                                | Error failure -> resolutionFailure <- Some failure
+                                                                | Ok() -> ()
+                                                            | None -> ()
+
+                                                    match resolutionFailure with
+                                                    | Some failure ->
+                                                        return Failed { failure with StateChanged = true }
+                                                    | None ->
+                                                        // A staged change from another actor stays uncommitted, so only this finalize's resolution paths may trigger the commit.
+                                                        let resolutionPaths =
+                                                            conflict.Items
+                                                            |> List.map (fun item -> objectKey state item.ItemPath)
+                                                            |> Set.ofList
+
+                                                        let! pendingChanges =
+                                                            LakeFsApi.diffBranch
+                                                                resolved
+                                                                state.Index.Repository
+                                                                state.Index.WorkspaceBranch
+                                                                context
+
+                                                        let! committed =
+                                                            match pendingChanges with
+                                                            | Error failure -> async { return Error failure }
+                                                            | Ok [||] -> async { return Ok mergeResult.Reference }
+                                                            | Ok changes when
+                                                                changes
+                                                                |> Array.exists (fun change ->
+                                                                    Set.contains change.Path resolutionPaths) ->
+                                                                async {
+                                                                    let! commit =
+                                                                        LakeFsApi.commit
+                                                                            resolved
+                                                                            state.Index.Repository
+                                                                            state.Index.WorkspaceBranch
+                                                                            (request.Message
+                                                                             |> Option.defaultValue
+                                                                                 "merge: finalize conflict session")
+                                                                            context
+
+                                                                    return commit |> Result.map _.Id
+                                                                }
+                                                             | Ok _ -> async { return Ok mergeResult.Reference }
+
+                                                        match committed with
+                                                        | Error failure ->
+                                                            return Failed { failure with StateChanged = true }
+                                                        | Ok commitId ->
+                                                            let! branchAfter =
+                                                                LakeFsApi.getBranch
+                                                                    resolved
+                                                                    state.Index.Repository
+                                                                    state.Index.WorkspaceBranch
+                                                                    context
+
+                                                            let! commitAfter =
+                                                                LakeFsApi.getCommit
+                                                                    resolved
+                                                                    state.Index.Repository
+                                                                    commitId
+                                                                    context
+
+                                                            let! targetAfter = getTargetHead state context
+
+                                                            let resolutionVerified =
+                                                                match branchAfter, commitAfter with
+                                                                | Ok branch, Ok resultingCommit ->
+                                                                    branch.CommitId = commitId
+                                                                    && (commitId = mergeResult.Reference
+                                                                        || resultingCommit.Parents
+                                                                           |> Array.contains mergeResult.Reference)
+                                                                | _ -> false
+
+                                                            let targetVerified =
+                                                                match targetAfter with
+                                                                | Ok target -> target = observedTarget
+                                                                | Error _ -> false
+
+                                                            let canConfirmOnRetry =
+                                                                resolutionVerified && targetVerified
+
+                                                            if
+                                                                expectedDestination = observedDestination.CommitId
+                                                                && canConfirmOnRetry
+                                                            then
+                                                                return!
+                                                                    completeConflictFinalize
+                                                                        state
+                                                                        resolved
+                                                                        observedTarget
+                                                                        commitId
+                                                                        context
+                                                            else
+                                                                let observedTargetAfter =
+                                                                    match targetAfter with
+                                                                    | Ok target -> Some target
+                                                                    | Error _ -> None
+
+                                                                return
+                                                                    partialConflictFinalize
+                                                                        state
+                                                                        conflict
+                                                                        expectedDestination
+                                                                        observedDestination.CommitId
+                                                                        commitId
+                                                                        observedTargetAfter
+                                                                        canConfirmOnRetry
+                                                                        false
+            })
     Cancel =
         fun request context -> guardConflictMutation state (async {
             match validateHandle state request.Handle request.ExpectedWorkspaceVersion with

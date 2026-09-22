@@ -1729,6 +1729,390 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "lakeFS conflict finalize deletes a locally recreated file the target deleted",
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
+            fun () -> promise {
+                if not (integrationEnabled ()) then
+                    return failwith "lakeFS integration skipped: Docker not available"
+
+                let harness = createLakeFsHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let synchronization =
+                        workspace.Session.Synchronization
+                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization services.")
+
+                    do! workspace.RemoveFile "base.txt"
+                    do! workspace.WriteFile "base.txt" "recreated locally after target deletion\n"
+                    do!
+                        harness.AdvanceTarget workspace [|
+                            { Path = "base.txt"; Content = None }
+                        |]
+
+                    let! previewResult =
+                        synchronization.PreviewUpdate(OperationContext.detached "finalize-deletion-preview")
+                        |> Async.StartAsPromise
+
+                    let preview = expectValue "finalize deletion preview" previewResult
+                    Vitest.expect(preview.WouldCreateConflictSession).toBe true
+
+                    let! statusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "finalize-deletion-status")
+                        |> Async.StartAsPromise
+
+                    let status = expectValue "finalize deletion status" statusResult
+                    let! updateResult =
+                        synchronization.Update
+                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                            (OperationContext.detached "finalize-deletion-update")
+                        |> Async.StartAsPromise
+
+                    expectFailure "finalize deletion update" updateResult |> ignore
+
+                    let conflicts =
+                        workspace.Session.ConflictResolution
+                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS conflict-resolution services.")
+
+                    let! sessionResult =
+                        conflicts.GetActiveSession(OperationContext.detached "finalize-deletion-session")
+                        |> Async.StartAsPromise
+
+                    let summary =
+                        expectValue "finalize deletion session" sessionResult
+                        |> Option.defaultWith (fun () -> failwith "Expected an active conflict session.")
+
+                    let! resolutionStatusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "finalize-deletion-resolution-status")
+                        |> Async.StartAsPromise
+
+                    let resolutionStatus = expectValue "finalize deletion resolution status" resolutionStatusResult
+                    let! resolutionResult =
+                        conflicts.Resolve
+                            {
+                                Handle = summary.Handle
+                                ExpectedWorkspaceVersion = resolutionStatus.WorkspaceVersion
+                                Path = repositoryPath "base.txt"
+                                Resolution = PickCandidate "target"
+                            }
+                            (OperationContext.detached "finalize-deletion-resolution")
+                        |> Async.StartAsPromise
+
+                    let resolution = expectValue "finalize deletion resolution" resolutionResult
+                    let! finalizeStatusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "finalize-deletion-finalize-status")
+                        |> Async.StartAsPromise
+
+                    let finalizeStatus = expectValue "finalize deletion finalize status" finalizeStatusResult
+                    let! finalizeResult =
+                        conflicts.Finalize
+                            {
+                                Handle = resolution.RefreshedHandle
+                                ExpectedWorkspaceVersion = finalizeStatus.WorkspaceVersion
+                                Message = Some "finalize target deletion"
+                            }
+                            (OperationContext.detached "finalize-deletion-finalize")
+                        |> Async.StartAsPromise
+
+                    expectValue "finalize target deletion" finalizeResult |> ignore
+                    let! content = workspace.ReadFile "base.txt"
+                    Vitest.expect(content).toEqual None
+
+                    let afterIndex =
+                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        | LakeFsWorkspaceIndex.Loaded index -> index
+                        | _ -> failwith "Expected an index after the conflict finalize."
+
+                    Vitest.expect(
+                        afterIndex.Entries |> Array.exists (fun entry -> entry.Path = "base.txt")
+                    ).toBe false
+
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "lakeFS conflict finalize commits only the resolution paths",
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
+            fun () -> promise {
+                if not (integrationEnabled ()) then
+                    return failwith "lakeFS integration skipped: Docker not available"
+
+                let harness = createLakeFsHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+
+                    // The foreign object is staged from the barrier after the merge, because lakeFS
+                    // refuses to merge into a branch that already has uncommitted changes.
+                    let hooks: LakeFsWorkspaceSession.LakeFsSessionHooks = {
+                        Barrier =
+                            Some(fun _ point _ -> async {
+                                if point = "finalize-merge-verified" then
+                                    let parsedForStage =
+                                        LakeFsTypes.LakeFsLocation.tryParse workspace.Binding.Location.ProviderLocation
+                                        |> Result.defaultWith failwith
+
+                                    let indexForStage =
+                                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                                        | LakeFsWorkspaceIndex.Loaded value -> value
+                                        | _ -> failwith "Expected an index before staging the unrelated object."
+
+                                    let! staged =
+                                        LakeFsApi.uploadObjectFromFile
+                                            (connection ())
+                                            parsedForStage.Repository
+                                            indexForStage.WorkspaceBranch
+                                            "staged-unrelated.txt"
+                                            (NodePath.join [| workspace.Binding.WorkspaceRoot; "conflict.txt" |])
+                                            (OperationContext.detached "finalize-paths-stage-unrelated")
+
+                                    staged |> Result.defaultWith (fun failure -> failwith failure.Message) |> ignore
+                            })
+                    }
+
+                    let factory =
+                        LakeFsWorkspaceSession.createFactoryWithHooks
+                            lakeFsProviderOptions
+                            hooks
+                            (LakeFsCredentials.fixedConnection (connection ()))
+
+                    let! hookedOpen =
+                        factory.Open workspace.Binding (OperationContext.detached "finalize-paths-open")
+                        |> Async.StartAsPromise
+
+                    let session = expectValue "finalize paths open" hookedOpen
+
+                    let synchronization =
+                        session.Synchronization
+                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization services.")
+
+                    do! workspace.WriteFile "conflict.txt" "workspace conflict content\n"
+                    let! beforeRevisionStatusResult =
+                        session.Core.GetStatus(OperationContext.detached "finalize-paths-save-status")
+                        |> Async.StartAsPromise
+
+                    let beforeRevisionStatus = expectValue "finalize paths save status" beforeRevisionStatusResult
+                    let! beforeRevisionResult =
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: workspace conflict content"
+                                Paths = [| repositoryPath "conflict.txt" |]
+                                ExpectedWorkspaceVersion = beforeRevisionStatus.WorkspaceVersion
+                            }
+                            (OperationContext.detached "finalize-paths-save")
+                        |> Async.StartAsPromise
+
+                    expectValue "finalize paths save" beforeRevisionResult |> ignore
+                    do!
+                        harness.AdvanceTarget workspace [|
+                            { Path = "conflict.txt"; Content = Some "target conflict content\n" }
+                        |]
+
+                    let parsed =
+                        LakeFsTypes.LakeFsLocation.tryParse workspace.Binding.Location.ProviderLocation
+                        |> Result.defaultWith failwith
+
+                    let! targetResult =
+                        LakeFsApi.getBranch
+                            (connection ())
+                            parsed.Repository
+                            parsed.TargetRef
+                            (OperationContext.detached "finalize-paths-target")
+                        |> Async.StartAsPromise
+
+                    let target = targetResult |> Result.defaultWith (fun failure -> failwith failure.Message)
+                    let beforeIndex =
+                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        | LakeFsWorkspaceIndex.Loaded index -> index
+                        | _ -> failwith "Expected an index before the conflict update."
+
+                    let! previewResult =
+                        synchronization.PreviewUpdate(OperationContext.detached "finalize-paths-preview")
+                        |> Async.StartAsPromise
+
+                    let preview = expectValue "finalize paths preview" previewResult
+                    Vitest.expect(preview.WouldCreateConflictSession).toBe true
+
+                    let! statusResult =
+                        session.Core.GetStatus(OperationContext.detached "finalize-paths-update-status")
+                        |> Async.StartAsPromise
+
+                    let status = expectValue "finalize paths update status" statusResult
+                    let! updateResult =
+                        synchronization.Update
+                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                            (OperationContext.detached "finalize-paths-update")
+                        |> Async.StartAsPromise
+
+                    expectFailure "finalize paths update" updateResult |> ignore
+                    let conflicts =
+                        session.ConflictResolution
+                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS conflict-resolution services.")
+
+                    let! sessionResult =
+                        conflicts.GetActiveSession(OperationContext.detached "finalize-paths-session")
+                        |> Async.StartAsPromise
+
+                    let summary =
+                        expectValue "finalize paths session" sessionResult
+                        |> Option.defaultWith (fun () -> failwith "Expected an active conflict session.")
+
+                    let! resolutionStatusResult =
+                        session.Core.GetStatus(OperationContext.detached "finalize-paths-resolution-status")
+                        |> Async.StartAsPromise
+
+                    let resolutionStatus = expectValue "finalize paths resolution status" resolutionStatusResult
+                    let! resolutionResult =
+                        conflicts.Resolve
+                            {
+                                Handle = summary.Handle
+                                ExpectedWorkspaceVersion = resolutionStatus.WorkspaceVersion
+                                Path = repositoryPath "conflict.txt"
+                                Resolution = PickCandidate "workspace"
+                            }
+                            (OperationContext.detached "finalize-paths-resolution")
+                        |> Async.StartAsPromise
+
+                    let resolution = expectValue "finalize paths resolution" resolutionResult
+                    let! finalizeStatusResult =
+                        session.Core.GetStatus(OperationContext.detached "finalize-paths-finalize-status")
+                        |> Async.StartAsPromise
+
+                    let finalizeStatus = expectValue "finalize paths finalize status" finalizeStatusResult
+                    let! finalizeResult =
+                        conflicts.Finalize
+                            {
+                                Handle = resolution.RefreshedHandle
+                                ExpectedWorkspaceVersion = finalizeStatus.WorkspaceVersion
+                                Message = Some "finalize only reviewed paths"
+                            }
+                            (OperationContext.detached "finalize-paths-finalize")
+                        |> Async.StartAsPromise
+
+                    let finalizedRevision = expectValue "finalize only reviewed paths" finalizeResult
+                    let finalizedRevision =
+                        finalizedRevision |> Option.defaultWith (fun () -> failwith "Expected a finalized revision.")
+                    let! finalizedBranchResult =
+                        LakeFsApi.getBranch
+                            (connection ())
+                            parsed.Repository
+                            beforeIndex.WorkspaceBranch
+                            (OperationContext.detached "finalize-paths-workspace-head")
+                        |> Async.StartAsPromise
+
+                    let finalizedBranch = finalizedBranchResult |> Result.defaultWith (fun failure -> failwith failure.Message)
+                    Vitest.expect(finalizedBranch.CommitId).toBe (RevisionId.value finalizedRevision)
+                    let! finalizedCommitResult =
+                        LakeFsApi.getCommit
+                            (connection ())
+                            parsed.Repository
+                            finalizedBranch.CommitId
+                            (OperationContext.detached "finalize-paths-finalized-commit")
+                        |> Async.StartAsPromise
+
+                    let finalizedCommit = finalizedCommitResult |> Result.defaultWith (fun failure -> failwith failure.Message)
+                    Vitest.expect(finalizedCommit.Parents).toContain target.CommitId
+                    Vitest.expect(finalizedCommit.Parents).toContain beforeIndex.WorkspaceRevision.Value
+                    let! pendingResult =
+                        LakeFsApi.diffBranch
+                            (connection ())
+                            parsed.Repository
+                            beforeIndex.WorkspaceBranch
+                            (OperationContext.detached "finalize-paths-pending")
+                        |> Async.StartAsPromise
+
+                    let pending = pendingResult |> Result.defaultWith (fun failure -> failwith failure.Message)
+                    Vitest.expect(pending |> Array.exists (fun entry -> entry.Path = "staged-unrelated.txt")).toBe true
+
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "lakeFS resolve refuses an unadvertised base candidate",
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
+            fun () -> promise {
+                if not (integrationEnabled ()) then
+                    return failwith "lakeFS integration skipped: Docker not available"
+
+                let harness = createLakeFsHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let synchronization =
+                        workspace.Session.Synchronization
+                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization services.")
+
+                    do!
+                        harness.AdvanceTarget workspace [|
+                            { Path = "new-conflict.txt"; Content = Some "target new content\n" }
+                        |]
+                    do! workspace.WriteFile "new-conflict.txt" "workspace new content\n"
+
+                    let! previewResult =
+                        synchronization.PreviewUpdate(OperationContext.detached "unadvertised-base-preview")
+                        |> Async.StartAsPromise
+
+                    let preview = expectValue "unadvertised base preview" previewResult
+                    Vitest.expect(preview.WouldCreateConflictSession).toBe true
+                    let! statusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "unadvertised-base-status")
+                        |> Async.StartAsPromise
+
+                    let status = expectValue "unadvertised base status" statusResult
+                    let! updateResult =
+                        synchronization.Update
+                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                            (OperationContext.detached "unadvertised-base-update")
+                        |> Async.StartAsPromise
+
+                    expectFailure "unadvertised base update" updateResult |> ignore
+                    let conflicts =
+                        workspace.Session.ConflictResolution
+                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS conflict-resolution services.")
+
+                    let! sessionResult =
+                        conflicts.GetActiveSession(OperationContext.detached "unadvertised-base-session")
+                        |> Async.StartAsPromise
+
+                    let summary =
+                        expectValue "unadvertised base session" sessionResult
+                        |> Option.defaultWith (fun () -> failwith "Expected an active conflict session.")
+                    let! resolutionStatusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "unadvertised-base-resolution-status")
+                        |> Async.StartAsPromise
+
+                    let resolutionStatus = expectValue "unadvertised base resolution status" resolutionStatusResult
+                    let! resolutionResult =
+                        conflicts.Resolve
+                            {
+                                Handle = summary.Handle
+                                ExpectedWorkspaceVersion = resolutionStatus.WorkspaceVersion
+                                Path = repositoryPath "new-conflict.txt"
+                                Resolution = PickCandidate "base"
+                            }
+                            (OperationContext.detached "unadvertised-base-resolution")
+                        |> Async.StartAsPromise
+
+                    let failure = expectFailure "unadvertised base resolution" resolutionResult
+                    Vitest.expect(failure.Category).toEqual FailureCategory.Validation
+                    Vitest.expect(failure.Code).toBe "candidate_unknown"
+                    Vitest.expect(failure.Message).toContain "base"
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
             "lakeFS conflict finalize materializes the reviewed target write set",
             TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
             fun () -> promise {
