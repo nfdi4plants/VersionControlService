@@ -66,7 +66,7 @@ Optional services advertise real capability:
 
 Providers leave an unsupported service as `None`. Do not add a service whose methods are required stubs that always return `Unsupported`.
 
-Filling the gaps is the consumer's choice, not the provider's. `WorkspaceSession.withFallbackServices` returns a session with every service present, and `ProviderFactory.withFallbackServices` wraps a factory so `Open` returns such sessions. A fallback read succeeds as a no-op and carries a `service_unavailable` warning. A fallback mutation, and every synchronization operation, fails with that code. `WorkspaceSession.availability` reports what the provider really supplies and has to be read before the fallback is applied, because a filled session reports every service as present. The fallback covers an opened session only; provisioning, repository locations and credentials stay provider-specific at the composition root. `operation_not_supported` remains the provider's own code for an operation it implements but cannot perform for the given input.
+Consumers choose whether to fill absent services. `WorkspaceSession.withFallbackServices` returns a session with every service present, and `ProviderFactory.withFallbackServices` wraps a factory so `Open` returns such sessions. Every fallback operation succeeds as a no-op that carries a `service_unavailable` warning, except the synchronization service and the conflict mutations `Resolve`, `Finalize` and `Cancel`, which fail with that code. `WorkspaceSession.availability` reports what the provider really supplies and has to be read before the fallback is applied, because a filled session reports every service as present and a wrapped factory never yields an unfilled session. A host that needs the report keeps the unwrapped factory, or applies `WorkspaceSession.withFallbackServices` itself after reading the availability. Everything outside an opened session (`Probe`, `VerifyLocation`, `Initialize`, `Clone`, `Adopt`, `Bind`, `CheckDependencies`, `InstallDependency`), repository locations and credentials stay provider-specific at the composition root. A consumer that prefers to see an absent service as absent, as Swate does, does not apply the fallback. `operation_not_supported` remains the provider's own code for an operation it implements but cannot perform for the given input.
 
 ## Conflict sessions
 
@@ -166,5 +166,7 @@ The provider owns its storage keys and escaping rules. Hosts should not read or 
 ## Compatibility
 
 The published records are intentionally small. Add new capability as a new optional service record instead of adding required members to an existing published record. Provider-specific mechanics stay behind the SPI; a host should not need provider-specific parsing to resolve, adopt, open, or operate a workspace.
+
+`ServiceAvailability` is the exception to the rule about published records: a new optional service adds a required field to it, and that is a deliberate breaking change so a consumer's availability report can never be silently incomplete.
 
 Run the shared conformance profiles before publishing an external provider. The harness contract and profile expectations are described in [conformance-profiles.md](conformance-profiles.md).
