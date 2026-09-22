@@ -2513,7 +2513,12 @@ let private completeConflictFinalize
                         failure
                     )
             | Succeeded outcome ->
-                match removeResolvedDeletionFiles state (state.Conflict |> Option.get) with
+                let deletionCleanup =
+                    match state.Conflict with
+                    | None -> Ok()
+                    | Some conflict -> removeResolvedDeletionFiles state conflict
+
+                match deletionCleanup with
                 | Error failure ->
                     return
                         PartiallySucceeded(
@@ -2579,12 +2584,7 @@ let private partialConflictFinalize
         }
         {
             Code =
-                if canConfirmOnRetry then
-                    ConflictRecovery.RefreshConflictSession
-                elif refreshConflictSession then
-                    ConflictRecovery.RefreshConflictSession
-                else
-                    "review_and_retry"
+                if canConfirmOnRetry || refreshConflictSession then ConflictRecovery.RefreshConflictSession else "review_and_retry"
             Instructions =
                 Some(
                     if canConfirmOnRetry then
@@ -2902,7 +2902,7 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                     | Some failure ->
                                                         return Failed { failure with StateChanged = true }
                                                     | None ->
-                                                        // A staged change from another actor stays uncommitted, so only this finalize's resolution paths may trigger the commit.
+                                                        // A foreign staged change alone does not trigger the commit. A commit triggered by a resolution path carries whatever else is staged, because lakeFS has no per-path commit.
                                                         let resolutionPaths =
                                                             conflict.Items
                                                             |> List.map (fun item -> objectKey state item.ItemPath)
