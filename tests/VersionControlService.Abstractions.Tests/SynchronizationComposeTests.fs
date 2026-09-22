@@ -520,11 +520,11 @@ let synchronizationComposeTests =
                     (OperationResult.succeeded false)
                     (OperationResult.succeeded target)
                     (fun _ -> OperationResult.succeeded (preview false false [||]))
-                    (fun value -> Succeeded(performed value [||] [| "updated.txt" |] PublicationNotApplicable))
+                    (fun _ -> Succeeded(performed (state LocalAhead target.TargetRevision) [||] [| "updated.txt" |] PublicationNotApplicable))
                     (fun _ -> Failed(failure Network "publish_failed"))
 
             let outcome, observedFailure = expectPartial (run steps (request true true target.TargetRevision) None)
-            Expect.equal outcome.Publication LocalOnly "Update is local-only."
+            Expect.equal outcome.Publication LocalOnly "A merge that keeps local revisions is local-only."
             Expect.isTrue observedFailure.StateChanged "The update changed state."
             Expect.equal (observedFailure.RecoveryAction |> Option.map _.Code) (Some SynchronizationCodes.RetryPublishRecovery) "Retry recovery."
             assertSequence log [| "active"; "refresh"; "preview"; "update"; "publish" |]
@@ -619,15 +619,58 @@ let synchronizationComposeTests =
                     (OperationResult.succeeded false)
                     (OperationResult.succeeded target)
                     (fun _ -> OperationResult.succeeded (preview false false [||]))
-                    (fun value ->
+                    (fun _ ->
                         cancellation.Cancel()
-                        Succeeded(performed value [||] [||] PublicationNotApplicable))
+                        Succeeded(performed (state LocalAhead target.TargetRevision) [||] [||] PublicationNotApplicable))
                     (fun _ -> failwith "Publish must not run.")
 
             let outcome, observedFailure = expectPartial (run steps (request true true target.TargetRevision) (Some cancellation))
-            Expect.equal outcome.Publication LocalOnly "Canceled publish leaves local state."
+            Expect.equal outcome.Publication LocalOnly "A canceled publish after a merge leaves the local revisions unpublished."
             Expect.equal observedFailure.Category Canceled "Cancellation category."
             assertSequence log [| "active"; "refresh"; "preview"; "update" |]
+
+        testCase "canceled publish after a fast-forward update is publication not applicable"
+        <| fun () ->
+            let cancellation = OperationCancellation.Source()
+            let log = ResizeArray<string>()
+            let refreshed = state TargetAhead (Some(revision "target"))
+            let updated = state UpToDate (Some(revision "target"))
+            let steps, _, _ =
+                recordingSteps
+                    log
+                    (OperationResult.succeeded false)
+                    (OperationResult.succeeded refreshed)
+                    (fun _ -> OperationResult.succeeded (preview false false [||]))
+                    (fun _ ->
+                        cancellation.Cancel()
+                        Succeeded(performed updated [||] [||] PublicationNotApplicable))
+                    (fun _ -> failwith "Publish must not run.")
+
+            let outcome, observedFailure =
+                expectPartial (run steps (request true true refreshed.TargetRevision) (Some cancellation))
+
+            Expect.equal outcome.Publication PublicationNotApplicable "A synchronized fast-forward has no local publication state."
+            Expect.equal observedFailure.Category Canceled "Cancellation category."
+
+        testCase "a failed publish after a merge with local revisions is local-only"
+        <| fun () ->
+            let log = ResizeArray<string>()
+            let refreshed = state TargetAhead (Some(revision "target"))
+            let updated = state LocalAhead (Some(revision "target"))
+            let steps, _, _ =
+                recordingSteps
+                    log
+                    (OperationResult.succeeded false)
+                    (OperationResult.succeeded refreshed)
+                    (fun _ -> OperationResult.succeeded (preview false false [||]))
+                    (fun _ -> Succeeded(performed updated [||] [||] PublicationNotApplicable))
+                    (fun _ -> Failed(failure Network "publish_failed"))
+
+            let outcome, observedFailure =
+                expectPartial (run steps (request true true refreshed.TargetRevision) None)
+
+            Expect.equal outcome.Publication LocalOnly "A merged local revision remains unpublished."
+            Expect.equal observedFailure.Code "publish_failed" "The publish failure is preserved."
 
         testCase "publish receives the state returned by update"
         <| fun () ->

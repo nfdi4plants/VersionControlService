@@ -345,7 +345,7 @@ module Synchronization =
                                                             updateOutcome with
                                                                 Value = state1
                                                                 Effect = Performed
-                                                                Publication = LocalOnly
+                                                                Publication = publicationForUpdateOnly
                                                                 Warnings = Array.append refreshWarnings updateWarnings
                                                         },
                                                         { failure with
@@ -414,7 +414,7 @@ module Synchronization =
                                                             updateOutcome with
                                                                 Value = state1
                                                                 Effect = Performed
-                                                                Publication = LocalOnly
+                                                                Publication = publicationForUpdateOnly
                                                                 Warnings = Array.append refreshWarnings updateWarnings
                                                         },
                                                         { failure with
