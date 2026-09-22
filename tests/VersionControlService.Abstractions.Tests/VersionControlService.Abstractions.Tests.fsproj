@@ -9,6 +9,7 @@
     <Compile Include="ContractShapeTests.fs" />
     <Compile Include="SynchronizationComposeTests.fs" />
     <Compile Include="PortableConsumerTests.fs" />
+    <Compile Include="FallbackServicesTests.fs" />
   </ItemGroup>
   <ItemGroup>
     <!-- The portable consumer references only the abstractions package: no Fable.Core,
