@@ -1363,19 +1363,55 @@ let private resolveGitStatePaths
     (names: string[])
     (context: OperationContext)
     : Async<Result<string option[], OperationFailure>> =
-    let rec resolve index resolved =
-        async {
-            if index = names.Length then
-                return Ok(List.rev resolved |> List.toArray)
+    async {
+        // One rev-parse answers every --git-path in argument order, one line each.
+        let arguments =
+            Array.append [| "rev-parse" |] (names |> Array.collect (fun name -> [| "--git-path"; name |]))
+
+        let! output = runGit state.Hooks state.RepoPath arguments None context
+
+        match output with
+        | Error failure -> return Error failure
+        | Ok result when result.ExitCode = 0 ->
+            let lines =
+                result.StdOut.Replace("\r\n", "\n").Replace('\r', '\n').Split([| '\n' |], StringSplitOptions.None)
+
+            let paths =
+                names
+                |> Array.mapi (fun index _ ->
+                    if index >= lines.Length then
+                        None
+                    else
+                        let rawPath = lines[index].Trim()
+
+                        if String.IsNullOrWhiteSpace rawPath then
+                            None
+                        else
+                            let absolutePath =
+                                if rawPath.StartsWith "/" || (rawPath.Length >= 2 && rawPath[1] = ':') then
+                                    rawPath
+                                else
+                                    NodePath.join [| state.RepoPath; rawPath |]
+
+                            Some absolutePath)
+
+            return Ok paths
+        | Ok result ->
+            let detail = result.StdErr + result.StdOut
+            let missingRepository =
+                detail.IndexOf("not a git repository", StringComparison.OrdinalIgnoreCase) >= 0
+
+            if missingRepository then
+                return Ok(Array.create names.Length None)
             else
-                let! result = resolveGitStatePath state names[index] context
-
-                match result with
-                | Error failure -> return Error failure
-                | Ok path -> return! resolve (index + 1) (path :: resolved)
-        }
-
-    resolve 0 []
+                return
+                    Error(
+                        OperationFailure.createRedacted
+                            ProviderError
+                            "git_failure"
+                            $"git rev-parse --git-path failed: {detail}"
+                    )
+    }
 
 /// The active merge target revision, resolved through Git state paths.
 let private tryGetMergeHead (state: SessionState) (context: OperationContext) =
@@ -1400,7 +1436,14 @@ let private activeOperationGuard (state: SessionState) (context: OperationContex
             let! statePathsResult =
                 resolveGitStatePaths
                     state
-                    [| "rebase-merge"; "rebase-apply"; "CHERRY_PICK_HEAD"; "REVERT_HEAD"; "sequencer" |]
+                    [|
+                        "rebase-merge"
+                        "rebase-apply"
+                        "CHERRY_PICK_HEAD"
+                        "REVERT_HEAD"
+                        "sequencer"
+                        "BISECT_LOG"
+                    |]
                     context
 
             match statePathsResult with
@@ -1414,7 +1457,7 @@ let private activeOperationGuard (state: SessionState) (context: OperationContex
                     OperationFailure.create
                         Conflict
                         "operation_in_progress"
-                        "A Git operation is in progress (rebase, cherry-pick, revert or unmerged paths). Finish or abort it before synchronizing."
+                        "A Git operation is in progress (rebase, cherry-pick, revert, bisect or unmerged paths). Finish or abort it first."
 
                 if operationInProgress then
                     return Failed(inProgressFailure ())
