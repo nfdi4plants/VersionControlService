@@ -672,6 +672,29 @@ let synchronizationComposeTests =
             Expect.equal outcome.Publication LocalOnly "A merged local revision remains unpublished."
             Expect.equal observedFailure.Code "publish_failed" "The publish failure is preserved."
 
+        testCase "a failed publish after a fast-forward update is publication not applicable"
+        <| fun () ->
+            let refreshed = state TargetAhead (Some(revision "target"))
+            let updated = state UpToDate (Some(revision "target"))
+            let steps, _, _ =
+                recordingSteps
+                    (ResizeArray<string>())
+                    (OperationResult.succeeded false)
+                    (OperationResult.succeeded refreshed)
+                    (fun _ -> OperationResult.succeeded (preview false false [||]))
+                    (fun _ -> Succeeded(performed updated [||] [||] PublicationNotApplicable))
+                    (fun _ -> Failed { failure Network "publish_failed" with StateChanged = false })
+
+            let outcome, observedFailure =
+                expectPartial (run steps (request true true refreshed.TargetRevision) None)
+
+            Expect.equal outcome.Publication PublicationNotApplicable "A fast-forward has no local publication state."
+            Expect.equal observedFailure.Code "publish_failed" "The publish failure is preserved."
+            Expect.equal
+                (observedFailure.RecoveryAction |> Option.map _.Code)
+                (Some SynchronizationCodes.RetryPublishRecovery)
+                "Retry recovery."
+
         testCase "publish receives the state returned by update"
         <| fun () ->
             let log = ResizeArray<string>()
