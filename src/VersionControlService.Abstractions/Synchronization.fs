@@ -46,10 +46,11 @@ type PublishRequest = {
     ExpectedTargetRevision: RevisionId option
 }
 
-/// One synchronization: observe the target, incorporate its changes when the
-/// workspace is behind, publish local revisions. The consumer decides only where the
-/// provider cannot: it accepts a conflict session, saves or discards local changes an
-/// update would touch, retries a preview that could not be computed, and binds a
+/// One synchronization. The refresh observes the target, and the operation then
+/// performs two mutations at most: an update when the workspace is behind and a
+/// publish of the local revisions. The consumer decides only where the provider
+/// cannot: it accepts a conflict session, saves or discards local changes an update
+/// would touch, retries a preview that could not be computed, and binds a
 /// publication target the provider reports as missing.
 type SynchronizeRequest = {
     ExpectedWorkspaceVersion: string
@@ -75,8 +76,9 @@ type SynchronizationService = {
     Update: UpdateRequest -> OperationContext -> Async<OperationResult<SynchronizationState>>
     /// Make workspace revisions visible on the configured target.
     Publish: PublishRequest -> OperationContext -> Async<OperationResult<SynchronizationState>>
-    /// Refresh, update when the target is ahead and publish, as one operation under
-    /// the provider's mutation lock. See Synchronization.compose for the contract.
+    /// The refresh, the update the workspace needs and the publish of its revisions
+    /// run as one operation under the provider's mutation lock. See
+    /// Synchronization.compose for the contract.
     Synchronize: SynchronizeRequest -> OperationContext -> Async<OperationResult<SynchronizationState>>
 }
 

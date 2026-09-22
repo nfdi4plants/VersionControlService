@@ -3040,6 +3040,18 @@ let private update (state: SessionState) (request: UpdateRequest) (context: Oper
         | Succeeded outcome -> return! updateFromState state outcome.Value context
     }
 
+/// Whether the ref a publish just pushed is the ref the synchronization state tracks.
+/// Only then may the state claim the target sits at the pushed revision; a branch that
+/// tracks a differently named ref keeps the state its upstream describes.
+let private publishedRefIsSynchronizationTarget
+    (syncState: SynchronizationState)
+    (remoteName: string)
+    (branch: string)
+    =
+    match syncState.TargetRef with
+    | Some target when target.Kind = RemoteRef && target.Name = $"{remoteName}/{branch}" -> true
+    | _ -> false
+
 let private publish (state: SessionState) (expectedTarget: RevisionId option) (context: OperationContext) =
     async {
         let! branchResult = currentBranchName state context
@@ -3392,7 +3404,7 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
 
                                     let exactState, stateDetails =
                                         match stateResult with
-                                        | Ok syncState ->
+                                        | Ok syncState when publishedRefIsSynchronizationTarget syncState remoteName branch ->
                                             {
                                                 syncState with
                                                     BaseRevision = workspaceRevision |> Option.map mkRevisionId
@@ -3402,6 +3414,7 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                                     Relationship = UpToDate
                                             },
                                             [||]
+                                        | Ok syncState -> syncState, [||]
                                         | Error failure ->
                                             fallbackState verifiedRevision UpToDate,
                                             [| $"State inspection failed ({failure.Code}): {failure.Message}" |]
@@ -3472,15 +3485,8 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                         | Error failure ->
                                             fallbackState verifiedRevision UnknownRelationship, Some failure
 
-                                    let publishedRefIsSynchronizationTarget =
-                                        match syncState.TargetRef with
-                                        | Some target when
-                                            target.Kind = RemoteRef
-                                            && target.Name = $"{remoteName}/{branch}" -> true
-                                        | _ -> false
-
                                     let resultingState =
-                                        if publishedRefIsSynchronizationTarget then
+                                        if publishedRefIsSynchronizationTarget syncState remoteName branch then
                                             {
                                                 syncState with
                                                     BaseRevision = workspaceRevision |> Option.map mkRevisionId

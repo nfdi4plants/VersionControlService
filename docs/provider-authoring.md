@@ -82,7 +82,7 @@ Workspace versions are opaque optimistic-concurrency tokens. Conflict handles ha
 
 Providers call `Synchronization.compose` inside their mutation lock. The provider steps consume the refreshed state, so the update applies the revision that the preview described. The provider validates the workspace version once in its mutation wrapper.
 
-The consumer can accept an update that opens a conflict session. It has no acceptance choice for local changes on affected paths. The user must save or discard those changes first. A preview that cannot be computed is retried after the provider reports the failure.
+The consumer can accept an update that opens a conflict session. It has no acceptance choice for local changes on affected paths. The user must save or discard those changes first. When the provider cannot compute the preview, the consumer retries the synchronization later.
 
 The composition produces these decision codes and evidence:
 
