@@ -4288,18 +4288,27 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                     |> Array.skip 1
                                                     |> Array.contains currentMergeHead
 
+                                                // The merge commit already exists once the parent matches, so the
+                                                // probe runs detached from the caller's cancellation: a cancel or
+                                                // a git failure here must not report a committed merge as a plain
+                                                // failure.
                                                 let! alreadyCommitted =
                                                     if not hasMergeParent then
                                                         async { return Ok false }
                                                     else
                                                         async {
+                                                            let probeContext = {
+                                                                context with
+                                                                    Cancellation = OperationCancellation.none
+                                                            }
+
                                                             let! indexTreeResult =
-                                                                runGitChecked state.Hooks state.RepoPath [| "write-tree" |] None context
+                                                                runGitChecked state.Hooks state.RepoPath [| "write-tree" |] None probeContext
 
                                                             match indexTreeResult with
                                                             | Error failure -> return Error failure
                                                             | Ok indexTreeOutput ->
-                                                                let! headTreeResult = revParseResult state "HEAD^{tree}" context
+                                                                let! headTreeResult = revParseResult state "HEAD^{tree}" probeContext
 
                                                                 match headTreeResult with
                                                                 | Error failure -> return Error failure
@@ -4308,7 +4317,19 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                         }
 
                                                 match alreadyCommitted with
-                                                | Error failure -> return Failed failure
+                                                | Error failure ->
+                                                    return
+                                                        Failed {
+                                                            failure with
+                                                                StateChanged = true
+                                                                RecoveryAction =
+                                                                    Some {
+                                                                        Code = "inspect_workspace"
+                                                                        Instructions =
+                                                                            Some
+                                                                                "The merge is committed, but the index could not be compared with it. Inspect the workspace, then finalize again to finish the cleanup."
+                                                                    }
+                                                        }
                                                 | Ok true -> return! cleanupCommittedConflict state headRevision context
                                                 | Ok false ->
                                                     let! identityResult = resolveRevisionIdentity state context
@@ -4477,10 +4498,17 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                             | Ok None ->
                                 state.ConflictSession <- None
                                 return OperationResult.succeeded ()
-                            | Ok(Some _) | Error _ ->
+                            | readResult ->
+                                let message =
+                                    match readResult with
+                                    | Error readFailure ->
+                                        $"{failure.Message} MERGE_HEAD inspection failed: {readFailure.Message}"
+                                    | Ok _ -> failure.Message
+
                                 return
                                     Failed {
                                         failure with
+                                            Message = Redaction.redact message
                                             StateChanged = true
                                             RecoveryAction =
                                                 Some {
