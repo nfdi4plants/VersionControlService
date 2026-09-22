@@ -74,12 +74,13 @@ Codes the conflict service reports, shared by the providers unless a provider is
 
 | Code | Category | Recovery | Meaning |
 | --- | --- | --- | --- |
-| `conflict_item_not_found` | `NotFound` | None | No session is open, or the path has no unresolved item. |
+| `conflict_item_not_found` | `NotFound` | None | The path has no unresolved item (Git also reports it when no session is open). |
 | `unknown_candidate` | `Validation` | None | The candidate id is not one the item advertises. |
 | `manual_resolution_required` | `Unsupported` | None | The item holds binary or non-text content; pick an original candidate or edit the file. |
 | `candidate_content_unavailable` | `Validation` | None | The picked candidate has no content for the path (Git). |
 | `workspace_file_missing` | `NotFound` | None | The workspace candidate was picked but its file is gone (lakeFS). |
-| `file_write_failed` | `ProviderError` | `refresh_conflict_session` | The resolved content could not be written; the file may be truncated. |
+| `file_write_failed` | `ProviderError` | `refresh_conflict_session` | The resolved content could not be written; the file may be truncated (Git). |
+| `symlink_not_supported` | `Validation` | None | A candidate or workspace file is not a regular file (lakeFS). |
 | `conflicts_unresolved` | `Validation` | None | Finalize was called while items remain unresolved; the affected paths name them. |
 | `detached_head` | `Validation` | None | Finalize needs a current branch (Git). |
 
