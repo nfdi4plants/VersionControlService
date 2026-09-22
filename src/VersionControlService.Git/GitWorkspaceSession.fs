@@ -3041,7 +3041,7 @@ let private update (state: SessionState) (request: UpdateRequest) (context: Oper
     }
 
 /// Whether the ref a publish just pushed is the ref the synchronization state tracks.
-/// Only then may the state claim the target sits at the pushed revision; a branch that
+/// Only then may the state claim the target sits at the pushed revision. A branch that
 /// tracks a differently named ref keeps the state its upstream describes.
 let private publishedRefIsSynchronizationTarget
     (syncState: SynchronizationState)
