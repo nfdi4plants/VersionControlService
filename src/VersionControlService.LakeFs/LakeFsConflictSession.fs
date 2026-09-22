@@ -163,15 +163,27 @@ let resolve (conflict: State) (path: RepositoryPath) (resolution: ConflictResolu
                 Some(item.WorkspaceContent |> Option.map (fun _ -> WorkspaceFile path))
             | PickCandidate "target" ->
                 Some(item.TargetContent |> Option.map (fun value -> ExistingFile value.SourcePath))
+            | PickCandidate "base" when item.BaseContent.IsNone ->
+                None
             | PickCandidate "base" ->
                 Some(item.BaseContent |> Option.map (fun value -> ExistingFile value.SourcePath))
             | PickCandidate _ -> None
 
+        let baseCandidateMissing =
+            match resolution with
+            | PickCandidate "base" when item.BaseContent.IsNone -> true
+            | _ -> false
+
         match resolvedContent with
         | None ->
             let code, message =
-                if supportsResolvedContent then
-                    "unknown_candidate", "The candidate ID is not part of this conflict item."
+                if baseCandidateMissing then
+                    "candidate_unknown", "Candidate 'base' is not advertised for this conflict item."
+                elif supportsResolvedContent then
+                    match resolution with
+                    | PickCandidate candidateId ->
+                        "candidate_unknown", $"Candidate '{candidateId}' is not advertised for this conflict item."
+                    | _ -> "unknown_candidate", "The candidate ID is not part of this conflict item."
                 else
                     "binary_resolution_required",
                     "Binary conflicts must be resolved by selecting an original candidate or editing the file manually."

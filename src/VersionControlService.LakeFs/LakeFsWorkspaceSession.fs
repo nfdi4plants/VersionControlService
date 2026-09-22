@@ -298,9 +298,18 @@ let private pendingRecoveryGate (state: SessionState) =
 
 let private guardConflictMutation state operation =
     async {
-        match pendingRecoveryGate state with
-        | Error failure -> return Failed failure
-        | Ok() -> return! operation
+        // Conflict mutations share this gate with update and switch so their check and verify windows do not overlap.
+        while state.Busy do
+            do! Async.Sleep 5
+
+        state.Busy <- true
+
+        try
+            match pendingRecoveryGate state with
+            | Error failure -> return Failed failure
+            | Ok() -> return! operation
+        finally
+            state.Busy <- false
     }
 
 let private saveIndex (state: SessionState) =
@@ -1795,7 +1804,7 @@ let private buildConflictItems
     (overlapping: string list)
     (targetHead: string)
     (context: OperationContext)
-    : Async<LakeFsConflictSession.ItemState list> =
+    : Async<Result<LakeFsConflictSession.ItemState list, OperationFailure>> =
     async {
         let items = ResizeArray<LakeFsConflictSession.ItemState>()
 
@@ -1818,7 +1827,12 @@ let private buildConflictItems
             let buffer, _ = NodeFileSystem.readBufferNoFollowSync sourcePath
             candidateFromBuffer sourcePath buffer
 
+        // A candidate read that fails ends the build; the loop records the first failure
+        // because a return cannot leave a loop inside the builder.
+        let firstFailure: OperationFailure option ref = ref None
+
         for path in overlapping do
+          if firstFailure.Value.IsNone then
             let key = objectKey state path
 
             let readRef reference =
@@ -1835,34 +1849,43 @@ let private buildConflictItems
                             context
 
                     match content with
-                    | Ok _ -> return Some(candidateFromFile downloadedPath)
-                    | Error _ -> return None
+                    | Ok _ -> return Ok(Some(candidateFromFile downloadedPath))
+                    | Error failure when failure.Category = NotFound -> return Ok None
+                    | Error failure -> return Error failure
                 }
 
-            let! baseContent =
+            let! baseContentResult =
                 match state.Index.BaseRevision with
                 | Some baseRevision -> readRef baseRevision
-                | None -> async { return None }
+                | None -> async { return Ok None }
 
-            let! targetContent = readRef targetHead
+            match baseContentResult with
+            | Error failure -> firstFailure.Value <- Some failure
+            | Ok baseContent ->
+                let! targetContentResult = readRef targetHead
 
-            let workspaceContent =
-                match inspectLocalFile state path with
-                | None -> None
-                | Some inspected ->
-                    LakeFsPathSafety.readBuffer state.Binding.WorkspaceRoot (repositoryPath path)
-                    |> LakeFsPathSafety.orRaise
-                    |> Option.map (candidateFromBuffer inspected.AbsolutePath)
+                match targetContentResult with
+                | Error failure -> firstFailure.Value <- Some failure
+                | Ok targetContent ->
+                    let workspaceContent =
+                        match inspectLocalFile state path with
+                        | None -> None
+                        | Some inspected ->
+                            LakeFsPathSafety.readBuffer state.Binding.WorkspaceRoot (repositoryPath path)
+                            |> LakeFsPathSafety.orRaise
+                            |> Option.map (candidateFromBuffer inspected.AbsolutePath)
 
-            items.Add {
-                ItemPath = path
-                BaseContent = baseContent
-                WorkspaceContent = workspaceContent
-                TargetContent = targetContent
-                ResolvedContent = None
-            }
+                    items.Add {
+                        ItemPath = path
+                        BaseContent = baseContent
+                        WorkspaceContent = workspaceContent
+                        TargetContent = targetContent
+                        ResolvedContent = None
+                    }
 
-        return List.ofSeq items
+        match firstFailure.Value with
+        | Some failure -> return Error failure
+        | None -> return Ok(List.ofSeq items)
     }
 
 let private updateAgainst (state: SessionState) (head: string) (context: OperationContext) =
@@ -1892,26 +1915,29 @@ let private updateAgainst (state: SessionState) (head: string) (context: Operati
                     if not overlapping.IsEmpty then
                         // Conflicts: leave the logical target and workspace branch
                         // unchanged; open a provider-managed session.
-                        let! items = buildConflictItems state resolved overlapping head context
+                        let! itemsResult = buildConflictItems state resolved overlapping head context
 
-                        state.ConflictGeneration <- state.ConflictGeneration + 1
-                        let workspaceRevision =
-                            state.Index.WorkspaceRevision |> Option.defaultValue head
+                        match itemsResult with
+                        | Error failure -> return Failed failure
+                        | Ok items ->
+                            state.ConflictGeneration <- state.ConflictGeneration + 1
+                            let workspaceRevision =
+                                state.Index.WorkspaceRevision |> Option.defaultValue head
 
-                        state.Conflict <-
-                            Some(LakeFsConflictSession.create head workspaceRevision items)
+                            state.Conflict <-
+                                Some(LakeFsConflictSession.create head workspaceRevision items)
 
-                        return
-                            OperationResult.partiallySucceeded
-                                (OperationOutcome.performed (synchronizationState state (Some head)))
-                                (OperationFailure.create
-                                    Conflict
-                                    "conflicts_detected"
-                                    "The update produced conflicts that need resolution.")
-                                {
-                                    Code = "resolve_conflict_session"
-                                    Instructions = Some "Resolve every conflict item, then finalize."
-                                }
+                            return
+                                OperationResult.partiallySucceeded
+                                    (OperationOutcome.performed (synchronizationState state (Some head)))
+                                    (OperationFailure.create
+                                        Conflict
+                                        "conflicts_detected"
+                                        "The update produced conflicts that need resolution.")
+                                    {
+                                        Code = "resolve_conflict_session"
+                                        Instructions = Some "Resolve every conflict item, then finalize."
+                                    }
                     else
                         // Act: merge the target into the workspace branch, then
                         // verify the resulting head (client-side race window).
