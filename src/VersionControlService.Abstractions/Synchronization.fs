@@ -123,7 +123,8 @@ module SynchronizationCodes =
 /// observation instead of reading the target again, so the update applies exactly the
 /// revision the preview described and the decision evidence names that revision.
 type SynchronizationSteps = {
-    /// True when a conflict session is open. The composition refuses before the refresh.
+    /// True when a conflict session is open. The composition refuses before the refresh. A
+    /// Failed result (for example a provider's operation_in_progress) is returned as it is.
     HasActiveConflictSession: OperationContext -> Async<OperationResult<bool>>
     /// Observes the target and returns the pinned state.
     Refresh: OperationContext -> Async<OperationResult<SynchronizationState>>

@@ -39,7 +39,7 @@ module GitSessionHooks =
     let mutable postMergeInspectionTimeoutOverride: int option = None
 
 let private publicationVerificationTimeoutMilliseconds = 30_000
-/// This is a cancellation deadline, not a wall-clock bound. The runner resolves after the process closes.
+/// The deadline cancels the inspection. The runner resolves after the process closes.
 let private postMergeInspectionTimeoutMilliseconds = 30_000
 
 let private gitProviderId =
