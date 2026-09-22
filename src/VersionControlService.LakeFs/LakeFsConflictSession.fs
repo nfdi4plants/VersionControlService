@@ -155,6 +155,8 @@ let resolve (conflict: State) (path: RepositoryPath) (resolution: ConflictResolu
                 | TextPreview _ -> true
                 | UnsupportedPreview _ -> false)
 
+        let baseCandidateAdvertised = item.BaseContent.IsSome
+
         let resolvedContent =
             match resolution with
             | SupplyResolvedContent content when supportsResolvedContent -> Some(Some(SuppliedText content))
@@ -163,28 +165,19 @@ let resolve (conflict: State) (path: RepositoryPath) (resolution: ConflictResolu
                 Some(item.WorkspaceContent |> Option.map (fun _ -> WorkspaceFile path))
             | PickCandidate "target" ->
                 Some(item.TargetContent |> Option.map (fun value -> ExistingFile value.SourcePath))
-            | PickCandidate "base" when item.BaseContent.IsNone ->
+            | PickCandidate "base" when not baseCandidateAdvertised ->
                 None
             | PickCandidate "base" ->
                 Some(item.BaseContent |> Option.map (fun value -> ExistingFile value.SourcePath))
             | PickCandidate _ -> None
 
-        let baseCandidateMissing =
-            match resolution with
-            | PickCandidate "base" when item.BaseContent.IsNone -> true
-            | _ -> false
-
         match resolvedContent with
         | None ->
             let code, message =
-                if baseCandidateMissing then
-                    "candidate_unknown", "Candidate 'base' is not advertised for this conflict item."
-                elif supportsResolvedContent then
-                    match resolution with
-                    | PickCandidate candidateId ->
-                        "candidate_unknown", $"Candidate '{candidateId}' is not advertised for this conflict item."
-                    | _ -> "unknown_candidate", "The candidate ID is not part of this conflict item."
-                else
+                match resolution with
+                | PickCandidate candidateId ->
+                    "unknown_candidate", $"Candidate '{candidateId}' is not advertised for this conflict item."
+                | _ ->
                     "binary_resolution_required",
                     "Binary conflicts must be resolved by selecting an original candidate or editing the file manually."
 

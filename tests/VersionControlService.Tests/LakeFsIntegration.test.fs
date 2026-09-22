@@ -2103,7 +2103,7 @@ Vitest.describe (
 
                     let failure = expectFailure "unadvertised base resolution" resolutionResult
                     Vitest.expect(failure.Category).toEqual FailureCategory.Validation
-                    Vitest.expect(failure.Code).toBe "candidate_unknown"
+                    Vitest.expect(failure.Code).toBe "unknown_candidate"
                     Vitest.expect(failure.Message).toContain "base"
                     do! harness.Cleanup()
                 with error ->
