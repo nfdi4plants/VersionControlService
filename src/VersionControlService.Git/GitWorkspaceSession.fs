@@ -4376,14 +4376,22 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                                             Cancellation = OperationCancellation.none
                                                                     }
 
-                                                                    let! observedBranch = revParse state branchRef cleanupContext
+                                                                    let! observedBranch = revParseResult state branchRef cleanupContext
 
-                                                                    if observedBranch = Some newCommit then
+                                                                    match observedBranch with
+                                                                    | Ok(Some branchHead) when branchHead = newCommit ->
                                                                         return! cleanupCommittedConflict state newCommit context
-                                                                    else
+                                                                    | readResult ->
+                                                                        let message =
+                                                                            match readResult with
+                                                                            | Error readFailure ->
+                                                                                $"{failure.Message} Branch inspection failed: {readFailure.Message}"
+                                                                            | Ok _ -> failure.Message
+
                                                                         return
                                                                             Failed {
                                                                                 failure with
+                                                                                    Message = Redaction.redact message
                                                                                     StateChanged = true
                                                                                     RecoveryAction =
                                                                                         Some {
@@ -4475,7 +4483,7 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                             | Ok None ->
                                 state.ConflictSession <- None
                                 return OperationResult.succeeded ()
-                            | Ok(Some _) ->
+                            | Ok(Some _) | Error _ ->
                                 return
                                     Failed {
                                         failure with
@@ -4484,19 +4492,7 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                 Some {
                                                     Code = "abort_merge"
                                                     Instructions =
-                                                        Some "Run git merge --abort in the workspace and refresh."
-                                                }
-                                    }
-                            | Error _ ->
-                                return
-                                    Failed {
-                                        failure with
-                                            StateChanged = true
-                                            RecoveryAction =
-                                                Some {
-                                                    Code = "abort_merge"
-                                                    Instructions =
-                                                        Some "Run git merge --abort in the workspace and refresh."
+                                                        Some "Run git merge --abort in the workspace, check that MERGE_HEAD is gone, and refresh."
                                                 }
                                     }
                 })
