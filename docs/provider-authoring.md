@@ -93,11 +93,15 @@ The composition produces these decision codes and evidence:
 | `preview_indeterminate` | Provider-defined | Provider-defined | `observed_target` is added by the composition |
 | `acceptance_target_required` | `Validation` | None | The consumer must supply `ExpectedTargetRevision` |
 | `conflict_session_active` | `Conflict` | None | Resolve or cancel the active session |
+| `operation_in_progress` | `Conflict` | None | Finish or abort the Git operation in progress |
+| `publish_rejected` | `ProviderError` | None | The remote refused the push, the message carries the reason the remote printed |
 | `precondition_failed` | `Concurrency` | None | `StateChanged = false`, with `expected_target` and `observed_target` evidence |
 
 For `update_would_overwrite_local_changes`, `AcceptUpdateRisks` does not bypass the failure. The consumer retries with `AcceptUpdateRisks` and the observed target revision only for `update_would_create_conflict_session`. The composition checks that revision against the fresh target before it mutates anything.
 
 A publish failure after an applied update becomes `PartiallySucceeded` with `Publication = LocalOnly` when the failure reports no state change. The composition keeps a provider recovery action when one exists and supplies `retry_publish` otherwise. A publish failure that reports `StateChanged = true` after an applied update keeps its failure classification and carries `retry_publish` when it has no recovery action of its own.
+
+When an update applied successfully but its post-merge inspection failed, the provider returns the `refresh_workspace` recovery.
 
 ## Cancellation, progress, and redaction
 
