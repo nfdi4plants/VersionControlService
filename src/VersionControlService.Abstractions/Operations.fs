@@ -64,10 +64,17 @@ type OperationContext = {
 
 module OperationContext =
 
+    /// The context catches and drops any exception the progress callback throws, so a host
+    /// that reports to something already gone (a closed window, say) cannot fail the operation.
     let create (operationId: string) (cancellation: OperationCancellation) (reportProgress: OperationProgress -> unit) = {
         OperationId = operationId
         Cancellation = cancellation
-        ReportProgress = reportProgress
+        ReportProgress =
+            fun progress ->
+                try
+                    reportProgress progress
+                with _ ->
+                    ()
     }
 
     /// Context without cancellation or progress observation.

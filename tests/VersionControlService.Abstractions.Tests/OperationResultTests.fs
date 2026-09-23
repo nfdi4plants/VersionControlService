@@ -20,6 +20,25 @@ let operationResultTests =
             | PartiallySucceeded _
             | Failed _ -> failtest "Expected Succeeded."
 
+        testCase "a throwing progress callback does not escape the context"
+        <| fun () ->
+            let mutable calls = 0
+
+            let context =
+                OperationContext.create "progress-1" OperationCancellation.none (fun _ ->
+                    calls <- calls + 1
+                    failwith "Object has been destroyed")
+
+            context.ReportProgress {
+                PhaseCode = "transfer"
+                Item = None
+                Completed = None
+                Total = None
+                DisplayMessage = None
+            }
+
+            Expect.equal calls 1 "The callback ran once and its exception was dropped."
+
         testCase "noOp keeps its reason"
         <| fun () ->
             match OperationResult.noOp (Some "already up to date") "value" with
