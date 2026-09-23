@@ -695,6 +695,25 @@ let synchronizationComposeTests =
                 (Some SynchronizationCodes.RetryPublishRecovery)
                 "Retry recovery."
 
+        testCase "a failed publish after a fast-forward keeps the provider's recovery"
+        <| fun () ->
+            let refreshed = state TargetAhead (Some(revision "target"))
+            let updated = state UpToDate (Some(revision "target"))
+            let ownRecovery = { Code = "provider_recovery"; Instructions = None }
+            let publishFailure = { failure Network "publish_failed" with RecoveryAction = Some ownRecovery }
+            let steps, _, _ =
+                recordingSteps
+                    (ResizeArray<string>())
+                    (OperationResult.succeeded false)
+                    (OperationResult.succeeded refreshed)
+                    (fun _ -> OperationResult.succeeded (preview false false [||]))
+                    (fun _ -> Succeeded(performed updated [||] [||] PublicationNotApplicable))
+                    (fun _ -> Failed publishFailure)
+
+            let _, observedFailure = expectPartial (run steps (request true true refreshed.TargetRevision) None)
+
+            Expect.equal (observedFailure.RecoveryAction |> Option.map _.Code) (Some "provider_recovery") "Provider recovery is preserved."
+
         testCase "publish receives the state returned by update"
         <| fun () ->
             let log = ResizeArray<string>()
