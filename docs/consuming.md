@@ -122,10 +122,14 @@ let checkTools (factory: ProviderFactory) (context: OperationContext) = async {
 
 Each `DependencyStatus` names the component, whether it is installed, the version it
 found, whether that version is compatible, and a `Remediation` string to show the user.
+Git reports three components: `git`, `git-lfs`, and `git-lfs-configuration` for whether
+the LFS filter is set up.
+
 `InstallDependency` takes a component name and attempts the remediation the provider
-genuinely supports. A provider that cannot install a component returns a structured
-`Unsupported` failure, so treat a successful call as the exception and the message as the
-normal path.
+genuinely supports. Git supports only `git-lfs-configuration` and answers anything else
+with a structured `Unsupported` failure, so a host shows the `Remediation` text for git
+and Git LFS themselves and offers a button only for the filter. Treat a successful
+install as the exception and the message as the normal path.
 
 ## Opening a workspace
 
@@ -568,7 +572,9 @@ to supply both `AcceptUpdateRisks` and the `ExpectedTargetRevision` the evidence
 reported. Setting `AcceptUpdateRisks` without a target revision fails with
 `acceptance_target_required`, which exists so an acceptance can never apply to a target
 the user never saw. `conflict_session_active` means an open conflict session has to be
-resolved or cancelled first. The provider codes and evidence are tabulated in
+resolved or cancelled first. Git also reports `publish_target_missing` as a `Validation`
+failure before it touches the network, which means the workspace has no publication
+target and the host has to bind one. The provider codes and evidence are tabulated in
 [provider authoring](provider-authoring.md).
 
 ## Conflict sessions
