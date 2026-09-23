@@ -96,6 +96,21 @@ already stored answers it directly. Without one, the resolver asks every registe
 factory to probe.
 
 ```fsharp
+/// What the host has to decide for itself, because the library cannot.
+type OpenFailure =
+    | Unmanaged
+    | Ambiguous of Resolver.DetectionCandidate[]
+    | ProviderFailed of OperationFailure
+
+let openBinding (factory: ProviderFactory) binding context = async {
+    let! opened = factory.Open binding context
+
+    match opened with
+    | Succeeded outcome -> return Ok outcome.Value
+    | PartiallySucceeded(outcome, _) -> return Ok outcome.Value
+    | Failed failure -> return Error(ProviderFailed failure)
+}
+
 let openWorkspace
     (catalog: Resolver.ProviderCatalog)
     (storedBinding: WorkspaceBinding option)
