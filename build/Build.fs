@@ -13,7 +13,7 @@ let private usage =
         "  pack --version=<v> --output=<dir>           Pack the five coordinated packages into a local feed"
         "  verify packages --feed=<dir> --version=<v>  Check a local feed against the expected package graph"
         "  package-consumer [--version=<v>] [--temp=<dir>]"
-        "                                              Pack, verify and compile the one-reference consumer"
+        "                                              Pack, verify, compile and bundle the one-reference consumer"
     ]
     |> String.concat Environment.NewLine
 
@@ -84,6 +84,7 @@ let main args =
             Pack.Local version feed |> ignore
             Verify.PackageGraph feed version
             Consumer.Compile version feed cache output
+            Consumer.BundleWithOldestFable version feed cache output
         )
     | [] ->
         Console.WriteLine usage
