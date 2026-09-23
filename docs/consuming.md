@@ -390,8 +390,7 @@ ordering.
 
 Every session has `Descriptor`, `Core` and `Close`. The seven services are `option`, and a
 provider leaves one absent when it has nothing to offer there. Feature discovery is an
-`Option.isSome` check, and there are
-two reasonable ways to write a host against that.
+`Option.isSome` check, and there are two reasonable ways to write a host against that.
 
 ### Direct: an absent service stays absent
 
@@ -481,8 +480,7 @@ let repositoryUrl (session: WorkspaceSession) (context: OperationContext) = asyn
 Two groups of operations report the failure and do no quiet work: the whole
 synchronization service, and the conflict mutations `Resolve`, `Finalize` and `Cancel`.
 Both change what a user believes about where their work is. A publish that succeeded as a
-no-op would tell
-someone their work is safe on a server that never received it.
+no-op would tell someone their work is safe on a server that never received it.
 
 ```fsharp
 match result with
@@ -529,14 +527,13 @@ opposite choices against the same provider, which is the intent.
 
 Paths are exact repository-relative keys. `RepositoryPath.tryCreate` rejects an empty
 string, NUL, a backslash anywhere, an absolute or drive-rooted path, an empty segment, a
-trailing separator, and any `.` or `..` segment. The two a Windows host hits in practice are
-the drive-rooted one and the trailing separator, because `C:/data/x.csv` contains no backslash
-and `data/` looks harmless. The drive-rooted rule tests the shape of the string on every
-platform, so a
-Linux file named `a:b.csv` at the repository root is rejected too. Forward slash is the only
-separator. Anything the rules do not reject is a literal filename byte, with no Unicode
-normalization, no case folding and no wildcard expansion, so a file genuinely named
-`report [draft].csv` round-trips.
+trailing separator, and any `.` or `..` segment. The two a Windows host hits in practice
+are the drive-rooted one and the trailing separator, because `C:/data/x.csv` contains no
+backslash and `data/` looks harmless. The drive-rooted rule tests the shape of the string
+on every platform, so a Linux file named `a:b.csv` at the repository root is rejected too.
+Forward slash is the only separator. Anything the rules do not reject is a literal
+filename byte, with no Unicode normalization, no case folding and no wildcard expansion,
+so a file genuinely named `report [draft].csv` round-trips.
 
 ```fsharp
 /// What the host needs back from a save: the revision when one was created, and the
@@ -645,10 +642,9 @@ let switchRef (session: WorkspaceSession) (request: SwitchRefRequest) (context: 
 ```
 
 `PathsAtRisk` is the overlap between the paths that carry local changes and the paths that
-differ between the current revision and the target, which is the set the checkout would have
-to overwrite. `IsSafe` false is therefore a prediction that the checkout will be refused,
-and it names
-the files to deal with first.
+differ between the current revision and the target, which is the set the checkout would
+have to overwrite. `IsSafe` false is therefore a prediction that the checkout will be
+refused, and it names the files to deal with first.
 
 `request.TargetRef` is a `ProviderRef`, and the place to get one is the `ProviderRef` field
 of a `LogicalRef` that `ListRefs` returned. It is opaque, so pass it back unchanged.
