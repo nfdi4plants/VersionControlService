@@ -42,6 +42,21 @@ let private publicationVerificationTimeoutMilliseconds = 30_000
 /// The deadline cancels the inspection. The runner resolves after the process closes.
 let private postMergeInspectionTimeoutMilliseconds = 30_000
 
+/// Starts a deadline and returns the function that stops it. A stopped deadline clears
+/// its timer, so a finished operation leaves nothing pending in the event loop.
+let private startDeadline (milliseconds: int) (onTimeout: unit -> unit) : unit -> unit =
+    let source = new System.Threading.CancellationTokenSource()
+
+    Async.StartImmediate(
+        async {
+            do! Async.Sleep milliseconds
+            onTimeout ()
+        },
+        source.Token
+    )
+
+    fun () -> source.Cancel()
+
 let private gitProviderId =
     match ProviderId.tryCreate "git" with
     | Ok providerId -> providerId
@@ -3045,19 +3060,16 @@ let private updateFromState
             let inspectionTimeoutMilliseconds =
                 GitSessionHooks.postMergeInspectionTimeoutOverride
                 |> Option.defaultValue postMergeInspectionTimeoutMilliseconds
+            let mutable stopInspectionDeadline = fun () -> ()
 
             let startInspection () =
                 // Start the deadline only in an arm that performs an inspection. Early
                 // merge and setup failures must not leave a timer pending.
-                Async.StartImmediate(
-                    async {
-                        do! Async.Sleep inspectionTimeoutMilliseconds
-
+                stopInspectionDeadline <-
+                    startDeadline inspectionTimeoutMilliseconds (fun () ->
                         if not inspectionCompleted then
                             inspectionTimedOut <- true
-                            inspectionCancellation.Cancel()
-                    }
-                )
+                            inspectionCancellation.Cancel())
 
                 {
                     context with
@@ -3106,6 +3118,7 @@ let private updateFromState
                 match updatedState with
                 | Error failure ->
                     inspectionCompleted <- true
+                    stopInspectionDeadline ()
                     return Failed(inspectionFailure (Some refreshWorkspaceRecovery) failure)
                 | Ok newState ->
                     let! materializationSetting =
@@ -3116,6 +3129,7 @@ let private updateFromState
                             None
                             inspectionContext
                     inspectionCompleted <- true
+                    stopInspectionDeadline ()
 
                     let materializationFailure, materializeLargeObjects =
                         match materializationSetting with
@@ -3230,6 +3244,7 @@ let private updateFromState
                 match mergeHeadResult with
                 | Error failure ->
                     inspectionCompleted <- true
+                    stopInspectionDeadline ()
                     let recoveryAction =
                         Some {
                             Code = "inspect_workspace"
@@ -3244,6 +3259,7 @@ let private updateFromState
                     // provider-managed session; the shell reports the structured code.
                     let! updatedState = synchronizationState state inspectionContext
                     inspectionCompleted <- true
+                    stopInspectionDeadline ()
 
                     let conflictRecovery = {
                         Code = "resolve_conflict_session"
@@ -3275,6 +3291,7 @@ let private updateFromState
                 | Ok None ->
                     let! workspaceVersionAfter = computeWorkspaceVersion state inspectionContext
                     inspectionCompleted <- true
+                    stopInspectionDeadline ()
 
                     let stateChanged, recoveryAction =
                         match workspaceVersionAfter with
@@ -3585,15 +3602,11 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                             let mutable verificationCompleted = false
                             let mutable verificationTimedOut = false
 
-                            Async.StartImmediate(
-                                async {
-                                    do! Async.Sleep publicationVerificationTimeoutMilliseconds
-
+                            let stopVerificationDeadline =
+                                startDeadline publicationVerificationTimeoutMilliseconds (fun () ->
                                     if not verificationCompleted then
                                         verificationTimedOut <- true
-                                        verificationCancellation.Cancel()
-                                }
-                            )
+                                        verificationCancellation.Cancel())
 
                             let verificationContext = {
                                 context with
@@ -3609,6 +3622,7 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                     verificationContext
 
                             verificationCompleted <- true
+                            stopVerificationDeadline ()
 
                             let verification =
                                 if verificationTimedOut then
