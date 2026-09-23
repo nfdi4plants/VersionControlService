@@ -29,6 +29,7 @@ let gitFactory = Git.createFactory Git.GitSessionHooks.none
 
 let lakeFsOptions: LakeFsOptions.LakeFsProviderOptions = {
     StateRoot = applicationStateDirectory
+    PathCaseSensitivity = CaseInsensitive
 }
 
 let lakeFsFactory =
@@ -39,7 +40,7 @@ let catalog =
     |> Result.defaultWith invalidOp
 ```
 
-The host persists `WorkspaceBinding` values. An explicit binding wins over probing. Without a binding, `ProviderResolver.resolve` reports one candidate, an ambiguity, or an unmanaged workspace; the host decides whether to call `Adopt` and when to save the returned binding.
+The host persists `WorkspaceBinding` values. An explicit binding wins over probing. Without a binding, `ProviderResolver.resolve` reports one candidate, an ambiguity, or an unmanaged workspace. The host decides whether to call `Adopt` and when to save the returned binding.
 
 ## Public contract
 
@@ -51,6 +52,7 @@ Everything outside an opened session (`Probe`, `VerifyLocation`, `Initialize`, `
 
 See:
 
+- [Consuming the library](docs/consuming.md)
 - [Provider authoring](docs/provider-authoring.md)
 - [Workspace bindings and resolution](docs/workspace-bindings.md)
 - [Conformance profiles](docs/conformance-profiles.md)
