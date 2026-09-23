@@ -5845,6 +5845,44 @@ let private advanceBranch
         return revision.Trim()
     }
 
+let private initializeAndBindWorkspace
+    (hooks: GitWorkspaceSession.GitSessionHooks)
+    (workPath: string)
+    (barePath: string)
+    (operationPrefix: string)
+    =
+    promise {
+        let factory = GitWorkspaceSession.createFactory hooks
+
+        let! initializeResult =
+            factory.Initialize
+                {
+                    TargetPath = workPath
+                    Location = None
+                }
+                (ctx $"{operationPrefix}-initialize")
+            |> Async.StartAsPromise
+
+        let initializedBinding = expectSucceeded "initialize Git workspace" initializeResult
+
+        let! bindResult =
+            factory.Bind
+                {
+                    WorkspaceRoot = initializedBinding.WorkspaceRoot
+                    Location = (syncBinding workPath barePath).Location
+                }
+                (ctx $"{operationPrefix}-bind")
+            |> Async.StartAsPromise
+
+        let binding = expectSucceeded "bind Git workspace" bindResult
+
+        let! openResult =
+            factory.Open binding (ctx $"{operationPrefix}-open")
+            |> Async.StartAsPromise
+
+        return expectSucceeded "open bound Git workspace" openResult
+    }
+
 Vitest.describe (
     "Git publish tracking",
     fun () ->
@@ -5917,7 +5955,7 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "a first publish into an empty remote sets the upstream",
+            "an unborn branch synchronizes with a NoOp and no upstream",
             TestOptions(timeout = 120000),
             fun () -> promise {
                 let! root = createTempDirectoryAsync ()
@@ -5926,15 +5964,65 @@ Vitest.describe (
 
                 try
                     let! _ = runGitIn root [| "init"; "--bare"; "-b"; "main"; barePath |]
-                    let! _ = runGitIn root [| "init"; "-b"; "main"; workPath |]
+                    let! session =
+                        initializeAndBindWorkspace
+                            GitWorkspaceSession.GitSessionHooks.none
+                            workPath
+                            barePath
+                            "publish-tracking-unborn"
+
+                    let! beforeSynchronize = sessionStatus session
+
+                    let! synchronizeResult =
+                        (syncService session).Synchronize
+                            {
+                                ExpectedWorkspaceVersion = beforeSynchronize.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                                AcceptUpdateRisks = false
+                                PublishLocalRevisions = true
+                            }
+                            (ctx "publish-tracking-unborn-sync")
+                        |> Async.StartAsPromise
+
+                    let synchronized = expectSucceededOutcome "unborn branch synchronize" synchronizeResult
+
+                    match synchronized.Effect with
+                    | NoOp _ -> ()
+                    | Performed -> failwith "Expected an unborn branch synchronize to return a NoOp."
+
+                    let! branch = runGitIn workPath [| "symbolic-ref"; "--short"; "HEAD" |]
+                    let! mergeConfig =
+                        runGitResultIn workPath [| "config"; "--get"; $"branch.{branch.Trim()}.merge" |]
+
+                    Vitest.expect(mergeConfig.ExitCode).toBe 1
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+
+                do! removeDirectoryAsync root
+            }
+        )
+
+        Vitest.test (
+            "a first publish into an empty remote sets the upstream and the next synchronize updates",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root = createTempDirectoryAsync ()
+                let barePath = join [| root; "empty-origin.git" |]
+                let workPath = join [| root; "empty-work" |]
+
+                try
+                    let! _ = runGitIn root [| "init"; "--bare"; "-b"; "main"; barePath |]
+                    let! session =
+                        initializeAndBindWorkspace
+                            GitWorkspaceSession.GitSessionHooks.none
+                            workPath
+                            barePath
+                            "publish-tracking-empty"
+
                     let! _ = runGitIn workPath [| "config"; "user.name"; "VCS Sync Tests" |]
                     let! _ = runGitIn workPath [| "config"; "user.email"; "sync@example.org" |]
                     let! _ = runGitIn workPath [| "config"; "core.autocrlf"; "false" |]
-                    let! _ = runGitIn workPath [| "remote"; "add"; "origin"; barePath |]
-                    let session =
-                        GitWorkspaceSession.createSession
-                            GitWorkspaceSession.GitSessionHooks.none
-                            (syncBinding workPath barePath)
 
                     do! writeUtf8FileAsync (join [| workPath; "initial.txt" |]) "initial commit\n"
                     let! revisionStatus = sessionStatus session
@@ -6049,6 +6137,106 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "a tracked publish rejects an unfetched remote advance",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, barePath, session = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+
+                try
+                    let! theirs = advanceBranch root barePath "main" "external-advance.txt" "external revision\n"
+                    let! beforePublish = sessionStatus session
+
+                    let! publishResult =
+                        (syncService session).Publish
+                            {
+                                ExpectedWorkspaceVersion = beforePublish.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                            }
+                            (ctx "publish-tracking-unfetched-target")
+                        |> Async.StartAsPromise
+
+                    let failure = expectProviderFailure "publish with an unfetched remote advance" publishResult
+                    Vitest.expect(failure.Category).toEqual (Concurrency)
+                    Vitest.expect(failure.Code).toBe "precondition_failed"
+                    Vitest.expect(failure.StateChanged).toBe false
+                    Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "refresh_workspace")
+
+                    let! remoteRevision = runGitIn barePath [| "rev-parse"; "refs/heads/main" |]
+                    Vitest.expect(remoteRevision.Trim()).toBe theirs
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+
+                do! removeDirectoryAsync root
+            }
+        )
+
+        Vitest.test (
+            "a diverged untracked target is adopted before publish fails",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, barePath, session = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+
+                try
+                    do! createUntrackedFeature workPath
+                    do! writeUtf8FileAsync (join [| workPath; "feature.txt" |]) "feature base\n"
+                    let! firstStatus = sessionStatus session
+
+                    let! firstRevision =
+                        session.Core.CreateRevision
+                            {
+                                Message = "feature base revision"
+                                Paths = [| mkPath "feature.txt" |]
+                                ExpectedWorkspaceVersion = firstStatus.WorkspaceVersion
+                            }
+                            (ctx "publish-tracking-diverged-base")
+                        |> Async.StartAsPromise
+
+                    expectSucceeded "feature base revision" firstRevision |> ignore
+                    let! _ = runGitIn workPath [| "push"; "origin"; "feature" |]
+                    do! writeUtf8FileAsync (join [| workPath; "local-only.txt" |]) "local commit\n"
+                    let! localStatus = sessionStatus session
+
+                    let! localRevision =
+                        session.Core.CreateRevision
+                            {
+                                Message = "local feature revision"
+                                Paths = [| mkPath "local-only.txt" |]
+                                ExpectedWorkspaceVersion = localStatus.WorkspaceVersion
+                            }
+                            (ctx "publish-tracking-diverged-local")
+                        |> Async.StartAsPromise
+
+                    expectSucceeded "local feature revision" localRevision |> ignore
+                    let! _ = advanceBranch root barePath "feature" "remote-only.txt" "remote commit\n"
+                    let! beforePublish = sessionStatus session
+
+                    let! publishResult =
+                        (syncService session).Publish
+                            {
+                                ExpectedWorkspaceVersion = beforePublish.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                            }
+                            (ctx "publish-tracking-diverged")
+                        |> Async.StartAsPromise
+
+                    let failure = expectProviderFailure "publish diverged target" publishResult
+                    Vitest.expect(failure.Category).toEqual (Concurrency)
+                    Vitest.expect(failure.Code).toBe "precondition_failed"
+                    Vitest.expect(failure.StateChanged).toBe true
+                    Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "refresh_workspace")
+
+                    let! mergeConfig = runGitIn workPath [| "config"; "--get"; "branch.feature.merge" |]
+                    Vitest.expect(mergeConfig.Trim()).toBe "refs/heads/feature"
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+
+                do! removeDirectoryAsync root
+            }
+        )
+
+        Vitest.test (
             "a publish over a remote branch that moved ahead adopts it and asks for a refresh",
             TestOptions(timeout = 120000),
             fun () -> promise {
@@ -6151,6 +6339,97 @@ Vitest.describe (
                     Vitest.expect(failure.Code).toBe "precondition_failed"
                     Vitest.expect(failure.Retryable).toBe true
                     Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "refresh_workspace")
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+
+                do! removeDirectoryAsync root
+            }
+        )
+
+        Vitest.test (
+            "a verified publish reports tracking failure and rolls back the remote key",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let hooks = {
+                    GitWorkspaceSession.GitSessionHooks.none with
+                        RunProcess =
+                            Some(fun request processContext ->
+                                async {
+                                    let mergeWrite =
+                                        request.Arguments.Length >= 3
+                                        && request.Arguments[0] = "config"
+                                        && request.Arguments[1].StartsWith("branch.", StringComparison.Ordinal)
+                                        && request.Arguments[1].EndsWith(".merge", StringComparison.Ordinal)
+
+                                    if mergeWrite then
+                                        return
+                                            OperationResult.succeeded {
+                                                NodeProcess.ExitCode = 1
+                                                StdOut = ""
+                                                StdErr = "error: could not lock config file"
+                                            }
+                                    elif
+                                        (request.Arguments |> Array.contains "push")
+                                        && (request.Arguments |> Array.contains "--set-upstream")
+                                    then
+                                        // Git would write tracking during push, so this reproduces a push without that side effect.
+                                        let strippedRequest = {
+                                            request with
+                                                Arguments = request.Arguments |> Array.filter ((<>) "--set-upstream")
+                                        }
+
+                                        return! NodeProcess.run strippedRequest processContext
+                                    else
+                                        return! NodeProcess.run request processContext
+                                })
+                }
+
+                let! root, workPath, barePath, session = createSyncFixture hooks
+
+                try
+                    do! createUntrackedFeature workPath
+                    do! writeUtf8FileAsync (join [| workPath; "feature.txt" |]) "feature content\n"
+                    let! revisionStatus = sessionStatus session
+
+                    let! revisionResult =
+                        session.Core.CreateRevision
+                            {
+                                Message = "feature revision for tracking failure"
+                                Paths = [| mkPath "feature.txt" |]
+                                ExpectedWorkspaceVersion = revisionStatus.WorkspaceVersion
+                            }
+                            (ctx "publish-tracking-config-failure-revision")
+                        |> Async.StartAsPromise
+
+                    expectSucceeded "feature revision for tracking failure" revisionResult |> ignore
+                    let! beforePublish = sessionStatus session
+
+                    let! publishResult =
+                        (syncService session).Publish
+                            {
+                                ExpectedWorkspaceVersion = beforePublish.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                            }
+                            (ctx "publish-tracking-config-failure")
+                        |> Async.StartAsPromise
+
+                    match publishResult with
+                    | PartiallySucceeded(outcome, failure) ->
+                        Vitest.expect(outcome.Publication).toEqual (Published)
+                        Vitest.expect(failure.Code).toBe "upstream_config_failed"
+                        Vitest.expect(failure.StateChanged).toBe true
+                        Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "retry_publish")
+
+                        let! remoteConfig =
+                            runGitResultIn workPath [| "config"; "--get"; "branch.feature.remote" |]
+
+                        Vitest.expect(remoteConfig.ExitCode).toBe 1
+                        let! branchRevision = runGitIn barePath [| "rev-parse"; "refs/heads/feature" |]
+                        let! head = runGitIn workPath [| "rev-parse"; "HEAD" |]
+                        Vitest.expect(branchRevision.Trim()).toBe (head.Trim())
+                    | Succeeded _ -> failwith "Expected tracking setup to fail after publication."
+                    | Failed failure -> failwith $"Publish failed before the verified push ({failure.Code})."
                 with error ->
                     do! removeDirectoryAsync root
                     return raise error

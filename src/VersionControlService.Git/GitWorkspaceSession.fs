@@ -3476,7 +3476,7 @@ let private publishedRefIsSynchronizationTarget
     | _ -> false
 
 type private PublishTrackingDecision =
-    | ContinuePublish of setUpstream: bool
+    | ContinuePublish of setUpstream: bool * observedVerified: bool option
     | AdoptPublicationTarget of observed: string
 
 /// Reads the merge key that defines whether a branch has an upstream.
@@ -3490,7 +3490,7 @@ let private branchTrackingAbsent
         return merge |> Result.map Option.isNone
     }
 
-/// Checks for a local commit object without allowing Git to fetch lazily.
+/// Checks for a local commit object with lazy fetching disabled by `GIT_NO_LAZY_FETCH=1`, a variable older Git ignores and that matters only for partial clones.
 let private localCommitAvailable
     (state: SessionState)
     (revision: string)
@@ -3498,11 +3498,12 @@ let private localCommitAvailable
     : Async<Result<bool, OperationFailure>> =
     async {
         let! result =
-            runGit
+            runGitEnv
                 state.Hooks
                 state.RepoPath
-                [| "--no-lazy-fetch"; "cat-file"; "--batch-check=%(objectname) %(objecttype)" |]
+                [| "cat-file"; "--batch-check=%(objectname) %(objecttype)" |]
                 (Some(revision + "\n"))
+                [| "GIT_NO_LAZY_FETCH", "1" |]
                 context
 
         match result with
@@ -3515,7 +3516,7 @@ let private localCommitAvailable
                     OperationFailure.createRedacted
                         ProviderError
                         "git_failure"
-                        $"git --no-lazy-fetch cat-file failed: {output.StdErr}"
+                        $"git cat-file --batch-check failed: {output.StdErr}"
                 )
     }
 
@@ -3548,7 +3549,7 @@ let private isAncestorOfHead
                 )
     }
 
-/// Writes both upstream keys without allowing cancellation to leave only one set.
+/// Writes both upstream keys together or not at all, as far as git config allows.
 let private writeBranchTracking
     (state: SessionState)
     (remoteName: string)
@@ -3577,6 +3578,31 @@ let private writeBranchTracking
         | Ok output when output.ExitCode <> 0 ->
             return Error(configFailure $"git config branch.{branch}.remote failed: {output.StdErr}")
         | Ok _ ->
+            let rollbackRemote detail = async {
+                let! rollbackResult =
+                    runGit
+                        state.Hooks
+                        state.RepoPath
+                        [| "config"; "--unset"; $"branch.{branch}.remote" |]
+                        None
+                        context
+
+                let trackingFailure = configFailure detail
+
+                let rollbackDetails =
+                    match rollbackResult with
+                    | Error rollbackFailure -> [| rollbackFailure.Message |]
+                    | Ok output when output.ExitCode <> 0 ->
+                        [| $"git config --unset branch.{branch}.remote failed: {output.StdErr}" |]
+                    | Ok _ -> [||]
+
+                return
+                    Error {
+                        trackingFailure with
+                            Details = Array.append trackingFailure.Details rollbackDetails
+                    }
+            }
+
             let! mergeResult =
                 runGit
                     state.Hooks
@@ -3586,9 +3612,9 @@ let private writeBranchTracking
                     context
 
             match mergeResult with
-            | Error failure -> return Error(configFailure failure.Message)
+            | Error failure -> return! rollbackRemote failure.Message
             | Ok output when output.ExitCode <> 0 ->
-                return Error(configFailure $"git config branch.{branch}.merge failed: {output.StdErr}")
+                return! rollbackRemote $"git config branch.{branch}.merge failed: {output.StdErr}"
             | Ok _ -> return Ok()
     }
 
@@ -3662,10 +3688,10 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                     | Some expected, Some observed -> RevisionId.value expected = observed
                     | Some _, None -> false
 
-                let publishWithTracking setUpstream = async {
+                let publishWithTracking setUpstream observedVerified = async {
                     let! workspaceRevision = revParse state "HEAD" context
 
-                    if workspaceRevision = observedTarget && not setUpstream then
+                    if workspaceRevision = observedTarget && (not setUpstream || Option.isNone workspaceRevision) then
                         let! stateResult = synchronizationState state context
 
                         match stateResult with
@@ -3689,9 +3715,10 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                 do! barrier state.Hooks state.RepoPath "transfer-start" context
 
                                 let! observedObjectResult =
-                                    match observedTarget with
-                                    | None -> async { return Ok true }
-                                    | Some observed -> localCommitAvailable state observed context
+                                    match observedTarget, observedVerified with
+                                    | None, _ -> async { return Ok true }
+                                    | Some _, Some verified -> async { return Ok verified }
+                                    | Some observed, None -> localCommitAvailable state observed context
 
                                 let pathResultAsync =
                                     match observedObjectResult with
@@ -3956,6 +3983,37 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                     |> Option.toList
                             |]
 
+                            let ensureBranchTracking = async {
+                                if not setUpstream then
+                                    return None
+                                else
+                                    let! trackingAbsentResult =
+                                        branchTrackingAbsent state branch verificationContext
+
+                                    match trackingAbsentResult with
+                                    | Error failure ->
+                                        return
+                                            Some {
+                                                failure with
+                                                    StateChanged = true
+                                                    RecoveryAction = None
+                                            }
+                                    | Ok false -> return None
+                                    | Ok true ->
+                                        let! trackingWriteResult =
+                                            writeBranchTracking state remoteName branch
+
+                                        match trackingWriteResult with
+                                        | Error failure ->
+                                            return
+                                                Some {
+                                                    failure with
+                                                        StateChanged = true
+                                                        RecoveryAction = None
+                                                }
+                                        | Ok () -> return None
+                            }
+
                             let fallbackState verifiedRevision relationship = {
                                 BaseRevision = None
                                 WorkspaceRevision = workspaceRevision |> Option.map mkRevisionId
@@ -4012,6 +4070,7 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
 
                                 match pushFailure with
                                 | Some originalFailure when publicationVerified ->
+                                    let! trackingFailure = ensureBranchTracking
                                     let! stateResult = synchronizationState state verificationContext
 
                                     let exactState, stateDetails =
@@ -4031,9 +4090,17 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                             fallbackState verifiedRevision UpToDate,
                                             [| $"State inspection failed ({failure.Code}): {failure.Message}" |]
 
+                                    let trackingDetails =
+                                        match trackingFailure with
+                                        | Some failure ->
+                                            Array.append
+                                                failure.Details
+                                                [| $"Tracking setup failed ({failure.Code}): {failure.Message}" |]
+                                        | None -> [||]
+
                                     let failureWithEvidence =
                                         originalFailure
-                                        |> appendDetails stateDetails
+                                        |> appendDetails (Array.append stateDetails trackingDetails)
 
                                     let failureAffectedPaths =
                                         Array.append originalFailure.AffectedPaths affectedPaths
@@ -4089,37 +4156,7 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                                         (targetEvidence verifiedRevision)
                                         }
                                 | None when publicationVerified ->
-                                    let! trackingFailure =
-                                        if not setUpstream then
-                                            async { return None }
-                                        else
-                                            async {
-                                                let! trackingAbsentResult =
-                                                    branchTrackingAbsent state branch verificationContext
-
-                                                match trackingAbsentResult with
-                                                | Error failure ->
-                                                    return
-                                                        Some {
-                                                            failure with
-                                                                StateChanged = true
-                                                                RecoveryAction = Some retryPublishRecovery
-                                                        }
-                                                | Ok false -> return None
-                                                | Ok true ->
-                                                    let! trackingWriteResult =
-                                                        writeBranchTracking state remoteName branch
-
-                                                    match trackingWriteResult with
-                                                    | Error failure ->
-                                                        return
-                                                            Some {
-                                                                failure with
-                                                                    StateChanged = true
-                                                                    RecoveryAction = Some retryPublishRecovery
-                                                            }
-                                                    | Ok () -> return None
-                                            }
+                                    let! trackingFailure = ensureBranchTracking
 
                                     let! stateResult = synchronizationState state verificationContext
 
@@ -4151,10 +4188,29 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
 
                                     match trackingFailure with
                                     | Some failure ->
+                                        let failureDetails =
+                                            match stateFailure with
+                                            | Some stateFailure ->
+                                                Array.append
+                                                    failure.Details
+                                                    [| $"State inspection failed ({stateFailure.Code}): {stateFailure.Message}" |]
+                                            | None -> failure.Details
+
                                         return
                                             OperationResult.partiallySucceeded
                                                 outcome
-                                                failure
+                                                {
+                                                    failure with
+                                                        AffectedPaths =
+                                                            Array.append failure.AffectedPaths affectedPaths
+                                                            |> Array.distinct
+                                                        RevisionEvidence =
+                                                            combineEvidence
+                                                                failure.RevisionEvidence
+                                                                (publishedEvidence verifiedRevision)
+                                                        Details = failureDetails
+                                                        RecoveryAction = None
+                                                }
                                                 retryPublishRecovery
                                     | None ->
                                         match stateFailure with
@@ -4298,10 +4354,10 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                     | Ok trackingAbsent ->
                         let! trackingDecision =
                             if not trackingAbsent then
-                                async { return Ok(ContinuePublish false) }
+                                async { return Ok(ContinuePublish(false, None)) }
                             else
                                 match observedTarget with
-                                | None -> async { return Ok(ContinuePublish true) }
+                                | None -> async { return Ok(ContinuePublish(true, None)) }
                                 | Some observed ->
                                     async {
                                         let! availableResult = localCommitAvailable state observed context
@@ -4314,13 +4370,14 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
 
                                             match ancestorResult with
                                             | Error failure -> return Error failure
-                                            | Ok true -> return Ok(ContinuePublish true)
+                                            | Ok true -> return Ok(ContinuePublish(true, Some true))
                                             | Ok false -> return Ok(AdoptPublicationTarget observed)
                                     }
 
                         match trackingDecision with
                         | Error failure -> return Failed failure
-                        | Ok(ContinuePublish setUpstream) -> return! publishWithTracking setUpstream
+                        | Ok(ContinuePublish(setUpstream, observedVerified)) ->
+                            return! publishWithTracking setUpstream observedVerified
                         | Ok(AdoptPublicationTarget observed) -> return! adoptObservedTarget observed
     }
 

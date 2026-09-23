@@ -667,12 +667,13 @@ Prefer `Synchronize` for a button that means "bring me up to date". It refuses w
 decide safely, and the refusal says what the host has to ask the user. Keep
 `PublishLocalRevisions` true unless the user asked to update without publishing. A missing
 `TargetRef` is not a reason to turn it off. Git derives `TargetRef` from the branch's upstream,
-and publishing a branch without one sets the upstream to the branch of the same name on the
-publish remote (the branch's configured remote, otherwise `origin`). A branch created with
-`checkout -b` therefore has no `TargetRef` before its first publish and tracks its remote branch
-after it. When that remote branch already exists with revisions the workspace lacks, the publish
+and publishing a branch without one sets the upstream to the branch of the same name on
+`origin`. A branch created with `checkout -b` therefore has no `TargetRef` before its first
+publish and tracks its remote branch after it. When that remote branch already exists with revisions the workspace lacks, the publish
 adopts it as the upstream and fails with `precondition_failed` and the recovery
-`refresh_workspace`, so the next `Synchronize` integrates them:
+`refresh_workspace`, so the next `Synchronize` integrates them. When the remote's fetch refspec
+does not map the branch, as in a single-branch clone or a custom refspec, the upstream is written
+but does not resolve, so `TargetRef` stays empty. This is a known limitation.
 
 ```fsharp
 let synchronize
@@ -707,14 +708,22 @@ let synchronize
             match result with
             | Succeeded outcome -> return Ok outcome.Value
             | PartiallySucceeded(outcome, failure) ->
-                // The update landed and the publish did not. Do not report this as success:
-                // the user's revisions are still local. The recovery is usually retry_publish.
                 let recovery =
                     failure.RecoveryAction
                     |> Option.map (fun action -> action.Code)
                     |> Option.defaultValue "none"
 
-                return Error $"Updated, but not published ({failure.Code}). Recovery: {recovery}."
+                match outcome.Publication with
+                | LocalOnly ->
+                    // The update landed and the publish did not. The user's revisions remain
+                    // local, so report the recovery with the local publication state.
+                    return Error $"Updated, but not published ({failure.Code}). Recovery: {recovery}."
+                | Published ->
+                    // The publish landed and tracking setup did not. The revisions are remote,
+                    // and the recovery can repair the tracking state.
+                    return Error $"Published, but tracking failed ({failure.Code}). Recovery: {recovery}."
+                | PublicationNotApplicable ->
+                    return Error $"Synchronization partially succeeded ({failure.Code}). Recovery: {recovery}."
             | Failed failure when failure.Code = SynchronizationCodes.UpdateWouldOverwriteLocalChanges ->
                 // AcceptUpdateRisks does not override this one. The user saves or discards
                 // the paths in AffectedPaths first.
@@ -742,11 +751,11 @@ resolved or cancelled first. Git also reports `publish_target_missing` as a `Val
 failure before it touches the network, which means the workspace has no publication
 target and the host has to bind one.
 
-A `PartiallySucceeded` result here is its own outcome and not a success. It means the update
-applied and the publish did not, so the revisions are local while the workspace is up to
-date. The recovery is `retry_publish` unless the provider supplied its own. Show that
-difference, because a host that folds this into success tells the user their work is on the
-server when it is not. The provider codes and evidence are tabulated in
+A `PartiallySucceeded` result from `Synchronize` has two cases. With `Publication = LocalOnly`,
+the update applied and the publish did not, so the revisions remain local. With
+`Publication = Published`, the publish went through and tracking setup did not, so the revisions
+are remote while the workspace lacks tracking. Both cases use `retry_publish` for recovery. A
+host reads `Publication` to tell them apart. The provider codes and evidence are tabulated in
 [provider authoring](provider-authoring.md).
 
 ## Conflict sessions

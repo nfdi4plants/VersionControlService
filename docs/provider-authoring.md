@@ -126,7 +126,9 @@ The synchronize result uses these decision codes and evidence:
 | `conflict_session_active` | `Conflict` | None | Resolve or cancel the active session |
 | `operation_in_progress` | `Conflict` | None | Finish or abort the Git operation in progress |
 | `publish_rejected` | `ProviderError` | None | The remote refused the push. The message carries the reason the remote printed. |
-| `precondition_failed` | `Concurrency` | None | `StateChanged = false`, with `expected_target` and `observed_target` evidence |
+| `precondition_failed` | `Concurrency` | `refresh_workspace` for Git publish cases, otherwise None | Git reports `StateChanged = false` with `expected_target` and `observed_target` when a tracked target advanced. Git adopts an untracked remote branch with `StateChanged = true`. |
+| `upstream_config_failed` | `ProviderError` | `retry_publish` | Git reports `StateChanged = true` when the tracking config could not be written after publication. |
+| `publish_target_untracked` | `Validation` | None | Git reports that the remote branch exists, but the fetch refspec does not map it. |
 
 The `operation_in_progress` and `publish_rejected` codes pass through from the provider. Another provider may classify them differently.
 
