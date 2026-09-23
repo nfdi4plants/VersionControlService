@@ -88,7 +88,7 @@ Codes the conflict service reports, shared by the providers unless a provider is
 | `conflicts_unresolved` | `Validation` | None | Finalize was called while items remain unresolved. The affected paths name them. |
 | `detached_head` | `Validation` | None | Finalize needs a current branch (Git). |
 
-Finalize checks whether the current merge commit already has the recorded merge target as a parent. It cleans up the Git merge state and closes the session when that commit exists. A ref-update failure is inspected on the branch ref before the provider reports it. A cleanup failure keeps the session open and returns `inspect_workspace` with the state-file path.
+Finalize checks whether HEAD already has the recorded merge target as a parent and whether the index tree equals the tree of HEAD. When both hold, it cleans up the Git merge state and closes the session without a second commit. A re-resolution after the commit changes the index, so Finalize commits it. A ref-update failure is inspected on the branch ref before the provider reports it. A cleanup failure keeps the session open and returns `inspect_workspace` with the state-file path.
 
 Cancel inspects `MERGE_HEAD` after a failed abort. A missing file means the abort completed and the session closes. A remaining file returns `abort_merge` with instructions to run `git merge --abort` and refresh.
 
