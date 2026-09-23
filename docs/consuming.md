@@ -267,6 +267,7 @@ let openWorkspace
             Resolver.resolve catalog {
                 WorkspacePath = workspaceRoot
                 ExplicitBinding = storedBinding
+                // Decides whether a detected root owns this path. CaseSensitive on Linux.
                 PathCaseSensitivity = CaseInsensitive
             }
 
@@ -548,8 +549,8 @@ let saveSelected
                 match outcome.Effect with
                 | NoOp _ ->
                     // Nothing needed committing. OperationOutcome.noOp leaves
-                    // ResultingWorkspaceVersion as None, so keep the token we passed in
-                    // instead of handing back None and losing it.
+                    // ResultingWorkspaceVersion as None, so keep the token we passed in.
+                    // Handing back None would lose it.
                     return Ok { Revision = None; WorkspaceVersion = Some expectedWorkspaceVersion }
                 | Performed ->
                     // CreateRevision is an OperationResult<RevisionId>, so the new revision is
@@ -736,7 +737,7 @@ let resolvePath
             | Succeeded outcome
             | PartiallySucceeded(outcome, _) ->
                 // Keep RefreshedHandle. The one you passed in is now stale, so replaying an
-                // earlier choice fails instead of silently redoing it.
+                // earlier choice fails. Nothing is redone silently.
                 return Ok(outcome.Value.RefreshedHandle, outcome.Value.RemainingItems)
             | Failed failure -> return Error failure.Message
     }
