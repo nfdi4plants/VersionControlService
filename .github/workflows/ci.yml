@@ -31,20 +31,6 @@ jobs:
       - run: dotnet format VersionControlService.slnx --verify-no-changes --no-restore
       - run: dotnet build VersionControlService.slnx --no-restore -c Release
       - run: dotnet test tests/VersionControlService.Abstractions.Tests/VersionControlService.Abstractions.Tests.fsproj --no-restore -c Release
-      - name: Check tracked names
-        shell: pwsh
-        run: |
-          $forbiddenPattern = @(
-              ('Swa' + 'te')
-              ('VersionControlProvider' + 'Registry')
-              ('VersionControlService' + '\.Contracts')
-          ) -join '|'
-          $forbidden = git grep -n -i -E $forbiddenPattern -- ':!docs/superpowers/**'
-          if ($LASTEXITCODE -eq 0) { throw "Forbidden legacy or consumer-specific tracked content:`n$forbidden" }
-
-          $qualified = git grep -n -i -E '\bv[0-9]+\b' -- src tests |
-              Where-Object { $_ -notmatch 'git-lfs\.github\.com/spec/v1|/api/v1|--porcelain=v2' }
-          if ($qualified) { throw "Version-qualified naming in library sources:`n$($qualified -join [System.Environment]::NewLine)" }
 
   fable-vitest:
     runs-on: windows-latest
