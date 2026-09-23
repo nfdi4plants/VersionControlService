@@ -14,7 +14,7 @@ dotnet add package VersionControlService --version 0.0.1-local
 
 The umbrella package is dependency-only and carries the public abstractions, the Node runtime, the Git provider, and the lakeFS provider at one coordinated version. An external provider that does not need the built-in implementations can reference `VersionControlService.Abstractions` alone. Once the packages are published, `dotnet add package VersionControlService --prerelease` replaces the three commands above.
 
-The Git and lakeFS providers run on Fable and Node, and the Git provider also needs the git and Git LFS binaries. [Consuming the library](docs/consuming.md) lists what to install.
+The Git and lakeFS providers run on Fable and Node, and the Git provider needs the git binary. Git LFS is optional and only the large-object services use it. [Consuming the library](docs/consuming.md) lists what to install.
 
 ## Compose providers
 

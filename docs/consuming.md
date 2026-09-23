@@ -2,8 +2,8 @@
 
 A host that puts version control over a local workspace needs four things from this
 library: a factory for each provider it supports, a catalog holding those factories, a
-binding for the workspace, and an opened session. The sections below build those four in
-order, then cover the two ways to handle services a provider does not have.
+binding for the workspace, and an opened session. This page builds those four in order, and
+then covers the two ways to handle services a provider does not have.
 
 Writing a provider is a different job, covered in [provider authoring](provider-authoring.md).
 
@@ -38,6 +38,7 @@ let gitFactory = Git.createFactory Git.GitSessionHooks.none
 
 let lakeFsOptions: LakeFsOptions.LakeFsProviderOptions = {
     StateRoot = applicationStateDirectory
+    // The host's own filesystem semantics. CaseSensitive on Linux.
     PathCaseSensitivity = CaseInsensitive
 }
 
@@ -99,11 +100,99 @@ let lakeFsFactory =
 `LakeFsCredentials.unconfigured` refuses every profile and is the right default until
 the user has configured one.
 
+## Naming a repository
+
+A `RepositoryLocation` is nonsecret provider-owned location data plus the profile that
+resolves its credentials. `ProviderLocation` is whatever that provider understands. Git
+takes a clone URL or a local path. lakeFS takes `lakefs://repository/ref` with an optional
+prefix after it.
+
+```fsharp
+let gitLocation: RepositoryLocation = {
+    ProviderId = ProviderId.tryCreate WellKnownProviderIds.Git |> Result.defaultWith invalidOp
+    DisplayName = Some "Study archive"
+    ProviderLocation = "https://github.com/example/study-archive.git"
+    // The key the credential strategy will be asked for. None means anonymous.
+    ConnectionProfileId = None
+}
+
+let lakeFsLocation: RepositoryLocation = {
+    ProviderId = ProviderId.tryCreate WellKnownProviderIds.LakeFs |> Result.defaultWith invalidOp
+    DisplayName = Some "Study archive"
+    ProviderLocation = "lakefs://study-archive/main"
+    ConnectionProfileId = Some "lakefs-production"
+}
+```
+
+The lakeFS connection the profile resolves to is endpoint plus keys:
+
+```fsharp
+let connection: VersionControlService.LakeFs.LakeFsTypes.LakeFsConnection = {
+    Endpoint = "https://lakefs.example.org"
+    AccessKeyId = accessKeyId
+    SecretAccessKey = secretAccessKey
+}
+```
+
+Secrets belong here, behind the strategy, and never in the location or the binding.
+
+## Creating a workspace
+
+Three factory operations produce a binding, and none of them needs an opened session. Each
+one returns the binding for the host to persist, after which `Open` works exactly as in the
+next section.
+
+`Clone` wants a destination that is missing or empty:
+
+```fsharp
+let cloneWorkspace (factory: ProviderFactory) location targetPath (context: OperationContext) = async {
+    let! result =
+        factory.Clone
+            {
+                Location = location
+                TargetPath = targetPath
+                // None checks out whatever the provider treats as the default ref.
+                TargetRef = None
+                // False leaves large objects as pointers until something asks for them.
+                MaterializeAllObjects = false
+            }
+            context
+
+    match result with
+    | Succeeded outcome
+    | PartiallySucceeded(outcome, _) -> return Ok outcome.Value
+    | Failed failure -> return Error failure
+}
+```
+
+`Initialize` takes a directory the provider does not already own, keeps the files already in
+it, and reports them as ordinary workspace changes. Its `Location` is optional, so a
+workspace can start with no target and get one later:
+
+```fsharp
+let! result = factory.Initialize { TargetPath = targetPath; Location = Some location } context
+```
+
+`Bind` attaches or retargets a local workspace without cloning, which is the answer to
+`publish_target_missing`:
+
+```fsharp
+let! result = factory.Bind { WorkspaceRoot = workspaceRoot; Location = location } context
+```
+
+`Adopt` is the fourth, and it is for a workspace the provider already owns. The next section
+uses it.
+
 ## Checking the provider can run
 
 A provider that shells out to external tools cannot work until those tools are installed.
-Ask before the user hits a failure in the middle of a save. The Git provider reports on
-git itself, on Git LFS, and on whether the LFS filter is configured.
+Ask before the user hits a failure in the middle of a save. The Git provider reports on git
+itself, on Git LFS, and on whether the LFS filter is configured.
+
+Only git is required. Git LFS is optional, and the services that use it (object
+materialization, storage policy and maintenance) report their own dependency status when it
+is absent. A host that treats a missing `git-lfs` as fatal refuses workspaces that would
+have worked, so separate the two:
 
 ```fsharp
 let checkTools (factory: ProviderFactory) (context: OperationContext) = async {
@@ -113,21 +202,29 @@ let checkTools (factory: ProviderFactory) (context: OperationContext) = async {
     | Failed failure -> return Error failure.Message
     | Succeeded outcome
     | PartiallySucceeded(outcome, _) ->
+        let unusable (status: DependencyStatus) =
+            not status.Installed || not status.Compatible
+
+        // git missing means nothing works. Anything else only narrows what works.
         let blocking =
             outcome.Value
-            |> Array.filter (fun status -> not status.Installed || not status.Compatible)
+            |> Array.filter (fun status -> status.Component = "git" && unusable status)
 
-        return Ok blocking
+        let degraded =
+            outcome.Value
+            |> Array.filter (fun status -> status.Component <> "git" && unusable status)
+
+        return Ok(blocking, degraded)
 }
 ```
 
-Each `DependencyStatus` names the component, whether it is installed, the version it
-found, whether that version is compatible, and a `Remediation` string to show the user.
-Git reports three components: `git`, `git-lfs`, and `git-lfs-configuration` for whether
-the LFS filter is set up.
+Each `DependencyStatus` names the component, whether it is installed, the version it found,
+whether that version is compatible, and a `Remediation` string to show the user. Git reports
+three components: `git`, `git-lfs`, and `git-lfs-configuration` for whether the LFS filter
+is set up. Show the remediation text for a degraded component and let the user carry on.
 
 `InstallDependency` takes a component name and attempts the remediation the provider
-genuinely supports. Git supports only `git-lfs-configuration` and answers anything else
+supports. Git supports only `git-lfs-configuration` and answers anything else
 with a structured `Unsupported` failure, so a host shows the `Remediation` text for git
 and Git LFS themselves and offers a button only for the filter. Treat a successful
 install as the exception and the message as the normal path.
@@ -206,7 +303,7 @@ The four resolutions and what a host does with each:
 
 | Resolution | Meaning | What the host does |
 |---|---|---|
-| `Bound` | The stored binding named a registered provider. Probes were skipped. | Open it. |
+| `Bound` | The stored binding named a registered provider, so the resolver ran no probes. | Open it. |
 | `ProbedWorkspace` | One provider owns the nearest root. | Ask the user, call `Adopt`, persist the binding, open. |
 | `AmbiguousWorkspace` | Several providers claim the same root. | Ask which one. Registration order is not a tie-breaker. |
 | `UnmanagedWorkspace` | No provider claims it, or the stored binding named a provider the catalog does not hold. | Read the diagnostics before treating it as a fresh directory. Then offer `Initialize` or `Clone`. |
@@ -269,8 +366,8 @@ do not parse it or compare it for ordering, and do not keep it past the view it 
 
 ## Optional services
 
-Every session has `Core`. The rest are `option`, and a provider leaves one absent when it
-has nothing to offer there. Feature discovery is an `Option.isSome` check, and there are
+Every session has `Descriptor`, `Core` and `Close`. The seven services are `option`, and a
+provider leaves one absent when it has nothing to offer there. Feature discovery is an `Option.isSome` check, and there are
 two reasonable ways to write a host against that.
 
 ### Direct: an absent service stays absent
@@ -333,7 +430,7 @@ and `GetRepositoryWebUrl` `None`, `GetSettings` no threshold with
 A fallback write also succeeds and changes nothing. `Materialize`, `Dematerialize`,
 `SetPathPolicy` and `SetSettings` return `Succeeded` with the same warning. Read the
 warning before you treat one of these as done. The storage settings reseed in
-[provider authoring](provider-authoring.md) is the case that bites: it tells a host to
+[provider authoring](provider-authoring.md) shows why this matters. It tells a host to
 write its saved threshold through `SetSettings` and mark the migration complete only
 after success. On a filled session that success stored nothing, so a host doing that
 migration should check the warning or keep the unwrapped session for it.
@@ -430,10 +527,8 @@ let saveSelected
     (context: OperationContext)
     =
     async {
-        let paths, rejected =
-            selected
-            |> Array.map (fun raw -> raw, RepositoryPath.tryCreate raw)
-            |> Array.partition (fun (_, parsed) -> Result.isOk parsed)
+        let parsed = selected |> Array.map (fun raw -> raw, RepositoryPath.tryCreate raw)
+        let rejected = parsed |> Array.filter (fun (_, result) -> Result.isError result)
 
         if rejected.Length > 0 then
             let names = rejected |> Array.map fst |> String.concat ", "
@@ -443,7 +538,7 @@ let saveSelected
                 session.Core.CreateRevision
                     {
                         Message = message
-                        Paths = paths |> Array.map (snd >> Result.defaultWith failwith)
+                        Paths = parsed |> Array.choose (snd >> Result.toOption)
                         ExpectedWorkspaceVersion = expectedWorkspaceVersion
                     }
                     context
@@ -452,8 +547,10 @@ let saveSelected
             | Succeeded outcome ->
                 match outcome.Effect with
                 | NoOp _ ->
-                    // Nothing needed committing. The workspace version has not moved.
-                    return Ok { Revision = None; WorkspaceVersion = outcome.ResultingWorkspaceVersion }
+                    // Nothing needed committing. OperationOutcome.noOp leaves
+                    // ResultingWorkspaceVersion as None, so keep the token we passed in
+                    // instead of handing back None and losing it.
+                    return Ok { Revision = None; WorkspaceVersion = Some expectedWorkspaceVersion }
                 | Performed ->
                     // CreateRevision is an OperationResult<RevisionId>, so the new revision is
                     // outcome.Value. ResultingRevision is optional metadata that a conforming
@@ -483,13 +580,16 @@ let saveSelected
 workspace that moved underneath rejects the save with `Concurrency`, so nobody commits
 work they never saw.
 
-`Paths` are exact literal keys, never patterns. A provider that receives
-`data/*.csv` looks for a file with that name.
+`Paths` are exact literal keys. A provider that receives `data/*.csv` looks for a file
+whose name contains an asterisk.
 
 ## Switching refs without losing work
 
-`SwitchRef` can overwrite local changes. `PreflightSwitchRef` answers whether it would,
-and it takes the same request, so ask first and show the answer.
+`PreflightSwitchRef` takes the same request as `SwitchRef` and reports whether the switch
+is safe. Ask first, because the switch itself will not negotiate. Git runs a plain
+`git checkout`, so git refuses a switch that would overwrite local changes and the provider
+returns `checkout_failed`. `SwitchRefRequest` carries only the target ref and the expected
+workspace version, so there is no way to say "switch anyway". Deal with the paths first.
 
 ```fsharp
 let switchRef (session: WorkspaceSession) (request: SwitchRefRequest) (context: OperationContext) = async {
@@ -500,9 +600,10 @@ let switchRef (session: WorkspaceSession) (request: SwitchRefRequest) (context: 
     | Succeeded outcome
     | PartiallySucceeded(outcome, _) ->
         if not outcome.Value.IsSafe then
-            // PathsAtRisk names the files the switch would take away. Ask the user before
-            // going ahead, and pass their answer back as a fresh request.
-            return Error(sprintf "%d paths at risk" outcome.Value.PathsAtRisk.Length)
+            // PathsAtRisk names the files that block the switch. The host commits them with
+            // CreateRevision or throws them away with RestorePaths, then sends the same
+            // request again. There is no flag that forces the switch.
+            return Error(sprintf "%d paths block the switch" outcome.Value.PathsAtRisk.Length)
         else
             let! switched = session.Core.SwitchRef request context
 
@@ -512,6 +613,14 @@ let switchRef (session: WorkspaceSession) (request: SwitchRefRequest) (context: 
             | Failed failure -> return Error failure.Message
 }
 ```
+
+`PathsAtRisk` is the overlap between the paths that carry local changes and the paths that
+differ between the current revision and the target, which is the set the checkout would have
+to overwrite. `IsSafe` false is therefore a prediction that the checkout will be refused, and it names
+the files to deal with first.
+
+`request.TargetRef` is a `ProviderRef`, and the place to get one is the `ProviderRef` field
+of a `LogicalRef` that `ListRefs` returned. It is opaque, so pass it back unchanged.
 
 The rest of `Core` follows the same shape. `ListRefs` and `CreateRef` cover the branch
 list and branch creation, `RestorePaths` throws away local changes on exact paths, and
@@ -528,13 +637,21 @@ workspace needs, and the publish of its revisions as one operation under the pro
 lock.
 
 Prefer `Synchronize` for a button that means "bring me up to date". It refuses when it cannot
-decide safely, and the refusal says what the host has to ask the user:
+decide safely, and the refusal says what the host has to ask the user. Pass
+`PublishLocalRevisions = false` when the refreshed state has no `TargetRef`, because a
+workspace with no publication target reaches the publish step and fails there:
 
 ```fsharp
 let synchronize
     (session: WorkspaceSession)
     (expectedWorkspaceVersion: string)
-    (accepted: RevisionId option)
+    // The target the user was looking at when they decided. A target that moved since then
+    // fails before anything mutates. It is required when acceptedConflictSession is true.
+    (observedTarget: RevisionId option)
+    // The user saw the preview and accepted that the update opens a conflict session. This
+    // is consent, and it is a separate question from which target they saw.
+    (acceptedConflictSession: bool)
+    (publishLocalRevisions: bool)
     (context: OperationContext)
     =
     async {
@@ -545,11 +662,11 @@ let synchronize
                 synchronization.Synchronize
                     {
                         ExpectedWorkspaceVersion = expectedWorkspaceVersion
-                        // The target the user was looking at when they decided. A target that
-                        // moved since then fails before anything mutates.
-                        ExpectedTargetRevision = accepted
-                        AcceptUpdateRisks = Option.isSome accepted
-                        PublishLocalRevisions = true
+                        ExpectedTargetRevision = observedTarget
+                        AcceptUpdateRisks = acceptedConflictSession
+                        // False on a workspace with no publication target, otherwise the
+                        // operation reaches the publish step and fails there.
+                        PublishLocalRevisions = publishLocalRevisions
                     }
                     context
 
@@ -561,9 +678,12 @@ let synchronize
                 // the paths in AffectedPaths first.
                 return Error "Save or discard your changes to these files first."
             | Failed failure when failure.Code = SynchronizationCodes.UpdateWouldCreateConflictSession ->
-                // Show the preview, then call again with AcceptUpdateRisks and the target
-                // revision the failure reported in RevisionEvidence.
+                // Show the preview, then call again with acceptedConflictSession true and the
+                // target revision the failure reported in RevisionEvidence.
                 return Error "This update opens a conflict session. Ask the user to accept."
+            | Failed failure when failure.Code = "publish_target_missing" ->
+                // Nothing to publish to. Offer Bind, or call again with publishing off.
+                return Error "This workspace has no publication target yet."
             | Failed failure -> return Error failure.Message
     }
 ```
@@ -669,15 +789,15 @@ cancellation left behind:
     return Error $"Canceled. State changed: {failure.StateChanged}. Recovery: {recovery}."
 ```
 
-A canceled Git update is the case worth handling properly. On Windows a killed git
+A canceled Git update needs real handling. On Windows a killed git
 process leaves its `index.lock` behind, so `remove_index_lock` is the usual recovery code
 and a host needs a path for it. The recovery codes a Git update can report are listed in
 [provider authoring](provider-authoring.md).
 
 `OperationProgress` carries a stable `PhaseCode` such as `transfer`, an optional item,
-completed and total counts, and a sanitized `DisplayMessage`. Counts are `float` because a
-32-bit int overflows past two GiB once the code is compiled to JavaScript, so byte totals
-above that stay exact on .NET and on Fable alike. Show the message, and branch on the
+completed and total counts, and a sanitized `DisplayMessage`. Counts are `float` because
+JavaScript has no native 64-bit integer, so a float is what carries byte totals above two
+GiB exactly on both runtimes. Show the message, and branch on the
 phase code.
 
 ## Building against the packages
@@ -711,7 +831,7 @@ of that toolchain.
 A Fable host also needs the npm side and a Fable compile step:
 
 ```console
-npm install simple-git @fable-org/fable-library-js
+npm install simple-git
 dotnet new tool-manifest
 dotnet tool install fable
 dotnet tool run fable YourApp.fsproj --outDir output
@@ -722,10 +842,12 @@ Fable is a dotnet tool, so a consumer needs its own manifest. This repository pi
 5.5.0 in `.config/dotnet-tools.json` and CI runs `dotnet tool restore` before any target
 that compiles with it, which is why the command works here without the install step.
 
-The Git provider shells out to the real tools on top of that. It wants Git 2.38 or newer,
-because it uses `merge-tree --write-tree`, and Git LFS 3.7 or newer. `CheckDependencies`
-reports on all of that at runtime, which is why it is worth calling before the user gets
-far. lakeFS needs no local tool and talks to its server over HTTP.
+The Git provider shells out to the real tools on top of that. It requires Git 2.38 or newer,
+because it uses `merge-tree --write-tree`. Git LFS 3.7 or newer is optional, and without it
+the object materialization, storage policy and maintenance services report their own
+dependency status while core Git work carries on. `CheckDependencies` reports all of that at
+runtime, which is why it is worth calling before the user gets far. lakeFS needs no local
+tool and talks to its server over HTTP.
 
 Two files in this repository are worth copying from.
 `tests/VersionControlService.PackageConsumer/Program.fs` is the smallest composition root
