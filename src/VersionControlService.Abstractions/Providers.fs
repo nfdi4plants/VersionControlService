@@ -1,8 +1,8 @@
 namespace VersionControlService.Abstractions
 
-/// One opened per-workspace session. Service presence, not Boolean capability
-/// flags, controls feature discovery: a consumer checks presence once and enables
-/// matching UI; it never calls a required stub that returns Unsupported.
+/// One opened per-workspace session. Service presence controls feature discovery.
+/// A provider leaves a service absent when it has nothing to offer there, and a
+/// consumer checks presence once and enables the matching UI.
 ///
 /// After prerelease stabilization this record and its service records are frozen: new
 /// capabilities are added as new optional service records, never as new members
@@ -145,6 +145,14 @@ module WorkspaceSession =
 
     /// The session with every absent optional service filled by a fallback, for a
     /// consumer that wants one code path for every provider. Present services are kept.
+    ///
+    /// Each fallback that succeeds does nothing and carries a service_unavailable warning.
+    /// ListObjects returns an empty array, GetSettings returns no threshold with
+    /// MaterializeLargeObjects = true, the text diff reads return UnsupportedContent,
+    /// and GetActiveSession and GetRepositoryWebUrl return None. Prune and Deduplicate
+    /// return the reason as their report. Every synchronization operation and the
+    /// conflict mutations Resolve, Finalize and Cancel fail as Unsupported with the
+    /// service_unavailable code.
     let withFallbackServices (session: WorkspaceSession) : WorkspaceSession = {
         // Naming every field makes a newly added optional service fail compilation until this fallback handles it.
         Descriptor = session.Descriptor
