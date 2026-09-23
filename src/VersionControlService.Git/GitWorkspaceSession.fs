@@ -3926,10 +3926,16 @@ let private manualConflictResolutionFailure (path: RepositoryPath) =
     }
 
 let private ensureConflictSupportsTextResolution
+    (path: RepositoryPath)
+    (item: ConflictItem)
+    =
+    if item.SupportsResolvedContent then Ok() else Error(manualConflictResolutionFailure path)
+
+let private getConflictItem
     (state: SessionState)
     (path: RepositoryPath)
     (context: OperationContext)
-    =
+    : Async<Result<ConflictItem, OperationFailure>> =
     async {
         let! summaryResult = getMergeConflictSummary state context
 
@@ -3950,9 +3956,7 @@ let private ensureConflictSupportsTextResolution
                             "conflict_item_not_found"
                             "No unresolved conflict exists for the selected path."
                     )
-            | Some item when not item.SupportsResolvedContent ->
-                return Error(manualConflictResolutionFailure path)
-            | Some _ -> return Ok()
+            | Some item -> return Ok item
     }
 
 let private refreshConflictSessionFailure (failure: OperationFailure) =
@@ -4115,12 +4119,17 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                             $"No unresolved conflict exists for the selected path."
                                     )
                             else
-                                let! supportResult =
-                                    ensureConflictSupportsTextResolution state request.Path context
+                                let! itemResult = getConflictItem state request.Path context
 
-                                match supportResult with
+                                match itemResult with
                                 | Error failure -> return Failed failure
-                                | Ok() ->
+                                | Ok item ->
+                                    let unknownCandidateFailure () =
+                                        OperationFailure.create
+                                            Validation
+                                            "unknown_candidate"
+                                            "The candidate ID is not part of this conflict item."
+
                                     let readCandidate stage =
                                         async {
                                             let! previewResult =
@@ -4129,7 +4138,7 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                             match previewResult with
                                             | Error failure -> return Error failure
                                             | Ok None -> return Ok None
-                                            | Ok(Some(TextPreview content)) -> return Ok(Some content)
+                                            | Ok(Some(TextPreview content)) -> return Ok(Some(Choice1Of2 content))
                                             | Ok(Some(UnsupportedPreview _)) ->
                                                 return Error(manualConflictResolutionFailure request.Path)
                                         }
@@ -4137,18 +4146,42 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                     let resolveContent () =
                                         async {
                                             match request.Resolution with
-                                            | SupplyResolvedContent content -> return Ok(Some content)
-                                            | PickCandidate "workspace" -> return! readCandidate 2
-                                            | PickCandidate "target" -> return! readCandidate 3
-                                            | PickCandidate "base" -> return! readCandidate 1
-                                            | PickCandidate _ ->
-                                                return
-                                                    Error(
-                                                        OperationFailure.create
-                                                            Validation
-                                                            "unknown_candidate"
-                                                            "The candidate ID is not part of this conflict item."
-                                                    )
+                                            | SupplyResolvedContent content ->
+                                                match ensureConflictSupportsTextResolution request.Path item with
+                                                | Error failure -> return Error failure
+                                                | Ok() -> return Ok(Some(Choice1Of2 content))
+                                            | PickCandidate candidateId ->
+                                                match
+                                                    item.Candidates
+                                                    |> Array.tryFind (fun candidate -> candidate.CandidateId = candidateId)
+                                                with
+                                                | None -> return Error(unknownCandidateFailure ())
+                                                | Some candidate ->
+                                                    let stage =
+                                                        match candidate.CandidateId with
+                                                        | "workspace" -> Some 2
+                                                        | "target" -> Some 3
+                                                        | "base" -> Some 1
+                                                        | _ -> None
+
+                                                    match stage with
+                                                    | None -> return Error(unknownCandidateFailure ())
+                                                    | Some stage when item.SupportsResolvedContent ->
+                                                        return! readCandidate stage
+                                                    | Some stage ->
+                                                        let! stageResult =
+                                                            runGit
+                                                                state.Hooks
+                                                                state.RepoPath
+                                                                [| "rev-parse"; "--verify"; "--quiet"; $":{stage}:{pathValue}" |]
+                                                                None
+                                                                context
+
+                                                        match stageResult with
+                                                        // The stage check only reads, so its failure reports no state change.
+                                                        | Error failure -> return Error { failure with AffectedPaths = [| pathValue |] }
+                                                        | Ok output when output.ExitCode <> 0 -> return Ok None
+                                                        | Ok _ -> return Ok(Some(Choice2Of2 stage))
                                         }
 
                                     let! contentResult = resolveContent ()
@@ -4164,21 +4197,64 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                     "The selected candidate has no content for this path."
                                             )
                                     | Ok(Some content) ->
-                                        let absolutePath = NodePath.join [| state.RepoPath; pathValue |]
-                                        let writeResult =
-                                            try
-                                                NodeFileSystem.writeFileSync absolutePath content NodeFileSystem.TextEncoding.Utf8
-                                                Ok()
-                                            with error ->
-                                                Error(
-                                                    {
-                                                        OperationFailure.createRedacted
-                                                            ProviderError
-                                                            "file_write_failed"
-                                                            $"Writing resolved content to '{pathValue}' failed: {error.Message}" with
-                                                            AffectedPaths = [| pathValue |]
-                                                    }
-                                                )
+                                        let! writeResult =
+                                            async {
+                                                match content with
+                                                | Choice1Of2 text ->
+                                                    let absolutePath = NodePath.join [| state.RepoPath; pathValue |]
+
+                                                    try
+                                                        NodeFileSystem.writeFileSync
+                                                            absolutePath
+                                                            text
+                                                            NodeFileSystem.TextEncoding.Utf8
+
+                                                        return Ok()
+                                                    with error ->
+                                                        return
+                                                            Error(
+                                                                {
+                                                                    OperationFailure.createRedacted
+                                                                        ProviderError
+                                                                        "file_write_failed"
+                                                                        $"Writing resolved content to '{pathValue}' failed: {error.Message}" with
+                                                                        AffectedPaths = [| pathValue |]
+                                                                }
+                                                            )
+                                                | Choice2Of2 stage ->
+                                                    let! result =
+                                                        runGitEnv
+                                                            state.Hooks
+                                                            state.RepoPath
+                                                            [| "checkout-index"; "-f"; $"--stage={stage}"; "--"; pathValue |]
+                                                            None
+                                                            [| "GIT_LFS_SKIP_SMUDGE", "1" |]
+                                                            context
+
+                                                    match result with
+                                                    // A runner failure (a canceled context included) keeps its own
+                                                    // category. Git may have written part of the file before it stopped.
+                                                    | Error failure ->
+                                                        return Error { failure with AffectedPaths = [| pathValue |] }
+                                                    | Ok output when output.ExitCode = 0 -> return Ok()
+                                                    | Ok output ->
+                                                        let detail =
+                                                            if String.IsNullOrWhiteSpace output.StdErr then
+                                                                $"Git exited with code {output.ExitCode}."
+                                                            else
+                                                                output.StdErr.Trim()
+
+                                                        return
+                                                            Error(
+                                                                {
+                                                                    OperationFailure.createRedacted
+                                                                        ProviderError
+                                                                        "file_write_failed"
+                                                                        $"Writing the picked candidate to '{pathValue}' failed: {detail}" with
+                                                                        AffectedPaths = [| pathValue |]
+                                                                }
+                                                            )
+                                            }
 
                                         match writeResult with
                                         | Error failure -> return Failed(refreshConflictSessionFailure failure)

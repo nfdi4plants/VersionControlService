@@ -80,8 +80,8 @@ Codes the conflict service reports, shared by the providers unless a provider is
 | --- | --- | --- | --- |
 | `conflict_item_not_found` | `NotFound` | None | The path has no unresolved item (Git also reports it when no session is open). |
 | `unknown_candidate` | `Validation` | None | The candidate id is not one the item advertises. |
-| `manual_resolution_required` | `Unsupported` | None | The item holds binary or non-text content. Pick an original candidate or edit the file. |
-| `candidate_content_unavailable` | `Validation` | None | The picked candidate has no content for the path (Git). |
+| `manual_resolution_required` | `Unsupported` | None | The item holds binary or non-text content, and the resolution supplies text. Pick an original candidate instead. |
+| `candidate_content_unavailable` | `Validation` | None | The item advertises the candidate, but its content cannot be read for the path (Git). |
 | `workspace_file_missing` | `NotFound` | None | The workspace candidate was picked but its file is gone (lakeFS). |
 | `file_write_failed` | `ProviderError` | `refresh_conflict_session` | The resolved content could not be written. The file may be truncated (Git). |
 | `symlink_not_supported` | `Validation` | None | A candidate or workspace file is not a regular file, or the path changed while it was being read (lakeFS). |

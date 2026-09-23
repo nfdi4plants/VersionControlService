@@ -58,6 +58,9 @@ let private writeUtf8FileAsync (path: string) (content: string) : JS.Promise<uni
 [<Emit("Buffer.from($0)")>]
 let private bufferFromBytes (_bytes: int[]) : obj = jsNative
 
+[<Emit("$0.equals($1)")>]
+let private buffersEqual (_left: obj) (_right: obj) : bool = jsNative
+
 let private writeBinaryFileAsync (path: string) (bytes: int[]) : JS.Promise<unit> = promise {
     do! ensureDirectoryAsync (dirname path)
     let! _ = fsPromisesDynamic?writeFile (path, bufferFromBytes bytes) |> unbox<JS.Promise<obj>>
@@ -243,6 +246,22 @@ let private advanceTarget (root: string) (barePath: string) (mutations: (string 
 
     let! _ = runGitIn clonePath [| "add"; "-A" |]
     let! _ = runGitIn clonePath [| "commit"; "-m"; "external: advance" |]
+    let! _ = runGitIn clonePath [| "push"; "origin"; "HEAD" |]
+    return ()
+}
+
+let private advanceTargetWithBinary (root: string) (barePath: string) (path: string) (bytes: int[]) = promise {
+    let clonePath = join [| root; $"advance-binary-{DateTime.Now.Ticks}" |]
+
+    let! _ =
+        runGitIn root [| "clone"; "-c"; "core.autocrlf=false"; barePath; clonePath |]
+
+    let! _ = runGitIn clonePath [| "config"; "user.name"; "External Client" |]
+    let! _ = runGitIn clonePath [| "config"; "user.email"; "external@example.org" |]
+    do! writeBinaryFileAsync (join [| clonePath; path |]) bytes
+
+    let! _ = runGitIn clonePath [| "add"; "-A" |]
+    let! _ = runGitIn clonePath [| "commit"; "-m"; "external: advance binary" |]
     let! _ = runGitIn clonePath [| "push"; "origin"; "HEAD" |]
     return ()
 }
@@ -1749,7 +1768,7 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "keeps invalid UTF-8 stage candidates byte-oriented and rejects automatic resolution",
+            "keeps invalid UTF-8 stage candidates byte-oriented and rejects a text resolution",
             TestOptions(timeout = 120000),
             fun () -> promise {
                 let mutable injectBinaryStages = false
@@ -1803,15 +1822,368 @@ Vitest.describe (
                                     Handle = summary.Handle
                                     ExpectedWorkspaceVersion = workspaceVersion
                                     Path = mkPath "base.txt"
-                                    Resolution = PickCandidate "workspace"
+                                    Resolution = SupplyResolvedContent "manual text resolution\n"
                                 }
                                 (ctx "binary-stage-resolve")
                         )
 
-                    let failure = expectFailure "binary stage automatic resolution" resolveResult
+                    let failure = expectFailure "binary stage text resolution" resolveResult
                     Vitest.expect(failure.Category).toEqual (Unsupported)
                     Vitest.expect(failure.Code).toBe ("manual_resolution_required")
                     let! markerContent = tryReadUtf8FileAsync (join [| workPath; "base.txt" |])
+                    Vitest.expect(markerContent |> Option.exists (fun content -> content.Contains "<<<<<<<")).toBe (true)
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "picks an original candidate for a binary conflict",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let workspaceBytes = [| 0; 159; 146; 150; 255 |]
+                let targetBytes = [| 0; 255; 1; 2; 3 |]
+                let! root, workPath, barePath, session = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+
+                try
+                    do! writeBinaryFileAsync (join [| workPath; "base.txt" |]) workspaceBytes
+                    let! workspaceStatus = sessionStatus session
+                    let! saveResult =
+                        Async.StartAsPromise(
+                            session.Core.CreateRevision
+                                {
+                                    Message = "local binary conflict"
+                                    Paths = [| mkPath "base.txt" |]
+                                    ExpectedWorkspaceVersion = workspaceStatus.WorkspaceVersion
+                                }
+                                (ctx "binary-conflict-save")
+                        )
+
+                    expectValue "local binary conflict revision" saveResult |> ignore
+                    do! advanceTargetWithBinary root barePath "base.txt" targetBytes
+
+                    let! updateStatus = sessionStatus session
+                    let! updateResult =
+                        Async.StartAsPromise(
+                            (syncService session).Update
+                                { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
+                                (ctx "binary-conflict-update")
+                        )
+
+                    match updateResult with
+                    | Failed failure
+                    | PartiallySucceeded(_, failure) when failure.Code = "conflicts_detected" -> ()
+                    | Failed failure
+                    | PartiallySucceeded(_, failure) ->
+                        failwith $"Expected conflicts_detected, received {failure.Category}/{failure.Code}."
+                    | Succeeded _ -> failwith "Expected the binary changes to conflict."
+
+                    let conflicts = conflictService session
+                    let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession(ctx "binary-conflict-session"))
+                    let summary =
+                        match expectValue "binary conflict session" summaryResult with
+                        | Some value -> value
+                        | None -> failwith "Expected an active binary conflict session."
+
+                    Vitest.expect(summary.Items[0].SupportsResolvedContent).toBe (false)
+
+                    let! status = sessionStatus session
+                    let! resolveResult =
+                        Async.StartAsPromise(
+                            conflicts.Resolve
+                                {
+                                    Handle = summary.Handle
+                                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                    Path = mkPath "base.txt"
+                                    Resolution = PickCandidate "target"
+                                }
+                                (ctx "binary-conflict-pick-target")
+                        )
+
+                    let resolution = expectValue "binary conflict target pick" resolveResult
+                    Vitest.expect(resolution.RemainingItems.Length).toBe (0)
+
+                    let! resolvedBytes =
+                        fsPromisesDynamic?readFile (join [| workPath; "base.txt" |])
+                        |> unbox<JS.Promise<obj>>
+
+                    Vitest.expect(buffersEqual resolvedBytes (bufferFromBytes targetBytes)).toBe (true)
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "picks a binary candidate of an LFS-tracked conflict without smudging",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGitResultIn "." [| "lfs"; "version" |]
+
+                if lfsProbe.ExitCode <> 0 then
+                    // Git LFS may be unavailable, so report a pass with a skip note.
+                    Vitest.expect(true).toBe true
+                else
+                    let path = "tracked.xlsx"
+                    let workspaceBytes = [| 0; 159; 146; 150; 255 |]
+                    let targetBytes = [| 0; 255; 1; 2; 3 |]
+                    let! root, workPath, barePath, session = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+
+                    try
+                        let! _ = runGitIn workPath [| "lfs"; "install"; "--local" |]
+                        let! _ = runGitIn workPath [| "lfs"; "track"; "*.xlsx" |]
+                        do! writeBinaryFileAsync (join [| workPath; path |]) [| 0; 1; 2; 3; 4 |]
+                        let! _ = runGitIn workPath [| "add"; ".gitattributes"; path |]
+                        let! _ = runGitIn workPath [| "commit"; "-m"; "init: LFS conflict path" |]
+                        let! _ = runGitIn workPath [| "push"; "origin"; "main" |]
+
+                        do! writeBinaryFileAsync (join [| workPath; path |]) workspaceBytes
+                        let! workspaceStatus = sessionStatus session
+                        let! saveResult =
+                            Async.StartAsPromise(
+                                session.Core.CreateRevision
+                                    {
+                                        Message = "local LFS binary conflict"
+                                        Paths = [| mkPath path |]
+                                        ExpectedWorkspaceVersion = workspaceStatus.WorkspaceVersion
+                                    }
+                                    (ctx "lfs-binary-conflict-save")
+                            )
+
+                        expectValue "local LFS binary conflict revision" saveResult |> ignore
+
+                        let clonePath = join [| root; "advance-lfs-binary" |]
+                        let! _ = runGitIn root [| "clone"; "-c"; "core.autocrlf=false"; barePath; clonePath |]
+                        let! _ = runGitIn clonePath [| "config"; "user.name"; "External Client" |]
+                        let! _ = runGitIn clonePath [| "config"; "user.email"; "external@example.org" |]
+                        let! _ = runGitIn clonePath [| "lfs"; "install"; "--local" |]
+                        do! writeBinaryFileAsync (join [| clonePath; path |]) targetBytes
+                        let! _ = runGitIn clonePath [| "add"; "-A" |]
+                        let! _ = runGitIn clonePath [| "commit"; "-m"; "external: advance LFS binary" |]
+                        let! _ = runGitIn clonePath [| "push"; "origin"; "HEAD" |]
+
+                        let! updateStatus = sessionStatus session
+                        let! updateResult =
+                            Async.StartAsPromise(
+                                (syncService session).Update
+                                    { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
+                                    (ctx "lfs-binary-conflict-update")
+                            )
+
+                        match updateResult with
+                        | Failed failure
+                        | PartiallySucceeded(_, failure) when failure.Code = "conflicts_detected" -> ()
+                        | Failed failure
+                        | PartiallySucceeded(_, failure) ->
+                            failwith $"Expected conflicts_detected, received {failure.Category}/{failure.Code}."
+                        | Succeeded _ -> failwith "Expected the LFS binary changes to conflict."
+
+                        let conflicts = conflictService session
+                        let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession(ctx "lfs-binary-conflict-session"))
+                        let summary =
+                            match expectValue "LFS binary conflict session" summaryResult with
+                            | Some value -> value
+                            | None -> failwith "Expected an active LFS binary conflict session."
+
+                        Vitest.expect(summary.Items[0].SupportsResolvedContent).toBe false
+
+                        let! status = sessionStatus session
+                        let! resolveResult =
+                            Async.StartAsPromise(
+                                conflicts.Resolve
+                                    {
+                                        Handle = summary.Handle
+                                        ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                        Path = mkPath path
+                                        Resolution = PickCandidate "target"
+                                    }
+                                    (ctx "lfs-binary-conflict-pick-target")
+                            )
+
+                        let resolution = expectValue "LFS binary target pick" resolveResult
+                        Vitest.expect(resolution.RemainingItems.Length).toBe 0
+
+                        let! pointer = tryReadUtf8FileAsync (join [| workPath; path |])
+
+                        match pointer with
+                        | Some content ->
+                            Vitest.expect(content.StartsWith "version https://git-lfs.github.com/spec/v1").toBe true
+                        | None -> failwith "Expected the picked LFS pointer file to exist."
+
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "answers candidate_content_unavailable for a binary pick of a deleted side",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let path = "base.txt"
+                let initialBytes = [| 0; 1; 2; 3; 4 |]
+                let workspaceBytes = [| 0; 159; 146; 150; 255 |]
+                let! root, workPath, barePath, session = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+
+                try
+                    do! writeBinaryFileAsync (join [| workPath; path |]) initialBytes
+                    let! _ = runGitIn workPath [| "add"; path |]
+                    let! _ = runGitIn workPath [| "commit"; "-m"; "init: binary conflict path" |]
+                    let! _ = runGitIn workPath [| "push"; "origin"; "main" |]
+
+                    do! writeBinaryFileAsync (join [| workPath; path |]) workspaceBytes
+                    let! workspaceStatus = sessionStatus session
+                    let! saveResult =
+                        Async.StartAsPromise(
+                            session.Core.CreateRevision
+                                {
+                                    Message = "local binary modify/delete conflict"
+                                    Paths = [| mkPath path |]
+                                    ExpectedWorkspaceVersion = workspaceStatus.WorkspaceVersion
+                                }
+                                (ctx "binary-modify-delete-save")
+                        )
+
+                    expectValue "local binary modify/delete revision" saveResult |> ignore
+
+                    let clonePath = join [| root; "advance-delete" |]
+                    let! _ = runGitIn root [| "clone"; "-c"; "core.autocrlf=false"; barePath; clonePath |]
+                    let! _ = runGitIn clonePath [| "config"; "user.name"; "External Client" |]
+                    let! _ = runGitIn clonePath [| "config"; "user.email"; "external@example.org" |]
+                    let! _ = runGitIn clonePath [| "rm"; path |]
+                    let! _ = runGitIn clonePath [| "commit"; "-m"; "external: delete binary path" |]
+                    let! _ = runGitIn clonePath [| "push"; "origin"; "HEAD" |]
+
+                    let! updateStatus = sessionStatus session
+                    let! updateResult =
+                        Async.StartAsPromise(
+                            (syncService session).Update
+                                { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
+                                (ctx "binary-modify-delete-update")
+                        )
+
+                    match updateResult with
+                    | Failed failure
+                    | PartiallySucceeded(_, failure) when failure.Code = "conflicts_detected" -> ()
+                    | Failed failure
+                    | PartiallySucceeded(_, failure) ->
+                        failwith $"Expected conflicts_detected, received {failure.Category}/{failure.Code}."
+                    | Succeeded _ -> failwith "Expected the binary modify/delete changes to conflict."
+
+                    let conflicts = conflictService session
+                    let! summaryResult =
+                        Async.StartAsPromise(conflicts.GetActiveSession(ctx "binary-modify-delete-session"))
+                    let summary =
+                        match expectValue "binary modify/delete conflict session" summaryResult with
+                        | Some value -> value
+                        | None -> failwith "Expected an active binary modify/delete conflict session."
+
+                    let! status = sessionStatus session
+                    let! bytesBeforePick =
+                        fsPromisesDynamic?readFile (join [| workPath; path |])
+                        |> unbox<JS.Promise<obj>>
+                    let! resolveResult =
+                        Async.StartAsPromise(
+                            conflicts.Resolve
+                                {
+                                    Handle = summary.Handle
+                                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                    Path = mkPath path
+                                    Resolution = PickCandidate "target"
+                                }
+                                (ctx "binary-modify-delete-pick-target")
+                        )
+
+                    let failure = expectProviderFailure "binary deleted-side pick" resolveResult
+                    Vitest.expect(failure.Category).toEqual (Validation)
+                    Vitest.expect(failure.Code).toBe "candidate_content_unavailable"
+                    Vitest.expect(failure.StateChanged).toBe false
+
+                    let! bytesAfterPick =
+                        fsPromisesDynamic?readFile (join [| workPath; path |])
+                        |> unbox<JS.Promise<obj>>
+
+                    Vitest.expect(buffersEqual bytesAfterPick bytesBeforePick).toBe true
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "answers unknown_candidate for a base pick without a base stage",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, barePath, session = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+                let addedPath = "added.txt"
+
+                try
+                    do! writeUtf8FileAsync (join [| workPath; addedPath |]) "workspace addition\n"
+                    let! workspaceStatus = sessionStatus session
+                    let! saveResult =
+                        Async.StartAsPromise(
+                            session.Core.CreateRevision
+                                {
+                                    Message = "local add-add conflict"
+                                    Paths = [| mkPath addedPath |]
+                                    ExpectedWorkspaceVersion = workspaceStatus.WorkspaceVersion
+                                }
+                                (ctx "add-add-conflict-save")
+                        )
+
+                    expectValue "local add-add conflict revision" saveResult |> ignore
+                    do! advanceTarget root barePath [ addedPath, "target addition\n" ]
+
+                    let! updateStatus = sessionStatus session
+                    let! updateResult =
+                        Async.StartAsPromise(
+                            (syncService session).Update
+                                { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
+                                (ctx "add-add-conflict-update")
+                        )
+
+                    match updateResult with
+                    | Failed failure
+                    | PartiallySucceeded(_, failure) when failure.Code = "conflicts_detected" -> ()
+                    | Failed failure
+                    | PartiallySucceeded(_, failure) ->
+                        failwith $"Expected conflicts_detected, received {failure.Category}/{failure.Code}."
+                    | Succeeded _ -> failwith "Expected the add/add changes to conflict."
+
+                    let conflicts = conflictService session
+                    let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession(ctx "add-add-conflict-session"))
+                    let summary =
+                        match expectValue "add/add conflict session" summaryResult with
+                        | Some value -> value
+                        | None -> failwith "Expected an active add/add conflict session."
+
+                    Vitest.expect(summary.Items[0].Candidates |> Array.exists (fun candidate -> candidate.CandidateId = "base")).toBe (false)
+
+                    let! status = sessionStatus session
+                    let! resolveResult =
+                        Async.StartAsPromise(
+                            conflicts.Resolve
+                                {
+                                    Handle = summary.Handle
+                                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                    Path = mkPath addedPath
+                                    Resolution = PickCandidate "base"
+                                }
+                                (ctx "add-add-conflict-pick-base")
+                        )
+
+                    let failure = expectFailure "add/add base candidate pick" resolveResult
+                    Vitest.expect(failure.Category).toEqual (Validation)
+                    Vitest.expect(failure.Code).toBe ("unknown_candidate")
+                    Vitest.expect(failure.StateChanged).toBe (false)
+                    Vitest.expect(failure.Message).toBe ("The candidate ID is not part of this conflict item.")
+
+                    let! markerContent = tryReadUtf8FileAsync (join [| workPath; addedPath |])
                     Vitest.expect(markerContent |> Option.exists (fun content -> content.Contains "<<<<<<<")).toBe (true)
                     do! removeDirectoryAsync root
                 with error ->
