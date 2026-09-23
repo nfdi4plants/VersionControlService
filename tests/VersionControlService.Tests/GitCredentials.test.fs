@@ -154,6 +154,8 @@ Vitest.describe (
                     // git reports the file URL as the effective fetch and push URL. The hook
                     // answers both get-url queries with the https URL so credential scoping
                     // stays under test.
+                    let mutable failAuthenticatedFetch = false
+
                     let hooks = {
                         GitWorkspaceSession.GitSessionHooks.none with
                             RunProcess =
@@ -170,6 +172,14 @@ Vitest.describe (
                                                 StdOut = testHttpsUrl + "
 "
                                                 StdErr = ""
+                                            }
+
+                                            return OperationResult.succeeded output
+                                        elif failAuthenticatedFetch && (request.Arguments |> Array.contains "fetch") then
+                                            let output: NodeProcess.ProcessOutput = {
+                                                ExitCode = 128
+                                                StdOut = ""
+                                                StdErr = "fatal: Could not resolve host: git.local.test"
                                             }
 
                                             return OperationResult.succeeded output
@@ -424,11 +434,25 @@ Vitest.describe (
                             testHttpsUrl
                         |]
 
+                    observedCommands.Clear()
+                    failAuthenticatedFetch <- true
                     let! failingRefresh = Async.StartAsPromise(syncService.Refresh(ctx "failing-refresh"))
 
                     match failingRefresh with
                     | Failed failure ->
+                        Vitest.expect(failure.Message.Contains "Could not resolve host").toBe (true)
+                        Vitest.expect(failure.Message.Contains "Authorization").toBe (false)
                         Vitest.expect(failure.Message.Contains testSecret).toBe (false)
+
+                        let failingFetch =
+                            observedCommands
+                            |> Seq.tryFind (fun arguments -> arguments |> Array.contains "fetch")
+                            |> Option.defaultWith (fun () -> failwith "Expected an authenticated fetch invocation.")
+
+                        Vitest.expect(
+                            failingFetch
+                            |> Array.exists (fun argument -> argument.StartsWith expectedHeaderPrefix)
+                        ).toBe (true)
 
                         for detail in failure.Details do
                             Vitest.expect(detail.Contains testSecret).toBe (false)

@@ -184,6 +184,18 @@ let private runHookedBytesProcess
         | Failed failure -> return Error failure
     }
 
+/// The summary leaves out the leading `-c` pairs because they can hold credentials, and redacting a header would take Git's reason with it.
+let private commandSummary (arguments: string[]) =
+    let mutable firstRemainingArgument = 0
+
+    while firstRemainingArgument + 1 < arguments.Length && arguments[firstRemainingArgument] = "-c" do
+        firstRemainingArgument <- firstRemainingArgument + 2
+
+    arguments
+    |> Array.skip firstRemainingArgument
+    |> Array.truncate 3
+    |> String.concat " "
+
 /// runGit that fails when git exits nonzero.
 let private runGitChecked hooks repoPath arguments stdinData context =
     async {
@@ -192,14 +204,12 @@ let private runGitChecked hooks repoPath arguments stdinData context =
         match result with
         | Error failure -> return Error failure
         | Ok output when output.ExitCode <> 0 ->
-            let commandSummary = String.concat " " (Array.truncate 3 arguments)
-
             return
                 Error(
                     OperationFailure.createRedacted
                         ProviderError
                         "git_failure"
-                        $"git {commandSummary} failed: {output.StdErr}"
+                        $"git {commandSummary arguments} failed: {output.StdErr}"
                 )
         | Ok output -> return Ok output
     }
