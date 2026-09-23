@@ -255,9 +255,9 @@ module FakeHarness =
     type FakeConflictItem = {
         ItemPath: string
         BaseContent: string option
-        OursContent: string
-        TheirsContent: string
-        mutable ResolvedContent: string option
+        OursContent: string option
+        TheirsContent: string option
+        mutable ResolvedContent: string option option
     }
 
     type FakeConflictSession = {
@@ -397,14 +397,14 @@ module FakeHarness =
                             CandidateId = "workspace"
                             Label = "Workspace version"
                             Revision = None
-                            Preview = Some(TextPreview item.OursContent)
+                            Preview = item.OursContent |> Option.map TextPreview
                             Object = None
                         }
                         {
                             CandidateId = "target"
                             Label = "Target version"
                             Revision = Some(mkRevisionId session.TheirRevisionId)
-                            Preview = Some(TextPreview item.TheirsContent)
+                            Preview = item.TheirsContent |> Option.map TextPreview
                             Object = None
                         }
                         yield!
@@ -931,8 +931,8 @@ module FakeHarness =
                                     |> List.map (fun path -> {
                                         ItemPath = path
                                         BaseContent = baseFiles.TryFind path
-                                        OursContent = oursContent path |> Option.defaultValue ""
-                                        TheirsContent = targetFiles.TryFind path |> Option.defaultValue ""
+                                        OursContent = oursContent path
+                                        TheirsContent = targetFiles.TryFind path
                                         ResolvedContent = None
                                     })
                                 TheirRevisionId = targetRevision
@@ -1142,9 +1142,9 @@ module FakeHarness =
                                 match request.Resolution with
                                 | PickCandidate "workspace" -> Some item.OursContent
                                 | PickCandidate "target" -> Some item.TheirsContent
-                                | PickCandidate "base" -> item.BaseContent
+                                | PickCandidate "base" -> item.BaseContent |> Option.map Some
                                 | PickCandidate _ -> None
-                                | SupplyResolvedContent content -> Some content
+                                | SupplyResolvedContent content -> Some(Some content)
 
                             match resolvedContent with
                             | None ->
@@ -1212,8 +1212,10 @@ module FakeHarness =
                             | None ->
                                 for item in session.ConflictItems do
                                     match item.ResolvedContent with
-                                    | Some content ->
+                                    | Some(Some content) ->
                                         workspace.LocalFiles <- workspace.LocalFiles |> Map.add item.ItemPath content
+                                    | Some None ->
+                                        workspace.LocalFiles <- workspace.LocalFiles |> Map.remove item.ItemPath
                                     | None -> ()
 
                                 let localHead = headRevisionId workspace

@@ -63,6 +63,55 @@ let private openConflict (harness: ProviderTestHarness) = promise {
     | None -> return failwith "Expected an active conflict session after a conflicting update."
 }
 
+let private openModifyDeleteConflict (harness: ProviderTestHarness) (targetDeletes: bool) = promise {
+    let! workspace = harness.CreateWorkspace()
+
+    do!
+        harness.AdvanceTarget workspace [|
+            {
+                Path = "base.txt"
+                Content = if targetDeletes then None else Some "target version\n"
+            }
+        |]
+
+    if targetDeletes then
+        do! workspace.WriteFile "base.txt" "workspace version\n"
+    else
+        do! workspace.RemoveFile "base.txt"
+
+    let! saveStatus = getStatus workspace
+
+    let! saveResult =
+        run (
+            workspace.Session.Core.CreateRevision
+                {
+                    Message = "workspace modify-delete change"
+                    Paths = [| mkPath "base.txt" |]
+                    ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+                }
+                (ctx "modify-delete-save")
+        )
+
+    expectPerformed "workspace modify-delete revision" saveResult |> ignore
+    let! status = getStatus workspace
+
+    let! updateResult =
+        run (
+            (syncService workspace.Session).Update
+                { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                (ctx "modify-delete-update")
+        )
+
+    let failure = carriedFailure "modify-delete update" updateResult
+    Vitest.expect(failure.Code).toBe (ConformanceCodes.ConflictsDetected)
+
+    let! sessionResult = run ((conflictService workspace.Session).GetActiveSession(ctx "modify-delete-session"))
+
+    match expectValue "active modify-delete session" sessionResult with
+    | Some summary -> return workspace, summary
+    | None -> return failwith "Expected an active conflict session after a modify-delete update."
+}
+
 /// Conflict-session profile: real conflicts, candidate selection, resolved content,
 /// rotating opaque handles, terminal closure, mutation-free stale rejection, and the
 /// deterministic finalize race.
@@ -92,6 +141,92 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 let candidateIds = item.Candidates |> Array.map _.CandidateId
                 Vitest.expect(candidateIds |> Array.contains "workspace").toBe (true)
                 Vitest.expect(candidateIds |> Array.contains "target").toBe (true)
+            }
+
+            profileTest "picking the deleted target side resolves the conflict to the deletion"
+            <| fun () -> promise {
+                let! workspace, summary = openModifyDeleteConflict harness true
+                let item = summary.Items |> Array.find (fun item -> RepositoryPath.value item.Path = "base.txt")
+                let candidate = item.Candidates |> Array.find (fun candidate -> candidate.CandidateId = "target")
+
+                Vitest.expect(candidate.Preview).toEqual None
+                Vitest.expect(candidate.Object).toEqual None
+
+                let! status = getStatus workspace
+                let! resolveResult =
+                    run (
+                        (conflictService workspace.Session).Resolve
+                            {
+                                Handle = summary.Handle
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                Path = mkPath "base.txt"
+                                Resolution = PickCandidate "target"
+                            }
+                            (ctx "pick-deleted-target")
+                    )
+
+                let resolution = expectValue "deleted target resolution" resolveResult
+                Vitest.expect(resolution.RefreshedHandle.SessionId).toBe (summary.Handle.SessionId)
+                Vitest.expect(resolution.RefreshedHandle.Version = summary.Handle.Version).toBe (false)
+                Vitest.expect(resolution.RemainingItems.Length).toBe (0)
+
+                let! afterResolve = getStatus workspace
+                let! finalizeResult =
+                    run (
+                        (conflictService workspace.Session).Finalize
+                            {
+                                Handle = resolution.RefreshedHandle
+                                ExpectedWorkspaceVersion = afterResolve.WorkspaceVersion
+                                Message = Some "finalize deleted target"
+                            }
+                            (ctx "finalize-deleted-target")
+                    )
+
+                expectValue "deleted target finalize" finalizeResult |> ignore
+                let! content = workspace.ReadFile "base.txt"
+                Vitest.expect(content).toEqual None
+            }
+
+            profileTest "picking the deleted workspace side resolves the conflict to the deletion"
+            <| fun () -> promise {
+                let! workspace, summary = openModifyDeleteConflict harness false
+                let item = summary.Items |> Array.find (fun item -> RepositoryPath.value item.Path = "base.txt")
+                let candidate = item.Candidates |> Array.find (fun candidate -> candidate.CandidateId = "workspace")
+
+                Vitest.expect(candidate.Preview).toEqual None
+                Vitest.expect(candidate.Object).toEqual None
+
+                let! status = getStatus workspace
+                let! resolveResult =
+                    run (
+                        (conflictService workspace.Session).Resolve
+                            {
+                                Handle = summary.Handle
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                Path = mkPath "base.txt"
+                                Resolution = PickCandidate "workspace"
+                            }
+                            (ctx "pick-deleted-workspace")
+                    )
+
+                let resolution = expectValue "deleted workspace resolution" resolveResult
+                Vitest.expect(resolution.RemainingItems.Length).toBe (0)
+
+                let! afterResolve = getStatus workspace
+                let! finalizeResult =
+                    run (
+                        (conflictService workspace.Session).Finalize
+                            {
+                                Handle = resolution.RefreshedHandle
+                                ExpectedWorkspaceVersion = afterResolve.WorkspaceVersion
+                                Message = Some "finalize deleted workspace"
+                            }
+                            (ctx "finalize-deleted-workspace")
+                    )
+
+                expectValue "deleted workspace finalize" finalizeResult |> ignore
+                let! content = workspace.ReadFile "base.txt"
+                Vitest.expect(content).toEqual None
             }
 
             profileTest "candidate selection resolves an item and rotates the handle"
