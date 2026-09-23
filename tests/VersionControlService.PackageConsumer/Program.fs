@@ -21,7 +21,14 @@ let main _ =
     let lakeFsFactory =
         LakeFsWorkspaceSession.createFactory lakeFsOptions LakeFsCredentials.unconfigured
 
-    match ProviderResolver.tryCreateCatalog [ gitFactory; lakeFsFactory ] with
-    | Ok catalog when ProviderResolver.factories catalog |> Array.length = 2 -> 0
-    | Ok _
-    | Error _ -> 1
+    let code =
+        match ProviderResolver.tryCreateCatalog [ gitFactory; lakeFsFactory ] with
+        | Ok catalog when ProviderResolver.factories catalog |> Array.length = 2 -> 0
+        | Ok _
+        | Error _ -> 1
+
+#if FABLE_COMPILER
+    // A Fable entry point's return value is discarded, so node sees the result only through exitCode.
+    Fable.Core.JsInterop.emitJsStatement code "process.exitCode = $0"
+#endif
+    code
