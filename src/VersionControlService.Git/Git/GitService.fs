@@ -809,7 +809,11 @@ let private runGitCapturedWithOutput progressCallback request =
         pending.Append chunk |> ignore
 
         if pending.Length > 4096 then
-            pending.Remove(0, pending.Length - 4096) |> ignore
+            // Workaround: the fable-library of Fable 5.0.0-alpha.21, which Swate still uses, has no
+            // StringBuilder.Remove, so the bundled app fails to build. Go back to
+            // pending.Remove(0, pending.Length - 4096) once consumers are on a newer Fable.
+            let tail = pending.ToString(pending.Length - 4096, 4096)
+            pending.Clear().Append(tail) |> ignore
 
         match tryParseTransferBytes (pending.ToString()) with
         | Some(processed, total) when lastReported <> Some(processed, total) ->

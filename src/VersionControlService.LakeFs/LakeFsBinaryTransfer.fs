@@ -14,7 +14,10 @@ type StreamCopyResult = NodeBinaryIO.StreamCopyResult
 
 let private fileSystemDynamic: obj = importAll "node:fs"
 let private streamPromisesDynamic: obj = importAll "node:stream/promises"
-let private streamDynamic: obj = importAll "node:stream"
+// A default import, not importAll: bundlers that turn `import * as` into a CommonJS namespace
+// copy walk the module with for...in and crash on the members node:stream inherits from
+// EventEmitter. The default export is the same module object, so nothing else changes.
+let private streamDynamic: obj = importDefault "node:stream"
 
 [<Emit("fetch($0, $1)")>]
 let private fetchJs (_url: string) (_options: obj) : JS.Promise<obj> = jsNative
