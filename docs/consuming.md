@@ -666,9 +666,13 @@ lock.
 Prefer `Synchronize` for a button that means "bring me up to date". It refuses when it cannot
 decide safely, and the refusal says what the host has to ask the user. Keep
 `PublishLocalRevisions` true unless the user asked to update without publishing. A missing
-`TargetRef` is not a reason to turn it off, because Git derives `TargetRef` from the branch's
-upstream while its publish falls back to the `origin` remote, so a branch created with
-`checkout -b` has no `TargetRef` and still publishes:
+`TargetRef` is not a reason to turn it off. Git derives `TargetRef` from the branch's upstream,
+and publishing a branch without one sets the upstream to the branch of the same name on the
+publish remote (the branch's configured remote, otherwise `origin`). A branch created with
+`checkout -b` therefore has no `TargetRef` before its first publish and tracks its remote branch
+after it. When that remote branch already exists with revisions the workspace lacks, the publish
+adopts it as the upstream and fails with `precondition_failed` and the recovery
+`refresh_workspace`, so the next `Synchronize` integrates them:
 
 ```fsharp
 let synchronize

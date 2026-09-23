@@ -3348,6 +3348,133 @@ let private publishedRefIsSynchronizationTarget
     | Some target when target.Kind = RemoteRef && target.Name = $"{remoteName}/{branch}" -> true
     | _ -> false
 
+type private PublishTrackingDecision =
+    | ContinuePublish of setUpstream: bool
+    | AdoptPublicationTarget of observed: string
+
+/// Reads the merge key that defines whether a branch has an upstream.
+let private branchTrackingAbsent
+    (state: SessionState)
+    (branch: string)
+    (context: OperationContext)
+    : Async<Result<bool, OperationFailure>> =
+    async {
+        let! merge = readOptionalConfigValue state $"branch.{branch}.merge" context
+        return merge |> Result.map Option.isNone
+    }
+
+/// Checks for a local commit object without allowing Git to fetch lazily.
+let private localCommitAvailable
+    (state: SessionState)
+    (revision: string)
+    (context: OperationContext)
+    : Async<Result<bool, OperationFailure>> =
+    async {
+        let! result =
+            runGit
+                state.Hooks
+                state.RepoPath
+                [| "--no-lazy-fetch"; "cat-file"; "--batch-check=%(objectname) %(objecttype)" |]
+                (Some(revision + "\n"))
+                context
+
+        match result with
+        | Error failure -> return Error failure
+        | Ok output when output.ExitCode = 0 ->
+            return Ok(output.StdOut.Trim() = $"{revision} commit")
+        | Ok output ->
+            return
+                Error(
+                    OperationFailure.createRedacted
+                        ProviderError
+                        "git_failure"
+                        $"git --no-lazy-fetch cat-file failed: {output.StdErr}"
+                )
+    }
+
+/// Checks whether the target revision is reachable from HEAD.
+let private isAncestorOfHead
+    (state: SessionState)
+    (revision: string)
+    (context: OperationContext)
+    : Async<Result<bool, OperationFailure>> =
+    async {
+        let! result =
+            runGit
+                state.Hooks
+                state.RepoPath
+                [| "merge-base"; "--is-ancestor"; revision; "HEAD" |]
+                None
+                context
+
+        match result with
+        | Error failure -> return Error failure
+        | Ok output when output.ExitCode = 0 -> return Ok true
+        | Ok output when output.ExitCode = 1 -> return Ok false
+        | Ok output ->
+            return
+                Error(
+                    OperationFailure.createRedacted
+                        ProviderError
+                        "git_failure"
+                        $"git merge-base --is-ancestor failed: {output.StdErr}"
+                )
+    }
+
+/// Writes both upstream keys without allowing cancellation to leave only one set.
+let private writeBranchTracking
+    (state: SessionState)
+    (remoteName: string)
+    (branch: string)
+    : Async<Result<unit, OperationFailure>> =
+    async {
+        let context = OperationContext.detached "write-branch-tracking"
+
+        let configFailure detail =
+            {
+                OperationFailure.createRedacted ProviderError "upstream_config_failed" detail with
+                    StateChanged = true
+                    AffectedPaths = [||]
+            }
+
+        let! remoteResult =
+            runGit
+                state.Hooks
+                state.RepoPath
+                [| "config"; $"branch.{branch}.remote"; remoteName |]
+                None
+                context
+
+        match remoteResult with
+        | Error failure -> return Error(configFailure failure.Message)
+        | Ok output when output.ExitCode <> 0 ->
+            return Error(configFailure $"git config branch.{branch}.remote failed: {output.StdErr}")
+        | Ok _ ->
+            let! mergeResult =
+                runGit
+                    state.Hooks
+                    state.RepoPath
+                    [| "config"; $"branch.{branch}.merge"; $"refs/heads/{branch}" |]
+                    None
+                    context
+
+            match mergeResult with
+            | Error failure -> return Error(configFailure failure.Message)
+            | Ok output when output.ExitCode <> 0 ->
+                return Error(configFailure $"git config branch.{branch}.merge failed: {output.StdErr}")
+            | Ok _ -> return Ok()
+    }
+
+let private refreshBeforePublishRecovery = {
+    Code = "refresh_workspace"
+    Instructions = Some "Refresh the workspace to fetch the publication target, then synchronize again."
+}
+
+let private retryPublishRecovery = {
+    Code = "retry_publish"
+    Instructions = Some "The revisions are published, but the workspace does not track the remote branch yet. Publish again to set up tracking."
+}
+
 let private publish (state: SessionState) (expectedTarget: RevisionId option) (context: OperationContext) =
     async {
         let! branchResult = currentBranchName state context
@@ -3408,28 +3535,10 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                     | Some expected, Some observed -> RevisionId.value expected = observed
                     | Some _, None -> false
 
-                if not expectedMatches then
-                    return
-                        Failed {
-                            OperationFailure.create
-                                Concurrency
-                                "precondition_failed"
-                                "The publication target advanced past the expected revision." with
-                                RevisionEvidence = [|
-                                    yield!
-                                        expectedTarget
-                                        |> Option.map (fun revision -> "expected_target", revision)
-                                        |> Option.toList
-                                    yield!
-                                        observedTarget
-                                        |> Option.map (fun observed -> "observed_target", mkRevisionId observed)
-                                        |> Option.toList
-                                |]
-                        }
-                else
+                let publishWithTracking setUpstream = async {
                     let! workspaceRevision = revParse state "HEAD" context
 
-                    if workspaceRevision = observedTarget then
+                    if workspaceRevision = observedTarget && not setUpstream then
                         let! stateResult = synchronizationState state context
 
                         match stateResult with
@@ -3452,25 +3561,59 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                 do! barrier state.Hooks state.RepoPath "publish-precheck-done" context
                                 do! barrier state.Hooks state.RepoPath "transfer-start" context
 
-                                let! pathResult =
-                                    match workspaceRevision with
-                                    | Some publishedRevision ->
-                                        publicationChangedPaths
-                                            state
-                                            observedTarget
-                                            publishedRevision
-                                            context
-                                    | None ->
+                                let! observedObjectResult =
+                                    match observedTarget with
+                                    | None -> async { return Ok true }
+                                    | Some observed -> localCommitAvailable state observed context
+
+                                let pathResultAsync =
+                                    match observedObjectResult with
+                                    | Error failure ->
+                                        async {
+                                            return
+                                                Error {
+                                                    failure with
+                                                        StateChanged = false
+                                                }
+                                        }
+                                    | Ok false ->
                                         async {
                                             return
                                                 Error {
                                                     OperationFailure.create
-                                                        ProviderError
-                                                        "publish_evidence_failed"
-                                                        "The intended publication revision could not be read." with
+                                                        Concurrency
+                                                        "precondition_failed"
+                                                        "The publication target has revisions this workspace has not fetched." with
+                                                        StateChanged = false
                                                         Retryable = true
+                                                        RecoveryAction = Some refreshBeforePublishRecovery
+                                                        RevisionEvidence =
+                                                            observedTarget
+                                                            |> Option.map (fun observed -> [| "observed_target", mkRevisionId observed |])
+                                                            |> Option.defaultValue [||]
                                                 }
                                         }
+                                    | Ok true ->
+                                        match workspaceRevision with
+                                        | Some publishedRevision ->
+                                            publicationChangedPaths
+                                                state
+                                                observedTarget
+                                                publishedRevision
+                                                context
+                                        | None ->
+                                            async {
+                                                return
+                                                    Error {
+                                                        OperationFailure.create
+                                                            ProviderError
+                                                            "publish_evidence_failed"
+                                                            "The intended publication revision could not be read." with
+                                                            Retryable = true
+                                                    }
+                                            }
+
+                                let! pathResult = pathResultAsync
 
                                 match pathResult with
                                 | Error failure ->
@@ -3519,6 +3662,8 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                     [|
                                         yield! authentication.ConfigArgs
                                         "push"
+                                        if setUpstream then
+                                            "--set-upstream"
                                         remoteName
                                         branch
                                     |]
@@ -3817,6 +3962,38 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                                         (targetEvidence verifiedRevision)
                                         }
                                 | None when publicationVerified ->
+                                    let! trackingFailure =
+                                        if not setUpstream then
+                                            async { return None }
+                                        else
+                                            async {
+                                                let! trackingAbsentResult =
+                                                    branchTrackingAbsent state branch verificationContext
+
+                                                match trackingAbsentResult with
+                                                | Error failure ->
+                                                    return
+                                                        Some {
+                                                            failure with
+                                                                StateChanged = true
+                                                                RecoveryAction = Some retryPublishRecovery
+                                                        }
+                                                | Ok false -> return None
+                                                | Ok true ->
+                                                    let! trackingWriteResult =
+                                                        writeBranchTracking state remoteName branch
+
+                                                    match trackingWriteResult with
+                                                    | Error failure ->
+                                                        return
+                                                            Some {
+                                                                failure with
+                                                                    StateChanged = true
+                                                                    RecoveryAction = Some retryPublishRecovery
+                                                            }
+                                                    | Ok () -> return None
+                                            }
+
                                     let! stateResult = synchronizationState state verificationContext
 
                                     let syncState, stateFailure =
@@ -3845,23 +4022,31 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                             ResultingRevision = workspaceRevision |> Option.map mkRevisionId
                                     }
 
-                                    match stateFailure with
-                                    | None -> return Succeeded outcome
+                                    match trackingFailure with
                                     | Some failure ->
                                         return
                                             OperationResult.partiallySucceeded
                                                 outcome
-                                                {
-                                                    failure with
-                                                        AffectedPaths =
-                                                            Array.append failure.AffectedPaths affectedPaths
-                                                            |> Array.distinct
-                                                        RevisionEvidence =
-                                                            combineEvidence
-                                                                failure.RevisionEvidence
-                                                                (publishedEvidence verifiedRevision)
-                                                }
-                                                reconcilePublished
+                                                failure
+                                                retryPublishRecovery
+                                    | None ->
+                                        match stateFailure with
+                                        | None -> return Succeeded outcome
+                                        | Some failure ->
+                                            return
+                                                OperationResult.partiallySucceeded
+                                                    outcome
+                                                    {
+                                                        failure with
+                                                            AffectedPaths =
+                                                                Array.append failure.AffectedPaths affectedPaths
+                                                                |> Array.distinct
+                                                            RevisionEvidence =
+                                                                combineEvidence
+                                                                    failure.RevisionEvidence
+                                                                    (publishedEvidence verifiedRevision)
+                                                    }
+                                                    reconcilePublished
                                 | None when verifiedRevision = observedTarget ->
                                     return
                                         Failed {
@@ -3886,6 +4071,130 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                                 RecoveryAction = Some verifyBeforeRetry
                                                 RevisionEvidence = targetEvidence verifiedRevision
                                         }
+                }
+
+                let adoptObservedTarget observed = async {
+                    let! authArgumentsResult = fetchAuthArgumentsForRemote state remoteName context
+
+                    match authArgumentsResult with
+                    | Error failure ->
+                        return
+                            Failed {
+                                failure with
+                                    Retryable = true
+                            }
+                    | Ok authArguments ->
+                        let! fetchResult =
+                            runGitChecked
+                                state.Hooks
+                                state.RepoPath
+                                [| yield! authArguments; "fetch"; remoteName |]
+                                None
+                                context
+
+                        match fetchResult with
+                        | Error failure ->
+                            return
+                                Failed {
+                                    failure with
+                                        Retryable = true
+                                }
+                        | Ok _ ->
+                            let! remoteTrackingRef =
+                                runGit
+                                    state.Hooks
+                                    state.RepoPath
+                                    [|
+                                        "rev-parse"
+                                        "--verify"
+                                        "--quiet"
+                                        $"refs/remotes/{remoteName}/{branch}"
+                                    |]
+                                    None
+                                    context
+
+                            match remoteTrackingRef with
+                            | Error failure -> return Failed failure
+                            | Ok output when output.ExitCode <> 0 ->
+                                return
+                                    Failed {
+                                        OperationFailure.create
+                                            Validation
+                                            "publish_target_untracked"
+                                            $"The branch '{branch}' exists on '{remoteName}', but the fetch configuration of '{remoteName}' does not map it, so the workspace cannot track it." with
+                                            StateChanged = false
+                                    }
+                            | Ok _ ->
+                                let! trackingResult = writeBranchTracking state remoteName branch
+
+                                match trackingResult with
+                                | Error failure -> return Failed failure
+                                | Ok () ->
+                                    return
+                                        Failed {
+                                            OperationFailure.create
+                                                Concurrency
+                                                "precondition_failed"
+                                                $"'{remoteName}/{branch}' has revisions this workspace does not have. The workspace now tracks it. Synchronize to integrate them before publishing." with
+                                                StateChanged = true
+                                                Retryable = true
+                                                RecoveryAction = Some refreshBeforePublishRecovery
+                                                RevisionEvidence = [| "observed_target", mkRevisionId observed |]
+                                        }
+                }
+
+                if not expectedMatches then
+                    return
+                        Failed {
+                            OperationFailure.create
+                                Concurrency
+                                "precondition_failed"
+                                "The publication target advanced past the expected revision." with
+                                Retryable = true
+                                RecoveryAction = Some refreshBeforePublishRecovery
+                                RevisionEvidence = [|
+                                    yield!
+                                        expectedTarget
+                                        |> Option.map (fun revision -> "expected_target", revision)
+                                        |> Option.toList
+                                    yield!
+                                        observedTarget
+                                        |> Option.map (fun observed -> "observed_target", mkRevisionId observed)
+                                        |> Option.toList
+                                |]
+                        }
+                else
+                    let! trackingAbsentResult = branchTrackingAbsent state branch context
+
+                    match trackingAbsentResult with
+                    | Error failure -> return Failed failure
+                    | Ok trackingAbsent ->
+                        let! trackingDecision =
+                            if not trackingAbsent then
+                                async { return Ok(ContinuePublish false) }
+                            else
+                                match observedTarget with
+                                | None -> async { return Ok(ContinuePublish true) }
+                                | Some observed ->
+                                    async {
+                                        let! availableResult = localCommitAvailable state observed context
+
+                                        match availableResult with
+                                        | Error failure -> return Error failure
+                                        | Ok false -> return Ok(AdoptPublicationTarget observed)
+                                        | Ok true ->
+                                            let! ancestorResult = isAncestorOfHead state observed context
+
+                                            match ancestorResult with
+                                            | Error failure -> return Error failure
+                                            | Ok true -> return Ok(ContinuePublish true)
+                                            | Ok false -> return Ok(AdoptPublicationTarget observed)
+                                    }
+
+                        match trackingDecision with
+                        | Error failure -> return Failed failure
+                        | Ok(ContinuePublish setUpstream) -> return! publishWithTracking setUpstream
+                        | Ok(AdoptPublicationTarget observed) -> return! adoptObservedTarget observed
     }
 
 // ---------------------------------------------------------------------------
