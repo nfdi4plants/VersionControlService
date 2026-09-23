@@ -2,22 +2,22 @@
 
 A host that puts version control over a local workspace needs four things from this
 library: a factory for each provider it supports, a catalog holding those factories, a
-binding for the workspace, and an opened session. Everything below builds those four in
-order, and then covers the two ways to handle services a provider does not have.
+binding for the workspace, and an opened session. The sections below build those four in
+order, then cover the two ways to handle services a provider does not have.
 
 Writing a provider is a different job, covered in [provider authoring](provider-authoring.md).
 
 ## What the host owns
 
-The library has no settings store, no credential store, and no UI state. The host keeps:
+The library has no settings store, no credential store and no UI state of its own. The host keeps:
 
 - the bindings, one for each workspace root it manages
 - the credentials, behind a strategy the factory calls when it needs one
 - the choice to adopt a workspace a probe found, and the choice to retry after a failure
 - the workspace version it last showed the user, which it passes back on the next mutation
 
-The library owns provider mechanics. Nothing in a host should parse provider output,
-read provider configuration files, or build provider command lines.
+The library owns provider mechanics. Nothing in a host should parse provider output, read
+provider configuration files, build provider command lines, or reimplement provider rules.
 
 ## The composition root
 
@@ -79,6 +79,15 @@ let gitFactory = Git.createFactoryWithCredentials Git.GitSessionHooks.none crede
 Returning `None` means anonymous. Secrets stay inside the strategy and never reach a
 binding, a message, or progress output.
 
+Git also wants an identity to attribute revisions to.
+`Git.createFactoryWithCredentialsAndIdentity` takes a `GitIdentityStrategy` alongside the
+credentials, and its `ResolveIdentity` runs for each operation that may create a revision.
+Returning `None` falls back to the repository's configured `user.name` and `user.email`.
+When the strategy gives nothing and the repository has no complete identity either, the
+revision fails before it mutates anything, with the validation code `identity_missing` and
+a `configure_git_identity` recovery. A host on a machine that has never had git configured
+needs either the strategy or a path that walks the user through configuring git.
+
 lakeFS resolves a whole connection, endpoint plus access keys, from the profile:
 
 ```fsharp
@@ -88,6 +97,35 @@ let lakeFsFactory =
 
 `LakeFsCredentials.unconfigured` refuses every profile and is the right default until
 the user has configured one.
+
+## Checking the provider can run
+
+A provider that shells out to external tools cannot work until those tools are installed.
+Ask before the user hits a failure in the middle of a save. The Git provider reports on
+git itself, on Git LFS, and on whether the LFS filter is configured.
+
+```fsharp
+let checkTools (factory: ProviderFactory) (context: OperationContext) = async {
+    let! result = factory.CheckDependencies context
+
+    match result with
+    | Failed failure -> return Error failure.Message
+    | Succeeded outcome
+    | PartiallySucceeded(outcome, _) ->
+        let blocking =
+            outcome.Value
+            |> Array.filter (fun status -> not status.Installed || not status.Compatible)
+
+        return Ok blocking
+}
+```
+
+Each `DependencyStatus` names the component, whether it is installed, the version it
+found, whether that version is compatible, and a `Remediation` string to show the user.
+`InstallDependency` takes a component name and attempts the remediation the provider
+genuinely supports. A provider that cannot install a component returns a structured
+`Unsupported` failure, so treat a successful call as the exception and the message as the
+normal path.
 
 ## Opening a workspace
 
@@ -107,7 +145,12 @@ let openBinding (factory: ProviderFactory) binding context = async {
 
     match opened with
     | Succeeded outcome -> return Ok outcome.Value
-    | PartiallySucceeded(outcome, _) -> return Ok outcome.Value
+    | PartiallySucceeded(outcome, failure) ->
+        // The session is usable and something went wrong opening it. A host that keeps
+        // this short is dropping a recovery action, so report the failure somewhere
+        // before returning the session.
+        reportOpenWarning failure
+        return Ok outcome.Value
     | Failed failure -> return Error(ProviderFailed failure)
 }
 
@@ -161,11 +204,18 @@ The four resolutions and what a host does with each:
 | `Bound` | The stored binding named a registered provider. Probes were skipped. | Open it. |
 | `ProbedWorkspace` | One provider owns the nearest root. | Ask the user, call `Adopt`, persist the binding, open. |
 | `AmbiguousWorkspace` | Several providers claim the same root. | Ask which one. Registration order is not a tie-breaker. |
-| `UnmanagedWorkspace` | No provider claims it. | Offer `Initialize` or `Clone`. |
+| `UnmanagedWorkspace` | No provider claims it, or the stored binding named a provider the catalog does not hold. | Read the diagnostics before treating it as a fresh directory. Then offer `Initialize` or `Clone`. |
 
-`report.Diagnostics` carries structured failures from probes that failed or threw. A
-probe never breaks resolution, so read the diagnostics when a workspace you expected to
-be detected comes back unmanaged.
+`report.Diagnostics` carries structured failures that resolution collected instead of
+throwing. A probe that failed or threw appears there, as does `probe_invalid` from a
+probe that reported an invalid workspace, `probe_root_outside_workspace` when a probe
+claimed a root that does not own the path, and `provider_not_registered` when a stored
+binding names a provider the catalog does not hold.
+
+That last one matters. A workspace whose provider was dropped from the catalog resolves
+as `UnmanagedWorkspace` with a `provider_not_registered` diagnostic, and it is a managed
+workspace, not an empty directory. A host that offers `Initialize` on it without reading
+the diagnostics is offering to initialize over someone's repository.
 
 Persist the binding `Adopt` returned, keyed by the normalized workspace root, and give it
 back unchanged on the next open. Details are in
@@ -206,8 +256,8 @@ its last known status or has to re-read it. `AffectedPaths` and `RevisionEvidenc
 what the failure was about. Messages and details arrive redacted, so a host can show
 them to a user.
 
-`ResultingWorkspaceVersion` is the token to pass into the next mutation. It is opaque.
-Do not parse it, compare it for ordering, or keep it past the view it belongs to.
+`ResultingWorkspaceVersion` is the token to pass into the next mutation. It is opaque, so
+do not parse it or compare it for ordering, and do not keep it past the view it belongs to.
 
 ## Optional services
 
@@ -266,12 +316,21 @@ let createCatalog (factories: ProviderFactory seq) =
     |> Resolver.tryCreateCatalog
 ```
 
-A fallback read returns an empty answer and marks it. `ListObjects` gives an empty array,
-the text diff reads give `UnsupportedContent`, `GetActiveSession` and
-`GetRepositoryWebUrl` give `None`, `GetSettings` gives no threshold with
-`MaterializeLargeObjects = true`, and `Prune` and `Deduplicate` give the reason as their
-report. Each one succeeds as a no-op carrying a `service_unavailable` warning, so a
-caller that wants to tell a real answer from a filled one reads the warnings:
+Every filled operation succeeds as a no-op carrying a `service_unavailable` warning,
+apart from the two groups named further down. A fallback read hands back an empty answer:
+`ListObjects` an empty array, the text diff reads `UnsupportedContent`, `GetActiveSession`
+and `GetRepositoryWebUrl` `None`, `GetSettings` no threshold with
+`MaterializeLargeObjects = true`, and `Prune` and `Deduplicate` the reason as their report.
+
+A fallback write also succeeds and changes nothing. `Materialize`, `Dematerialize`,
+`SetPathPolicy` and `SetSettings` return `Succeeded` with the same warning. Read the
+warning before you treat one of these as done. The storage settings reseed in
+[provider authoring](provider-authoring.md) is the case that bites: it tells a host to
+write its saved threshold through `SetSettings` and mark the migration complete only
+after success. On a filled session that success stored nothing, so a host doing that
+migration should check the warning or keep the unwrapped session for it.
+
+A caller that wants to tell a real answer from a filled one reads the warnings:
 
 ```fsharp
 let private isFallback (warnings: OperationWarning[]) =
@@ -291,9 +350,9 @@ let repositoryUrl (session: WorkspaceSession) (context: OperationContext) = asyn
 }
 ```
 
-Two groups of operations fail instead of succeeding quietly: the whole synchronization
-service, and the conflict mutations `Resolve`, `Finalize` and `Cancel`. Both change what
-a user believes about where their work is. A publish that succeeded as a no-op would tell
+Two groups of operations report the failure and do no quiet work: the whole
+synchronization service, and the conflict mutations `Resolve`, `Finalize` and `Cancel`.
+Both change what a user believes about where their work is. A publish that succeeded as a no-op would tell
 someone their work is safe on a server that never received it.
 
 ```fsharp
@@ -339,11 +398,22 @@ opposite choices against the same provider, which is the intent.
 
 ## Saving work
 
-Paths are exact repository-relative keys. `RepositoryPath.tryCreate` rejects absolute
-paths, backslashes, and `.` or `..` segments. It never normalizes Unicode, folds case, or
-reads a wildcard, so a file genuinely named `report [draft].csv` round-trips.
+Paths are exact repository-relative keys. `RepositoryPath.tryCreate` rejects an empty
+string, NUL, a backslash anywhere, an absolute or drive-rooted path, an empty segment, a
+trailing separator, and any `.` or `..` segment. The two a Windows host hits in practice
+are the drive-rooted one and the trailing separator, because `C:/data/x.csv` contains no
+backslash and `data/` looks harmless. Everything else is a literal filename byte, with no
+Unicode normalization, no case folding, and no wildcard expansion, so a file genuinely
+named `report [draft].csv` round-trips.
 
 ```fsharp
+/// What the host needs back from a save: the revision when one was created, and the
+/// token the next mutation has to carry.
+type SaveResult = {
+    Revision: RevisionId option
+    WorkspaceVersion: string option
+}
+
 let saveSelected
     (session: WorkspaceSession)
     (selected: string[])
@@ -373,8 +443,18 @@ let saveSelected
             match result with
             | Succeeded outcome ->
                 match outcome.Effect with
-                | NoOp reason -> return Ok(None, reason)
-                | Performed -> return Ok(outcome.ResultingRevision, None)
+                | NoOp _ ->
+                    // Nothing needed committing. The workspace version has not moved.
+                    return Ok { Revision = None; WorkspaceVersion = outcome.ResultingWorkspaceVersion }
+                | Performed ->
+                    // CreateRevision is an OperationResult<RevisionId>, so the new revision is
+                    // outcome.Value. ResultingRevision is optional metadata that a conforming
+                    // provider may leave as None, so do not read the revision out of it.
+                    return
+                        Ok {
+                            Revision = Some outcome.Value
+                            WorkspaceVersion = outcome.ResultingWorkspaceVersion
+                        }
 
             | PartiallySucceeded(_, failure) ->
                 let recovery =
@@ -392,11 +472,158 @@ let saveSelected
 ```
 
 `ExpectedWorkspaceVersion` is the version from the status the host last showed. A
-workspace that moved underneath rejects the save with `Concurrency` instead of committing
-something the user never saw.
+workspace that moved underneath rejects the save with `Concurrency`, so nobody commits
+work they never saw.
 
 `Paths` are exact literal keys, never patterns. A provider that receives
 `data/*.csv` looks for a file with that name.
+
+## Switching refs without losing work
+
+`SwitchRef` can overwrite local changes. `PreflightSwitchRef` answers whether it would,
+and it takes the same request, so ask first and show the answer.
+
+```fsharp
+let switchRef (session: WorkspaceSession) (request: SwitchRefRequest) (context: OperationContext) = async {
+    let! preflight = session.Core.PreflightSwitchRef request context
+
+    match preflight with
+    | Failed failure -> return Error failure.Message
+    | Succeeded outcome
+    | PartiallySucceeded(outcome, _) ->
+        if not outcome.Value.IsSafe then
+            // PathsAtRisk names the files the switch would take away. Ask the user before
+            // going ahead, and pass their answer back as a fresh request.
+            return Error(sprintf "%d paths at risk" outcome.Value.PathsAtRisk.Length)
+        else
+            let! switched = session.Core.SwitchRef request context
+
+            match switched with
+            | Succeeded outcome
+            | PartiallySucceeded(outcome, _) -> return Ok outcome.Value
+            | Failed failure -> return Error failure.Message
+}
+```
+
+The rest of `Core` follows the same shape. `ListRefs` and `CreateRef` cover the branch
+list and branch creation, `RestorePaths` throws away local changes on exact paths, and
+`GetDiffSummary` gives per-path entries whose line counts are optional because an
+object-oriented provider cannot always compute them.
+
+## Synchronizing
+
+`Synchronization` is optional, so a provider that has no remote leaves it absent. The
+service separates observing from mutating. `Refresh` observes the target and changes no
+workspace content. `PreviewUpdate` reports what an update would change. `Update` and
+`Publish` are the two mutations, and `Synchronize` runs a refresh, the update the
+workspace needs, and the publish of its revisions as one operation under the provider's
+lock.
+
+Prefer `Synchronize` for a button that means "bring me up to date". It refuses rather
+than guessing, and the refusal says what the host has to ask the user:
+
+```fsharp
+let synchronize
+    (session: WorkspaceSession)
+    (expectedWorkspaceVersion: string)
+    (accepted: RevisionId option)
+    (context: OperationContext)
+    =
+    async {
+        match session.Synchronization with
+        | None -> return Error "This provider has no synchronization service."
+        | Some synchronization ->
+            let! result =
+                synchronization.Synchronize
+                    {
+                        ExpectedWorkspaceVersion = expectedWorkspaceVersion
+                        // The target the user was looking at when they decided. A target that
+                        // moved since then fails before anything mutates.
+                        ExpectedTargetRevision = accepted
+                        AcceptUpdateRisks = Option.isSome accepted
+                        PublishLocalRevisions = true
+                    }
+                    context
+
+            match result with
+            | Succeeded outcome
+            | PartiallySucceeded(outcome, _) -> return Ok outcome.Value
+            | Failed failure when failure.Code = SynchronizationCodes.UpdateWouldOverwriteLocalChanges ->
+                // AcceptUpdateRisks does not override this one. The user saves or discards
+                // the paths in AffectedPaths first.
+                return Error "Save or discard your changes to these files first."
+            | Failed failure when failure.Code = SynchronizationCodes.UpdateWouldCreateConflictSession ->
+                // Show the preview, then call again with AcceptUpdateRisks and the target
+                // revision the failure reported in RevisionEvidence.
+                return Error "This update opens a conflict session. Ask the user to accept."
+            | Failed failure -> return Error failure.Message
+    }
+```
+
+Two refusals need the host to do something specific.
+`update_would_overwrite_local_changes` carries the `resolve_local_changes` recovery and
+names the overlapping paths, and setting `AcceptUpdateRisks` does not get past it.
+`update_would_create_conflict_session` carries `accept_update_risks`, and the retry has
+to supply both `AcceptUpdateRisks` and the `ExpectedTargetRevision` the evidence
+reported. Setting `AcceptUpdateRisks` without a target revision fails with
+`acceptance_target_required`, which exists so an acceptance can never apply to a target
+the user never saw. `conflict_session_active` means an open conflict session has to be
+resolved or cancelled first. The provider codes and evidence are tabulated in
+[provider authoring](provider-authoring.md).
+
+## Conflict sessions
+
+When an update leaves conflicts, the provider opens a session and
+`WorkspaceStatus.ActiveConflictSession` reports it. `GetActiveSession` returns the
+summary, with one `ConflictItem` per path and the candidates that path offers.
+
+Resolution is one path at a time, and each success rotates the handle:
+
+```fsharp
+let resolvePath
+    (session: WorkspaceSession)
+    (handle: ConflictSessionHandle)
+    (expectedWorkspaceVersion: string)
+    (path: RepositoryPath)
+    (choice: ConflictResolution)
+    (context: OperationContext)
+    =
+    async {
+        match session.ConflictResolution with
+        | None -> return Error "This provider has no conflict resolution service."
+        | Some conflicts ->
+            let! result =
+                conflicts.Resolve
+                    {
+                        Handle = handle
+                        ExpectedWorkspaceVersion = expectedWorkspaceVersion
+                        Path = path
+                        Resolution = choice
+                    }
+                    context
+
+            match result with
+            | Succeeded outcome
+            | PartiallySucceeded(outcome, _) ->
+                // Keep RefreshedHandle. The one you passed in is now stale, so replaying an
+                // earlier choice fails instead of silently redoing it.
+                return Ok(outcome.Value.RefreshedHandle, outcome.Value.RemainingItems)
+            | Failed failure -> return Error failure.Message
+    }
+```
+
+`ConflictSessionHandle.Version` rotates after every successful nonterminal resolution and
+has a different lifetime from the workspace version, so carry both and never collapse
+them into one field. A stale, foreign, or closed handle is rejected before any provider
+state changes, with category `Concurrency`, code `precondition_failed`, and the
+`refresh_conflict_session` recovery. That recovery means: call `GetActiveSession` again
+and rebuild the view from the summary it returns.
+
+Pick a candidate with `PickCandidate candidateId`, using an id the item advertises.
+Supply merged text with `SupplyResolvedContent`, and only when the item's
+`SupportsResolvedContent` is true. `Finalize` needs every item resolved and returns the
+revision it created, which is `None` when the provider closed the session without needing
+a second commit. `Cancel` abandons the session. Both close the handle.
 
 ## Cancellation and progress
 
@@ -438,25 +665,58 @@ and a host needs a path for it. The recovery codes a Git update can report are l
 [provider authoring](provider-authoring.md).
 
 `OperationProgress` carries a stable `PhaseCode` such as `transfer`, an optional item,
-completed and total counts, and a sanitized `DisplayMessage`. Byte totals use `float` so
-values above two GiB stay exact in JavaScript. Show the message, and branch on the phase
-code.
+completed and total counts, and a sanitized `DisplayMessage`. Counts are `float` because a
+32-bit int overflows past two GiB once the code is compiled to JavaScript, so byte totals
+above that stay exact on .NET and on Fable alike. Show the message, and branch on the
+phase code.
 
 ## Building against the packages
 
-The umbrella package brings the abstractions, the Node runtime, and both providers at one
-coordinated version:
+The packages are not on nuget.org yet. Until they are, produce them locally and restore
+from that feed:
 
 ```console
-dotnet add package VersionControlService --prerelease
+dotnet run --project build/Build.fsproj -- pack --version=0.0.1-local --output=<feed-dir>
+dotnet nuget add source <feed-dir> --name vcs-local
+dotnet add package VersionControlService --version 0.0.1-local
 ```
 
-The Git and lakeFS providers run on Fable and Node. A .NET consumer can reference the
-packages and compile against the contracts, and the built-in providers need the Node
-runtime to execute. A host that only defines or consumes contracts references
-`VersionControlService.Abstractions` alone.
+`pack` empties the output directory first, so it refuses a path inside the repository, a
+volume root, or anything reached through a junction. Pick a directory outside the clone.
+
+`pack` builds five coordinated packages, and the umbrella depends on the other four at
+that exact version. Referencing the umbrella is enough. A host that only defines or
+consumes contracts references `VersionControlService.Abstractions` alone and needs
+nothing else. Once the packages are published, `dotnet add package VersionControlService
+--prerelease` replaces the three commands above.
+
+### What the built-in providers need at runtime
+
+The contracts in `VersionControlService.Abstractions` are portable and compile on .NET and
+on Fable. The Git and lakeFS providers are different: they go through
+`VersionControlService.Runtime.Node`, which imports Node modules, so they run on Fable and
+Node. Referencing the package compiles, and executing a built-in provider needs the rest
+of that toolchain.
+
+A Fable host also needs the npm side and a Fable compile step:
+
+```console
+npm install simple-git @fable-org/fable-library-js
+dotnet fable YourApp.fsproj --outDir output
+node output/App.js
+```
+
+The Git provider shells out to the real tools on top of that. It wants Git 2.38 or newer,
+because it uses `merge-tree --write-tree`, and Git LFS 3.7 or newer. `CheckDependencies`
+reports on all of that at runtime, which is why it is worth calling before the user gets
+far. lakeFS needs no local tool and talks to its server over HTTP.
 
 Two files in this repository are worth copying from.
 `tests/VersionControlService.PackageConsumer/Program.fs` is the smallest composition root
-that builds against the published packages, and `samples/ExternalProvider/Provider.fs` is
-a compiling core-only provider.
+that builds against the packed packages, and `samples/ExternalProvider/Provider.fs` is a
+compiling core-only provider.
+
+Related reading: [workspace bindings and resolution](workspace-bindings.md) for binding
+persistence, and [provider authoring](provider-authoring.md) for the revision path policy
+a host hands to a factory (`RevisionPolicyStrategy`) and for the storage settings reseed
+recipe.
