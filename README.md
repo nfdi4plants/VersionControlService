@@ -4,13 +4,17 @@ VersionControlService defines portable version-control workspace contracts for F
 
 ## Install
 
-Install the dependency-only umbrella package to get the public abstractions, Node runtime, Git provider, and lakeFS provider at one coordinated version:
+The packages are not on nuget.org yet. Build the five coordinated packages into a local feed and restore from there:
 
 ```console
-dotnet add package VersionControlService --prerelease
+dotnet run --project build/Build.fsproj -- pack --version=0.0.1-local --output=<feed-dir>
+dotnet nuget add source <feed-dir> --name vcs-local
+dotnet add package VersionControlService --version 0.0.1-local
 ```
 
-An external provider that does not need the built-in implementations can reference `VersionControlService.Abstractions` alone.
+The umbrella package is dependency-only and carries the public abstractions, the Node runtime, the Git provider, and the lakeFS provider at one coordinated version. An external provider that does not need the built-in implementations can reference `VersionControlService.Abstractions` alone. Once the packages are published, `dotnet add package VersionControlService --prerelease` replaces the three commands above.
+
+The Git and lakeFS providers run on Fable and Node, and the Git provider also needs the git and Git LFS binaries. [Consuming the library](docs/consuming.md) lists what to install.
 
 ## Compose providers
 
@@ -68,10 +72,10 @@ dotnet test tests/VersionControlService.Abstractions.Tests/VersionControlService
 .\build.cmd test run
 ```
 
-On non-Windows systems, replace the last command with:
+`build.cmd` and `build.sh` both forward their arguments to the build project, so on non-Windows systems the last command becomes:
 
 ```console
-dotnet run --project build/Build.fsproj -- test run
+./build.sh test run
 ```
 
 The ordinary suite skips live lakeFS tests. Run the pinned Docker matrix explicitly when Docker is available:
@@ -79,5 +83,7 @@ The ordinary suite skips live lakeFS tests. Run the pinned Docker matrix explici
 ```console
 .\build.cmd test lakefs
 ```
+
+CI runs that row on Linux as `./build.sh test lakefs`.
 
 Run `.\build.cmd` without a target to list every target, including the focused test run and the package graph checks.
