@@ -1832,7 +1832,7 @@ let private buildConflictItems
             let buffer, _ = NodeFileSystem.readBufferNoFollowSync sourcePath
             candidateFromBuffer sourcePath buffer
 
-        // A candidate read that fails ends the build; the loop records the first failure
+        // A candidate read that fails ends the build. The loop records the first failure
         // because a return cannot leave a loop inside the builder.
         let firstFailure: OperationFailure option ref = ref None
 
