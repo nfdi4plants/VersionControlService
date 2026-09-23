@@ -2235,6 +2235,213 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "lakeFS conflict finalize canceled after the merge resumes through the pending revision",
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
+            fun () -> promise {
+                if not (integrationEnabled ()) then
+                    return failwith "lakeFS integration skipped: Docker not available"
+
+                let harness = createLakeFsHarness ()
+                let cancellation = OperationCancellation.Source()
+                let mutable cancelFirstFinalize = true
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let hooks: LakeFsWorkspaceSession.LakeFsSessionHooks = {
+                        Barrier =
+                            Some(fun _ point _ -> async {
+                                if point = "finalize-before-completion" && cancelFirstFinalize then
+                                    cancelFirstFinalize <- false
+                                    cancellation.Cancel()
+                            })
+                    }
+
+                    let factory =
+                        LakeFsWorkspaceSession.createFactoryWithHooks
+                            lakeFsProviderOptions
+                            hooks
+                            (LakeFsCredentials.fixedConnection (connection ()))
+
+                    let! opened =
+                        factory.Open
+                            workspace.Binding
+                            (OperationContext.detached "finalize-cancel-after-merge-open")
+                        |> Async.StartAsPromise
+
+                    let session = expectValue "finalize cancel after merge open" opened
+                    let synchronization =
+                        session.Synchronization
+                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization services.")
+
+                    do!
+                        harness.AdvanceTarget workspace [|
+                            { Path = "conflict.txt"; Content = Some "target conflict content\n" }
+                            { Path = "target-unrelated.txt"; Content = Some "target unrelated content\n" }
+                        |]
+
+                    do! workspace.WriteFile "conflict.txt" "local conflict content\n"
+                    do! workspace.WriteFile "dirty-unrelated.txt" "dirty local content\n"
+
+                    let parsed =
+                        LakeFsTypes.LakeFsLocation.tryParse workspace.Binding.Location.ProviderLocation
+                        |> Result.defaultWith failwith
+
+                    let! targetResult =
+                        LakeFsApi.getBranch
+                            (connection ())
+                            parsed.Repository
+                            parsed.TargetRef
+                            (OperationContext.detached "finalize-cancel-after-merge-target")
+                        |> Async.StartAsPromise
+
+                    let target = targetResult |> Result.defaultWith (fun failure -> failwith failure.Message)
+                    let! previewResult =
+                        synchronization.PreviewUpdate(OperationContext.detached "finalize-cancel-after-merge-preview")
+                        |> Async.StartAsPromise
+
+                    let preview = expectValue "finalize cancel after merge preview" previewResult
+                    Vitest.expect(preview.WouldCreateConflictSession).toBe true
+
+                    let! updateStatusResult =
+                        session.Core.GetStatus(OperationContext.detached "finalize-cancel-after-merge-update-status")
+                        |> Async.StartAsPromise
+
+                    let updateStatus = expectValue "finalize cancel after merge update status" updateStatusResult
+                    let! updateResult =
+                        synchronization.Update
+                            { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
+                            (OperationContext.detached "finalize-cancel-after-merge-update")
+                        |> Async.StartAsPromise
+
+                    expectFailure "finalize cancel after merge update" updateResult |> ignore
+                    let conflicts =
+                        session.ConflictResolution
+                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS conflict-resolution services.")
+
+                    let! sessionResult =
+                        conflicts.GetActiveSession(OperationContext.detached "finalize-cancel-after-merge-session")
+                        |> Async.StartAsPromise
+
+                    let summary =
+                        expectValue "finalize cancel after merge session" sessionResult
+                        |> Option.defaultWith (fun () -> failwith "Expected an active conflict session.")
+
+                    let! resolutionStatusResult =
+                        session.Core.GetStatus(OperationContext.detached "finalize-cancel-after-merge-resolution-status")
+                        |> Async.StartAsPromise
+
+                    let resolutionStatus = expectValue "finalize cancel after merge resolution status" resolutionStatusResult
+                    let! resolutionResult =
+                        conflicts.Resolve
+                            {
+                                Handle = summary.Handle
+                                ExpectedWorkspaceVersion = resolutionStatus.WorkspaceVersion
+                                Path = repositoryPath "conflict.txt"
+                                Resolution = PickCandidate "target"
+                            }
+                            (OperationContext.detached "finalize-cancel-after-merge-resolution")
+                        |> Async.StartAsPromise
+
+                    let resolution = expectValue "finalize cancel after merge resolution" resolutionResult
+                    let! finalizeStatusResult =
+                        session.Core.GetStatus(OperationContext.detached "finalize-cancel-after-merge-finalize-status")
+                        |> Async.StartAsPromise
+
+                    let finalizeStatus = expectValue "finalize cancel after merge finalize status" finalizeStatusResult
+                    let beforeIndex =
+                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        | LakeFsWorkspaceIndex.Loaded index -> index
+                        | _ -> failwith "Expected an index before conflict finalize."
+
+                    let! branchBeforeResult =
+                        LakeFsApi.getBranch
+                            (connection ())
+                            beforeIndex.Repository
+                            beforeIndex.WorkspaceBranch
+                            (OperationContext.detached "finalize-cancel-after-merge-head-before")
+                        |> Async.StartAsPromise
+
+                    let branchBefore = branchBeforeResult |> Result.defaultWith (fun failure -> failwith failure.Message)
+                    let firstFinalizeContext =
+                        OperationContext.create
+                            "finalize-cancel-after-merge-first"
+                            cancellation.Cancellation
+                            ignore
+
+                    let! firstFinalizeResult =
+                        conflicts.Finalize
+                            {
+                                Handle = resolution.RefreshedHandle
+                                ExpectedWorkspaceVersion = finalizeStatus.WorkspaceVersion
+                                Message = Some "finalize reviewed write set"
+                            }
+                            firstFinalizeContext
+                        |> Async.StartAsPromise
+
+                    let firstFailure =
+                        match firstFinalizeResult with
+                        | PartiallySucceeded(_, failure) -> failure
+                        | Failed failure ->
+                            failwith $"Canceled finalize did not partially succeed: {failure.Code}"
+                        | Succeeded _ -> failwith "Canceled finalize unexpectedly succeeded."
+
+                    Vitest.expect(firstFailure.Category).toEqual FailureCategory.Canceled
+                    Vitest.expect(firstFailure.StateChanged).toBe true
+                    Vitest.expect(firstFailure.RecoveryAction |> Option.map _.Code).toEqual (Some "reconcile_materialization")
+
+                    let! branchAfterResult =
+                        LakeFsApi.getBranch
+                            (connection ())
+                            beforeIndex.Repository
+                            beforeIndex.WorkspaceBranch
+                            (OperationContext.detached "finalize-cancel-after-merge-head-after")
+                        |> Async.StartAsPromise
+
+                    let branchAfter = branchAfterResult |> Result.defaultWith (fun failure -> failwith failure.Message)
+                    Vitest.expect(branchAfter.CommitId).not.toEqual branchBefore.CommitId
+
+                    let! activeAfterFailureResult =
+                        conflicts.GetActiveSession(OperationContext.detached "finalize-cancel-after-merge-session-after")
+                        |> Async.StartAsPromise
+
+                    let activeAfterFailure =
+                        expectValue "finalize cancel after merge session after" activeAfterFailureResult
+                        |> Option.defaultWith (fun () -> failwith "The conflict session closed after canceled finalize.")
+
+                    let! retryStatusResult =
+                        session.Core.GetStatus(OperationContext.detached "finalize-cancel-after-merge-retry-status")
+                        |> Async.StartAsPromise
+
+                    let retryStatus = expectValue "finalize cancel after merge retry status" retryStatusResult
+                    let! retryResult =
+                        conflicts.Finalize
+                            {
+                                Handle = activeAfterFailure.Handle
+                                ExpectedWorkspaceVersion = retryStatus.WorkspaceVersion
+                                Message = Some "retry finalize reviewed write set"
+                            }
+                            (OperationContext.detached "finalize-cancel-after-merge-retry")
+                        |> Async.StartAsPromise
+
+                    expectValue "finalize cancel after merge retry" retryResult |> ignore
+                    let! targetUnrelated = workspace.ReadFile "target-unrelated.txt"
+                    Vitest.expect(targetUnrelated).toEqual(Some "target unrelated content\n")
+
+                    let afterIndex =
+                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        | LakeFsWorkspaceIndex.Loaded index -> index
+                        | _ -> failwith "Expected an index after conflict finalize."
+
+                    Vitest.expect(afterIndex.BaseRevision).toEqual(Some target.CommitId)
+
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
             "lakeFS conflict finalize without a changed resolution takes the merge commit",
             TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
             fun () -> promise {

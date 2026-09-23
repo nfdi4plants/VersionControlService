@@ -2445,13 +2445,11 @@ let private removeResolvedDeletionFiles
             state.Index <- nextIndex
             saveIndex state
 
-let private completeConflictFinalize
+let private readConflictFinalizeTargetWriteSet
     (state: SessionState)
-    (resolved: LakeFsConnection)
     (targetRevision: string)
-    (resultingRevision: string)
     (context: OperationContext)
-    =
+    : Async<Result<string list, OperationFailure>> =
     async {
         let targetHead =
             state.Conflict
@@ -2461,86 +2459,98 @@ let private completeConflictFinalize
         let! targetChangedResult = targetChangedPathsAgainst state targetHead context
 
         match targetChangedResult with
-        | Ok None -> return Failed(LakeFsSynchronization.missingBaseRevisionFailure ())
+        | Ok(Some paths) -> return Ok paths
+        | Ok None -> return Error(LakeFsSynchronization.missingBaseRevisionFailure ())
+        | Error failure when failure.Category = Canceled -> return Error failure
         | Error failure ->
             return
-                Failed(
+                Error(
                     LakeFsSynchronization.previewIndeterminate
                         "target changed paths"
                         failure
                 )
-        | Ok(Some targetChangedPaths) ->
-            let selectedPaths =
-                let conflictPaths =
-                    state.Conflict
-                    |> Option.map (fun conflict -> conflict.Items |> List.map _.ItemPath |> Set.ofList)
-                    |> Option.defaultValue Set.empty
+    }
 
-                Set.union (Set.ofList targetChangedPaths) conflictPaths
+let private completeConflictFinalize
+    (state: SessionState)
+    (resolved: LakeFsConnection)
+    (targetRevision: string)
+    (targetChangedPaths: string list)
+    (resultingRevision: string)
+    (context: OperationContext)
+    =
+    async {
+        let selectedPaths =
+            let conflictPaths =
+                state.Conflict
+                |> Option.map (fun conflict -> conflict.Items |> List.map _.ItemPath |> Set.ofList)
+                |> Option.defaultValue Set.empty
 
-            let finalizeIndex (index: LakeFsIndex.WorkspaceIndex) = {
-                index with
-                    BaseRevision = Some targetRevision
-                    WorkspaceRevision = Some resultingRevision
-            }
+            Set.union (Set.ofList targetChangedPaths) conflictPaths
 
-            let! materialized =
-                materializeRef
-                    state
-                    resolved
-                    resultingRevision
-                    false
-                    (Some selectedPaths)
-                    finalizeIndex
-                    context
+        let finalizeIndex (index: LakeFsIndex.WorkspaceIndex) = {
+            index with
+                BaseRevision = Some targetRevision
+                WorkspaceRevision = Some resultingRevision
+        }
 
-            match materialized with
-            | Failed failure ->
+        let! materialized =
+            materializeRef
+                state
+                resolved
+                resultingRevision
+                false
+                (Some selectedPaths)
+                finalizeIndex
+                context
+
+        match materialized with
+        | Failed failure ->
+            return
+                PartiallySucceeded(
+                    OperationOutcome.performed (Some(mkRevisionId resultingRevision)),
+                    materializationRecoveryFailure
+                        state.RecoveryDirectory
+                        state.Index.WorkspaceRevision
+                        resultingRevision
+                        [||]
+                        failure
+                )
+        | PartiallySucceeded(outcome, failure) ->
+            return
+                PartiallySucceeded(
+                    mapOutcomeValue (Some(mkRevisionId resultingRevision)) outcome,
+                    failure
+                )
+        | Succeeded outcome ->
+            let deletionCleanup =
+                match state.Conflict with
+                | None -> Ok()
+                | Some conflict -> removeResolvedDeletionFiles state conflict
+
+            match deletionCleanup with
+            | Error failure ->
                 return
                     PartiallySucceeded(
-                        OperationOutcome.performed (Some(mkRevisionId resultingRevision)),
+                        mapOutcomeValue (Some(mkRevisionId resultingRevision)) outcome,
                         materializationRecoveryFailure
                             state.RecoveryDirectory
                             state.Index.WorkspaceRevision
                             resultingRevision
-                            [||]
+                            failure.AffectedPaths
                             failure
                     )
-            | PartiallySucceeded(outcome, failure) ->
+            | Ok() ->
+                cleanupConflictCandidates state
+                state.Conflict <- None
+                let finalizedOutcome =
+                    mapOutcomeValue (Some(mkRevisionId resultingRevision)) outcome
+
                 return
-                    PartiallySucceeded(
-                        mapOutcomeValue (Some(mkRevisionId resultingRevision)) outcome,
-                        failure
-                    )
-            | Succeeded outcome ->
-                let deletionCleanup =
-                    match state.Conflict with
-                    | None -> Ok()
-                    | Some conflict -> removeResolvedDeletionFiles state conflict
-
-                match deletionCleanup with
-                | Error failure ->
-                    return
-                        PartiallySucceeded(
-                            mapOutcomeValue (Some(mkRevisionId resultingRevision)) outcome,
-                            materializationRecoveryFailure
-                                state.RecoveryDirectory
-                                state.Index.WorkspaceRevision
-                                resultingRevision
-                                failure.AffectedPaths
-                                failure
-                        )
-                | Ok() ->
-                    cleanupConflictCandidates state
-                    state.Conflict <- None
-                    let finalizedOutcome =
-                        mapOutcomeValue (Some(mkRevisionId resultingRevision)) outcome
-
-                    return
-                        Succeeded {
-                            finalizedOutcome with
-                                ResultingWorkspaceVersion = Some(workspaceVersion state)
-                        }
+                    Succeeded {
+                        finalizedOutcome with
+                            ResultingWorkspaceVersion = Some(workspaceVersion state)
+                    }
     }
 
 let private partialConflictFinalize
@@ -2668,27 +2678,44 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                 |]
                                         }
                                 | Ok _ ->
-                                    return!
-                                        completeConflictFinalize
-                                            state
-                                            resolved
-                                            observedTarget
-                                            pendingRevision
-                                            context
+                                    let! targetWriteSet =
+                                        readConflictFinalizeTargetWriteSet state observedTarget context
+
+                                    match targetWriteSet with
+                                    | Error failure -> return Failed failure
+                                    | Ok targetChangedPaths ->
+                                        return!
+                                            completeConflictFinalize
+                                                state
+                                                resolved
+                                                observedTarget
+                                                targetChangedPaths
+                                                pendingRevision
+                                                context
                             | None ->
                                 let expectedDestination = conflict.WorkspaceRevisionAtOpen
                                 do! barrier state "finalize-precheck-done" context
 
-                                let! destinationBeforeMerge =
-                                    LakeFsApi.getBranch
-                                        resolved
-                                        state.Index.Repository
-                                        state.Index.WorkspaceBranch
-                                        context
+                                let! destinationBeforeMerge = async {
+                                    let! targetWriteSet =
+                                        readConflictFinalizeTargetWriteSet state observedTarget context
+
+                                    match targetWriteSet with
+                                    | Error failure -> return Error failure
+                                    | Ok targetChangedPaths ->
+                                        let! destination =
+                                            LakeFsApi.getBranch
+                                                resolved
+                                                state.Index.Repository
+                                                state.Index.WorkspaceBranch
+                                                context
+
+                                        return destination |> Result.map (fun branch -> targetChangedPaths, branch)
+                                }
 
                                 match destinationBeforeMerge with
                                 | Error failure -> return Failed failure
-                                | Ok observedDestination ->
+                                | Ok(targetChangedPaths, observedDestination) ->
                                     // Use destination-wins only to establish the merge base;
                                     // each selected resolution is applied explicitly below.
                                     let! merged =
@@ -2979,11 +3006,15 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                                 expectedDestination = observedDestination.CommitId
                                                                 && canConfirmOnRetry
                                                             then
+                                                                conflict.PendingFinalizeRevision <- Some commitId
+                                                                do! barrier state "finalize-before-completion" context
+
                                                                 return!
                                                                     completeConflictFinalize
                                                                         state
                                                                         resolved
                                                                         observedTarget
+                                                                        targetChangedPaths
                                                                         commitId
                                                                         context
                                                             else
