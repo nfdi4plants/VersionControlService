@@ -205,3 +205,83 @@ let getEnvironementVariableOrFail (name: string) =
         exit 1
     else
         value
+
+
+/// .NET starts processes without probing PATHEXT, so the npm shims need their extension
+/// on Windows. Commands that Fable launches through `--run` are spelled plainly instead.
+let npx = if OperatingSystem.IsWindows() then "npx.cmd" else "npx"
+
+/// Runs a command that is allowed to fail and returns its exit code with the captured
+/// output, for probes whose result is an answer rather than an error.
+let runReadResult (cmd: string) (args: seq<string>) (workingDir: string) =
+    let mutable exitCode = 0
+
+    let standardOutput, standardError =
+        Command.ReadAsync(
+            cmd,
+            args = args,
+            workingDirectory = workingDir,
+            handleExitCode =
+                (fun code ->
+                    exitCode <- code
+                    true
+                )
+        )
+        |> Async.AwaitTask
+        |> Async.RunSynchronously
+        |> _.ToTuple()
+
+    exitCode, standardOutput, standardError
+
+/// Runs a command, echoing every line as it arrives and returning the exit code together
+/// with everything that was printed, so a caller can also assert on the output.
+let runCaptured (prefix: string) (cmd: string) (args: seq<string>) (workingDir: string) =
+    let startInfo = ProcessStartInfo(FileName = cmd, WorkingDirectory = workingDir)
+    startInfo.UseShellExecute <- false
+    startInfo.RedirectStandardOutput <- true
+    startInfo.RedirectStandardError <- true
+
+    for arg in args do
+        startInfo.ArgumentList.Add arg
+
+    use proc = new Process()
+    proc.StartInfo <- startInfo
+
+    let captured = Text.StringBuilder()
+
+    let onLine (e: DataReceivedEventArgs) =
+        if not (isNull e.Data) then
+            lock captured (fun () -> captured.AppendLine e.Data |> ignore)
+            Console.WriteLine $"[{prefix}] {e.Data}"
+
+    proc.OutputDataReceived.Add onLine
+    proc.ErrorDataReceived.Add onLine
+
+    Console.WriteLine $"""[{prefix}] {cmd} {String.Join(" ", args)}"""
+
+    if not (proc.Start()) then
+        failwithf "Failed to start %s" cmd
+
+    proc.BeginOutputReadLine()
+    proc.BeginErrorReadLine()
+    proc.WaitForExit()
+
+    proc.ExitCode, captured.ToString()
+
+/// Reads a `--name=value` argument. Targets are matched case-insensitively, but the value
+/// keeps its case because paths, versions and test filters depend on it.
+let tryFlagValue (name: string) (args: string list) =
+    let prefix = name + "="
+
+    args
+    |> List.tryPick (fun arg ->
+        if arg.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) then
+            Some(arg.Substring prefix.Length)
+        else
+            None
+    )
+
+let flagValue (name: string) (args: string list) =
+    match tryFlagValue name args with
+    | Some value -> value
+    | None -> failwithf "Missing required argument %s=<value>." name
