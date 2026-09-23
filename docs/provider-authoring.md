@@ -172,6 +172,8 @@ let reseedStorageSettings
 
 The provider owns its storage keys and escaping rules. Hosts should not read or write provider configuration directly.
 
+Git's `SetPathPolicy` reports the path and `.gitattributes` in `AffectedPaths`, and the next revision that includes the path stores it under the new policy. Git refuses to unmark a pointer whose object is not local (`object_not_local`), because the pointer text would be committed as content.
+
 ## Compatibility
 
 The published records are intentionally small. Add new capability as a new optional service record instead of adding required members to an existing published record. Provider-specific mechanics stay behind the SPI. A host should not need provider-specific parsing to resolve, adopt, open, or operate a workspace.

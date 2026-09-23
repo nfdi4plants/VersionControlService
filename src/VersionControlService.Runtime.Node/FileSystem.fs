@@ -1,5 +1,6 @@
 module VersionControlService.Runtime.Node.FileSystem
 
+open System
 open Fable.Core
 open Fable.Core.JsInterop
 
@@ -65,6 +66,9 @@ let statSync (path: string) : Stats = jsNative
 
 [<Import("lstatSync", "fs")>]
 let lstatSync (path: string) : Stats = jsNative
+
+[<Import("utimesSync", "fs")>]
+let utimesSync (path: string) (atime: DateTime) (mtime: DateTime) : unit = jsNative
 
 let tryLstatSync (path: string) : Stats option =
     try

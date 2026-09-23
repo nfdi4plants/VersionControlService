@@ -12,6 +12,7 @@ module GitWorkspaceSession = VersionControlService.Git.GitWorkspaceSession
 module LakeFsCredentials = VersionControlService.LakeFs.LakeFsCredentials
 module LakeFsProviderOptions = VersionControlService.LakeFs.LakeFsProviderOptions
 module LakeFsWorkspaceSession = VersionControlService.LakeFs.LakeFsWorkspaceSession
+module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodeProcess = VersionControlService.Runtime.Node.Process
 
 let private fsPromisesDynamic: obj = importAll "fs/promises"
@@ -86,6 +87,13 @@ let private context name = OperationContext.detached name
 let private expectSucceeded label result =
     match result with
     | Succeeded outcome -> outcome.Value
+    | PartiallySucceeded(_, failure) ->
+        failwith $"Expected {label} to succeed, got partial success ({failure.Code})."
+    | Failed failure -> failwith $"Expected {label} to succeed, got failure ({failure.Code})."
+
+let private expectSucceededOutcome label result =
+    match result with
+    | Succeeded outcome -> outcome
     | PartiallySucceeded(_, failure) ->
         failwith $"Expected {label} to succeed, got partial success ({failure.Code})."
     | Failed failure -> failwith $"Expected {label} to succeed, got failure ({failure.Code})."
@@ -506,6 +514,174 @@ Vitest.describe (
 
                     Vitest.expect(largeContent.StartsWith(lfsPointerPrefix)).toBe true
                     Vitest.expect(smallSize.Trim() |> int).toBe 100
+                })
+        )
+
+        Vitest.test (
+            "marking a committed plain file makes it modified and stores a pointer on its next revision",
+            TestOptions(timeout = 180000),
+            fun () ->
+                withGitFixture RevisionPolicyStrategy.automatic (Some "\n") (fun fixture -> promise {
+                    let path = "manual/mark-small.txt"
+                    let absolutePath = join [| fixture.WorkPath; path |]
+                    do! writeUtf8FileAsync absolutePath "plain content\n"
+
+                    let! initial = createRevision fixture "test: commit plain path before marking" [| path |]
+                    expectSucceeded "initial plain revision" initial |> ignore
+
+                    let storagePolicy =
+                        fixture.Session.StoragePolicy
+                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
+
+                    let! markResult =
+                        storagePolicy.SetPathPolicy (repositoryPath path) true (context "mark-plain-path")
+                        |> Async.StartAsPromise
+
+                    let marked = expectSucceededOutcome "mark plain path" markResult
+                    Vitest.expect(marked.AffectedPaths |> Array.contains path).toBe true
+                    Vitest.expect(marked.AffectedPaths |> Array.contains ".gitattributes").toBe true
+
+                    let! status = runGitOk fixture.WorkPath [| "status"; "--porcelain" |]
+                    Vitest.expect(status.Contains($" M {path}")).toBe true
+
+                    let! revision =
+                        createRevision fixture "test: store marked path as large object" [| path; ".gitattributes" |]
+
+                    expectSucceeded "marked path revision" revision |> ignore
+
+                    let! committed = runGitOk fixture.WorkPath [| "cat-file"; "-p"; $"HEAD:{path}" |]
+                    Vitest.expect(committed.StartsWith(lfsPointerPrefix)).toBe true
+                })
+        )
+
+        Vitest.test (
+            "unmarking a local LFS pointer materializes and stores its plain content",
+            TestOptions(timeout = 180000),
+            fun () ->
+                withGitFixture RevisionPolicyStrategy.automatic (Some "\n") (fun fixture -> promise {
+                    let path = "manual/unmark-local.bin"
+                    let absolutePath = join [| fixture.WorkPath; path |]
+                    let original = "local object content\n"
+                    do! writeUtf8FileAsync absolutePath original
+
+                    let! initial = createRevision fixture "test: commit path before LFS marking" [| path |]
+                    expectSucceeded "initial plain revision" initial |> ignore
+
+                    let storagePolicy =
+                        fixture.Session.StoragePolicy
+                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
+
+                    let! markResult =
+                        storagePolicy.SetPathPolicy (repositoryPath path) true (context "mark-for-unmark-test")
+                        |> Async.StartAsPromise
+
+                    expectSucceeded "mark before local unmark" markResult |> ignore
+
+                    let! lfsRevision =
+                        createRevision fixture "test: commit path with LFS" [| path; ".gitattributes" |]
+
+                    expectSucceeded "LFS revision before unmark" lfsRevision |> ignore
+
+                    let! pointer = runGitOk fixture.WorkPath [| "cat-file"; "-p"; $"HEAD:{path}" |]
+                    Vitest.expect(pointer.StartsWith(lfsPointerPrefix)).toBe true
+                    do! writeUtf8FileAsync absolutePath pointer
+
+                    let! unmarkResult =
+                        storagePolicy.SetPathPolicy (repositoryPath path) false (context "unmark-local-pointer")
+                        |> Async.StartAsPromise
+
+                    let unmarked = expectSucceededOutcome "unmark local pointer" unmarkResult
+                    Vitest.expect(unmarked.AffectedPaths |> Array.contains path).toBe true
+                    Vitest.expect(unmarked.AffectedPaths |> Array.contains ".gitattributes").toBe true
+                    let! materialized = readUtf8FileAsync absolutePath
+                    Vitest.expect(materialized).toBe original
+
+                    let! plainRevision =
+                        createRevision fixture "test: store unmarked path as plain content" [| path; ".gitattributes" |]
+
+                    expectSucceeded "plain revision after unmark" plainRevision |> ignore
+
+                    let! committed = runGitOk fixture.WorkPath [| "cat-file"; "-p"; $"HEAD:{path}" |]
+                    let! status = runGitOk fixture.WorkPath [| "status"; "--porcelain" |]
+                    Vitest.expect(committed).toBe original
+                    Vitest.expect(status.Trim()).toBe ""
+                })
+        )
+
+        Vitest.test (
+            "unmarking a pointer with no local object leaves attributes unchanged",
+            TestOptions(timeout = 180000),
+            fun () ->
+                withGitFixture RevisionPolicyStrategy.automatic (Some "\n") (fun fixture -> promise {
+                    let path = "manual/unmark-missing.bin"
+                    let absolutePath = join [| fixture.WorkPath; path |]
+                    do! writeUtf8FileAsync absolutePath "missing local object\n"
+
+                    let! initial = createRevision fixture "test: commit path before LFS marking" [| path |]
+                    expectSucceeded "initial plain revision" initial |> ignore
+
+                    let storagePolicy =
+                        fixture.Session.StoragePolicy
+                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
+
+                    let! markResult =
+                        storagePolicy.SetPathPolicy (repositoryPath path) true (context "mark-for-missing-object-test")
+                        |> Async.StartAsPromise
+
+                    expectSucceeded "mark before missing-object unmark" markResult |> ignore
+
+                    let! lfsRevision =
+                        createRevision fixture "test: commit path with LFS" [| path; ".gitattributes" |]
+
+                    expectSucceeded "LFS revision before missing-object unmark" lfsRevision |> ignore
+
+                    let! pointer = runGitOk fixture.WorkPath [| "cat-file"; "-p"; $"HEAD:{path}" |]
+                    let oidPrefix = "oid sha256:"
+
+                    let oid =
+                        pointer.Split('\n')
+                        |> Array.tryPick (fun line ->
+                            if line.StartsWith(oidPrefix, StringComparison.Ordinal) then
+                                Some(line.Substring(oidPrefix.Length))
+                            else
+                                None)
+                        |> Option.defaultWith (fun () -> failwith "Expected the committed LFS pointer to contain an object id.")
+
+                    let! lfsEnvironment = runGitOk fixture.WorkPath [| "lfs"; "env" |]
+
+                    let mediaDirectory =
+                        lfsEnvironment.Split('\n')
+                        |> Array.tryPick (fun line ->
+                            let prefix = "LocalMediaDir="
+                            let line = line.TrimEnd('\r')
+
+                            if line.StartsWith(prefix, StringComparison.Ordinal) then
+                                Some(line.Substring(prefix.Length).Trim())
+                            else
+                                None)
+                        |> Option.defaultWith (fun () -> failwith "Expected Git LFS to report its local media directory.")
+
+                    let objectPath = join [| mediaDirectory; oid.Substring(0, 2); oid.Substring(2, 2); oid |]
+                    NodeFileSystem.unlinkSync objectPath
+                    do! writeUtf8FileAsync absolutePath pointer
+                    let! attributesBefore = readUtf8FileAsync (join [| fixture.WorkPath; ".gitattributes" |])
+
+                    let! unmarkResult =
+                        storagePolicy.SetPathPolicy (repositoryPath path) false (context "unmark-missing-pointer")
+                        |> Async.StartAsPromise
+
+                    match unmarkResult with
+                    | Failed failure ->
+                        Vitest.expect(failure.Category).toEqual Validation
+                        Vitest.expect(failure.Code).toBe "object_not_local"
+                        Vitest.expect(failure.Message).toBe "Download the file before storing it without Git LFS."
+                        Vitest.expect(failure.StateChanged).toBe false
+                        Vitest.expect(failure.AffectedPaths).toEqual [| path |]
+                    | Succeeded _
+                    | PartiallySucceeded _ -> failwith "Expected unmarking the missing LFS object to fail."
+
+                    let! attributesAfter = readUtf8FileAsync (join [| fixture.WorkPath; ".gitattributes" |])
+                    Vitest.expect(attributesAfter).toBe attributesBefore
                 })
         )
 

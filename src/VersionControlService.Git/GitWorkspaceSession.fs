@@ -1981,15 +1981,6 @@ let private restorePaths (state: SessionState) (request: RestoreRequest) (contex
                     | Ok() -> return OperationResult.succeeded ()
     }
 
-let private escapeLfsPathspec (path: string) =
-    path
-    |> Seq.map (fun character ->
-        if character = '*' || character = '?' || character = '[' || character = ']' || character = '{' || character = '}' then
-            "\\" + string character
-        else
-            string character)
-    |> String.concat ""
-
 let private listRefs (state: SessionState) (context: OperationContext) =
     async {
         let! result = awaitGit (GitService.getBranches state.RepoPath)
@@ -4901,7 +4892,7 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                                                     "lfs"
                                                                                     "checkout"
                                                                                     "--"
-                                                                                    escapeLfsPathspec pathValue
+                                                                                    GitLfsObjects.escapeLfsPathspec pathValue
                                                                                 |]
                                                                                 None
                                                                                 context
@@ -5766,7 +5757,12 @@ let createSessionWithCredentialsIdentityAndPolicy
                         state.Credentials
                         state.ConnectionProfileId
                 )
-            StoragePolicy = Some(GitLfsExtensions.createStoragePolicy state.RepoPath)
+            StoragePolicy =
+                Some(
+                    GitLfsExtensions.createStoragePolicy
+                        state.RepoPath
+                        (fun arguments context -> runGit state.Hooks state.RepoPath arguments None context)
+                )
             Maintenance =
                 Some(
                     GitLfsExtensions.createMaintenance

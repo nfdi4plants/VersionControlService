@@ -3,13 +3,19 @@
 /// reports its own dependency status when git-lfs is unavailable.
 module internal VersionControlService.Git.GitLfsExtensions
 
+open System
 open Fable.Core
 open VersionControlService.Abstractions
 open VersionControlService.Git.GitEngineTypes
 
 module GitService = VersionControlService.Git.GitService
 module GitLfsService = VersionControlService.Git.GitLfsService
+module GitLfsObjects = VersionControlService.Git.GitLfsObjects
 module GitCredentialStrategy = VersionControlService.Git.GitCredentialStrategy
+module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
+module NodeInterop = VersionControlService.Runtime.Node.Interop
+module NodePath = VersionControlService.Runtime.Node.Path
+module NodeProcess = VersionControlService.Runtime.Node.Process
 
 let private categoryOfKind (kind: GitFailureKind) =
     match kind with
@@ -56,6 +62,105 @@ let private wrapUnit
                     return OperationResult.canceled "Git LFS operation canceled."
                 | Ok() -> return OperationResult.succeeded ()
                 | Error failure -> return toOperationResult failure
+    }
+
+let private storagePolicyPaths (relativePath: string) = [| relativePath; ".gitattributes" |]
+
+let private affectedPath (relativePath: string) (failure: OperationFailure) = {
+    failure with
+        StateChanged = false
+        AffectedPaths = [| relativePath |]
+}
+
+let private bumpRegularFileMtime (repoPath: string) (relativePath: string) : Result<unit, string> =
+    try
+        let absolutePath = NodePath.resolve [| repoPath; relativePath |]
+
+        match NodeFileSystem.tryLstatSync absolutePath with
+        | Some stats when stats.isFile () ->
+            let now = DateTime.Now
+            NodeFileSystem.utimesSync absolutePath now now
+            Ok()
+        | _ -> Ok()
+    with error ->
+        Error(NodeInterop.errorMessage error)
+
+let private completeStoragePolicyChange (repoPath: string) (relativePath: string) : OperationResult<unit> =
+    let affectedPaths = storagePolicyPaths relativePath
+
+    match bumpRegularFileMtime repoPath relativePath with
+    | Ok() ->
+        Succeeded {
+            OperationOutcome.performed () with
+                AffectedPaths = affectedPaths
+        }
+    | Error error ->
+        Failed {
+            OperationFailure.createRedacted
+                ProviderError
+                "mtime_update_failed"
+                $"Git LFS changed the path policy, but could not refresh the file timestamp: {error}" with
+                StateChanged = true
+                AffectedPaths = affectedPaths
+        }
+
+let private prepareUnmark
+    (repoPath: string)
+    (runGit: string[] -> OperationContext -> Async<Result<NodeProcess.ProcessOutput, OperationFailure>>)
+    (relativePath: string)
+    (context: OperationContext)
+    : Async<Result<bool, OperationFailure>> =
+    async {
+        let! pointerResult = GitLfsObjects.readWorktreePointer repoPath relativePath
+
+        match pointerResult with
+        | Error failure -> return Error(affectedPath relativePath failure)
+        | Ok None -> return Ok false
+        | Ok(Some pointer) ->
+            let! mediaDirectoryResult =
+                GitLfsObjects.resolveLocalMediaDirectory (fun arguments -> runGit arguments context) repoPath
+
+            match mediaDirectoryResult with
+            | Error failure -> return Error(affectedPath relativePath failure)
+            | Ok mediaDirectory when
+                not (GitLfsObjects.isObjectLocallyAvailable mediaDirectory pointer.Oid pointer.SizeInBytes) ->
+                return
+                    Error(
+                        OperationFailure.create
+                            Validation
+                            "object_not_local"
+                            "Download the file before storing it without Git LFS."
+                        |> affectedPath relativePath
+                    )
+            | Ok _ ->
+                let! checkoutResult =
+                    runGit
+                        [| "lfs"; "checkout"; "--"; GitLfsObjects.lfsCheckoutPattern relativePath |]
+                        context
+
+                match checkoutResult with
+                | Error failure ->
+                    return
+                        Error(
+                            OperationFailure.createRedacted
+                                ProviderError
+                                "object_materialization_failed"
+                                failure.Message
+                            |> affectedPath relativePath
+                        )
+                | Ok output when output.ExitCode = 0 -> return Ok true
+                | Ok output ->
+                    let detail =
+                        if String.IsNullOrWhiteSpace output.StdErr then
+                            $"Git exited with code {output.ExitCode}."
+                        else
+                            output.StdErr.Trim()
+
+                    return
+                        Error(
+                            OperationFailure.createRedacted ProviderError "object_materialization_failed" detail
+                            |> affectedPath relativePath
+                        )
     }
 
 let createObjectMaterialization
@@ -165,30 +270,53 @@ let createObjectMaterialization
                         context)
 }
 
-let createStoragePolicy (repoPath: string) : StoragePolicyService = {
+let createStoragePolicy
+    (repoPath: string)
+    (runGit: string[] -> OperationContext -> Async<Result<NodeProcess.ProcessOutput, OperationFailure>>)
+    : StoragePolicyService = {
     SetPathPolicy =
-        fun path useLargeObjectStorage _ -> async {
+        fun path useLargeObjectStorage context -> async {
             let relativePath = RepositoryPath.value path
 
-            let! (result: Result<unit, string>) =
-                if useLargeObjectStorage then
-                    GitLfsService.trackLiteral repoPath relativePath
-                else
-                    GitLfsService.untrackLiteral repoPath relativePath
-                |> Async.AwaitPromise
+            if useLargeObjectStorage then
+                let! result = GitLfsService.trackLiteral repoPath relativePath |> Async.AwaitPromise
 
-            match result with
-            | Ok() -> return OperationResult.succeeded ()
-            | Error error ->
-                let kind = GitService.classifyFailureKind error
+                match result with
+                | Ok() -> return completeStoragePolicyChange repoPath relativePath
+                | Error error ->
+                    let kind = GitService.classifyFailureKind error
 
-                return
-                    Failed(
-                        OperationFailure.createRedacted
-                            (categoryOfKind kind)
-                            "lfs_operation_failed"
-                            error
-                    )
+                    return
+                        Failed(
+                            OperationFailure.createRedacted
+                                (categoryOfKind kind)
+                                "lfs_operation_failed"
+                                error
+                        )
+            else
+                let! preparation = prepareUnmark repoPath runGit relativePath context
+
+                match preparation with
+                | Error failure -> return Failed failure
+                | Ok wasMaterialized ->
+                    let! result = GitLfsService.untrackLiteral repoPath relativePath |> Async.AwaitPromise
+
+                    match result with
+                    | Ok() -> return completeStoragePolicyChange repoPath relativePath
+                    | Error error ->
+                        let kind = GitService.classifyFailureKind error
+                        let failure =
+                            OperationFailure.createRedacted
+                                (categoryOfKind kind)
+                                "lfs_operation_failed"
+                                error
+
+                        return
+                            Failed {
+                                failure with
+                                    StateChanged = wasMaterialized
+                                    AffectedPaths = if wasMaterialized then [| relativePath |] else [||]
+                            }
         }
     GetSettings =
         fun _ -> async {

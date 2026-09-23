@@ -1,11 +1,13 @@
 module internal VersionControlService.Git.GitLfsObjects
 
 open System
+open Fable.Core
 open VersionControlService.Abstractions
 
 module NodeProcess = VersionControlService.Runtime.Node.Process
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodePath = VersionControlService.Runtime.Node.Path
+module NodeInterop = VersionControlService.Runtime.Node.Interop
 
 type internal LfsPointerInfo = {
     Oid: string
@@ -64,6 +66,59 @@ let internal tryParseLfsPointer (pointerText: string) =
         | _ -> None
     else
         None
+
+let internal readWorktreePointer
+    (repoPath: string)
+    (relativePath: string)
+    : Async<Result<LfsPointerInfo option, OperationFailure>> =
+    async {
+        let absolutePath = NodePath.resolve [| repoPath; relativePath |]
+
+        try
+            match NodeFileSystem.tryLstatSync absolutePath with
+            | None -> return Ok None
+            | Some pathStats when not (pathStats.isFile ()) || pathStats.size > 1024.0 -> return Ok None
+            | Some pathStats ->
+                let! handle = NodeFileSystem.openReadNoFollowAsync absolutePath |> Async.AwaitPromise
+
+                try
+                    let! handleStats = handle.stat () |> Async.AwaitPromise
+
+                    if
+                        not (handleStats.isFile ())
+                        || handleStats.dev <> pathStats.dev
+                        || handleStats.ino <> pathStats.ino
+                    then
+                        return
+                            Error(
+                                OperationFailure.createRedacted
+                                    ProviderError
+                                    "worktree_read_failed"
+                                    "The worktree file changed while its storage policy was being checked."
+                            )
+                    elif handleStats.size > 1024.0 then
+                        return Ok None
+                    else
+                        let buffer = NodeInterop.bufferAlloc 1024
+                        let! readResult = handle.read(buffer, 0, 1024, 0.0) |> Async.AwaitPromise
+
+                        let content =
+                            readResult.buffer
+                            |> fun bytes -> NodeInterop.bufferSubarray bytes 0 readResult.bytesRead
+                            |> NodeInterop.bufferToUtf8String
+
+                        return Ok(tryParseLfsPointer content)
+                finally
+                    NodeInterop.observePromise (handle.close ()) ignore ignore
+        with _ ->
+            return
+                Error(
+                    OperationFailure.createRedacted
+                        ProviderError
+                        "worktree_read_failed"
+                        "The worktree file could not be inspected before changing its storage policy."
+                )
+    }
 
 let private runCommonDirectoryFallback
     (runGit: string[] -> Async<Result<NodeProcess.ProcessOutput, OperationFailure>>)
@@ -140,3 +195,17 @@ let isObjectLocallyAvailable (mediaDirectory: string) (oid: string) (sizeBytes: 
         | None -> false
     with _ ->
         false
+
+/// Escapes the glob characters git-lfs would otherwise expand in a path argument.
+let internal escapeLfsPathspec (path: string) =
+    path
+    |> Seq.map (fun character ->
+        if character = '*' || character = '?' || character = '[' || character = ']' || character = '{' || character = '}' then
+            "\\" + string character
+        else
+            string character)
+    |> String.concat ""
+
+/// Root-anchored `git lfs checkout` pattern for one repository path. git-lfs reads its
+/// arguments as gitignore-style patterns, so an unanchored name also matches in subfolders.
+let internal lfsCheckoutPattern (path: string) = "/" + escapeLfsPathspec path
