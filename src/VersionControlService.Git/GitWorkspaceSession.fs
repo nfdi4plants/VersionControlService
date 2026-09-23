@@ -5895,7 +5895,25 @@ let createFactoryWithCredentialsIdentityAndPolicy
                 | Error failure when failure.Category = Canceled -> return Failed failure
                 | _ ->
                     let! lfsFilter =
-                        runGit hooks "." [| "config"; "--global"; "--get"; "filter.lfs.process" |] None context
+                        async {
+                            let! globalFilter =
+                                runGit hooks "." [| "config"; "--global"; "--get"; "filter.lfs.process" |] None context
+
+                            match globalFilter with
+                            | Error failure when failure.Category = Canceled -> return globalFilter
+                            | Error _ -> return globalFilter
+                            | Ok output when output.ExitCode = 0 && not (String.IsNullOrWhiteSpace output.StdOut) ->
+                                return globalFilter
+                            | Ok _ ->
+                                let! systemFilter =
+                                    runGit hooks "." [| "config"; "--system"; "--get"; "filter.lfs.process" |] None context
+
+                                match systemFilter with
+                                | Error failure when failure.Category = Canceled -> return systemFilter
+                                | Ok output when output.ExitCode = 0 && not (String.IsNullOrWhiteSpace output.StdOut) ->
+                                    return systemFilter
+                                | _ -> return globalFilter
+                        }
 
                     match lfsFilter with
                     | Error failure when failure.Category = Canceled -> return Failed failure

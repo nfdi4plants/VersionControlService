@@ -34,6 +34,7 @@ let private dependencyHooks
     (lfsVersion: string option)
     (initialFilterProcess: string option)
     (filterProcessAfterInstall: string option)
+    (systemFilterProcess: string option)
     =
     let mutable filterProcess = initialFilterProcess
     let commands = ResizeArray<string[]>()
@@ -56,6 +57,11 @@ let private dependencyHooks
                             processOutput 0 (filterProcess |> Option.get) ""
                         | [| "config"; "--global"; "--get"; "filter.lfs.process" |] ->
                             processOutput 1 "" ""
+                        | [| "config"; "--system"; "--get"; "filter.lfs.process" |]
+                            when gitAvailable && systemFilterProcess.IsSome ->
+                            processOutput 0 (systemFilterProcess |> Option.get) ""
+                        | [| "config"; "--system"; "--get"; "filter.lfs.process" |] ->
+                            processOutput 1 "" ""
                         | [| "lfs"; "install"; "--skip-repo" |] when lfsVersion.IsSome ->
                             filterProcess <- filterProcessAfterInstall
 
@@ -77,7 +83,7 @@ Vitest.describe (
         Vitest.test (
             "Git dependency remediation is truthful",
             fun () -> promise {
-                let missingHooks, _ = dependencyHooks false None None None
+                let missingHooks, _ = dependencyHooks false None None None None
                 let missingFactory = GitWorkspaceSession.createFactory missingHooks
                 let! missingResult = Async.StartAsPromise(missingFactory.CheckDependencies(context "missing-dependencies"))
                 let missing = expectValue "missing dependencies" missingResult
@@ -88,7 +94,7 @@ Vitest.describe (
                     Vitest.expect(status.Compatible).toBe (false)
                     Vitest.expect(status.Remediation.IsSome).toBe (true)
 
-                let missingLfsHooks, missingLfsCommands = dependencyHooks true None None None
+                let missingLfsHooks, missingLfsCommands = dependencyHooks true None None None None
                 let missingLfsFactory = GitWorkspaceSession.createFactory missingLfsHooks
                 let! missingLfsResult =
                     Async.StartAsPromise(
@@ -105,7 +111,7 @@ Vitest.describe (
                 ).toBe (false)
 
                 let incompatibleLfsHooks, incompatibleLfsCommands =
-                    dependencyHooks true (Some "git-lfs/3.6.1 (GitHub; windows amd64; go 1.23.0)\n") None None
+                    dependencyHooks true (Some "git-lfs/3.6.1 (GitHub; windows amd64; go 1.23.0)\n") None None None
 
                 let incompatibleLfsFactory = GitWorkspaceSession.createFactory incompatibleLfsHooks
                 let! incompatibleLfsResult =
@@ -125,7 +131,7 @@ Vitest.describe (
                 ).toBe (false)
 
                 let noRepairHooks, _ =
-                    dependencyHooks true (Some "git-lfs/3.7.0 (GitHub; windows amd64; go 1.23.0)\n") None None
+                    dependencyHooks true (Some "git-lfs/3.7.0 (GitHub; windows amd64; go 1.23.0)\n") None None None
                 let noRepairFactory = GitWorkspaceSession.createFactory noRepairHooks
                 let! noRepairResult =
                     Async.StartAsPromise(noRepairFactory.InstallDependency "git-lfs-configuration" (context "repair-not-applied"))
@@ -161,6 +167,7 @@ Vitest.describe (
                         (Some "git-lfs/3.7.0 (GitHub; windows amd64; go 1.23.0)\n")
                         None
                         (Some "git-lfs filter-process\n")
+                        None
                 let repairedFactory = GitWorkspaceSession.createFactory repairedHooks
                 let! repairedResult =
                     Async.StartAsPromise(repairedFactory.InstallDependency "git-lfs-configuration" (context "repair-applied"))
@@ -196,6 +203,7 @@ Vitest.describe (
                         (Some "git-lfs/3.7.0 (GitHub; windows amd64; go 1.23.0)\n")
                         staleFilter
                         staleFilter
+                        None
 
                 let staleFactory = GitWorkspaceSession.createFactory staleHooks
                 let! staleDependenciesResult = Async.StartAsPromise(staleFactory.CheckDependencies(context "stale-filter"))
@@ -214,6 +222,27 @@ Vitest.describe (
                 Vitest.expect(staleInstallFailure.Category).toEqual (DependencyMissing)
                 Vitest.expect(staleInstallFailure.Code).toBe ("lfs_configuration_unhealthy")
 
+            }
+        )
+
+        Vitest.test (
+            "Git LFS configured in the system config counts as configured",
+            fun () -> promise {
+                let systemLfsHooks, _ =
+                    dependencyHooks
+                        true
+                        (Some "git-lfs/3.7.0 (GitHub; windows amd64; go 1.23.0)\n")
+                        None
+                        None
+                        (Some "git-lfs filter-process\n")
+
+                let factory = GitWorkspaceSession.createFactory systemLfsHooks
+                let! result = Async.StartAsPromise(factory.CheckDependencies(context "system-lfs-filter"))
+                let dependencies = expectValue "system Git LFS configuration" result
+                let status = dependencies |> Array.find (fun entry -> entry.Component = "git-lfs-configuration")
+
+                Vitest.expect(status.Installed).toBe (true)
+                Vitest.expect(status.Compatible).toBe (true)
             }
         )
 
