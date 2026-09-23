@@ -822,8 +822,9 @@ let createContext (operationId: string) (onProgress: OperationProgress -> unit) 
     context, source
 ```
 
-`OperationContext.create` catches and drops exceptions from the progress callback. A
-callback that reports to a closed window cannot fail the operation it watches.
+`OperationContext.create` catches and drops exceptions from the progress callback, so a
+callback that reports to a closed window cannot fail the operation it watches. The guard
+belongs to `create`. A context built as a record literal calls the callback unguarded.
 
 The host calls `source.Cancel()` from wherever the user asks, such as a stop button. A
 canceled operation comes back as a `Canceled` failure that describes what the
