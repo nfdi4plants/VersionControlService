@@ -188,7 +188,8 @@ match result with
     | NoOp reason -> showNothingToDo reason
 
 | PartiallySucceeded(outcome, failure) ->
-    // State changed before a later step failed. There is always a recovery action.
+    // State changed before a later step failed. The contract obliges the provider to
+    // attach a recovery action here, and the field stays an option on the type.
     showRecovery failure.RecoveryAction
 
 | Failed failure ->
