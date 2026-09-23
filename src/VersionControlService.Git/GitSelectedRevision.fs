@@ -706,6 +706,10 @@ let private prepareLfsPointerBlob
             | Error failure -> return Error failure
             | Ok(Some sourceContent) when tryParseLfsPointer sourceContent |> Option.isSome ->
                 return! hashTextBlob runGit sourceContent
+            // git-lfs stores an empty file as empty content (its clean filter writes no pointer),
+            // so the empty blob is what git add would produce.
+            | Ok(Some "") ->
+                return! hashTextBlob runGit ""
             | Ok _ ->
                     return!
                         async {

@@ -304,6 +304,38 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "an empty file under a large object path commits as the empty blob",
+            TestOptions(timeout = 120000),
+            fun () ->
+                let strategy: RevisionPolicyStrategy = {
+                    ResolvePathPolicy = fun request ->
+                        if RepositoryPath.value request.Path = "dataset/.gitkeep" then
+                            RevisionPathPolicy.LargeObject
+                        else
+                            RevisionPathPolicy.Automatic
+                }
+
+                withGitFixture strategy None (fun fixture -> promise {
+                    do!
+                        writeUtf8FileAsync
+                            (join [| fixture.WorkPath; "dataset/.gitkeep" |])
+                            ""
+
+                    let! revision =
+                        createRevision fixture "test: empty large object" [| "dataset/.gitkeep" |]
+
+                    expectSucceeded "empty large object revision" revision |> ignore
+
+                    let! size =
+                        runGitOk fixture.WorkPath [| "cat-file"; "-s"; "HEAD:dataset/.gitkeep" |]
+
+                    let! status = runGitOk fixture.WorkPath [| "status"; "--porcelain" |]
+                    Vitest.expect(size.Trim()).toBe "0"
+                    Vitest.expect(status.Trim()).toBe ""
+                })
+        )
+
+        Vitest.test (
             "an inline path holding a pointer is refused before any mutation",
             TestOptions(timeout = 120000),
             fun () ->
