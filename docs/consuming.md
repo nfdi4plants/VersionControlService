@@ -319,9 +319,13 @@ provider the catalog does not hold. Only the `ProbeFailed` entry carries a provi
 code, so treat that one by its category.
 
 `Adopt` is allowed to refuse. A provider that cannot derive a binding it can verify answers
-`Unsupported` with `operation_not_supported`, and the built-in lakeFS factory always does,
-even though it probes the `.lakefs_ref.yaml` marker and reports a candidate. So a probed lakeFS workspace never adopts. Fall back to `Bind` with a location the
-user supplies, or to `Clone` into a fresh directory.
+with the `Unsupported` category, and the code differs by provider: lakeFS reports
+`operation_not_supported` and Git reports `adoption_unsupported` for a workspace whose
+metadata it cannot parse. Branch on the category, because the two providers reach similar
+behavior through different mechanisms. The built-in lakeFS factory always refuses, even
+though it probes the `.lakefs_ref.yaml` marker and reports a candidate, so a probed lakeFS
+workspace never adopts. Fall back to `Bind` with a location the user supplies, or to `Clone`
+into a fresh directory.
 
 The `provider_not_registered` case is the one to handle first. A workspace whose provider
 was dropped from the catalog resolves as `UnmanagedWorkspace` carrying that diagnostic,
@@ -375,15 +379,18 @@ exist locally and a publish can still be retried. `PublicationNotApplicable` mea
 operation has no publication meaning at all, so it is not a claim that anything was published.
 
 `ResultingWorkspaceVersion` is optional and a provider may leave it `None`. The built-in Git
-provider never sets it, and lakeFS does, so do not build a host around it. Take the token for
-the next mutation from `Core.GetStatus`, or from the `WorkspaceStatus` that `SwitchRef` and
-the synchronization operations return as their payload. The token is opaque either way, so do
-not parse it or compare it for ordering.
+provider never sets it, and lakeFS does, so do not build a host around it. Two payloads carry
+a workspace version: `Core.GetStatus` and `SwitchRef`, which both return a `WorkspaceStatus`.
+The synchronization operations return a `SynchronizationState`, which has revisions and a
+target but no workspace version, so call `Core.GetStatus` after a synchronize to get the token
+for the next mutation. The token is opaque either way, so do not parse it or compare it for
+ordering.
 
 ## Optional services
 
 Every session has `Descriptor`, `Core` and `Close`. The seven services are `option`, and a
-provider leaves one absent when it has nothing to offer there. Feature discovery is an `Option.isSome` check, and there are
+provider leaves one absent when it has nothing to offer there. Feature discovery is an
+`Option.isSome` check, and there are
 two reasonable ways to write a host against that.
 
 ### Direct: an absent service stays absent
@@ -473,7 +480,8 @@ let repositoryUrl (session: WorkspaceSession) (context: OperationContext) = asyn
 
 Two groups of operations report the failure and do no quiet work: the whole
 synchronization service, and the conflict mutations `Resolve`, `Finalize` and `Cancel`.
-Both change what a user believes about where their work is. A publish that succeeded as a no-op would tell
+Both change what a user believes about where their work is. A publish that succeeded as a
+no-op would tell
 someone their work is safe on a server that never received it.
 
 ```fsharp
@@ -523,8 +531,9 @@ Paths are exact repository-relative keys. `RepositoryPath.tryCreate` rejects an 
 string, NUL, a backslash anywhere, an absolute or drive-rooted path, an empty segment, a
 trailing separator, and any `.` or `..` segment. The two a Windows host hits in practice are
 the drive-rooted one and the trailing separator, because `C:/data/x.csv` contains no backslash
-and `data/` looks harmless. The drive-rooted rule is a shape, not a platform check, so a Linux
-file named `a:b.csv` at the repository root is rejected too. Forward slash is the only
+and `data/` looks harmless. The drive-rooted rule tests the shape of the string on every
+platform, so a
+Linux file named `a:b.csv` at the repository root is rejected too. Forward slash is the only
 separator. Anything the rules do not reject is a literal filename byte, with no Unicode
 normalization, no case folding and no wildcard expansion, so a file genuinely named
 `report [draft].csv` round-trips.
@@ -573,8 +582,8 @@ let saveSelected
                     // provider may leave as None, so do not read the revision out of it.
                     //
                     // The commit moved the workspace version, and ResultingWorkspaceVersion is
-                    // None on Git, so None here means "re-read the status before the next
-                    // mutation" instead of "unchanged".
+                    // None on Git. None here means the host re-reads the status before the
+                    // next mutation. It does not mean the version is unchanged.
                     return
                         Ok {
                             Revision = Some outcome.Value
@@ -622,8 +631,8 @@ let switchRef (session: WorkspaceSession) (request: SwitchRefRequest) (context: 
         if not outcome.Value.IsSafe then
             // PathsAtRisk names the files that block the switch. The host commits them with
             // CreateRevision or throws them away with RestorePaths. Either one moves the
-            // workspace version, so re-read the status and build a fresh request rather than
-            // resending this one. There is no flag that forces the switch.
+            // workspace version, so re-read the status and build a fresh request. Resending
+            // this one fails. There is no flag that forces the switch.
             return Error(sprintf "%d paths block the switch" outcome.Value.PathsAtRisk.Length)
         else
             let! switched = session.Core.SwitchRef request context
@@ -637,7 +646,8 @@ let switchRef (session: WorkspaceSession) (request: SwitchRefRequest) (context: 
 
 `PathsAtRisk` is the overlap between the paths that carry local changes and the paths that
 differ between the current revision and the target, which is the set the checkout would have
-to overwrite. `IsSafe` false is therefore a prediction that the checkout will be refused, and it names
+to overwrite. `IsSafe` false is therefore a prediction that the checkout will be refused,
+and it names
 the files to deal with first.
 
 `request.TargetRef` is a `ProviderRef`, and the place to get one is the `ProviderRef` field
