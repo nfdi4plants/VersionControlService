@@ -176,6 +176,20 @@ let private runGitIn
         | Failed _ -> return failwith "harness git invocation failed"
     }
 
+let private runGitResultIn (cwd: string) (arguments: string[]) : JS.Promise<NodeProcess.ProcessOutput> = promise {
+    let request = {
+        NodeProcess.ProcessRequest.create "git" arguments with
+            WorkingDirectory = Some cwd
+    }
+
+    let! result = Async.StartAsPromise(NodeProcess.run request (OperationContext.detached "git-harness"))
+
+    match result with
+    | Succeeded outcome -> return outcome.Value
+    | PartiallySucceeded _
+    | Failed _ -> return failwith "harness git invocation failed"
+}
+
 let private configureUser (repoPath: string) = promise {
     let! _ = runGitIn repoPath [||] [| "config"; "user.name"; "VCS Harness" |] None
     let! _ = runGitIn repoPath [||] [| "config"; "user.email"; "harness@example.org" |] None
@@ -3651,6 +3665,70 @@ let private createBaseContentFixtureWithHooks (hooks: GitWorkspaceSession.GitSes
     return root, GitWorkspaceSession.createSession hooks binding
 }
 
+let private lfsPointerPrefix = "version https://git-lfs.github.com/spec/v1"
+let private lfsCsvContent = "name,value\nalpha,1\nbeta,2\ngamma,3\n"
+
+let private lfsOidFromPointer (pointer: string) =
+    pointer.Replace("\r\n", "\n").Split('\n')
+    |> Array.tryPick (fun line ->
+        let prefix = "oid sha256:"
+
+        if line.StartsWith(prefix, StringComparison.Ordinal) then
+            Some(line.Substring(prefix.Length).Trim())
+        else
+            None)
+    |> Option.defaultWith (fun () -> failwith "Expected an LFS pointer object id.")
+
+let private lfsMediaDirectoryFromEnvironment (lfsEnvironment: string) =
+    lfsEnvironment.Replace("\r\n", "\n").Split('\n')
+    |> Array.tryPick (fun line ->
+        let prefix = "LocalMediaDir="
+        let line = line.TrimEnd('\r')
+
+        if line.StartsWith(prefix, StringComparison.Ordinal) then
+            Some(line.Substring(prefix.Length).Trim())
+        else
+            None)
+    |> Option.defaultWith (fun () -> failwith "Expected Git LFS to report its local media directory.")
+
+let private lfsObjectPath (mediaDirectory: string) (oid: string) =
+    join [| mediaDirectory; oid.Substring(0, 2); oid.Substring(2, 2); oid |]
+
+let private createLfsBaseContentFixture () = promise {
+    let! root = createTempDirectoryAsync ()
+    let repoPath = join [| root; "work" |]
+    let csvPath = join [| repoPath; "data.csv" |]
+    let binaryPath = join [| repoPath; "data.bin" |]
+    let! _ = runGitIn root [||] [| "init"; "-b"; "main"; repoPath |] None
+    do! configureUser repoPath
+    let! _ = runGitIn repoPath [||] [| "lfs"; "install"; "--local" |] None
+    let! _ = runGitIn repoPath [||] [| "lfs"; "track"; "data.csv" |] None
+    let! _ = runGitIn repoPath [||] [| "lfs"; "track"; "data.bin" |] None
+    do! writeUtf8FileAsync csvPath lfsCsvContent
+    do! writeBinaryFileAsync binaryPath [| 0; 255; 7; 8; 9 |]
+    let! _ = runGitIn repoPath [||] [| "add"; "-A" |] None
+    let! _ = runGitIn repoPath [||] [| "commit"; "-m"; "test: commit LFS base files" |] None
+    let! csvPointer = runGitIn repoPath [||] [| "show"; "HEAD:data.csv" |] None
+    do! writeUtf8FileAsync csvPath csvPointer
+    let! _ = runGitIn repoPath [||] [| "lfs"; "checkout"; "--"; "data.csv" |] None
+
+    let binding: WorkspaceBinding = {
+        SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
+        ProviderId = gitProviderId
+        WorkspaceRoot = repoPath
+        ProviderStateRef = None
+        Location = {
+            ProviderId = gitProviderId
+            DisplayName = None
+            ProviderLocation = repoPath
+            ConnectionProfileId = None
+        }
+        ConnectionProfileId = None
+    }
+
+    return root, repoPath, GitWorkspaceSession.createSession GitWorkspaceSession.GitSessionHooks.none binding
+}
+
 let private createBaseContentFixture () =
     createBaseContentFixtureWithHooks GitWorkspaceSession.GitSessionHooks.none
 
@@ -4334,6 +4412,108 @@ Vitest.describe (
                 with error ->
                     do! removeDirectoryAsync root
                     return raise error
+            }
+        )
+
+        Vitest.test (
+            "returns materialized committed LFS text when the object is local",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGitResultIn "." [| "lfs"; "version" |]
+
+                if lfsProbe.ExitCode <> 0 then
+                    Vitest.expect(true).toBe true
+                else
+                    let! root, repoPath, session = createLfsBaseContentFixture ()
+
+                    try
+                        do!
+                            writeUtf8FileAsync
+                                (join [| repoPath; "data.csv" |])
+                                "name,value\nalpha,10\nbeta,20\ngamma,3\n"
+
+                        let! result =
+                            (textDiffService session).GetBaseContent
+                                (repositoryPath "data.csv")
+                                (OperationContext.detached "base-local-lfs-text")
+                            |> Async.StartAsPromise
+
+                        match expectProviderValue "local LFS text base content" result with
+                        | TextContent text -> Vitest.expect(text).toBe lfsCsvContent
+                        | UnsupportedContent _ -> failwith "Expected materialized local LFS text content."
+
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "returns the LFS pointer when the base object is missing locally",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGitResultIn "." [| "lfs"; "version" |]
+
+                if lfsProbe.ExitCode <> 0 then
+                    Vitest.expect(true).toBe true
+                else
+                    let! root, repoPath, session = createLfsBaseContentFixture ()
+
+                    try
+                        let! pointer = runGitIn repoPath [||] [| "show"; "HEAD:data.csv" |] None
+                        let! lfsEnvironment = runGitIn repoPath [||] [| "lfs"; "env" |] None
+                        let mediaDirectory = lfsMediaDirectoryFromEnvironment lfsEnvironment
+                        let oid = lfsOidFromPointer pointer
+                        do! removeFileAsync (lfsObjectPath mediaDirectory oid)
+                        do!
+                            writeUtf8FileAsync
+                                (join [| repoPath; "data.csv" |])
+                                "name,value\nalpha,10\nbeta,20\ngamma,3\n"
+
+                        let! result =
+                            (textDiffService session).GetBaseContent
+                                (repositoryPath "data.csv")
+                                (OperationContext.detached "base-missing-lfs-object")
+                            |> Async.StartAsPromise
+
+                        match expectProviderValue "missing local LFS base content" result with
+                        | TextContent text -> Vitest.expect(text.StartsWith(lfsPointerPrefix)).toBe true
+                        | UnsupportedContent _ -> failwith "Expected the textual LFS pointer base content."
+
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "returns unsupported content for a local binary LFS object",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGitResultIn "." [| "lfs"; "version" |]
+
+                if lfsProbe.ExitCode <> 0 then
+                    Vitest.expect(true).toBe true
+                else
+                    let! root, repoPath, session = createLfsBaseContentFixture ()
+
+                    try
+                        let! result =
+                            (textDiffService session).GetBaseContent
+                                (repositoryPath "data.bin")
+                                (OperationContext.detached "base-local-lfs-binary")
+                            |> Async.StartAsPromise
+
+                        match expectProviderValue "local LFS binary base content" result with
+                        | UnsupportedContent _ -> ()
+                        | TextContent text -> failwith $"Expected unsupported binary content, received '{text}'."
+
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
             }
         )
 

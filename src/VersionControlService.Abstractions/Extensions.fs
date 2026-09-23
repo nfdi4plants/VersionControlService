@@ -9,7 +9,8 @@ type ContentView =
 type TextDiffService = {
     GetDiff: RepositoryPath -> OperationContext -> Async<OperationResult<ContentView>>
     GetWordDiff: RepositoryPath -> OperationContext -> Async<OperationResult<ContentView>>
-    /// Committed/base content of a path; providers own base revision lookup.
+    /// Providers own base revision lookup. GetBaseContent returns the committed base in materialized form when available locally and never transfers large objects.
+    /// When content is unavailable locally, a provider may return its textual reference or UnsupportedContent, and binary content is UnsupportedContent.
     GetBaseContent: RepositoryPath -> OperationContext -> Async<OperationResult<ContentView>>
 }
 

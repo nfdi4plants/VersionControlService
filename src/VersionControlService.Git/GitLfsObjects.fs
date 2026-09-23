@@ -229,6 +229,21 @@ let isObjectLocallyAvailable (mediaDirectory: string) (oid: string) (sizeBytes: 
     with _ ->
         false
 
+/// Reads and verifies a locally stored Git LFS object within the requested size limit.
+let tryReadLocalObject (mediaDirectory: string) (oid: string) (sizeBytes: float) (maximumBytes: float) : obj option =
+    try
+        if sizeBytes <= maximumBytes && isObjectLocallyAvailable mediaDirectory oid sizeBytes then
+            let bytes, _ = NodeFileSystem.readBufferNoFollowSync (objectPath mediaDirectory oid)
+
+            if NodeInterop.sha256Buffer bytes = oid then
+                Some bytes
+            else
+                None
+        else
+            None
+    with _ ->
+        None
+
 /// Escapes the glob characters git-lfs would otherwise expand in a path argument.
 let internal escapeLfsPathspec (path: string) =
     path

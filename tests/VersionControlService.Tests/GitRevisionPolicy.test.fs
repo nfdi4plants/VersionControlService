@@ -195,6 +195,29 @@ let private lfsPointer payloadSize =
     let oid = String.replicate 64 "0"
     $"{lfsPointerPrefix}\noid sha256:{oid}\nsize {payloadSize}\n"
 
+let private lfsOidFromPointer (pointer: string) =
+    pointer.Replace("\r\n", "\n").Split('\n')
+    |> Array.tryPick (fun line ->
+        let prefix = "oid sha256:"
+
+        if line.StartsWith(prefix, StringComparison.Ordinal) then
+            Some(line.Substring(prefix.Length).Trim())
+        else
+            None)
+    |> Option.defaultWith (fun () -> failwith "Expected an LFS pointer object id.")
+
+let private lfsMediaDirectoryFromEnvironment (lfsEnvironment: string) =
+    lfsEnvironment.Replace("\r\n", "\n").Split('\n')
+    |> Array.tryPick (fun line ->
+        let prefix = "LocalMediaDir="
+        let line = line.TrimEnd('\r')
+
+        if line.StartsWith(prefix, StringComparison.Ordinal) then
+            Some(line.Substring(prefix.Length).Trim())
+        else
+            None)
+    |> Option.defaultWith (fun () -> failwith "Expected Git LFS to report its local media directory.")
+
 Vitest.describe (
     "Git revision policy",
     fun () ->
@@ -309,6 +332,52 @@ Vitest.describe (
                     Vitest.expect(content.StartsWith(lfsPointerPrefix)).toBe true
                     Vitest.expect(attributes.Contains("\"/assets/small.bin\" filter=lfs")).toBe true
                 })
+        )
+
+        Vitest.test (
+            "stores a LargeObject revision under configured LFS storage",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let path = "assets/custom-storage.bin"
+
+                    let strategy: RevisionPolicyStrategy = {
+                        ResolvePathPolicy = fun request ->
+                            if RepositoryPath.value request.Path = path then
+                                RevisionPathPolicy.LargeObject
+                            else
+                                RevisionPathPolicy.Automatic
+                    }
+
+                    let! _ =
+                        withGitFixture strategy None (fun fixture -> promise {
+                            let customStorage = join [| fixture.Root; "custom-lfs-store" |]
+                            let absolutePath = join [| fixture.WorkPath; path |]
+                            let! _ =
+                                runGitOk
+                                    fixture.WorkPath
+                                    [| "config"; "--local"; "lfs.storage"; customStorage |]
+
+                            do! writeUtf8FileAsync absolutePath (String.replicate 100 "c")
+                            let! revision = createRevision fixture "test: custom LFS storage" [| path |]
+                            expectSucceeded "custom LFS storage revision" revision |> ignore
+
+                            let! pointer = runGitOk fixture.WorkPath [| "cat-file"; "-p"; $"HEAD:{path}" |]
+                            let oid = lfsOidFromPointer pointer
+                            let! lfsEnvironment = runGitOk fixture.WorkPath [| "lfs"; "env" |]
+                            let mediaDirectory = lfsMediaDirectoryFromEnvironment lfsEnvironment
+                            let objectPath = join [| mediaDirectory; oid.Substring(0, 2); oid.Substring(2, 2); oid |]
+
+                            Vitest.expect(mediaDirectory.StartsWith(customStorage, StringComparison.Ordinal)).toBe true
+                            Vitest.expect(NodeFileSystem.existsSync objectPath).toBe true
+                        })
+
+                    return ()
+            }
         )
 
         Vitest.test (

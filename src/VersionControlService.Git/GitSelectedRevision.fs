@@ -680,32 +680,41 @@ let private prepareLfsPointerBlob
                                                     "Git LFS did not return a canonical pointer for an oversized selected file."
                                             )
                                     | Some oid ->
-                                        let objectDirectory =
-                                            NodePath.join
-                                                [|
-                                                    commonGitDir
-                                                    "lfs"
-                                                    "objects"
-                                                    oid.Substring(0, 2)
-                                                    oid.Substring(2, 2)
-                                                |]
+                                        let! mediaDirectoryResult =
+                                            GitLfsObjects.resolveLocalMediaDirectory
+                                                (fun arguments -> runGit arguments None [||])
+                                                repoPath
 
-                                        let objectPath = NodePath.join [| objectDirectory; oid |]
-                                        NodeFileSystem.mkdirSync objectDirectory (NodeFileSystem.MkdirOptions(recursive = true))
+                                        match mediaDirectoryResult with
+                                        | Error failure ->
+                                            return
+                                                Error(
+                                                    OperationFailure.createRedacted
+                                                        ProviderError
+                                                        "lfs_object_prepare_failed"
+                                                        failure.Message
+                                                )
+                                        | Ok mediaDirectory ->
+                                            let objectPath = GitLfsObjects.objectPath mediaDirectory oid
+                                            let objectDirectory = NodePath.dirname objectPath
 
-                                        if NodeFileSystem.existsSync objectPath then
-                                            cleanupSnapshot ()
-                                        else
-                                            NodeFileSystem.renameSync snapshotPath objectPath
+                                            NodeFileSystem.mkdirSync
+                                                objectDirectory
+                                                (NodeFileSystem.MkdirOptions(recursive = true))
 
-                                        let! pointerBlob =
-                                            runGit [| "hash-object"; "-w"; "--stdin" |] (Some output.StdOut) [||]
+                                            if NodeFileSystem.existsSync objectPath then
+                                                cleanupSnapshot ()
+                                            else
+                                                NodeFileSystem.renameSync snapshotPath objectPath
 
-                                        match pointerBlob with
-                                        | Error failure -> return Error failure
-                                        | Ok hashOutput when hashOutput.ExitCode <> 0 ->
-                                            return Error(failedRun "git hash-object (LFS pointer)" hashOutput)
-                                        | Ok hashOutput -> return Ok(hashOutput.StdOut.Trim())
+                                            let! pointerBlob =
+                                                runGit [| "hash-object"; "-w"; "--stdin" |] (Some output.StdOut) [||]
+
+                                            match pointerBlob with
+                                            | Error failure -> return Error failure
+                                            | Ok hashOutput when hashOutput.ExitCode <> 0 ->
+                                                return Error(failedRun "git hash-object (LFS pointer)" hashOutput)
+                                            | Ok hashOutput -> return Ok(hashOutput.StdOut.Trim())
                             with error ->
                                 return
                                     Error(

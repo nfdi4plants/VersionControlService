@@ -56,6 +56,9 @@ let digestHashHex (hash: obj) : string = jsNative
 [<Emit("require('node:crypto').createHash('sha256').update($0, 'utf8').digest('hex')")>]
 let sha256Utf8 (content: string) : string = jsNative
 
+[<Emit("require('node:crypto').createHash('sha256').update($0).digest('hex')")>]
+let sha256Buffer (buffer: obj) : string = jsNative
+
 [<Emit("new (require('node:string_decoder').StringDecoder)('utf8')")>]
 let createUtf8StringDecoder () : obj = jsNative
 

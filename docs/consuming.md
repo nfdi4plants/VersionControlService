@@ -449,6 +449,11 @@ apart from the two groups named further down. A fallback read hands back an empt
 and `GetRepositoryWebUrl` `None`, `GetSettings` no threshold with
 `MaterializeLargeObjects = true`, and `Prune` and `Deduplicate` the reason as their report.
 
+`GetBaseContent` returns committed base content in materialized form when the provider has it locally,
+and it never transfers large objects. When content is unavailable locally, a provider may return its
+textual reference, such as Git's LFS pointer text, or `UnsupportedContent`. Binary content is
+`UnsupportedContent`, and lakeFS has no text diff service, so its fallback returns `UnsupportedContent`.
+
 A fallback write also succeeds and changes nothing. `Materialize`, `Dematerialize`,
 `SetPathPolicy` and `SetSettings` return `Succeeded` with the same warning. Read the
 warning before you treat one of these as done. The storage settings reseed in

@@ -5648,6 +5648,9 @@ let private readBaseBlob
         | Ok processOutput -> return Ok processOutput.StdOut
     }
 
+// Text diff bases are capped at 10 MiB because larger files are not diffed line by line.
+let private maximumBaseTextDiffBytes = 10.0 * 1024.0 * 1024.0
+
 let private getBaseContent
     (state: SessionState)
     (path: RepositoryPath)
@@ -5745,16 +5748,53 @@ let private getBaseContent
 
                                     match baseBlob with
                                     | Error failure -> return Failed failure
-                                    | Ok buffer when GitService.isLikelyBinaryBuffer buffer ->
-                                        return
-                                            OperationResult.succeeded (
-                                                UnsupportedContent(Some $"Unsupported git content for '{literalPath}'.")
-                                            )
                                     | Ok buffer ->
-                                        return
-                                            OperationResult.succeeded (
-                                                TextContent(NodeInterop.bufferToUtf8String buffer)
-                                            )
+                                        let pointerCandidate =
+                                            if NodeInterop.bufferLength buffer <= 1024 && NodeInterop.bufferIsValidUtf8 buffer then
+                                                let pointerText = NodeInterop.bufferToUtf8String buffer
+                                                Some(pointerText, GitLfsObjects.tryParseLfsPointer pointerText)
+                                            else
+                                                None
+
+                                        match pointerCandidate with
+                                        | Some(pointerText, Some pointer) ->
+                                            let! mediaDirectoryResult =
+                                                resolveSessionMediaDirectory
+                                                    state
+                                                    (fun arguments -> runGit state.Hooks state.RepoPath arguments None context)
+
+                                            let materializedBuffer =
+                                                match mediaDirectoryResult with
+                                                | Ok mediaDirectory ->
+                                                    GitLfsObjects.tryReadLocalObject
+                                                        mediaDirectory
+                                                        pointer.Oid
+                                                        pointer.SizeInBytes
+                                                        maximumBaseTextDiffBytes
+                                                | Error _ -> None
+
+                                            match materializedBuffer with
+                                            | Some content when GitService.isLikelyBinaryBuffer content ->
+                                                return
+                                                    OperationResult.succeeded (
+                                                        UnsupportedContent(Some $"Unsupported git content for '{literalPath}'.")
+                                                    )
+                                            | Some content ->
+                                                return
+                                                    OperationResult.succeeded (
+                                                        TextContent(NodeInterop.bufferToUtf8String content)
+                                                    )
+                                            | None ->
+                                                return OperationResult.succeeded (TextContent pointerText)
+                                        | _ when GitService.isLikelyBinaryBuffer buffer ->
+                                            return
+                                                OperationResult.succeeded (
+                                                    UnsupportedContent(Some $"Unsupported git content for '{literalPath}'.")
+                                                )
+                                        | Some(pointerText, None) ->
+                                            return OperationResult.succeeded (TextContent pointerText)
+                                        | None ->
+                                            return OperationResult.succeeded (TextContent(NodeInterop.bufferToUtf8String buffer))
                 }
 
             return! readStableBase 2
