@@ -5541,4 +5541,79 @@ Vitest.describe (
                     return raise error
             }
         )
+
+        Vitest.test (
+            "a batched rejection of a locked or moved remote ref is a retryable concurrency failure",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable barePath = ""
+                let mutable rejectPush = false
+                let mutable rejectionReason = "reference already exists"
+
+                let hooks = {
+                    GitWorkspaceSession.GitSessionHooks.none with
+                        RunProcess =
+                            Some(fun request processContext ->
+                                async {
+                                    if rejectPush && (request.Arguments |> Array.contains "push") then
+                                        return
+                                            OperationResult.succeeded {
+                                                ExitCode = 1
+                                                StdOut = ""
+                                                StdErr =
+                                                    $"remote: error: Unable to create '{barePath}/refs/heads/main.lock': File exists.\nTo {barePath}\n ! [remote rejected] main -> main ({rejectionReason})\nerror: failed to push some refs to '{barePath}'\n"
+                                            }
+                                    else
+                                        return! NodeProcess.run request processContext
+                                })
+                }
+
+                let! root, workPath, createdBarePath, session = createSyncFixture hooks
+                barePath <- createdBarePath
+                rejectPush <- true
+
+                try
+                    do! writeUtf8FileAsync (join [| workPath; "batched-publish.txt" |]) "local content\n"
+                    let! status = sessionStatus session
+
+                    let! revisionResult =
+                        session.Core.CreateRevision
+                            {
+                                Message = "local revision for batched publish rejection"
+                                Paths = [| mkPath "batched-publish.txt" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (ctx "batched-publish-revision")
+                        |> Async.StartAsPromise
+
+                    expectSucceeded "local revision for batched publish rejection" revisionResult |> ignore
+
+                    let assertConcurrencyFailure contextId = promise {
+                        let! beforePublish = sessionStatus session
+                        let! publishResult =
+                            (syncService session).Publish
+                                {
+                                    ExpectedWorkspaceVersion = beforePublish.WorkspaceVersion
+                                    ExpectedTargetRevision = None
+                                }
+                                (ctx contextId)
+                            |> Async.StartAsPromise
+
+                        let failure = expectProviderFailure contextId publishResult
+                        Vitest.expect(failure.Category).toEqual (Concurrency)
+                        Vitest.expect(failure.Code).toBe ("precondition_failed")
+                        Vitest.expect(failure.Retryable).toBe (true)
+                        Vitest.expect(failure.StateChanged).toBe (false)
+                    }
+
+                    do! assertConcurrencyFailure "batched locked publish"
+                    rejectionReason <- "incorrect old value provided"
+                    do! assertConcurrencyFailure "batched moved publish"
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
 )
