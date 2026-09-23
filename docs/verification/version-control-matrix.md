@@ -26,34 +26,28 @@ Docker is required only for the live lakeFS row.
 | Formatting and Release build | `dotnet format VersionControlService.slnx --verify-no-changes && dotnet build VersionControlService.slnx --no-restore -c Release` | No |
 | Portable .NET tests | `dotnet test tests/VersionControlService.Abstractions.Tests/VersionControlService.Abstractions.Tests.fsproj --no-restore` | No |
 | Fable and Vitest | `dotnet run --project build/Build.fsproj -- test run` | No |
-| Git and Git LFS scenarios | `powershell -NoProfile -File build/RunFocusedTest.ps1 -TestFile GitProviderContract.test.js -Filter ".*"` | No |
-| Package graph and one-reference consumer | Run the package commands below | No |
+| Portable Fable consumer | `dotnet run --project build/Build.fsproj -- test consumer` | No |
+| Git and Git LFS scenarios | `dotnet run --project build/Build.fsproj -- test focused GitProviderContract.test.js ".*"` | No |
+| Package graph and one-reference consumer | `dotnet run --project build/Build.fsproj -- package-consumer` | No |
 | External provider sample | `dotnet build samples/ExternalProvider/ExternalProvider.fsproj -c Release` | No |
-| Live lakeFS profiles and integration scenarios | `powershell -NoProfile -File build/RunLakeFsIntegration.ps1` | Yes |
+| Live lakeFS profiles and integration scenarios | `dotnet run --project build/Build.fsproj -- test lakefs` | Yes |
 
-For the package row, create a unique local version and use directories outside the repository:
+The package row packs the five coordinated packages at a unique local version, verifies
+the graph and then restores and Fable-compiles the one-reference consumer against that
+feed. The feed, the package cache and the compiler output are created under the temporary
+directory; `--temp=<dir>` puts them somewhere else and `--version=<v>` pins the version.
 
-```powershell
-$version = "0.0.0-local.$(Get-Date -Format yyyyMMddHHmmss)"
-$feed = Join-Path $env:TEMP "version-control-service-local-feed"
-$cache = Join-Path $env:TEMP "version-control-service-local-cache"
+The restore must resolve the umbrella and all four internal dependencies at that one
+version. Only the umbrella package is referenced, so anything missing from the graph shows
+up here.
 
-powershell -NoProfile -File build/PackLocal.ps1 -Version $version -Output $feed
-powershell -NoProfile -File build/VerifyPackageGraph.ps1 -Feed $feed -Version $version
+The steps are also available on their own, which is useful when a feed should outlive the
+check:
 
-dotnet restore tests/VersionControlService.PackageConsumer/VersionControlService.PackageConsumer.fsproj `
-    --source $feed `
-    --source https://api.nuget.org/v3/index.json `
-    --packages $cache `
-    --no-cache `
-    -p:VersionControlServicePackageVersion=$version
-
-$env:VersionControlServicePackageVersion = $version
-dotnet fable tests/VersionControlService.PackageConsumer/VersionControlService.PackageConsumer.fsproj `
-    --noRestore `
-    --noCache `
-    -o (Join-Path $env:TEMP "version-control-service-consumer-output") `
-    -s
+```console
+dotnet run --project build/Build.fsproj -- pack --version=<v> --output=<dir>
+dotnet run --project build/Build.fsproj -- verify packages --feed=<dir> --version=<v>
 ```
 
-The environment property is deliberate: Fable 5.5 does not accept arbitrary `-p:` arguments. The restore must resolve the umbrella and all four internal dependencies at the unique local version.
+Packing empties the output directory first, so it refuses a directory inside the
+repository, a volume root, or anything reached through a junction.

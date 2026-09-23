@@ -75,5 +75,7 @@ dotnet run --project build/Build.fsproj -- test run
 The ordinary suite skips live lakeFS tests. Run the pinned Docker matrix explicitly when Docker is available:
 
 ```console
-powershell -NoProfile -File build/RunLakeFsIntegration.ps1
+.\build.cmd test lakefs
 ```
+
+Run `.\build.cmd` without a target to list every target, including the focused test run and the package graph checks.

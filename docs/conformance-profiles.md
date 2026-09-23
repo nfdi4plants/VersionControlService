@@ -38,7 +38,7 @@ Git profiles use isolated local repositories and bare remotes. They require Git 
 The ordinary run registers lakeFS tests as skipped when `LAKEFS_INTEGRATION` is not `1`. The release gate starts the pinned lakeFS container and makes every lakeFS profile mandatory:
 
 ```console
-powershell -NoProfile -File build/RunLakeFsIntegration.ps1
+dotnet run --project build/Build.fsproj -- test lakefs
 ```
 
 That command fails if a live profile reports a skip.
