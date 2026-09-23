@@ -21,6 +21,7 @@ type ConflictCandidateObject = {
     IsLocallyAvailable: bool
 }
 
+/// A candidate with Preview None and Object None stands for the side that deleted the file, and picking it resolves the item to the deletion.
 type ConflictCandidate = {
     CandidateId: string
     Label: string
@@ -35,7 +36,7 @@ type ConflictItem = {
     Candidates: ConflictCandidate[]
     /// Provider-owned combined representation, e.g. Git conflict-marker text.
     CombinedPreview: ConflictPreview option
-    /// True when the provider accepts caller-supplied resolved content. False for items whose candidates include a stored object, which are resolved by picking a candidate.
+    /// True when the provider accepts caller-supplied resolved content. A consumer resolves binary items, oversized items and items whose candidates include a stored object by picking a candidate.
     SupportsResolvedContent: bool
 }
 

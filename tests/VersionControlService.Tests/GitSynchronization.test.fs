@@ -360,67 +360,174 @@ let private lfsMediaDirectory (environmentOutput: string) =
         if trimmed.StartsWith(prefix, StringComparison.Ordinal) then Some(trimmed.Substring(prefix.Length).Trim()) else None)
     |> Option.defaultWith (fun () -> failwith "Expected LocalMediaDir in git lfs env output.")
 
-let private createLfsConflictFixture () = promise {
-    let path = "tracked.xlsx"
-    let baseBytes = [| 0; 1; 2; 3; 4 |]
-    let workspaceBytes = [| 0; 159; 146; 150; 255 |]
-    let targetBytes = [| 0; 255; 1; 2; 3 |]
-    let! root, workPath, barePath, session = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+let private createLfsConflictFixtureWithOptions
+    (hooks: GitWorkspaceSession.GitSessionHooks)
+    (path: string)
+    (mediaDirectory: string option)
+    (extraFiles: (string * int[])[])
+    =
+    promise {
+        let baseBytes = [| 0; 1; 2; 3; 4 |]
+        let workspaceBytes = [| 0; 159; 146; 150; 255 |]
+        let targetBytes = [| 0; 255; 1; 2; 3 |]
+        let! root, workPath, barePath, session = createSyncFixture hooks
 
-    try
-        let! _ = runGitIn workPath [| "lfs"; "install"; "--local" |]
-        let! _ = runGitIn workPath [| "lfs"; "track"; "*.xlsx" |]
-        do! writeBinaryFileAsync (join [| workPath; path |]) baseBytes
-        let! _ = runGitIn workPath [| "add"; ".gitattributes"; path |]
-        let! _ = runGitIn workPath [| "commit"; "-m"; "init: LFS conflict path" |]
-        let! _ = runGitIn workPath [| "push"; "origin"; "main" |]
+        try
+            let! _ = runGitIn workPath [| "lfs"; "install"; "--local" |]
+            match mediaDirectory with
+            | Some directory ->
+                let! _ = runGitIn workPath [| "config"; "lfs.storage"; directory |]
+                ()
+            | None -> ()
 
-        do! writeBinaryFileAsync (join [| workPath; path |]) workspaceBytes
-        let! workspaceStatus = sessionStatus session
-        let! saveResult =
-            Async.StartAsPromise(
-                session.Core.CreateRevision
-                    {
-                        Message = "local LFS binary conflict"
-                        Paths = [| mkPath path |]
-                        ExpectedWorkspaceVersion = workspaceStatus.WorkspaceVersion
-                    }
-                    (ctx "lfs-binary-conflict-save")
-            )
+            let extension = path.Substring(path.LastIndexOf ".")
+            let! _ = runGitIn workPath [| "lfs"; "track"; $"*{extension}" |]
+            do! writeBinaryFileAsync (join [| workPath; path |]) baseBytes
 
-        expectValue "local LFS binary conflict revision" saveResult |> ignore
+            for extraPath, bytes in extraFiles do
+                do! writeBinaryFileAsync (join [| workPath; extraPath |]) bytes
 
-        let clonePath = join [| root; "advance-lfs-binary" |]
-        let! _ = runGitIn root [| "clone"; "-c"; "core.autocrlf=false"; barePath; clonePath |]
-        let! _ = runGitIn clonePath [| "config"; "user.name"; "External Client" |]
-        let! _ = runGitIn clonePath [| "config"; "user.email"; "external@example.org" |]
-        let! _ = runGitIn clonePath [| "lfs"; "install"; "--local" |]
-        do! writeBinaryFileAsync (join [| clonePath; path |]) targetBytes
-        let! _ = runGitIn clonePath [| "add"; "-A" |]
-        let! _ = runGitIn clonePath [| "commit"; "-m"; "external: advance LFS binary" |]
-        let! _ = runGitIn clonePath [| "push"; "origin"; "HEAD" |]
+            let! _ = runGitIn workPath [| "--literal-pathspecs"; "add"; "--"; ".gitattributes"; path |]
 
-        let! updateStatus = sessionStatus session
-        let! updateResult =
-            Async.StartAsPromise(
-                (syncService session).Update
-                    { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
-                    (ctx "lfs-binary-conflict-update")
-            )
+            for extraPath, _ in extraFiles do
+                let! _ = runGitIn workPath [| "add"; extraPath |]
+                ()
 
-        match updateResult with
-        | Failed failure
-        | PartiallySucceeded(_, failure) when failure.Code = "conflicts_detected" -> ()
-        | Failed failure
-        | PartiallySucceeded(_, failure) ->
-            failwith $"Expected conflicts_detected, received {failure.Category}/{failure.Code}."
-        | Succeeded _ -> failwith "Expected the LFS binary changes to conflict."
+            let! _ = runGitIn workPath [| "commit"; "-m"; "init: LFS conflict path" |]
+            let! _ = runGitIn workPath [| "push"; "origin"; "main" |]
 
-        return root, workPath, path, baseBytes, workspaceBytes, targetBytes, session
-    with error ->
-        do! removeDirectoryAsync root
-        return raise error
-}
+            do! writeBinaryFileAsync (join [| workPath; path |]) workspaceBytes
+            let! workspaceStatus = sessionStatus session
+            let! saveResult =
+                Async.StartAsPromise(
+                    session.Core.CreateRevision
+                        {
+                            Message = "local LFS binary conflict"
+                            Paths = [| mkPath path |]
+                            ExpectedWorkspaceVersion = workspaceStatus.WorkspaceVersion
+                        }
+                        (ctx "lfs-binary-conflict-save")
+                )
+
+            expectValue "local LFS binary conflict revision" saveResult |> ignore
+
+            let clonePath = join [| root; "advance-lfs-binary" |]
+            let! _ = runGitIn root [| "clone"; "-c"; "core.autocrlf=false"; barePath; clonePath |]
+            let! _ = runGitIn clonePath [| "config"; "user.name"; "External Client" |]
+            let! _ = runGitIn clonePath [| "config"; "user.email"; "external@example.org" |]
+            let! _ = runGitIn clonePath [| "lfs"; "install"; "--local" |]
+            do! writeBinaryFileAsync (join [| clonePath; path |]) targetBytes
+            let! _ = runGitIn clonePath [| "add"; "-A" |]
+            let! _ = runGitIn clonePath [| "commit"; "-m"; "external: advance LFS binary" |]
+            let! _ = runGitIn clonePath [| "push"; "origin"; "HEAD" |]
+
+            let! updateStatus = sessionStatus session
+            let! updateResult =
+                Async.StartAsPromise(
+                    (syncService session).Update
+                        { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
+                        (ctx "lfs-binary-conflict-update")
+                )
+
+            match updateResult with
+            | Failed failure
+            | PartiallySucceeded(_, failure) when failure.Code = "conflicts_detected" -> ()
+            | Failed failure
+            | PartiallySucceeded(_, failure) ->
+                failwith $"Expected conflicts_detected, received {failure.Category}/{failure.Code}."
+            | Succeeded _ -> failwith "Expected the LFS binary changes to conflict."
+
+            return root, workPath, path, baseBytes, workspaceBytes, targetBytes, session
+        with error ->
+            do! removeDirectoryAsync root
+            return raise error
+    }
+
+let private createLfsConflictFixture () =
+    createLfsConflictFixtureWithOptions GitWorkspaceSession.GitSessionHooks.none "tracked.xlsx" None [||]
+
+let private createModifyDeleteConflictFixture
+    (hooks: GitWorkspaceSession.GitSessionHooks)
+    (path: string)
+    (initialBytes: int[])
+    (workspaceBytes: int[] option)
+    (targetBytes: int[] option)
+    (useLfs: bool)
+    =
+    promise {
+        let! root, workPath, barePath, session = createSyncFixture hooks
+
+        try
+            if useLfs then
+                let! _ = runGitIn workPath [| "lfs"; "install"; "--local" |]
+                let extension = path.Substring(path.LastIndexOf ".")
+                let! _ = runGitIn workPath [| "lfs"; "track"; $"*{extension}" |]
+                do! writeBinaryFileAsync (join [| workPath; path |]) initialBytes
+                let! _ = runGitIn workPath [| "add"; ".gitattributes"; path |]
+                let! _ = runGitIn workPath [| "commit"; "-m"; "init: LFS modify-delete path" |]
+                ()
+            else
+                do! writeBinaryFileAsync (join [| workPath; path |]) initialBytes
+                let! _ = runGitIn workPath [| "add"; path |]
+                let! _ = runGitIn workPath [| "commit"; "-m"; "init: modify-delete path" |]
+                ()
+
+            let! _ = runGitIn workPath [| "push"; "origin"; "main" |]
+
+            match workspaceBytes with
+            | Some bytes -> do! writeBinaryFileAsync (join [| workPath; path |]) bytes
+            | None -> do! removePathAsync (join [| workPath; path |])
+
+            let! workspaceStatus = sessionStatus session
+            let! saveResult =
+                Async.StartAsPromise(
+                    session.Core.CreateRevision
+                        {
+                            Message = "local modify-delete change"
+                            Paths = [| mkPath path |]
+                            ExpectedWorkspaceVersion = workspaceStatus.WorkspaceVersion
+                        }
+                        (ctx "modify-delete-save")
+                )
+
+            expectValue "local modify-delete revision" saveResult |> ignore
+
+            let clonePath = join [| root; "advance-modify-delete" |]
+            let! _ = runGitIn root [| "clone"; "-c"; "core.autocrlf=false"; barePath; clonePath |]
+            let! _ = runGitIn clonePath [| "config"; "user.name"; "External Client" |]
+            let! _ = runGitIn clonePath [| "config"; "user.email"; "external@example.org" |]
+
+            match targetBytes with
+            | Some bytes -> do! writeBinaryFileAsync (join [| clonePath; path |]) bytes
+            | None ->
+                let! _ = runGitIn clonePath [| "rm"; path |]
+                ()
+
+            let! _ = runGitIn clonePath [| "add"; "-A" |]
+            let! _ = runGitIn clonePath [| "commit"; "-m"; "external: modify-delete change" |]
+            let! _ = runGitIn clonePath [| "push"; "origin"; "HEAD" |]
+
+            let! updateStatus = sessionStatus session
+            let! updateResult =
+                Async.StartAsPromise(
+                    (syncService session).Update
+                        { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
+                        (ctx "modify-delete-update")
+                )
+
+            match updateResult with
+            | Failed failure
+            | PartiallySucceeded(_, failure) when failure.Code = "conflicts_detected" -> ()
+            | Failed failure
+            | PartiallySucceeded(_, failure) ->
+                failwith $"Expected conflicts_detected, received {failure.Category}/{failure.Code}."
+            | Succeeded _ -> failwith "Expected the modify-delete changes to conflict."
+
+            return root, workPath, barePath, session
+        with error ->
+            do! removeDirectoryAsync root
+            return raise error
+    }
 
 let private createMergeHeadConflictFixture () = promise {
     let! root, workPath, barePath, session = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
@@ -2176,6 +2283,478 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "picking a target with a fetched LFS object materializes its bytes",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGitResultIn "." [| "lfs"; "version" |]
+
+                if lfsProbe.ExitCode <> 0 then
+                    Vitest.expect(true).toBe true
+                else
+                    let! root, workPath, path, _, _, targetBytes, session = createLfsConflictFixture ()
+
+                    try
+                        let! mergeHead = runGitIn workPath [| "rev-parse"; "MERGE_HEAD" |]
+                        let! _ = runGitIn workPath [| "lfs"; "fetch"; "origin"; mergeHead.Trim() |]
+                        let conflicts = conflictService session
+                        let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession(ctx "lfs-target-local-session"))
+                        let summary =
+                            match expectValue "LFS conflict session" summaryResult with
+                            | Some value -> value
+                            | None -> failwith "Expected an active LFS conflict session."
+
+                        let! status = sessionStatus session
+                        let! resolveResult =
+                            Async.StartAsPromise(
+                                conflicts.Resolve
+                                    {
+                                        Handle = summary.Handle
+                                        ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                        Path = mkPath path
+                                        Resolution = PickCandidate "target"
+                                    }
+                                    (ctx "lfs-target-local-pick")
+                            )
+
+                        let outcome = expectSucceededOutcome "LFS target pick with local object" resolveResult
+                        Vitest.expect(outcome.Warnings.Length).toBe 0
+                        let! resolvedBytes = fsPromisesDynamic?readFile (join [| workPath; path |]) |> unbox<JS.Promise<obj>>
+                        Vitest.expect(buffersEqual resolvedBytes (bufferFromBytes targetBytes)).toBe true
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "picking a root LFS path leaves a same-named nested pointer unchanged",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGitResultIn "." [| "lfs"; "version" |]
+
+                if lfsProbe.ExitCode <> 0 then
+                    Vitest.expect(true).toBe true
+                else
+                    let nestedBytes = [| 11; 12; 13; 14 |]
+                    let! root, workPath, path, _, workspaceBytes, _, session =
+                        createLfsConflictFixtureWithOptions
+                            GitWorkspaceSession.GitSessionHooks.none
+                            "tracked.xlsx"
+                            None
+                            [| "sub/tracked.xlsx", nestedBytes |]
+
+                    try
+                        let nestedPath = join [| workPath; "sub/tracked.xlsx" |]
+                        let! nestedPointer = runGitIn workPath [| "lfs"; "pointer"; $"--file={nestedPath}" |]
+                        do! writeUtf8FileAsync nestedPath nestedPointer
+                        let conflicts = conflictService session
+                        let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession(ctx "lfs-root-anchored-session"))
+                        let summary =
+                            match expectValue "LFS conflict session" summaryResult with
+                            | Some value -> value
+                            | None -> failwith "Expected an active LFS conflict session."
+
+                        let! status = sessionStatus session
+                        let! resolveResult =
+                            Async.StartAsPromise(
+                                conflicts.Resolve
+                                    {
+                                        Handle = summary.Handle
+                                        ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                        Path = mkPath path
+                                        Resolution = PickCandidate "workspace"
+                                    }
+                                    (ctx "lfs-root-anchored-pick")
+                            )
+
+                        expectSucceededOutcome "root LFS pick" resolveResult |> ignore
+                        let! rootBytes = fsPromisesDynamic?readFile (join [| workPath; path |]) |> unbox<JS.Promise<obj>>
+                        Vitest.expect(buffersEqual rootBytes (bufferFromBytes workspaceBytes)).toBe true
+                        let! nestedAfterPick = tryReadUtf8FileAsync (join [| workPath; "sub/tracked.xlsx" |])
+                        Vitest.expect(nestedAfterPick).toEqual (Some nestedPointer)
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "reports a partial LFS pick when checkout fails after staging",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGitResultIn "." [| "lfs"; "version" |]
+
+                if lfsProbe.ExitCode <> 0 then
+                    Vitest.expect(true).toBe true
+                else
+                    let hooks: GitWorkspaceSession.GitSessionHooks = {
+                        GitWorkspaceSession.GitSessionHooks.none with
+                            RunProcess =
+                                Some(fun request context ->
+                                    if
+                                        request.Arguments.Length >= 2
+                                        && request.Arguments[0] = "lfs"
+                                        && request.Arguments[1] = "checkout"
+                                    then
+                                        async {
+                                            return
+                                                OperationResult.succeeded {
+                                                    NodeProcess.ExitCode = 2
+                                                    StdOut = ""
+                                                    StdErr = "boom"
+                                                }
+                                        }
+                                    else
+                                        NodeProcess.run request context)
+                    }
+
+                    let! root, workPath, path, _, _, _, session =
+                        createLfsConflictFixtureWithOptions hooks "tracked.xlsx" None [||]
+
+                    try
+                        let conflicts = conflictService session
+                        let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession(ctx "lfs-checkout-failure-session"))
+                        let summary =
+                            match expectValue "LFS conflict session" summaryResult with
+                            | Some value -> value
+                            | None -> failwith "Expected an active LFS conflict session."
+
+                        let! status = sessionStatus session
+                        let! resolveResult =
+                            Async.StartAsPromise(
+                                conflicts.Resolve
+                                    {
+                                        Handle = summary.Handle
+                                        ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                        Path = mkPath path
+                                        Resolution = PickCandidate "workspace"
+                                    }
+                                    (ctx "lfs-checkout-failure-pick")
+                            )
+
+                        match resolveResult with
+                        | PartiallySucceeded(outcome, failure) ->
+                            Vitest.expect(failure.Category).toEqual (ProviderError)
+                            Vitest.expect(failure.Code).toBe "object_materialization_failed"
+                            Vitest.expect(failure.StateChanged).toBe true
+                            Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "retry_materialization")
+                            Vitest.expect(outcome.Value.RefreshedHandle.Version <> summary.Handle.Version).toBe true
+                        | Failed failure ->
+                            failwith $"Expected partial success, received {failure.Category}/{failure.Code}."
+                        | Succeeded _ -> failwith "Expected partial success after lfs checkout failed."
+
+                        let! unmerged = runGitIn workPath [| "ls-files"; "-u"; "-z"; "--"; path |]
+                        Vitest.expect(unmerged).toBe ""
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "rejects supplied content for an LFS conflict without changing the file or index",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGitResultIn "." [| "lfs"; "version" |]
+
+                if lfsProbe.ExitCode <> 0 then
+                    Vitest.expect(true).toBe true
+                else
+                    let! root, workPath, path, _, _, _, session = createLfsConflictFixture ()
+
+                    try
+                        let conflicts = conflictService session
+                        let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession(ctx "lfs-supply-content-session"))
+                        let summary =
+                            match expectValue "LFS conflict session" summaryResult with
+                            | Some value -> value
+                            | None -> failwith "Expected an active LFS conflict session."
+
+                        let! indexBefore = runGitIn workPath [| "ls-files"; "-u"; "-z"; "--"; path |]
+                        let! fileBefore = fsPromisesDynamic?readFile (join [| workPath; path |]) |> unbox<JS.Promise<obj>>
+                        let! status = sessionStatus session
+                        let! resolveResult =
+                            Async.StartAsPromise(
+                                conflicts.Resolve
+                                    {
+                                        Handle = summary.Handle
+                                        ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                        Path = mkPath path
+                                        Resolution = SupplyResolvedContent "manual replacement"
+                                    }
+                                    (ctx "lfs-supply-content")
+                            )
+
+                        let failure = expectProviderFailure "supplied content for LFS conflict" resolveResult
+                        Vitest.expect(failure.Category).toEqual (Unsupported)
+                        Vitest.expect(failure.Code).toBe "manual_resolution_required"
+                        Vitest.expect(failure.StateChanged).toBe false
+                        let! indexAfter = runGitIn workPath [| "ls-files"; "-u"; "-z"; "--"; path |]
+                        Vitest.expect(indexAfter).toBe indexBefore
+                        let! fileAfter = fsPromisesDynamic?readFile (join [| workPath; path |]) |> unbox<JS.Promise<obj>>
+                        Vitest.expect(buffersEqual fileAfter fileBefore).toBe true
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "marks a conflict pick-only when one side stores the file in LFS",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGitResultIn "." [| "lfs"; "version" |]
+
+                if lfsProbe.ExitCode <> 0 then
+                    Vitest.expect(true).toBe true
+                else
+                    let path = "mixed.bin"
+                    let! root, workPath, barePath, session = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+
+                    try
+                        do! writeBinaryFileAsync (join [| workPath; path |]) [| 98; 97; 115; 101 |]
+                        let! _ = runGitIn workPath [| "add"; path |]
+                        let! _ = runGitIn workPath [| "commit"; "-m"; "init: plain conflict file" |]
+                        let! _ = runGitIn workPath [| "push"; "origin"; "main" |]
+                        do! writeBinaryFileAsync (join [| workPath; path |]) [| 119; 111; 114; 107; 115; 112; 97; 99; 101 |]
+                        let! saveStatus = sessionStatus session
+                        let! saveResult =
+                            Async.StartAsPromise(
+                                session.Core.CreateRevision
+                                    {
+                                        Message = "local plain file edit"
+                                        Paths = [| mkPath path |]
+                                        ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+                                    }
+                                    (ctx "mixed-lfs-save")
+                            )
+
+                        expectValue "local plain file revision" saveResult |> ignore
+
+                        let clonePath = join [| root; "advance-mixed-lfs" |]
+                        let! _ = runGitIn root [| "clone"; "-c"; "core.autocrlf=false"; barePath; clonePath |]
+                        let! _ = runGitIn clonePath [| "config"; "user.name"; "External Client" |]
+                        let! _ = runGitIn clonePath [| "config"; "user.email"; "external@example.org" |]
+                        let! _ = runGitIn clonePath [| "lfs"; "install"; "--local" |]
+                        let! _ = runGitIn clonePath [| "lfs"; "track"; "*.bin" |]
+                        do! writeBinaryFileAsync (join [| clonePath; path |]) [| 116; 97; 114; 103; 101; 116 |]
+                        let! _ = runGitIn clonePath [| "add"; "-A" |]
+                        let! _ = runGitIn clonePath [| "commit"; "-m"; "external: move file into LFS" |]
+                        let! _ = runGitIn clonePath [| "push"; "origin"; "HEAD" |]
+
+                        let! updateStatus = sessionStatus session
+                        let! updateResult =
+                            Async.StartAsPromise(
+                                (syncService session).Update
+                                    { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
+                                    (ctx "mixed-lfs-update")
+                            )
+
+                        match updateResult with
+                        | Failed failure
+                        | PartiallySucceeded(_, failure) when failure.Code = "conflicts_detected" -> ()
+                        | Failed failure
+                        | PartiallySucceeded(_, failure) ->
+                            failwith $"Expected conflicts_detected, received {failure.Category}/{failure.Code}."
+                        | Succeeded _ -> failwith "Expected the plain-to-LFS changes to conflict."
+
+                        let! summaryResult = Async.StartAsPromise((conflictService session).GetActiveSession(ctx "mixed-lfs-session"))
+                        let summary =
+                            match expectValue "mixed LFS conflict session" summaryResult with
+                            | Some value -> value
+                            | None -> failwith "Expected an active mixed LFS conflict session."
+
+                        let item = summary.Items[0]
+                        let workspaceCandidate = item.Candidates |> Array.find (fun candidate -> candidate.CandidateId = "workspace")
+                        let targetCandidate = item.Candidates |> Array.find (fun candidate -> candidate.CandidateId = "target")
+                        Vitest.expect(item.SupportsResolvedContent).toBe false
+                        Vitest.expect(workspaceCandidate.Object).toEqual None
+                        Vitest.expect(Option.isSome targetCandidate.Object).toBe true
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "materializes an LFS pick for a path with spaces and brackets",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGitResultIn "." [| "lfs"; "version" |]
+
+                if lfsProbe.ExitCode <> 0 then
+                    Vitest.expect(true).toBe true
+                else
+                    let path = "dir with space/a[1].bin"
+                    let! root, workPath, _, _, workspaceBytes, _, session =
+                        createLfsConflictFixtureWithOptions
+                            GitWorkspaceSession.GitSessionHooks.none
+                            path
+                            None
+                            [||]
+
+                    try
+                        let conflicts = conflictService session
+                        let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession(ctx "lfs-special-path-session"))
+                        let summary =
+                            match expectValue "special path LFS conflict session" summaryResult with
+                            | Some value -> value
+                            | None -> failwith "Expected an active LFS conflict session."
+
+                        let! status = sessionStatus session
+                        let! resolveResult =
+                            Async.StartAsPromise(
+                                conflicts.Resolve
+                                    {
+                                        Handle = summary.Handle
+                                        ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                        Path = mkPath path
+                                        Resolution = PickCandidate "workspace"
+                                    }
+                                    (ctx "lfs-special-path-pick")
+                            )
+
+                        expectSucceededOutcome "special path LFS pick" resolveResult |> ignore
+                        let! resolvedBytes = fsPromisesDynamic?readFile (join [| workPath; path |]) |> unbox<JS.Promise<obj>>
+                        Vitest.expect(buffersEqual resolvedBytes (bufferFromBytes workspaceBytes)).toBe true
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "uses the configured local LFS storage for object lookup and materialization",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGitResultIn "." [| "lfs"; "version" |]
+
+                if lfsProbe.ExitCode <> 0 then
+                    Vitest.expect(true).toBe true
+                else
+                    let! mediaDirectory = createTempDirectoryAsync ()
+
+                    try
+                        let! root, workPath, path, _, workspaceBytes, _, session =
+                            createLfsConflictFixtureWithOptions
+                                GitWorkspaceSession.GitSessionHooks.none
+                                "custom-storage.xlsx"
+                                (Some mediaDirectory)
+                                [||]
+
+                        try
+                            let conflicts = conflictService session
+                            let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession(ctx "lfs-custom-storage-session"))
+                            let summary =
+                                match expectValue "custom storage LFS conflict session" summaryResult with
+                                | Some value -> value
+                                | None -> failwith "Expected an active LFS conflict session."
+
+                            let workspaceCandidate =
+                                summary.Items[0].Candidates
+                                |> Array.find (fun candidate -> candidate.CandidateId = "workspace")
+
+                            let objectInfo =
+                                workspaceCandidate.Object
+                                |> Option.defaultWith (fun () -> failwith "Expected workspace LFS object metadata.")
+
+                            Vitest.expect(objectInfo.IsLocallyAvailable).toBe true
+                            let! status = sessionStatus session
+                            let! resolveResult =
+                                Async.StartAsPromise(
+                                    conflicts.Resolve
+                                        {
+                                            Handle = summary.Handle
+                                            ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                            Path = mkPath path
+                                            Resolution = PickCandidate "workspace"
+                                        }
+                                        (ctx "lfs-custom-storage-pick")
+                                )
+
+                            let outcome = expectSucceededOutcome "custom storage LFS pick" resolveResult
+                            Vitest.expect(outcome.Warnings.Length).toBe 0
+                            let! resolvedBytes = fsPromisesDynamic?readFile (join [| workPath; path |]) |> unbox<JS.Promise<obj>>
+                            Vitest.expect(buffersEqual resolvedBytes (bufferFromBytes workspaceBytes)).toBe true
+                            do! removeDirectoryAsync root
+                        with error ->
+                            do! removeDirectoryAsync root
+                            return raise error
+                        do! removeDirectoryAsync mediaDirectory
+                    with error ->
+                        do! removeDirectoryAsync mediaDirectory
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "picking the deleted side of an LFS conflict deletes the file",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGitResultIn "." [| "lfs"; "version" |]
+
+                if lfsProbe.ExitCode <> 0 then
+                    Vitest.expect(true).toBe true
+                else
+                    let path = "deleted-lfs.xlsx"
+                    let! root, workPath, _, session =
+                        createModifyDeleteConflictFixture
+                            GitWorkspaceSession.GitSessionHooks.none
+                            path
+                            [| 0; 1; 2; 3 |]
+                            (Some [| 0; 159; 146; 150 |])
+                            None
+                            true
+
+                    try
+                        let conflicts = conflictService session
+                        let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession(ctx "lfs-delete-session"))
+                        let summary =
+                            match expectValue "LFS modify/delete conflict session" summaryResult with
+                            | Some value -> value
+                            | None -> failwith "Expected an active LFS modify/delete conflict."
+
+                        let targetCandidate =
+                            summary.Items[0].Candidates
+                            |> Array.find (fun candidate -> candidate.CandidateId = "target")
+
+                        Vitest.expect(targetCandidate.Preview).toEqual None
+                        Vitest.expect(targetCandidate.Object).toEqual None
+                        let! status = sessionStatus session
+                        let! resolveResult =
+                            Async.StartAsPromise(
+                                conflicts.Resolve
+                                    {
+                                        Handle = summary.Handle
+                                        ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                        Path = mkPath path
+                                        Resolution = PickCandidate "target"
+                                    }
+                                    (ctx "lfs-delete-pick")
+                            )
+
+                        let outcome = expectSucceededOutcome "LFS deleted-side pick" resolveResult
+                        Vitest.expect(outcome.Value.RemainingItems.Length).toBe 0
+                        let! worktreeExists = pathExistsAsync (join [| workPath; path |])
+                        Vitest.expect(worktreeExists).toBe false
+                        let! unmerged = runGitIn workPath [| "ls-files"; "-u"; "-z"; "--"; path |]
+                        Vitest.expect(unmerged).toBe ""
+                        let! indexEntries = runGitIn workPath [| "ls-files"; "-s"; "-z"; "--"; path |]
+                        Vitest.expect(indexEntries).toBe ""
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
             "RestorePaths refuses a conflicted LFS path",
             TestOptions(timeout = 120000),
             fun () -> promise {
@@ -2215,71 +2794,28 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "answers candidate_content_unavailable for a binary pick of a deleted side",
+            "picking the deleted side of a binary conflict deletes the file",
             TestOptions(timeout = 120000),
             fun () -> promise {
-                let path = "base.txt"
-                let initialBytes = [| 0; 1; 2; 3; 4 |]
-                let workspaceBytes = [| 0; 159; 146; 150; 255 |]
-                let! root, workPath, barePath, session = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+                let path = "binary-delete.bin"
+                let! root, workPath, _, session =
+                    createModifyDeleteConflictFixture
+                        GitWorkspaceSession.GitSessionHooks.none
+                        path
+                        [| 0; 1; 2; 3 |]
+                        (Some [| 0; 159; 146; 150; 255 |])
+                        None
+                        false
 
                 try
-                    do! writeBinaryFileAsync (join [| workPath; path |]) initialBytes
-                    let! _ = runGitIn workPath [| "add"; path |]
-                    let! _ = runGitIn workPath [| "commit"; "-m"; "init: binary conflict path" |]
-                    let! _ = runGitIn workPath [| "push"; "origin"; "main" |]
-
-                    do! writeBinaryFileAsync (join [| workPath; path |]) workspaceBytes
-                    let! workspaceStatus = sessionStatus session
-                    let! saveResult =
-                        Async.StartAsPromise(
-                            session.Core.CreateRevision
-                                {
-                                    Message = "local binary modify/delete conflict"
-                                    Paths = [| mkPath path |]
-                                    ExpectedWorkspaceVersion = workspaceStatus.WorkspaceVersion
-                                }
-                                (ctx "binary-modify-delete-save")
-                        )
-
-                    expectValue "local binary modify/delete revision" saveResult |> ignore
-
-                    let clonePath = join [| root; "advance-delete" |]
-                    let! _ = runGitIn root [| "clone"; "-c"; "core.autocrlf=false"; barePath; clonePath |]
-                    let! _ = runGitIn clonePath [| "config"; "user.name"; "External Client" |]
-                    let! _ = runGitIn clonePath [| "config"; "user.email"; "external@example.org" |]
-                    let! _ = runGitIn clonePath [| "rm"; path |]
-                    let! _ = runGitIn clonePath [| "commit"; "-m"; "external: delete binary path" |]
-                    let! _ = runGitIn clonePath [| "push"; "origin"; "HEAD" |]
-
-                    let! updateStatus = sessionStatus session
-                    let! updateResult =
-                        Async.StartAsPromise(
-                            (syncService session).Update
-                                { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
-                                (ctx "binary-modify-delete-update")
-                        )
-
-                    match updateResult with
-                    | Failed failure
-                    | PartiallySucceeded(_, failure) when failure.Code = "conflicts_detected" -> ()
-                    | Failed failure
-                    | PartiallySucceeded(_, failure) ->
-                        failwith $"Expected conflicts_detected, received {failure.Category}/{failure.Code}."
-                    | Succeeded _ -> failwith "Expected the binary modify/delete changes to conflict."
-
                     let conflicts = conflictService session
-                    let! summaryResult =
-                        Async.StartAsPromise(conflicts.GetActiveSession(ctx "binary-modify-delete-session"))
+                    let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession(ctx "binary-delete-session"))
                     let summary =
                         match expectValue "binary modify/delete conflict session" summaryResult with
                         | Some value -> value
                         | None -> failwith "Expected an active binary modify/delete conflict session."
 
                     let! status = sessionStatus session
-                    let! bytesBeforePick =
-                        fsPromisesDynamic?readFile (join [| workPath; path |])
-                        |> unbox<JS.Promise<obj>>
                     let! resolveResult =
                         Async.StartAsPromise(
                             conflicts.Resolve
@@ -2289,19 +2825,140 @@ Vitest.describe (
                                     Path = mkPath path
                                     Resolution = PickCandidate "target"
                                 }
-                                (ctx "binary-modify-delete-pick-target")
+                                (ctx "binary-delete-pick")
                         )
 
-                    let failure = expectProviderFailure "binary deleted-side pick" resolveResult
-                    Vitest.expect(failure.Category).toEqual (Validation)
-                    Vitest.expect(failure.Code).toBe "candidate_content_unavailable"
-                    Vitest.expect(failure.StateChanged).toBe false
+                    let outcome = expectSucceededOutcome "binary deleted-side pick" resolveResult
+                    Vitest.expect(outcome.Value.RemainingItems.Length).toBe 0
+                    Vitest.expect(outcome.Value.RefreshedHandle.Version <> summary.Handle.Version).toBe true
+                    let! worktreeExists = pathExistsAsync (join [| workPath; path |])
+                    Vitest.expect(worktreeExists).toBe false
 
-                    let! bytesAfterPick =
-                        fsPromisesDynamic?readFile (join [| workPath; path |])
-                        |> unbox<JS.Promise<obj>>
+                    let! unmerged = runGitIn workPath [| "ls-files"; "-u"; "-z"; "--"; path |]
+                    Vitest.expect(unmerged).toBe ""
+                    let! indexEntries = runGitIn workPath [| "ls-files"; "-s"; "-z"; "--"; path |]
+                    Vitest.expect(indexEntries).toBe ""
 
-                    Vitest.expect(buffersEqual bytesAfterPick bytesBeforePick).toBe true
+                    let! finalizeStatus = sessionStatus session
+                    let! finalizeResult =
+                        Async.StartAsPromise(
+                            conflicts.Finalize
+                                {
+                                    Handle = outcome.Value.RefreshedHandle
+                                    ExpectedWorkspaceVersion = finalizeStatus.WorkspaceVersion
+                                    Message = Some "test: delete binary conflict path"
+                                }
+                                (ctx "binary-delete-finalize")
+                        )
+
+                    expectValue "binary deleted-side finalize" finalizeResult |> ignore
+                    let! committedPath = runGitIn workPath [| "ls-tree"; "-r"; "--name-only"; "HEAD"; "--"; path |]
+                    Vitest.expect(committedPath.Trim()).toBe ""
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "picking the workspace deletion of a text conflict removes its index stages",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let path = "workspace-deleted.txt"
+                let! root, workPath, _, session =
+                    createModifyDeleteConflictFixture
+                        GitWorkspaceSession.GitSessionHooks.none
+                        path
+                        [| 98; 97; 115; 101; 10 |]
+                        None
+                        (Some [| 116; 97; 114; 103; 101; 116; 10 |])
+                        false
+
+                try
+                    let conflicts = conflictService session
+                    let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession(ctx "workspace-delete-session"))
+                    let summary =
+                        match expectValue "workspace deleted text conflict" summaryResult with
+                        | Some value -> value
+                        | None -> failwith "Expected an active text modify/delete conflict."
+
+                    let workspaceCandidate = summary.Items[0].Candidates |> Array.find (fun candidate -> candidate.CandidateId = "workspace")
+                    Vitest.expect(workspaceCandidate.Preview).toEqual None
+                    Vitest.expect(workspaceCandidate.Object).toEqual None
+
+                    let! status = sessionStatus session
+                    let! resolveResult =
+                        Async.StartAsPromise(
+                            conflicts.Resolve
+                                {
+                                    Handle = summary.Handle
+                                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                    Path = mkPath path
+                                    Resolution = PickCandidate "workspace"
+                                }
+                                (ctx "workspace-delete-pick")
+                        )
+
+                    let outcome = expectSucceededOutcome "workspace deleted-side pick" resolveResult
+                    Vitest.expect(outcome.Value.RemainingItems.Length).toBe 0
+                    let! worktreeExists = pathExistsAsync (join [| workPath; path |])
+                    Vitest.expect(worktreeExists).toBe false
+                    let! unmerged = runGitIn workPath [| "ls-files"; "-u"; "-z"; "--"; path |]
+                    Vitest.expect(unmerged).toBe ""
+                    let! indexEntries = runGitIn workPath [| "ls-files"; "-s"; "-z"; "--"; path |]
+                    Vitest.expect(indexEntries).toBe ""
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "picking a deleted side succeeds when the worktree file is already absent",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let path = "absent-before-pick.txt"
+                let! root, workPath, _, session =
+                    createModifyDeleteConflictFixture
+                        GitWorkspaceSession.GitSessionHooks.none
+                        path
+                        [| 98; 97; 115; 101; 10 |]
+                        (Some [| 119; 111; 114; 107; 115; 112; 97; 99; 101; 10 |])
+                        None
+                        false
+
+                try
+                    let conflicts = conflictService session
+                    let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession(ctx "absent-delete-session"))
+                    let summary =
+                        match expectValue "already absent modify/delete conflict" summaryResult with
+                        | Some value -> value
+                        | None -> failwith "Expected an active modify/delete conflict."
+
+                    do! removePathAsync (join [| workPath; path |])
+                    let! worktreeAbsent = pathExistsAsync (join [| workPath; path |])
+                    Vitest.expect(worktreeAbsent).toBe false
+                    let! status = sessionStatus session
+                    let! resolveResult =
+                        Async.StartAsPromise(
+                            conflicts.Resolve
+                                {
+                                    Handle = summary.Handle
+                                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                    Path = mkPath path
+                                    Resolution = PickCandidate "target"
+                                }
+                                (ctx "already-absent-delete-pick")
+                        )
+
+                    let outcome = expectSucceededOutcome "already absent deleted-side pick" resolveResult
+                    Vitest.expect(outcome.Value.RemainingItems.Length).toBe 0
+                    let! unmerged = runGitIn workPath [| "ls-files"; "-u"; "-z"; "--"; path |]
+                    Vitest.expect(unmerged).toBe ""
+                    let! indexEntries = runGitIn workPath [| "ls-files"; "-s"; "-z"; "--"; path |]
+                    Vitest.expect(indexEntries).toBe ""
                     do! removeDirectoryAsync root
                 with error ->
                     do! removeDirectoryAsync root
@@ -2429,11 +3086,8 @@ Vitest.describe (
                         | Some value -> value
                         | None -> failwith "Expected an active unsupported-extension conflict session."
 
-                    // The large-object probe reads a stage only when it is small enough to be a pointer.
-                    for blob in stageBlobReads do
-                        let! size = runGitIn workPath [| "cat-file"; "-s"; blob |]
-                        Vitest.expect(int (size.Trim()) <= 1024).toBe (true)
-
+                    Vitest.expect((stageBlobReads |> Seq.distinct |> Seq.length) = stageBlobReads.Count).toBe true
+                    Vitest.expect(stageBlobReads.Count <= 3).toBe true
                     Vitest.expect(combinedPreviewChunks).toBe (0)
                     Vitest.expect(summary.Items[0].SupportsResolvedContent).toBe (false)
                     do! removeDirectoryAsync root

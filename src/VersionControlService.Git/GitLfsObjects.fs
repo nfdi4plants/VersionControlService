@@ -179,7 +179,40 @@ let resolveLocalMediaDirectory
 
         match localMediaDirectory with
         | Some directory when not (String.IsNullOrWhiteSpace directory) ->
-            return Ok(if NodePath.isAbsolute directory then directory else NodePath.resolve [| repoPath; directory |])
+            if NodePath.isAbsolute directory then
+                return Ok directory
+            else
+                let! gitDirectoryResult = runGit [| "rev-parse"; "--absolute-git-dir" |]
+
+                match gitDirectoryResult with
+                | Error failure -> return Error failure
+                | Ok output when output.ExitCode <> 0 ->
+                    return
+                        Error(
+                            OperationFailure.createRedacted
+                                ProviderError
+                                "git_failure"
+                                $"Resolving the Git directory failed: {output.StdErr}"
+                        )
+                | Ok output ->
+                    let gitDirectory = output.StdOut.Trim()
+
+                    if String.IsNullOrWhiteSpace gitDirectory then
+                        return
+                            Error(
+                                OperationFailure.createRedacted
+                                    ProviderError
+                                    "invalid_git_output"
+                                    "Git returned an empty absolute Git directory."
+                            )
+                    else
+                        let absoluteGitDirectory =
+                            if NodePath.isAbsolute gitDirectory then
+                                gitDirectory
+                            else
+                                NodePath.resolve [| repoPath; gitDirectory |]
+
+                        return Ok(NodePath.resolve [| absoluteGitDirectory; directory |])
         | _ -> return! runCommonDirectoryFallback runGit repoPath
     }
 

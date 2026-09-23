@@ -255,6 +255,20 @@ type private MutationLock() =
 
     member _.Release() = busy <- false
 
+type private ConflictStageMemoEntry = {
+    BlobId: string
+    SizeBytes: int64
+    mutable BlobBytes: obj option
+}
+
+type private ConflictStageMemo =
+    System.Collections.Generic.Dictionary<string, Result<ConflictStageMemoEntry option, OperationFailure>>
+
+type private PickedConflictContent =
+    | TextConflictContent of string
+    | StoredConflictCandidate of stage: int * objectInfo: ConflictCandidateObject option * mode: string * blob: string
+    | DeletedConflictCandidate
+
 /// Session-internal mutable state shared by all operations of one open session.
 type private SessionState = {
     RepoPath: string
@@ -271,6 +285,7 @@ type private SessionState = {
     mutable ConflictSession: (string * int) option
     /// Monotonic counter so re-opened merges never reuse a closed session ID.
     mutable ConflictGeneration: int
+    mutable LfsMediaDirectory: string option
 }
 
 let private credentialAuthenticationForRemote
@@ -1540,198 +1555,226 @@ let private publicationTargetRevision
 let private conflictRunner (state: SessionState) (context: OperationContext) : GitConflictSession.GitRunner =
     fun arguments stdinData -> runGit state.Hooks state.RepoPath arguments stdinData context
 
+let private resolveSessionMediaDirectory
+    (state: SessionState)
+    (runGit: string[] -> Async<Result<NodeProcess.ProcessOutput, OperationFailure>>)
+    : Async<Result<string, OperationFailure>> =
+    async {
+        match state.LfsMediaDirectory with
+        | Some directory -> return Ok directory
+        | None ->
+            let! result = GitLfsObjects.resolveLocalMediaDirectory runGit state.RepoPath
+
+            match result with
+            | Ok directory ->
+                state.LfsMediaDirectory <- Some directory
+                return Ok directory
+            | Error failure -> return Error failure
+    }
+
 let private unsupportedConflictPreview (path: string) =
     UnsupportedPreview(Some $"Unsupported git content for '{path}'.")
 
 let private maximumConflictPreviewBytes = int64 (1024 * 1024)
 
-let private readConflictStagePreview
+let private getConflictStageMemoEntry
     (state: SessionState)
+    (memo: ConflictStageMemo)
     (stage: int)
     (path: string)
     (context: OperationContext)
-    : Async<Result<ConflictPreview option, OperationFailure>> =
+    : Async<Result<ConflictStageMemoEntry option, OperationFailure>> =
     async {
         let stageExpression = $":{stage}:{path}"
-        let! objectIdResult =
-            runGit
-                state.Hooks
-                state.RepoPath
-                [| "rev-parse"; "--verify"; "--quiet"; stageExpression |]
-                None
-                context
 
-        match objectIdResult with
-        | Error failure -> return Error failure
-        | Ok output when output.ExitCode <> 0 -> return Ok None
-        | Ok output ->
-            let objectId = output.StdOut.Trim()
+        match memo.TryGetValue stageExpression with
+        | true, result -> return result
+        | false, _ ->
+            let! result =
+                async {
+                    let! objectIdResult =
+                        runGit
+                            state.Hooks
+                            state.RepoPath
+                            [| "rev-parse"; "--verify"; "--quiet"; stageExpression |]
+                            None
+                            context
 
-            if String.IsNullOrWhiteSpace objectId then
-                return
-                    Error(
-                        OperationFailure.createRedacted
-                            ProviderError
-                            "invalid_git_output"
-                            $"Git returned an empty object ID for conflict stage {stage} at '{path}'."
-                    )
-            else
-                let! typeResult =
-                    runGit state.Hooks state.RepoPath [| "cat-file"; "-t"; objectId |] None context
-
-                match typeResult with
-                | Error failure -> return Error failure
-                | Ok typeOutput when typeOutput.ExitCode <> 0 ->
-                    return
-                        Error(
-                            OperationFailure.createRedacted
-                                ProviderError
-                                "git_failure"
-                                $"Git could not inspect conflict stage {stage} at '{path}'."
-                        )
-                | Ok typeOutput when
-                    typeOutput.StdOut.Trim() <> "blob"
-                    || GitService.isExplicitlyUnsupportedPath path
-                    ->
-                    return Ok(Some(unsupportedConflictPreview path))
-                | Ok _ ->
-                    let! sizeResult =
-                        runGit state.Hooks state.RepoPath [| "cat-file"; "-s"; objectId |] None context
-
-                    match sizeResult with
+                    match objectIdResult with
                     | Error failure -> return Error failure
-                    | Ok sizeOutput when sizeOutput.ExitCode <> 0 ->
-                        return
-                            Error(
-                                OperationFailure.createRedacted
-                                    ProviderError
-                                    "git_failure"
-                                    $"Git could not size conflict stage {stage} at '{path}'."
-                            )
-                    | Ok sizeOutput ->
-                        match Int64.TryParse(sizeOutput.StdOut.Trim()) with
-                        | false, _ ->
+                    | Ok output when output.ExitCode <> 0 -> return Ok None
+                    | Ok output ->
+                        let blobId = output.StdOut.Trim()
+
+                        if String.IsNullOrWhiteSpace blobId then
                             return
                                 Error(
                                     OperationFailure.createRedacted
                                         ProviderError
                                         "invalid_git_output"
-                                        $"Git returned an invalid size for conflict stage {stage} at '{path}'."
+                                        $"Git returned an empty object ID for conflict stage {stage} at '{path}'."
                                 )
-                        | true, size when size > maximumConflictPreviewBytes ->
-                            return Ok(Some(unsupportedConflictPreview path))
-                        | true, _ ->
-                            let request = {
-                                NodeProcess.ProcessRequest.create "git" [| "cat-file"; "blob"; objectId |] with
-                                    WorkingDirectory = Some state.RepoPath
-                                    Environment = mergeGitEnvironment [||]
-                                    ProgressPhase = "git"
-                            }
+                        else
+                            let! sizeResult =
+                                runGit state.Hooks state.RepoPath [| "cat-file"; "-s"; blobId |] None context
 
-                            let! processResult = runHookedBytesProcess state.Hooks request context
-
-                            match processResult with
+                            match sizeResult with
                             | Error failure -> return Error failure
-                            | Ok processOutput when processOutput.ExitCode <> 0 ->
+                            | Ok sizeOutput when sizeOutput.ExitCode <> 0 ->
                                 return
                                     Error(
                                         OperationFailure.createRedacted
                                             ProviderError
                                             "git_failure"
-                                            $"Git could not read conflict stage {stage} at '{path}'."
+                                            $"Git could not size conflict stage {stage} at '{path}'."
                                     )
-                            | Ok processOutput when GitService.isLikelyBinaryBuffer processOutput.StdOut ->
-                                return Ok(Some(unsupportedConflictPreview path))
-                            | Ok processOutput ->
-                                return Ok(Some(TextPreview(NodeInterop.bufferToUtf8String processOutput.StdOut)))
+                            | Ok sizeOutput ->
+                                match Int64.TryParse(sizeOutput.StdOut.Trim()) with
+                                | true, size when size >= 0L ->
+                                    return
+                                        Ok(
+                                            Some {
+                                                BlobId = blobId
+                                                SizeBytes = size
+                                                BlobBytes = None
+                                            }
+                                        )
+                                | _ ->
+                                    return
+                                        Error(
+                                            OperationFailure.createRedacted
+                                                ProviderError
+                                                "invalid_git_output"
+                                                $"Git returned an invalid size for conflict stage {stage} at '{path}'."
+                                        )
+                }
+
+            memo.[stageExpression] <- result
+            return result
     }
 
-let private readConflictStagePointer
+let private readConflictStagePreview
     (state: SessionState)
-    (mediaDirectory: string)
+    (memo: ConflictStageMemo)
     (stage: int)
     (path: string)
     (context: OperationContext)
-    : Async<Result<ConflictCandidateObject option, OperationFailure>> =
+    : Async<Result<ConflictPreview option, OperationFailure>> =
     async {
-        let stageExpression = $":{stage}:{path}"
-        let! objectIdResult =
-            runGit
-                state.Hooks
-                state.RepoPath
-                [| "rev-parse"; "--verify"; "--quiet"; stageExpression |]
-                None
-                context
+        let! stageResult = getConflictStageMemoEntry state memo stage path context
 
-        match objectIdResult with
+        match stageResult with
         | Error failure -> return Error failure
-        | Ok output when output.ExitCode <> 0 -> return Ok None
-        | Ok output ->
-            let blobId = output.StdOut.Trim()
+        | Ok None -> return Ok None
+        | Ok(Some stageInfo) ->
+            let! typeResult = runGit state.Hooks state.RepoPath [| "cat-file"; "-t"; stageInfo.BlobId |] None context
 
-            if String.IsNullOrWhiteSpace blobId then
+            match typeResult with
+            | Error failure -> return Error failure
+            | Ok typeOutput when typeOutput.ExitCode <> 0 ->
                 return
                     Error(
                         OperationFailure.createRedacted
                             ProviderError
-                            "invalid_git_output"
-                            $"Git returned an empty object ID for conflict stage {stage} at '{path}'."
+                            "git_failure"
+                            $"Git could not inspect conflict stage {stage} at '{path}'."
                     )
-            else
-                let! sizeResult = runGit state.Hooks state.RepoPath [| "cat-file"; "-s"; blobId |] None context
+            | Ok typeOutput when
+                typeOutput.StdOut.Trim() <> "blob"
+                || GitService.isExplicitlyUnsupportedPath path
+                ->
+                return Ok(Some(unsupportedConflictPreview path))
+            | Ok _ when stageInfo.SizeBytes > maximumConflictPreviewBytes ->
+                return Ok(Some(unsupportedConflictPreview path))
+            | Ok _ ->
+                let request = {
+                    NodeProcess.ProcessRequest.create "git" [| "cat-file"; "blob"; stageInfo.BlobId |] with
+                        WorkingDirectory = Some state.RepoPath
+                        Environment = mergeGitEnvironment [||]
+                        ProgressPhase = "git"
+                }
 
-                match sizeResult with
+                let! processResult = runHookedBytesProcess state.Hooks request context
+
+                match processResult with
                 | Error failure -> return Error failure
-                | Ok sizeOutput when sizeOutput.ExitCode <> 0 ->
+                | Ok processOutput when processOutput.ExitCode <> 0 ->
                     return
                         Error(
                             OperationFailure.createRedacted
                                 ProviderError
                                 "git_failure"
-                                $"Git could not size conflict stage {stage} at '{path}'."
+                                $"Git could not read conflict stage {stage} at '{path}'."
                         )
-                | Ok sizeOutput ->
-                    match Int64.TryParse(sizeOutput.StdOut.Trim()) with
-                    | false, _ ->
-                        return
-                            Error(
-                                OperationFailure.createRedacted
-                                    ProviderError
-                                    "invalid_git_output"
-                                    $"Git returned an invalid size for conflict stage {stage} at '{path}'."
-                            )
-                    | true, size when size > 1024L -> return Ok None
-                    | true, _ ->
-                        // The same bytes reader as the preview, so both read the blob they sized.
+                | Ok processOutput ->
+                    stageInfo.BlobBytes <- Some processOutput.StdOut
+
+                    if GitService.isLikelyBinaryBuffer processOutput.StdOut then
+                        return Ok(Some(unsupportedConflictPreview path))
+                    else
+                        return Ok(Some(TextPreview(NodeInterop.bufferToUtf8String processOutput.StdOut)))
+    }
+
+let private readConflictStagePointer
+    (state: SessionState)
+    (memo: ConflictStageMemo)
+    (mediaDirectory: string option)
+    (stage: int)
+    (path: string)
+    (context: OperationContext)
+    : Async<Result<ConflictCandidateObject option, OperationFailure>> =
+    async {
+        let! stageResult = getConflictStageMemoEntry state memo stage path context
+
+        match stageResult with
+        | Error failure -> return Error failure
+        | Ok None -> return Ok None
+        | Ok(Some stageInfo) when stageInfo.SizeBytes > 1024L -> return Ok None
+        | Ok(Some stageInfo) ->
+            let! pointerBytesResult =
+                match stageInfo.BlobBytes with
+                | Some bytes -> async { return Ok(Some bytes) }
+                | None ->
+                    async {
                         let request = {
-                            NodeProcess.ProcessRequest.create "git" [| "cat-file"; "blob"; blobId |] with
+                            NodeProcess.ProcessRequest.create "git" [| "cat-file"; "blob"; stageInfo.BlobId |] with
                                 WorkingDirectory = Some state.RepoPath
                                 Environment = mergeGitEnvironment [||]
                                 ProgressPhase = "git"
                         }
 
-                        let! pointerResult = runHookedBytesProcess state.Hooks request context
+                        let! result = runHookedBytesProcess state.Hooks request context
 
-                        match pointerResult with
+                        match result with
                         | Error failure -> return Error failure
-                        | Ok pointerOutput when pointerOutput.ExitCode <> 0 -> return Ok None
-                        | Ok pointerOutput when not (NodeInterop.bufferIsValidUtf8 pointerOutput.StdOut) -> return Ok None
-                        | Ok pointerOutput ->
-                            match GitLfsObjects.tryParseLfsPointer (NodeInterop.bufferToUtf8String pointerOutput.StdOut) with
-                            | None -> return Ok None
-                            | Some pointer ->
-                                return
-                                    Ok(
-                                        Some {
-                                            SizeBytes = Some pointer.SizeInBytes
-                                            ObjectId = Some pointer.Oid
-                                            IsLocallyAvailable =
-                                                GitLfsObjects.isObjectLocallyAvailable
-                                                    mediaDirectory
-                                                    pointer.Oid
-                                                    pointer.SizeInBytes
-                                        }
-                                    )
+                        | Ok output when output.ExitCode <> 0 -> return Ok None
+                        | Ok output ->
+                            stageInfo.BlobBytes <- Some output.StdOut
+                            return Ok(Some output.StdOut)
+                    }
+
+            match pointerBytesResult with
+            | Error failure -> return Error failure
+            | Ok None -> return Ok None
+            | Ok(Some bytes) when not (NodeInterop.bufferIsValidUtf8 bytes) -> return Ok None
+            | Ok(Some bytes) ->
+                match GitLfsObjects.tryParseLfsPointer (NodeInterop.bufferToUtf8String bytes) with
+                | None -> return Ok None
+                | Some pointer ->
+                    return
+                        Ok(
+                            Some {
+                                SizeBytes = Some pointer.SizeInBytes
+                                ObjectId = Some pointer.Oid
+                                IsLocallyAvailable =
+                                    mediaDirectory
+                                    |> Option.exists (fun directory ->
+                                        GitLfsObjects.isObjectLocallyAvailable
+                                            directory
+                                            pointer.Oid
+                                            pointer.SizeInBytes)
+                            }
+                        )
     }
 
 let private readConflictCombinedPreview
@@ -1800,32 +1843,31 @@ let private getMergeConflictSummary (state: SessionState) (context: OperationCon
             | Error failure -> return Error failure
             | Ok unmergedPaths ->
                 let! mediaDirectoryResult =
-                    GitLfsObjects.resolveLocalMediaDirectory (fun arguments -> runner arguments None) state.RepoPath
+                    resolveSessionMediaDirectory state (fun arguments -> runner arguments None)
+                let stageMemo: ConflictStageMemo = System.Collections.Generic.Dictionary()
 
-                match mediaDirectoryResult with
+                let! itemsResult =
+                    GitConflictSession.buildConflictItems
+                        (fun stage path -> readConflictStagePreview state stageMemo stage path context)
+                        (fun path -> readConflictCombinedPreview state path context)
+                        (fun stage path ->
+                            readConflictStagePointer state stageMemo (Result.toOption mediaDirectoryResult) stage path context)
+                        (Some(mkRevisionId mergeHeadValue))
+                        unmergedPaths
+
+                match itemsResult with
                 | Error failure -> return Error failure
-                | Ok mediaDirectory ->
-                    let! itemsResult =
-                        GitConflictSession.buildConflictItems
-                            (fun stage path -> readConflictStagePreview state stage path context)
-                            (fun path -> readConflictCombinedPreview state path context)
-                            (fun stage path -> readConflictStagePointer state mediaDirectory stage path context)
-                            (Some(mkRevisionId mergeHeadValue))
-                            unmergedPaths
-
-                    match itemsResult with
-                    | Error failure -> return Error failure
-                    | Ok items ->
-                        return
-                            Ok(
-                                Some {
-                                    Handle = {
-                                        SessionId = sessionId
-                                        Version = string version
-                                    }
-                                    Items = items
+                | Ok items ->
+                    return
+                        Ok(
+                            Some {
+                                Handle = {
+                                    SessionId = sessionId
+                                    Version = string version
                                 }
-                            )
+                                Items = items
+                            }
+                        )
     }
 
 let private getWorkspaceStatus (state: SessionState) (context: OperationContext) =
@@ -1952,33 +1994,57 @@ let private restorePaths (state: SessionState) (request: RestoreRequest) (contex
             return OperationResult.validationFailed "no_paths_selected" "Select at least one path."
         else
             let runner = conflictRunner state context
-            let! unmergedResult = GitConflictSession.listUnmergedPaths runner
+            let unmergedRequestedPaths = ResizeArray<string>()
+            let mutable listingFailure: OperationFailure option = None
 
-            match unmergedResult with
-            | Error failure -> return Failed failure
-            | Ok unmergedPaths ->
-                let requestedPaths = request.Paths |> Array.map RepositoryPath.value
+            for path in request.Paths do
+                if listingFailure.IsNone then
+                    let pathValue = RepositoryPath.value path
 
-                let unmergedRequestedPaths =
-                    requestedPaths
-                    |> Array.filter (fun requestedPath -> unmergedPaths |> Array.contains requestedPath)
-
-                if unmergedRequestedPaths.Length > 0 then
-                    return
-                        Failed {
-                            OperationFailure.create
-                                Validation
-                                "restore_unmerged_paths"
-                                "Resolve or abandon the merge before discarding changes to conflicted files." with
-                                AffectedPaths = unmergedRequestedPaths
-                        }
-                else
                     let! result =
-                        awaitGit (GitService.discardPaths state.RepoPath requestedPaths)
+                        runner
+                            [|
+                                "ls-files"
+                                "-u"
+                                "-z"
+                                "--"
+                                GitPathTransport.literalPathspec path
+                            |]
+                            None
 
                     match result with
-                    | Error failure -> return Failed failure
-                    | Ok() -> return OperationResult.succeeded ()
+                    | Error failure -> listingFailure <- Some failure
+                    | Ok output when output.ExitCode <> 0 ->
+                        listingFailure <-
+                            Some(
+                                OperationFailure.createRedacted
+                                    ProviderError
+                                    "git_failure"
+                                    $"Checking unmerged path '{pathValue}' failed: {output.StdErr}"
+                                |> fun failure -> { failure with AffectedPaths = [| pathValue |] }
+                            )
+                    | Ok output when not (String.IsNullOrEmpty output.StdOut) ->
+                        unmergedRequestedPaths.Add pathValue
+                    | Ok _ -> ()
+
+            match listingFailure with
+            | Some failure -> return Failed failure
+            | None when unmergedRequestedPaths.Count > 0 ->
+                return
+                    Failed {
+                        OperationFailure.create
+                            Validation
+                            "restore_unmerged_paths"
+                            "Resolve or abandon the merge before discarding changes to conflicted files." with
+                            AffectedPaths = unmergedRequestedPaths.ToArray()
+                    }
+            | None ->
+                let requestedPaths = request.Paths |> Array.map RepositoryPath.value
+                let! result = awaitGit (GitService.discardPaths state.RepoPath requestedPaths)
+
+                match result with
+                | Error failure -> return Failed failure
+                | Ok() -> return OperationResult.succeeded ()
     }
 
 let private listRefs (state: SessionState) (context: OperationContext) =
@@ -4595,6 +4661,142 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
             | Error failure -> return Error failure
         }
 
+    let readIndexStages (path: RepositoryPath) (context: OperationContext) =
+        async {
+            let pathValue = RepositoryPath.value path
+
+            let! result =
+                runGit
+                    state.Hooks
+                    state.RepoPath
+                    [|
+                        "ls-files"
+                        "-s"
+                        "-z"
+                        "--"
+                        GitPathTransport.literalPathspec path
+                    |]
+                    None
+                    context
+
+            match result with
+            | Error failure -> return Error { failure with AffectedPaths = [| pathValue |] }
+            | Ok output when output.ExitCode <> 0 ->
+                return
+                    Error(
+                        OperationFailure.createRedacted
+                            ProviderError
+                            "git_failure"
+                            $"Listing conflict stages at '{pathValue}' failed: {output.StdErr}"
+                        |> fun failure -> { failure with AffectedPaths = [| pathValue |] }
+                    )
+            | Ok output ->
+                let entries = output.StdOut.Split '\000' |> Array.filter (String.IsNullOrEmpty >> not)
+                let parsedEntries = ResizeArray<string * string * int>()
+                let mutable parseFailure = false
+
+                for entry in entries do
+                    let separator = entry.IndexOf '\t'
+
+                    if separator <= 0 then
+                        parseFailure <- true
+                    else
+                        let fields = entry.Substring(0, separator).Split ' '
+
+                        match fields with
+                        | [| mode; blob; stageText |] ->
+                            match Int32.TryParse stageText with
+                            | true, stage -> parsedEntries.Add((mode, blob, stage))
+                            | _ -> parseFailure <- true
+                        | _ -> parseFailure <- true
+
+                if parseFailure then
+                    return
+                        Error(
+                            OperationFailure.createRedacted
+                                ProviderError
+                                "invalid_git_output"
+                                $"Git returned invalid conflict stages for '{pathValue}'."
+                            |> fun failure -> { failure with AffectedPaths = [| pathValue |] }
+                        )
+                else
+                    return Ok(parsedEntries.ToArray())
+        }
+
+    let deleteConflictPath (path: RepositoryPath) (context: OperationContext) =
+        async {
+            let pathValue = RepositoryPath.value path
+            let absolutePath = NodePath.join [| state.RepoPath; pathValue |]
+
+            let canceledFailure () =
+                OperationFailure.create Canceled "operation_canceled" "The conflict deletion was canceled before the file was removed."
+                |> fun failure -> { failure with AffectedPaths = [| pathValue |] }
+
+            let deleteFailure detail =
+                OperationFailure.createRedacted
+                    ProviderError
+                    "file_delete_failed"
+                    $"Deleting '{pathValue}' failed: {detail}"
+                |> fun failure -> { failure with AffectedPaths = [| pathValue |] }
+
+            let worktreeResult =
+                if context.Cancellation.IsCancellationRequested() then
+                    Error(canceledFailure ())
+                else
+                    let fileStatsResult =
+                        try
+                            Ok(NodeFileSystem.tryLstatSync absolutePath)
+                        with error ->
+                            Error error.Message
+
+                    match fileStatsResult with
+                    | Error detail -> Error(deleteFailure detail)
+                    | Ok(Some stats) when stats.isDirectory () ->
+                        Error(
+                            OperationFailure.create
+                                Validation
+                                "deletion_blocked_by_directory"
+                                $"The conflicted path '{pathValue}' is a directory and cannot be deleted as a file."
+                            |> fun failure -> { failure with AffectedPaths = [| pathValue |] }
+                        )
+                    | Ok(Some stats) when stats.isFile () || stats.isSymbolicLink () ->
+                        try
+                            NodeFileSystem.unlinkSync absolutePath
+                            Ok()
+                        with error ->
+                            Error(deleteFailure error.Message)
+                    | Ok(Some _) -> Error(deleteFailure "The worktree entry is not a regular file or symbolic link.")
+                    | Ok None -> Ok()
+
+            match worktreeResult with
+            | Error failure -> return Error failure
+            | Ok() ->
+                let! removeIndexResult =
+                    runGit
+                        state.Hooks
+                        state.RepoPath
+                        [| "update-index"; "--force-remove"; "--"; pathValue |]
+                        None
+                        context
+
+                match removeIndexResult with
+                | Error failure ->
+                    return Error(refreshConflictSessionFailure { failure with AffectedPaths = [| pathValue |] })
+                | Ok output when output.ExitCode = 0 -> return Ok()
+                | Ok output ->
+                    return
+                        Error(
+                            OperationFailure.createRedacted
+                                ProviderError
+                                "git_failure"
+                                $"Staging the resolved path failed: {output.StdErr}"
+                            |> fun failure -> {
+                                refreshConflictSessionFailure failure with
+                                    AffectedPaths = [| pathValue |]
+                            }
+                        )
+        }
+
     {
         GetActiveSession =
             fun context -> async {
@@ -4640,15 +4842,17 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                             "unknown_candidate"
                                             "The candidate ID is not part of this conflict item."
 
+                                    let candidateStageMemo: ConflictStageMemo = System.Collections.Generic.Dictionary()
+
                                     let readCandidate stage =
                                         async {
                                             let! previewResult =
-                                                readConflictStagePreview state stage pathValue context
+                                                readConflictStagePreview state candidateStageMemo stage pathValue context
 
                                             match previewResult with
                                             | Error failure -> return Error failure
                                             | Ok None -> return Ok None
-                                            | Ok(Some(TextPreview content)) -> return Ok(Some(Choice1Of2 content))
+                                            | Ok(Some(TextPreview content)) -> return Ok(Some(TextConflictContent content))
                                             | Ok(Some(UnsupportedPreview _)) ->
                                                 return Error(manualConflictResolutionFailure request.Path)
                                         }
@@ -4659,7 +4863,7 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                             | SupplyResolvedContent content ->
                                                 match ensureConflictSupportsTextResolution request.Path item with
                                                 | Error failure -> return Error failure
-                                                | Ok() -> return Ok(Some(Choice1Of2 content))
+                                                | Ok() -> return Ok(Some(TextConflictContent content))
                                             | PickCandidate candidateId ->
                                                 match
                                                     item.Candidates
@@ -4676,73 +4880,18 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
 
                                                     match stage with
                                                     | None -> return Error(unknownCandidateFailure ())
-                                                    | Some stage when item.SupportsResolvedContent ->
-                                                        return! readCandidate stage
                                                     | Some stage ->
-                                                        let! stageResult =
-                                                            runGit
-                                                                state.Hooks
-                                                                state.RepoPath
-                                                                [| "rev-parse"; "--verify"; "--quiet"; $":{stage}:{pathValue}" |]
-                                                                None
-                                                                context
+                                                        let! stageEntriesResult = readIndexStages request.Path context
 
-                                                        match stageResult with
-                                                        // The stage check only reads, so its failure reports no state change.
-                                                        | Error failure -> return Error { failure with AffectedPaths = [| pathValue |] }
-                                                        | Ok output when output.ExitCode <> 0 -> return Ok None
-                                                        | Ok _ ->
-                                                            let! indexResult =
-                                                                runGit
-                                                                    state.Hooks
-                                                                    state.RepoPath
-                                                                    [|
-                                                                        "ls-files"
-                                                                        "-s"
-                                                                        "-z"
-                                                                        "--"
-                                                                        GitPathTransport.literalPathspec request.Path
-                                                                    |]
-                                                                    None
-                                                                    context
-
-                                                            match indexResult with
-                                                            | Error failure ->
-                                                                return Error { failure with AffectedPaths = [| pathValue |] }
-                                                            | Ok indexOutput when indexOutput.ExitCode <> 0 ->
-                                                                return
-                                                                    Error(
-                                                                        OperationFailure.createRedacted
-                                                                            ProviderError
-                                                                            "git_failure"
-                                                                            $"Listing conflict stage {stage} at '{pathValue}' failed: {indexOutput.StdErr}"
-                                                                        |> fun failure -> {
-                                                                            failure with
-                                                                                AffectedPaths = [| pathValue |]
-                                                                        }
-                                                                    )
-                                                            | Ok indexOutput ->
-                                                                let indexEntry =
-                                                                    indexOutput.StdOut.Split '\000'
-                                                                    |> Array.tryPick (fun entry ->
-                                                                        let separator = entry.IndexOf '\t'
-
-                                                                        if separator < 0 then
-                                                                            None
-                                                                        else
-                                                                            let fields = entry.Substring(0, separator).Split ' '
-
-                                                                            match fields with
-                                                                            | [| mode; blob; entryStage |] ->
-                                                                                match Int32.TryParse entryStage with
-                                                                                | true, parsedStage when parsedStage = stage -> Some(mode, blob)
-                                                                                | _ -> None
-                                                                            | _ -> None)
-
-                                                                match indexEntry with
-                                                                | None -> return Ok None
-                                                                | Some(mode, blob) ->
-                                                                    return Ok(Some(Choice2Of2(stage, candidate.Object, mode, blob)))
+                                                        match stageEntriesResult with
+                                                        | Error failure -> return Error failure
+                                                        | Ok stageEntries ->
+                                                            match stageEntries |> Array.tryFind (fun (_, _, entryStage) -> entryStage = stage) with
+                                                            | None -> return Ok(Some(DeletedConflictCandidate))
+                                                            | Some _ when item.SupportsResolvedContent ->
+                                                                return! readCandidate stage
+                                                            | Some(mode, blob, _) ->
+                                                                return Ok(Some(StoredConflictCandidate(stage, candidate.Object, mode, blob)))
                                         }
 
                                     let! contentResult = resolveContent ()
@@ -4761,7 +4910,7 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                         let! writeResult =
                                             async {
                                                 match content with
-                                                | Choice1Of2 text ->
+                                                | TextConflictContent text ->
                                                     let absolutePath = NodePath.join [| state.RepoPath; pathValue |]
 
                                                     try
@@ -4782,12 +4931,19 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                                         AffectedPaths = [| pathValue |]
                                                                 }
                                                             )
-                                                | Choice2Of2(stage, _, _, _) ->
+                                                | StoredConflictCandidate(stage, _, _, _) ->
                                                     let! result =
                                                         runGitEnv
                                                             state.Hooks
                                                             state.RepoPath
-                                                            [| "checkout-index"; "-f"; $"--stage={stage}"; "--"; pathValue |]
+                                                            [|
+                                                                "checkout-index"
+                                                                "-f"
+                                                                $"--stage={stage}"
+                                                                "--"
+                                                                // checkout-index takes file names, never pathspec magic.
+                                                                pathValue
+                                                            |]
                                                             None
                                                             [| "GIT_LFS_SKIP_SMUDGE", "1" |]
                                                             context
@@ -4815,6 +4971,7 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                                         AffectedPaths = [| pathValue |]
                                                                 }
                                                             )
+                                                | DeletedConflictCandidate -> return Ok()
                                             }
 
                                         match writeResult with
@@ -4823,10 +4980,13 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                             let! stagedResult =
                                                 async {
                                                     match content with
-                                                    | Choice1Of2 _ ->
+                                                    | TextConflictContent _ ->
                                                         let! stageResult = stagePath request.Path context
                                                         return stageResult |> Result.map (fun () -> [||], None)
-                                                    | Choice2Of2(_, candidateObject, mode, blob) ->
+                                                    | DeletedConflictCandidate ->
+                                                        let! deletionResult = deleteConflictPath request.Path context
+                                                        return deletionResult |> Result.map (fun () -> [||], None)
+                                                    | StoredConflictCandidate(_, candidateObject, mode, blob) ->
                                                         let indexInfo = $"{mode} {blob}\t{pathValue}\000"
                                                         let! updateIndexResult =
                                                             runGit
@@ -4850,10 +5010,42 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                             match candidateObject with
                                                             | None -> return Ok([||], None)
                                                             | Some objectInfo ->
+                                                                let objectNotMaterialized () =
+                                                                    [|
+                                                                        {
+                                                                            Code = "object_not_materialized"
+                                                                            Message =
+                                                                                $"The picked version of '{pathValue}' is not in the local cache, so the file holds a pointer until the object is downloaded."
+                                                                        }
+                                                                    |]
+
+                                                                let materializationFailure detail =
+                                                                    OperationFailure.createRedacted
+                                                                        ProviderError
+                                                                        "object_materialization_failed"
+                                                                        $"The pick of '{pathValue}' is staged, but materializing its object failed: {detail}"
+                                                                    |> fun failure -> {
+                                                                        failure with
+                                                                            StateChanged = true
+                                                                            AffectedPaths = [| pathValue |]
+                                                                    }
+
+                                                                let canceledMaterializationFailure detail =
+                                                                    OperationFailure.createRedacted
+                                                                        Canceled
+                                                                        "operation_canceled"
+                                                                        $"Materializing the picked object for '{pathValue}' was canceled: {detail}"
+                                                                    |> fun failure -> {
+                                                                        failure with
+                                                                            StateChanged = true
+                                                                            AffectedPaths = [| pathValue |]
+                                                                    }
+
                                                                 match objectInfo.ObjectId, objectInfo.SizeBytes with
                                                                 | Some objectId, Some sizeBytes ->
                                                                     let! mediaDirectoryResult =
-                                                                        GitLfsObjects.resolveLocalMediaDirectory
+                                                                        resolveSessionMediaDirectory
+                                                                            state
                                                                             (fun arguments ->
                                                                                 runGit
                                                                                     state.Hooks
@@ -4861,28 +5053,12 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                                                     arguments
                                                                                     None
                                                                                     context)
-                                                                            state.RepoPath
 
                                                                     match mediaDirectoryResult with
-                                                                    | Error failure -> return Ok([||], Some failure.Message)
+                                                                    | Error _ -> return Ok(objectNotMaterialized (), None)
                                                                     | Ok mediaDirectory when
-                                                                        not (
-                                                                            GitLfsObjects.isObjectLocallyAvailable
-                                                                                mediaDirectory
-                                                                                objectId
-                                                                                sizeBytes
-                                                                        ) ->
-                                                                        return
-                                                                            Ok(
-                                                                                [|
-                                                                                    {
-                                                                                        Code = "object_not_materialized"
-                                                                                        Message =
-                                                                                            $"The picked version of '{pathValue}' is not in the local cache, so the file holds a pointer until the object is downloaded."
-                                                                                    }
-                                                                                |],
-                                                                                None
-                                                                            )
+                                                                        not (GitLfsObjects.isObjectLocallyAvailable mediaDirectory objectId sizeBytes) ->
+                                                                        return Ok(objectNotMaterialized (), None)
                                                                     | Ok _ ->
                                                                         let! checkoutResult =
                                                                             runGit
@@ -4892,14 +5068,31 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                                                     "lfs"
                                                                                     "checkout"
                                                                                     "--"
-                                                                                    GitLfsObjects.escapeLfsPathspec pathValue
+                                                                                    GitLfsObjects.lfsCheckoutPattern pathValue
                                                                                 |]
                                                                                 None
                                                                                 context
 
                                                                         match checkoutResult with
-                                                                        | Error failure -> return Ok([||], Some failure.Message)
-                                                                        | Ok output when output.ExitCode = 0 -> return Ok([||], None)
+                                                                        | Error failure when failure.Category = Canceled ->
+                                                                            return Ok([||], Some(canceledMaterializationFailure failure.Message))
+                                                                        | Error failure when context.Cancellation.IsCancellationRequested() ->
+                                                                            return Ok([||], Some(canceledMaterializationFailure failure.Message))
+                                                                        | Error failure -> return Ok([||], Some(materializationFailure failure.Message))
+                                                                        | Ok output when output.ExitCode = 0 ->
+                                                                            let absolutePath = NodePath.join [| state.RepoPath; pathValue |]
+
+                                                                            let materialized =
+                                                                                try
+                                                                                    NodeFileSystem.tryLstatSync absolutePath
+                                                                                    |> Option.exists (fun stats -> stats.isFile () && stats.size = sizeBytes)
+                                                                                with _ ->
+                                                                                    false
+
+                                                                            if materialized then
+                                                                                return Ok([||], None)
+                                                                            else
+                                                                                return Ok(objectNotMaterialized (), None)
                                                                         | Ok output ->
                                                                             let detail =
                                                                                 if String.IsNullOrWhiteSpace output.StdErr then
@@ -4907,23 +5100,19 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                                                 else
                                                                                     output.StdErr.Trim()
 
-                                                                            return Ok([||], Some detail)
+                                                                            if context.Cancellation.IsCancellationRequested() then
+                                                                                return Ok([||], Some(canceledMaterializationFailure detail))
+                                                                            else
+                                                                                return Ok([||], Some(materializationFailure detail))
                                                                 | _ ->
-                                                                    return
-                                                                        Ok(
-                                                                            [|
-                                                                                {
-                                                                                    Code = "object_not_materialized"
-                                                                                    Message =
-                                                                                        $"The picked version of '{pathValue}' is not in the local cache, so the file holds a pointer until the object is downloaded."
-                                                                                }
-                                                                            |],
-                                                                            None
-                                                                        )
+                                                                    return Ok(objectNotMaterialized (), None)
                                                 }
 
                                             match stagedResult with
-                                            | Error failure -> return Failed(refreshConflictSessionFailure failure)
+                                            | Error failure ->
+                                                match content, failure.StateChanged with
+                                                | DeletedConflictCandidate, false -> return Failed failure
+                                                | _ -> return Failed(refreshConflictSessionFailure failure)
                                             | Ok(warnings, materializationFailure) ->
                                                 let refreshedHandle = rotateConflictHandle state
                                                 let summaryContext =
@@ -4949,18 +5138,7 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
 
                                                     match materializationFailure with
                                                     | None -> return Succeeded outcome
-                                                    | Some detail ->
-                                                        let failure =
-                                                            OperationFailure.createRedacted
-                                                                ProviderError
-                                                                "object_materialization_failed"
-                                                                $"The pick of '{pathValue}' is staged, but materializing its object failed: {detail}"
-                                                            |> fun currentFailure -> {
-                                                                currentFailure with
-                                                                    StateChanged = true
-                                                                    AffectedPaths = [| pathValue |]
-                                                            }
-
+                                                    | Some failure ->
                                                         return
                                                             OperationResult.partiallySucceeded
                                                                 outcome
@@ -5647,6 +5825,7 @@ let createSessionWithCredentialsIdentityAndPolicy
         RevisionPolicy = revisionPolicy
         ConflictSession = None
         ConflictGeneration = 0
+        LfsMediaDirectory = None
     }
 
     let core: CoreVersionControl = {

@@ -816,6 +816,12 @@ Use `Object` to show a stored object's size and download state. Use `Revision` f
 source revision, which identifies the revision it came from and may differ from the revision that
 last changed the file.
 
+Picking a candidate with no preview and no stored object resolves the item by deleting the file.
+A pick of a stored object whose bytes are not local succeeds with the warning
+`object_not_materialized`. A pick whose local materialization fails returns `PartiallySucceeded`
+with `object_materialization_failed` and `retry_materialization`. Git refuses to materialize a path
+while the merge is open, so the host materializes such paths after `Finalize`.
+
 ## Cancellation and progress
 
 Every operation takes an `OperationContext`. `OperationContext.detached` is enough for a
