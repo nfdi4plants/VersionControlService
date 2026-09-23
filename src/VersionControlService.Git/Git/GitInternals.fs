@@ -1,13 +1,66 @@
 module internal VersionControlService.Git.GitInternals
 
 open System
+open System.Text.RegularExpressions
 open Fable.Core
 open Fable.Core.JsInterop
+open VersionControlService.Abstractions
 open VersionControlService.Git.GitEngineTypes
 open VersionControlService.Bindings.SimpleGit
 open VersionControlService.Git.GitAuthAdapter
 
+module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
+
 type GitProgressCallback = GitProgressDto -> unit
+
+let private indexLockFailurePattern = Regex(@"Unable to create '([^']*index\.lock)': File exists", RegexOptions.Singleline)
+
+[<Emit("Date.now()")>]
+let private nowMilliseconds () : float = jsNative
+
+let internal tryFileAgeSeconds (path: string) : float option =
+    try
+        let modifiedAtMilliseconds = (NodeFileSystem.statSync path).mtimeMs
+        Some(max 0.0 ((nowMilliseconds () - modifiedAtMilliseconds) / 1000.0))
+    with _ ->
+        None
+
+/// Finds Git's index lock diagnostic and reads the lock's age when the path is accessible.
+let internal tryIndexLockFailure (output: string) : (string * float option) option =
+    let output = output |> Option.ofObj |> Option.defaultValue String.Empty
+    let matchResult = indexLockFailurePattern.Match output
+
+    if matchResult.Success then
+        let path = matchResult.Groups.[1].Value
+        Some(path, tryFileAgeSeconds path)
+    else
+        None
+
+let internal indexLockFailure (path: string) (ageSeconds: float option) : OperationFailure =
+    let details =
+        match ageSeconds with
+        | Some age -> [| $"Lock file: {path}"; $"Lock file age: {int age} s" |]
+        | None -> [| $"Lock file: {path}" |]
+
+    let failure =
+        OperationFailure.createRedacted
+            Concurrency
+            "index_locked"
+            "Another git process holds the repository index, or a previous one left its lock behind."
+        |> OperationFailure.withDetails details
+
+    {
+        failure with
+            Retryable = true
+            AffectedPaths = [||]
+            StateChanged = false
+            RecoveryAction =
+                Some {
+                    Code = "remove_index_lock"
+                    Instructions =
+                        Some "Make sure no git process is running on the repository, remove the lock file, then retry."
+                }
+    }
 
 let internal createProgressDto methodName stage progress processed total output : GitProgressDto = {
     Method = methodName

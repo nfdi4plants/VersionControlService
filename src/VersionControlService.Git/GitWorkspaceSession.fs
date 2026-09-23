@@ -12,6 +12,7 @@ module GitConflictSession = VersionControlService.Git.GitConflictSession
 module GitLfsObjects = VersionControlService.Git.GitLfsObjects
 module GitCredentialStrategy = VersionControlService.Git.GitCredentialStrategy
 module GitExecution = VersionControlService.Git.GitExecution
+module GitInternals = VersionControlService.Git.GitInternals
 module GitLfsExtensions = VersionControlService.Git.GitLfsExtensions
 module GitProvisioningService = VersionControlService.Git.GitProvisioningService
 module NodeProcess = VersionControlService.Runtime.Node.Process
@@ -98,7 +99,9 @@ let private codeOfKind (kind: GitFailureKind) =
     | GitFailureKind.Unknown -> "git_failure"
 
 let private toOperationFailure (failure: GitService.GitFailure) : OperationFailure =
-    OperationFailure.createRedacted (categoryOfKind failure.Kind) (codeOfKind failure.Kind) failure.Message
+    match GitInternals.tryIndexLockFailure failure.Message with
+    | Some(path, ageSeconds) -> GitInternals.indexLockFailure path ageSeconds
+    | None -> OperationFailure.createRedacted (categoryOfKind failure.Kind) (codeOfKind failure.Kind) failure.Message
 
 let private hydrationFailure (operation: string) (detail: string) =
     let kind = GitService.classifyFailureKind detail
@@ -204,13 +207,16 @@ let private runGitChecked hooks repoPath arguments stdinData context =
         match result with
         | Error failure -> return Error failure
         | Ok output when output.ExitCode <> 0 ->
-            return
-                Error(
-                    OperationFailure.createRedacted
-                        ProviderError
-                        "git_failure"
-                        $"git {commandSummary arguments} failed: {output.StdErr}"
-                )
+            match GitInternals.tryIndexLockFailure output.StdErr with
+            | Some(path, ageSeconds) -> return Error(GitInternals.indexLockFailure path ageSeconds)
+            | None ->
+                return
+                    Error(
+                        OperationFailure.createRedacted
+                            ProviderError
+                            "git_failure"
+                            $"git {commandSummary arguments} failed: {output.StdErr}"
+                    )
         | Ok output -> return Ok output
     }
 
@@ -1932,7 +1938,7 @@ let private refNameOfProviderRef (reference: ProviderRef) =
     else
         Choice1Of2 value
 
-let private createRevision (state: SessionState) (request: CreateRevisionRequest) (context: OperationContext) =
+let private createRevisionTransaction (state: SessionState) (request: CreateRevisionRequest) (context: OperationContext) =
     async {
         if request.Paths.Length = 0 then
             return OperationResult.validationFailed "no_paths_selected" "Select at least one path."
@@ -1986,6 +1992,20 @@ let private createRevision (state: SessionState) (request: CreateRevisionRequest
                         identityArguments
                         state.RevisionPolicy
                         context
+    }
+
+let private createRevision (state: SessionState) (request: CreateRevisionRequest) (context: OperationContext) =
+    async {
+        if request.Paths.Length = 0 then
+            return OperationResult.validationFailed "no_paths_selected" "Select at least one path."
+        else
+            let! lockPathResult = resolveGitStatePath state "index.lock" context
+
+            match lockPathResult with
+            | Error failure -> return Failed failure
+            | Ok(Some lockPath) when NodeFileSystem.existsSync lockPath ->
+                return Failed(GitInternals.indexLockFailure lockPath (GitInternals.tryFileAgeSeconds lockPath))
+            | Ok _ -> return! createRevisionTransaction state request context
     }
 
 let private restorePaths (state: SessionState) (request: RestoreRequest) (context: OperationContext) =

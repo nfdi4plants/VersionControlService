@@ -158,16 +158,19 @@ let private buildLfsInstallPromptMessage (thresholdMb: int option) (details: str
 
 // GitService shapes the final failure because LFS install-required errors need workflow-specific wording.
 let private createFailure kind (message: string) : GitFailure =
-    match kind with
-    | GitFailureKind.LfsInstallRequired ->
-        let finalMessage =
-            if message.IndexOf("Install Git LFS now?", StringComparison.OrdinalIgnoreCase) >= 0 then
-                message
-            else
-                buildLfsInstallPromptMessage None (Some message)
+    match GitInternals.tryIndexLockFailure message with
+    | Some _ -> { Kind = kind; Message = message }
+    | None ->
+        match kind with
+        | GitFailureKind.LfsInstallRequired ->
+            let finalMessage =
+                if message.IndexOf("Install Git LFS now?", StringComparison.OrdinalIgnoreCase) >= 0 then
+                    message
+                else
+                    buildLfsInstallPromptMessage None (Some message)
 
-        { Kind = kind; Message = finalMessage }
-    | _ -> { Kind = kind; Message = message }
+            { Kind = kind; Message = finalMessage }
+        | _ -> { Kind = kind; Message = message }
 
 let private toFailure (error: exn) : GitFailure =
     GitInternals.toFailure classifyFailureKind createFailure error

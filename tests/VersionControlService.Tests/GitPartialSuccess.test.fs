@@ -238,6 +238,59 @@ Vitest.describe (
     "Git workspace partial success",
     fun () ->
         Vitest.test (
+            "CreateRevision refuses an existing index lock before writing objects",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, binding = createSelectedRevisionFixture ()
+
+                try
+                    do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) "changed before lock\n"
+                    let! headBefore = runGitOk workPath [| "rev-parse"; "HEAD" |]
+                    let session = GitWorkspaceSession.createSession GitWorkspaceSession.GitSessionHooks.none binding
+                    let! statusResult = session.Core.GetStatus(ctx "index-lock-revision-status") |> Async.StartAsPromise
+
+                    let status =
+                        match statusResult with
+                        | Succeeded outcome -> outcome.Value
+                        | _ -> failwith "Expected status before the locked revision."
+
+                    let! objectsBefore = runGitOk workPath [| "count-objects"; "-v" |]
+                    do! writeUtf8FileAsync (join [| workPath; ".git"; "index.lock" |]) "stale lock\n"
+
+                    let! revisionResult =
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: reject revision with index lock"
+                                Paths = [| repositoryPath "base.txt" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (ctx "index-lock-create-revision")
+                        |> Async.StartAsPromise
+
+                    match revisionResult with
+                    | Failed failure ->
+                        Vitest.expect(failure.Category).toEqual Concurrency
+                        Vitest.expect(failure.Code).toBe "index_locked"
+                        Vitest.expect(failure.StateChanged).toBe false
+                        Vitest.expect(failure.Retryable).toBe true
+                        Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "remove_index_lock")
+                        Vitest.expect(
+                            failure.Details |> Array.exists (fun detail -> detail.StartsWith "Lock file age:")
+                        ).toBe true
+                    | _ -> failwith "Expected the index lock to reject CreateRevision."
+
+                    let! headAfter = runGitOk workPath [| "rev-parse"; "HEAD" |]
+                    let! objectsAfter = runGitOk workPath [| "count-objects"; "-v" |]
+                    Vitest.expect(headAfter.Trim()).toBe (headBefore.Trim())
+                    Vitest.expect(objectsAfter).toBe objectsBefore
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
             "direct git runs carry the resolved environment overrides",
             TestOptions(timeout = 120000),
             fun () -> promise {

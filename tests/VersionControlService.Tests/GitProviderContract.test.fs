@@ -11,6 +11,7 @@ open Vitest
 
 module GitWorkspaceSession = VersionControlService.Git.GitWorkspaceSession
 module GitCredentialStrategy = VersionControlService.Git.GitCredentialStrategy
+module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodeProcess = VersionControlService.Runtime.Node.Process
 
 let private fsPromisesDynamic: obj = importAll "fs/promises"
@@ -5072,6 +5073,53 @@ Vitest.describe (
                     do! removeDirectoryAsync root
                 with error ->
                     do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+)
+
+Vitest.describe (
+    "Git index lock recovery",
+    fun () ->
+        Vitest.test (
+            "RestorePaths reports a held index lock with recovery details",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    do! workspace.WriteFile "base.txt" "changed for restore\n"
+                    let! statusResult =
+                        workspace.Session.Core.GetStatus(OperationContext.detached "restore-index-lock-status")
+                        |> Async.StartAsPromise
+
+                    let status = expectProviderValue "status before locked restore" statusResult
+                    do!
+                        writeUtf8FileAsync
+                            (join [| workspace.Binding.WorkspaceRoot; ".git"; "index.lock" |])
+                            "manual lock\n"
+
+                    let! restoreResult =
+                        workspace.Session.Core.RestorePaths
+                            {
+                                Paths = [| mkRepositoryPath "base.txt" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (OperationContext.detached "restore-index-lock")
+                        |> Async.StartAsPromise
+
+                    let failure = expectProviderFailure "locked RestorePaths" restoreResult
+                    Vitest.expect(failure.Category).toEqual Concurrency
+                    Vitest.expect(failure.Code).toBe "index_locked"
+                    Vitest.expect(failure.StateChanged).toBe false
+                    Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "remove_index_lock")
+                    Vitest.expect(
+                        failure.Details |> Array.exists (fun detail -> detail.StartsWith "Lock file age:")
+                    ).toBe true
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
                     return raise error
             }
         )

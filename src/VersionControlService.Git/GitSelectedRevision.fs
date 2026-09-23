@@ -12,6 +12,7 @@ module NodeProcess = VersionControlService.Runtime.Node.Process
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodePath = VersionControlService.Runtime.Node.Path
 module NodeInterop = VersionControlService.Runtime.Node.Interop
+module GitInternals = VersionControlService.Git.GitInternals
 
 let private fileSystemDynamic: obj = importAll "node:fs"
 let private maxLfsPointerProbeBytes = 1024.0
@@ -24,7 +25,9 @@ type GitRunner =
 type TransactionBarrier = string -> Async<unit>
 
 let private failedRun (operation: string) (output: NodeProcess.ProcessOutput) =
-    OperationFailure.createRedacted ProviderError "git_failure" $"{operation} failed: {output.StdErr}"
+    match GitInternals.tryIndexLockFailure output.StdErr with
+    | Some(path, ageSeconds) -> GitInternals.indexLockFailure path ageSeconds
+    | None -> OperationFailure.createRedacted ProviderError "git_failure" $"{operation} failed: {output.StdErr}"
 
 /// Repository-relative roots of gitlink (submodule) entries in the index.
 let listGitlinkRoots (runGit: GitRunner) : Async<Result<string[], OperationFailure>> =
