@@ -80,12 +80,9 @@ jobs:
       - run: dotnet tool restore
       - run: dotnet restore VersionControlService.slnx
       - run: npm ci
-      - shell: pwsh
-        run: build/RunFocusedTest.ps1 -TestFile GitProviderContract.test.js -Filter '.*'
-      - shell: pwsh
-        run: build/RunFocusedTest.ps1 -TestFile GitSynchronization.test.js -Filter 'Git LFS transfer ordering'
-      - shell: pwsh
-        run: build/RunFocusedTest.ps1 -TestFile GitPartialSuccess.test.js -Filter 'selected revision|publish|push'
+      - run: .\build.cmd test focused GitProviderContract.test.js ".*"
+      - run: .\build.cmd test focused GitSynchronization.test.js "Git LFS transfer ordering"
+      - run: .\build.cmd test focused GitPartialSuccess.test.js "selected revision|publish|push"
 
   package-graph-consumer:
     runs-on: windows-latest
@@ -104,32 +101,7 @@ jobs:
       - run: dotnet restore VersionControlService.slnx
       - run: npm ci
       - name: Pack and compile the one-reference consumer
-        shell: pwsh
-        run: |
-          $version = "0.0.0-local.$(Get-Date -Format yyyyMMddHHmmss)"
-          $feed = Join-Path $env:RUNNER_TEMP 'version-control-service-feed'
-          $cache = Join-Path $env:RUNNER_TEMP 'version-control-service-cache'
-          $output = Join-Path $env:RUNNER_TEMP 'version-control-service-consumer-output'
-
-          powershell -NoProfile -File build/PackLocal.ps1 -Version $version -Output $feed
-          powershell -NoProfile -File build/VerifyPackageGraph.ps1 -Feed $feed -Version $version
-
-          # nuget.org has to be listed first: with a directory as the first source, dotnet/sdk#51514 turns every later source into a local path on Windows.
-          dotnet restore tests/VersionControlService.PackageConsumer/VersionControlService.PackageConsumer.fsproj `
-              --source 'https://api.nuget.org/v3/index.json' `
-              --source $feed `
-              --packages $cache `
-              --no-cache `
-              -p:VersionControlServicePackageVersion=$version
-          if ($LASTEXITCODE -ne 0) { throw 'Package consumer restore failed.' }
-
-          $env:VersionControlServicePackageVersion = $version
-          dotnet fable tests/VersionControlService.PackageConsumer/VersionControlService.PackageConsumer.fsproj `
-              --noRestore `
-              --noCache `
-              -o $output `
-              -s
-          if ($LASTEXITCODE -ne 0) { throw 'Package consumer Fable compilation failed.' }
+        run: .\build.cmd package-consumer --temp=$env:RUNNER_TEMP
 
   external-provider:
     runs-on: ubuntu-latest
@@ -158,5 +130,4 @@ jobs:
       - run: dotnet tool restore
       - run: dotnet restore VersionControlService.slnx
       - run: npm ci
-      - shell: pwsh
-        run: build/RunLakeFsIntegration.ps1
+      - run: ./build.sh test lakefs
