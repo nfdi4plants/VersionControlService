@@ -135,7 +135,7 @@ Cancellation that reaches the runner after the merge finishes has two truthful o
 
 ## Cancellation, progress, and redaction
 
-Use the supplied `OperationContext` throughout the operation. Check cancellation between bounded units of work and pass it into process, network, and streaming helpers. Report progress with stable phase codes; byte totals use `float` so values above two GiB remain exact across .NET and JavaScript.
+Use the supplied `OperationContext` throughout the operation. Check cancellation between bounded units of work and pass it into process, network, and streaming helpers. Report progress with stable phase codes. Byte totals use `float` so values above two GiB remain exact across .NET and JavaScript.
 
 Messages, details, progress text, bindings, and repository URLs must not contain secrets. Resolve credentials from the binding's `ConnectionProfileId`, scope them to the operation, and pass provider output through the redaction guard before returning it.
 

@@ -46,4 +46,4 @@ Keeping this boundary matters for two reasons: provider metadata cannot collide 
 
 ## Session ownership
 
-An opened session owns its locks, clients, and caches. Call `WorkspaceSession.Close` when the host releases it. Do not reuse a session for a different binding or connection profile. Multiple sessions can exist at once. Mutation safety comes from workspace-version and conflict-handle checks, not global singleton state.
+An opened session owns its locks, clients, and caches. Call `WorkspaceSession.Close` when the host releases it. Do not reuse a session for a different binding or connection profile. Multiple sessions can exist at once. Mutation safety comes from workspace-version and conflict-handle checks, which is why no global singleton state is needed.
