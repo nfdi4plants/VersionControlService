@@ -669,11 +669,12 @@ decide safely, and the refusal says what the host has to ask the user. Keep
 `TargetRef` is not a reason to turn it off. Git derives `TargetRef` from the branch's upstream,
 and publishing a branch without one sets the upstream to the branch of the same name on
 `origin`. A branch created with `checkout -b` therefore has no `TargetRef` before its first
-publish and tracks its remote branch after it. When that remote branch already exists with revisions the workspace lacks, the publish
-adopts it as the upstream and fails with `precondition_failed` and the recovery
-`refresh_workspace`, so the next `Synchronize` integrates them. When the remote's fetch refspec
-does not map the branch, as in a single-branch clone or a custom refspec, the upstream is written
-but does not resolve, so `TargetRef` stays empty. This is a known limitation.
+publish and tracks its remote branch after it. When that remote branch already exists with
+revisions the workspace lacks, the publish adopts it as the upstream and fails with
+`precondition_failed` and the recovery `refresh_workspace`, so the next `Synchronize`
+integrates them. When the remote's fetch refspec does not map the branch, as in a single-branch
+clone or a custom refspec, the publish writes the upstream but it does not resolve, so
+`TargetRef` stays empty. This is a known limitation.
 
 ```fsharp
 let synchronize
@@ -708,22 +709,19 @@ let synchronize
             match result with
             | Succeeded outcome -> return Ok outcome.Value
             | PartiallySucceeded(outcome, failure) ->
+                // A partial result is not a success. The recovery says what is left to do, and
+                // Publication says where the revisions are.
                 let recovery =
                     failure.RecoveryAction
                     |> Option.map (fun action -> action.Code)
                     |> Option.defaultValue "none"
 
-                match outcome.Publication with
-                | LocalOnly ->
-                    // The update landed and the publish did not. The user's revisions remain
-                    // local, so report the recovery with the local publication state.
-                    return Error $"Updated, but not published ({failure.Code}). Recovery: {recovery}."
-                | Published ->
-                    // The publish landed and tracking setup did not. The revisions are remote,
-                    // and the recovery can repair the tracking state.
-                    return Error $"Published, but tracking failed ({failure.Code}). Recovery: {recovery}."
-                | PublicationNotApplicable ->
-                    return Error $"Synchronization partially succeeded ({failure.Code}). Recovery: {recovery}."
+                match recovery, outcome.Publication with
+                | "retry_publish", Published ->
+                    return Error $"Published, but the branch does not track its remote branch yet ({failure.Code})."
+                | "retry_publish", _ ->
+                    return Error $"Updated, but not published ({failure.Code})."
+                | _ -> return Error $"Synchronization partially succeeded ({failure.Code}). Recovery: {recovery}."
             | Failed failure when failure.Code = SynchronizationCodes.UpdateWouldOverwriteLocalChanges ->
                 // AcceptUpdateRisks does not override this one. The user saves or discards
                 // the paths in AffectedPaths first.
@@ -751,12 +749,13 @@ resolved or cancelled first. Git also reports `publish_target_missing` as a `Val
 failure before it touches the network, which means the workspace has no publication
 target and the host has to bind one.
 
-A `PartiallySucceeded` result from `Synchronize` has two cases. With `Publication = LocalOnly`,
-the update applied and the publish did not, so the revisions remain local. With
-`Publication = Published`, the publish went through and tracking setup did not, so the revisions
-are remote while the workspace lacks tracking. Both cases use `retry_publish` for recovery. A
-host reads `Publication` to tell them apart. The provider codes and evidence are tabulated in
-[provider authoring](provider-authoring.md).
+A `PartiallySucceeded` result from `Synchronize` is not a success. When the update applied and
+the publish did not, the recovery is `retry_publish` unless the provider supplied its own, and
+`Publication` is `LocalOnly`, or `PublicationNotApplicable` after a fast-forward. When Git
+published but could not set up tracking, the recovery is also `retry_publish` and `Publication`
+is `Published`. A push that reported a failure although the remote holds the published revision
+carries `retry_publish_verification`. Read the recovery code first and `Publication` second.
+The provider codes and evidence are tabulated in [provider authoring](provider-authoring.md).
 
 ## Conflict sessions
 
