@@ -167,7 +167,7 @@ The provider owns its storage keys and escaping rules. Hosts should not read or 
 
 ## Compatibility
 
-The published records are intentionally small. Add new capability as a new optional service record instead of adding required members to an existing published record. Provider-specific mechanics stay behind the SPI; a host should not need provider-specific parsing to resolve, adopt, open, or operate a workspace.
+The published records are intentionally small. Add new capability as a new optional service record instead of adding required members to an existing published record. Provider-specific mechanics stay behind the SPI. A host should not need provider-specific parsing to resolve, adopt, open, or operate a workspace.
 
 `ServiceAvailability` is the exception to the rule about published records: a new optional service adds a required field to it, and that is a deliberate breaking change so a consumer's availability report can never be silently incomplete.
 

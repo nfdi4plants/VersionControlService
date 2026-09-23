@@ -8,7 +8,7 @@
 | Git LFS | 3.7 | `git lfs version` |
 | .NET SDK | 10.0 | `dotnet --version` |
 | Node.js (with npm) | 22 | `node --version` |
-| Docker (Linux containers) | any current engine; pulls `treeverse/lakefs:1.83.0` | `docker --version` |
+| Docker (Linux containers) | any current engine (pulls `treeverse/lakefs:1.83.0`) | `docker --version` |
 
 Set up the repository before running a matrix row:
 
@@ -35,7 +35,7 @@ Docker is required only for the live lakeFS row.
 The package row packs the five coordinated packages at a unique local version, verifies
 the graph and then restores and Fable-compiles the one-reference consumer against that
 feed. The feed, the package cache and the compiler output are created under the temporary
-directory; `--temp=<dir>` puts them somewhere else and `--version=<v>` pins the version.
+directory. `--temp=<dir>` puts them somewhere else and `--version=<v>` pins the version.
 
 The restore must resolve the umbrella and all four internal dependencies at that one
 version. Only the umbrella package is referenced, so anything missing from the graph shows
