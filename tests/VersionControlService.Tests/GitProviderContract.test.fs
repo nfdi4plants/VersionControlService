@@ -4490,6 +4490,45 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "returns the LFS pointer when a same-sized local object has the wrong hash",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGitResultIn "." [| "lfs"; "version" |]
+
+                if lfsProbe.ExitCode <> 0 then
+                    Vitest.expect(true).toBe true
+                else
+                    let! root, repoPath, session = createLfsBaseContentFixture ()
+
+                    try
+                        let! pointer = runGitIn repoPath [||] [| "show"; "HEAD:data.csv" |] None
+                        let! lfsEnvironment = runGitIn repoPath [||] [| "lfs"; "env" |] None
+                        let mediaDirectory = lfsMediaDirectoryFromEnvironment lfsEnvironment
+                        let objectPath = lfsObjectPath mediaDirectory (lfsOidFromPointer pointer)
+
+                        do!
+                            writeUtf8FileAsync
+                                objectPath
+                                (String.replicate lfsCsvContent.Length "x")
+
+                        let! result =
+                            (textDiffService session).GetBaseContent
+                                (repositoryPath "data.csv")
+                                (OperationContext.detached "base-mismatched-lfs-object")
+                            |> Async.StartAsPromise
+
+                        match expectProviderValue "mismatched local LFS base object" result with
+                        | TextContent text -> Vitest.expect(text).toBe pointer
+                        | UnsupportedContent _ -> failwith "Expected the LFS pointer text for the mismatched object."
+
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
             "returns unsupported content for a local binary LFS object",
             TestOptions(timeout = 120000),
             fun () -> promise {
@@ -5081,6 +5120,44 @@ Vitest.describe (
 Vitest.describe (
     "Git index lock recovery",
     fun () ->
+        Vitest.test (
+            "Materialize reports a held index lock before running Git LFS",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+                    let materialization =
+                        workspace.Session.ObjectMaterialization
+                        |> Option.defaultWith (fun () -> failwith "Expected Git object materialization.")
+
+                    do!
+                        writeUtf8FileAsync
+                            (join [| workspace.Binding.WorkspaceRoot; ".git"; "index.lock" |])
+                            "manual lock\n"
+
+                    let! result =
+                        materialization.Materialize
+                            (mkRepositoryPath "base.txt")
+                            (OperationContext.detached "materialize-index-lock")
+                        |> Async.StartAsPromise
+
+                    let failure = expectProviderFailure "locked Materialize" result
+                    Vitest.expect(failure.Category).toEqual Concurrency
+                    Vitest.expect(failure.Code).toBe "index_locked"
+                    Vitest.expect(failure.StateChanged).toBe false
+                    Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "remove_index_lock")
+                    Vitest.expect(
+                        failure.Details |> Array.exists (fun detail -> detail.StartsWith "Lock file age:")
+                    ).toBe true
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
         Vitest.test (
             "RestorePaths reports a held index lock with recovery details",
             TestOptions(timeout = 120000),

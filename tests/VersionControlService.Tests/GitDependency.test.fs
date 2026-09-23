@@ -247,6 +247,27 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "Git LFS global configuration takes precedence over system configuration",
+            fun () -> promise {
+                let precedenceHooks, _ =
+                    dependencyHooks
+                        true
+                        (Some "git-lfs/3.7.0 (GitHub; windows amd64; go 1.23.0)\n")
+                        (Some "another-filter-process\n")
+                        None
+                        (Some "git-lfs filter-process\n")
+
+                let factory = GitWorkspaceSession.createFactory precedenceHooks
+                let! result = Async.StartAsPromise(factory.CheckDependencies(context "global-lfs-filter"))
+                let dependencies = expectValue "global Git LFS configuration precedence" result
+                let status = dependencies |> Array.find (fun entry -> entry.Component = "git-lfs-configuration")
+
+                Vitest.expect(status.Installed).toBe (false)
+                Vitest.expect(status.Compatible).toBe (false)
+            }
+        )
+
+        Vitest.test (
             "Git dependency cancellation is preserved",
             fun () -> promise {
                 let cancellation = OperationCancellation.Source()

@@ -12,6 +12,7 @@ module GitService = VersionControlService.Git.GitService
 module GitLfsService = VersionControlService.Git.GitLfsService
 module GitLfsObjects = VersionControlService.Git.GitLfsObjects
 module GitCredentialStrategy = VersionControlService.Git.GitCredentialStrategy
+module GitInternals = VersionControlService.Git.GitInternals
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodeInterop = VersionControlService.Runtime.Node.Interop
 module NodePath = VersionControlService.Runtime.Node.Path
@@ -30,9 +31,11 @@ let private categoryOfKind (kind: GitFailureKind) =
     | GitFailureKind.Unknown -> ProviderError
 
 let private toOperationFailure (failure: GitService.GitFailure) : OperationFailure =
-    if failure.Kind = GitFailureKind.InvalidLfsThreshold then
+    match GitInternals.tryIndexLockFailure failure.Message with
+    | Some(path, ageSeconds) -> GitInternals.indexLockFailure path ageSeconds
+    | None when failure.Kind = GitFailureKind.InvalidLfsThreshold ->
         OperationFailure.create Validation "invalid_lfs_threshold" failure.Message
-    else
+    | None ->
         OperationFailure.createRedacted (categoryOfKind failure.Kind) "lfs_operation_failed" failure.Message
 
 let private toOperationResult (failure: GitService.GitFailure) : OperationResult<unit> =
@@ -104,7 +107,7 @@ let private completeStoragePolicyChange (repoPath: string) (relativePath: string
                 AffectedPaths = affectedPaths
         }
 
-let private prepareUnmark
+let private prepareUnmarkAfterPreflight
     (repoPath: string)
     (runGit: string[] -> OperationContext -> Async<Result<NodeProcess.ProcessOutput, OperationFailure>>)
     (relativePath: string)
@@ -148,7 +151,21 @@ let private prepareUnmark
                                 failure.Message
                             |> affectedPath relativePath
                         )
-                | Ok output when output.ExitCode = 0 -> return Ok true
+                | Ok output when output.ExitCode = 0 ->
+                    let! restoredPointerResult = GitLfsObjects.readWorktreePointer repoPath relativePath
+
+                    match restoredPointerResult with
+                    | Error failure -> return Error(affectedPath relativePath failure)
+                    | Ok(Some _) ->
+                        return
+                            Error(
+                                OperationFailure.create
+                                    ProviderError
+                                    "object_materialization_failed"
+                                    "Git LFS did not restore the file's content, so it stays in Git LFS."
+                                |> affectedPath relativePath
+                            )
+                    | Ok None -> return Ok true
                 | Ok output ->
                     let detail =
                         if String.IsNullOrWhiteSpace output.StdErr then
@@ -163,10 +180,44 @@ let private prepareUnmark
                         )
     }
 
+let private prepareUnmark
+    (repoPath: string)
+    (preflight: OperationContext -> Async<Result<unit, OperationFailure>>)
+    (runGit: string[] -> OperationContext -> Async<Result<NodeProcess.ProcessOutput, OperationFailure>>)
+    (relativePath: string)
+    (context: OperationContext)
+    : Async<Result<bool, OperationFailure>> =
+    async {
+        let! preflightResult = preflight context
+
+        match preflightResult with
+        | Error failure -> return Error(affectedPath relativePath failure)
+        | Ok() -> return! prepareUnmarkAfterPreflight repoPath runGit relativePath context
+    }
+
+let private wrapUnitWithPreflight
+    (preflight: OperationContext -> Async<Result<unit, OperationFailure>>)
+    (context: OperationContext)
+    (beginOperation: unit -> unit)
+    (operation: unit -> JS.Promise<GitService.GitResult<unit>>)
+    : Async<OperationResult<unit>> =
+    async {
+        if context.Cancellation.IsCancellationRequested() then
+            return OperationResult.canceled "Git LFS operation canceled."
+        else
+            let! preflightResult = preflight context
+
+            match preflightResult with
+            | Error failure when failure.Category = Canceled -> return OperationResult.canceled failure.Message
+            | Error failure -> return Failed failure
+            | Ok() -> return! wrapUnit context beginOperation operation
+    }
+
 let createObjectMaterialization
     (repoPath: string)
     (credentials: GitCredentialStrategy.GitCredentialStrategy)
     (connectionProfileId: string option)
+    (preflight: OperationContext -> Async<Result<unit, OperationFailure>>)
     : ObjectMaterializationService = {
     ListObjects =
         fun context -> async {
@@ -232,7 +283,8 @@ let createObjectMaterialization
         }
     Materialize =
         fun path context ->
-            wrapUnit
+            wrapUnitWithPreflight
+                preflight
                 context
                 (fun () ->
                     context.ReportProgress {
@@ -251,7 +303,8 @@ let createObjectMaterialization
                         context)
     Dematerialize =
         fun path context ->
-            wrapUnit
+            wrapUnitWithPreflight
+                preflight
                 context
                 (fun () ->
                     context.ReportProgress {
@@ -273,6 +326,7 @@ let createObjectMaterialization
 let createStoragePolicy
     (repoPath: string)
     (runGit: string[] -> OperationContext -> Async<Result<NodeProcess.ProcessOutput, OperationFailure>>)
+    (preflight: OperationContext -> Async<Result<unit, OperationFailure>>)
     : StoragePolicyService = {
     SetPathPolicy =
         fun path useLargeObjectStorage context -> async {
@@ -294,7 +348,7 @@ let createStoragePolicy
                                 error
                         )
             else
-                let! preparation = prepareUnmark repoPath runGit relativePath context
+                let! preparation = prepareUnmark repoPath preflight runGit relativePath context
 
                 match preparation with
                 | Error failure -> return Failed failure

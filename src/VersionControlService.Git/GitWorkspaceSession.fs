@@ -1405,6 +1405,17 @@ let private resolveGitStatePath (state: SessionState) (name: string) (context: O
                     )
     }
 
+let private preflightIndexLock (state: SessionState) (context: OperationContext) : Async<Result<unit, OperationFailure>> =
+    async {
+        let! lockPathResult = resolveGitStatePath state "index.lock" context
+
+        match lockPathResult with
+        | Error failure -> return Error failure
+        | Ok(Some lockPath) when NodeFileSystem.existsSync lockPath ->
+            return Error(GitInternals.indexLockFailure lockPath (GitInternals.tryFileAgeSeconds lockPath))
+        | Ok _ -> return Ok()
+    }
+
 let private resolveGitStatePaths
     (state: SessionState)
     (names: string[])
@@ -1999,13 +2010,11 @@ let private createRevision (state: SessionState) (request: CreateRevisionRequest
         if request.Paths.Length = 0 then
             return OperationResult.validationFailed "no_paths_selected" "Select at least one path."
         else
-            let! lockPathResult = resolveGitStatePath state "index.lock" context
+            let! lockResult = preflightIndexLock state context
 
-            match lockPathResult with
+            match lockResult with
             | Error failure -> return Failed failure
-            | Ok(Some lockPath) when NodeFileSystem.existsSync lockPath ->
-                return Failed(GitInternals.indexLockFailure lockPath (GitInternals.tryFileAgeSeconds lockPath))
-            | Ok _ -> return! createRevisionTransaction state request context
+            | Ok() -> return! createRevisionTransaction state request context
     }
 
 let private restorePaths (state: SessionState) (request: RestoreRequest) (context: OperationContext) =
@@ -5669,7 +5678,8 @@ let private readBaseBlob
         | Ok processOutput -> return Ok processOutput.StdOut
     }
 
-// Text diff bases are capped at 10 MiB because larger files are not diffed line by line.
+// getBaseContent reads a local LFS object into memory for a line diff up to 10 MiB.
+// It returns the pointer text when the object exceeds the limit or local verification fails.
 let private maximumBaseTextDiffBytes = 10.0 * 1024.0 * 1024.0
 
 let private getBaseContent
@@ -5996,12 +6006,14 @@ let createSessionWithCredentialsIdentityAndPolicy
                         state.RepoPath
                         state.Credentials
                         state.ConnectionProfileId
+                        (preflightIndexLock state)
                 )
             StoragePolicy =
                 Some(
                     GitLfsExtensions.createStoragePolicy
                         state.RepoPath
                         (fun arguments context -> runGit state.Hooks state.RepoPath arguments None context)
+                        (preflightIndexLock state)
                 )
             Maintenance =
                 Some(
@@ -6136,7 +6148,6 @@ let createFactoryWithCredentialsIdentityAndPolicy
                                 runGit hooks "." [| "config"; "--global"; "--get"; "filter.lfs.process" |] None context
 
                             match globalFilter with
-                            | Error failure when failure.Category = Canceled -> return globalFilter
                             | Error _ -> return globalFilter
                             | Ok output when output.ExitCode = 0 && not (String.IsNullOrWhiteSpace output.StdOut) ->
                                 return globalFilter

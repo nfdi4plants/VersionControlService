@@ -17,6 +17,9 @@ module GitInternals = VersionControlService.Git.GitInternals
 let private fileSystemDynamic: obj = importAll "node:fs"
 let private maxLfsPointerProbeBytes = 1024.0
 
+[<Emit("$0?.code")>]
+let private errorCode (_error: obj) : string = jsNative
+
 /// Runs git in the workspace with optional stdin and extra environment.
 type GitRunner =
     string[] -> string option -> (string * string)[] -> Async<Result<NodeProcess.ProcessOutput, OperationFailure>>
@@ -622,6 +625,7 @@ let private hashTextBlob (runGit: GitRunner) (content: string) =
 let private prepareLfsPointerBlob
     (runGit: GitRunner)
     (repoPath: string)
+    (getMediaDirectory: unit -> Async<Result<string, OperationFailure>>)
     (commonGitDir: string)
     (relativePath: string)
     : Async<Result<string, OperationFailure>> =
@@ -683,10 +687,7 @@ let private prepareLfsPointerBlob
                                                     "Git LFS did not return a canonical pointer for an oversized selected file."
                                             )
                                     | Some oid ->
-                                        let! mediaDirectoryResult =
-                                            GitLfsObjects.resolveLocalMediaDirectory
-                                                (fun arguments -> runGit arguments None [||])
-                                                repoPath
+                                        let! mediaDirectoryResult = getMediaDirectory ()
 
                                         match mediaDirectoryResult with
                                         | Error failure ->
@@ -708,7 +709,11 @@ let private prepareLfsPointerBlob
                                             if NodeFileSystem.existsSync objectPath then
                                                 cleanupSnapshot ()
                                             else
-                                                NodeFileSystem.renameSync snapshotPath objectPath
+                                                try
+                                                    NodeFileSystem.renameSync snapshotPath objectPath
+                                                with error when errorCode (box error) = "EXDEV" ->
+                                                    NodeFileSystem.copyFileSync snapshotPath objectPath
+                                                    NodeFileSystem.unlinkSync snapshotPath
 
                                             let! pointerBlob =
                                                 runGit [| "hash-object"; "-w"; "--stdin" |] (Some output.StdOut) [||]
@@ -958,11 +963,26 @@ let private applyLfsPlanToTemporaryIndex
                         | Error currentFailure -> failure <- Some currentFailure
                         | Ok() -> ()
 
+        let mutable cachedMediaDirectory: Result<string, OperationFailure> option = None
+
+        let getMediaDirectory () = async {
+            match cachedMediaDirectory with
+            | Some result -> return result
+            | None ->
+                let! result =
+                    GitLfsObjects.resolveLocalMediaDirectory
+                        (fun arguments -> runGit arguments None [||])
+                        repoPath
+
+                cachedMediaDirectory <- Some result
+                return result
+        }
+
         for relativePath in plan.OversizedPaths do
             match failure with
             | Some _ -> ()
             | None ->
-                match! prepareLfsPointerBlob runGit repoPath commonGitDir relativePath with
+                match! prepareLfsPointerBlob runGit repoPath getMediaDirectory commonGitDir relativePath with
                 | Error currentFailure -> failure <- Some currentFailure
                 | Ok pointerBlob ->
                     match! temporaryIndexMode runGit environment relativePath with
@@ -1410,13 +1430,20 @@ let createRevision
                                                                             failure.Message)
                                                             | Ok reconcileOutput ->
                                                                 // The revision exists; only reconciliation failed.
+                                                                let failure =
+                                                                    match GitInternals.tryIndexLockFailure reconcileOutput.StdErr with
+                                                                    | Some(path, ageSeconds) ->
+                                                                        GitInternals.indexLockFailure path ageSeconds
+                                                                    | None ->
+                                                                        OperationFailure.createRedacted
+                                                                            ProviderError
+                                                                            "index_reconciliation_failed"
+                                                                            reconcileOutput.StdErr
+
                                                                 return
                                                                     partialReconciliation
                                                                         "Reconcile the affected paths in the index (for example with git reset)."
-                                                                        (OperationFailure.createRedacted
-                                                                            ProviderError
-                                                                            "index_reconciliation_failed"
-                                                                            reconcileOutput.StdErr)
+                                                                        failure
                             finally
                                 cleanupTemporaryIndex ()
     }

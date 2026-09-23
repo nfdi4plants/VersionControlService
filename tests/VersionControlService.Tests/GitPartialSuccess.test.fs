@@ -332,6 +332,144 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "index lock diagnostics keep lock paths with apostrophes and linked-worktree lock paths",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, binding = createSelectedRevisionFixture ()
+                let mutable injectedLockPath: string option = None
+
+                let hooks = {
+                    GitWorkspaceSession.GitSessionHooks.none with
+                        RunProcess =
+                            Some(fun request operationContext ->
+                                async {
+                                    match injectedLockPath with
+                                    | Some lockPath when Array.contains "commit-tree" request.Arguments ->
+                                        let output: NodeProcess.ProcessOutput = {
+                                            ExitCode = 128
+                                            StdOut = ""
+                                            StdErr = $"fatal: Unable to create '{lockPath}': File exists.\n"
+                                        }
+
+                                        return OperationResult.succeeded output
+                                    | _ -> return! NodeProcess.run request operationContext
+                                })
+                }
+
+                try
+                    do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) "changed before the locked revision\n"
+                    let session = GitWorkspaceSession.createSession hooks binding
+                    let! status = sessionStatus session
+
+                    for lockPath in
+                        [|
+                            @"C:\Users\carol\repo's files\.git\index.lock"
+                            @"C:\Users\carol\repo\.git\worktrees\wt\index.lock"
+                        |] do
+                        injectedLockPath <- Some lockPath
+
+                        let! revisionResult =
+                            session.Core.CreateRevision
+                                {
+                                    Message = "test: parse the index lock path"
+                                    Paths = [| repositoryPath "base.txt" |]
+                                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                }
+                                (ctx "index-lock-path-parsing")
+                            |> Async.StartAsPromise
+
+                        match revisionResult with
+                        | Failed failure ->
+                            Vitest.expect(failure.Code).toBe "index_locked"
+                            Vitest.expect(failure.Details |> Array.contains $"Lock file: {lockPath}").toBe true
+                        | _ -> failwith $"Expected the lock diagnostic for {lockPath} to fail CreateRevision."
+
+                    injectedLockPath <- None
+                    do! removeDirectoryAsync root
+                with error ->
+                    injectedLockPath <- None
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "a post-commit index lock preserves index_locked details and requests index reconciliation",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, binding = createSelectedRevisionFixture ()
+                let lockPath = join [| workPath; ".git"; "index.lock" |]
+                let mutable refUpdated = false
+                let mutable lockCreated = false
+
+                let hooks = {
+                    GitWorkspaceSession.GitSessionHooks.none with
+                        RunProcess =
+                            Some(fun request operationContext ->
+                                async {
+                                    if Array.contains "update-ref" request.Arguments then
+                                        let! result = NodeProcess.run request operationContext
+
+                                        match result with
+                                        | Succeeded outcome when outcome.Value.ExitCode = 0 -> refUpdated <- true
+                                        | _ -> ()
+
+                                        return result
+                                    elif refUpdated && Array.contains "reset" request.Arguments then
+                                        lockCreated <- true
+                                        do!
+                                            writeUtf8FileAsync lockPath "lock created during index reconciliation\n"
+                                            |> Async.AwaitPromise
+
+                                        let output: NodeProcess.ProcessOutput = {
+                                            ExitCode = 128
+                                            StdOut = ""
+                                            StdErr = $"fatal: Unable to create '{lockPath}': File exists.\n"
+                                        }
+
+                                        return OperationResult.succeeded output
+                                    else
+                                        return! NodeProcess.run request operationContext
+                                })
+                }
+
+                try
+                    do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) "committed before index lock\n"
+                    let session = GitWorkspaceSession.createSession hooks binding
+                    let! beforeStatus = sessionStatus session
+                    let! revisionResult =
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: report post-commit index lock"
+                                Paths = [| repositoryPath "base.txt" |]
+                                ExpectedWorkspaceVersion = beforeStatus.WorkspaceVersion
+                            }
+                            (ctx "post-commit-index-lock")
+                        |> Async.StartAsPromise
+
+                    Vitest.expect(refUpdated).toBe true
+                    Vitest.expect(lockCreated).toBe true
+
+                    match revisionResult with
+                    | PartiallySucceeded(outcome, failure) ->
+                        Vitest.expect(failure.Category).toEqual Concurrency
+                        Vitest.expect(failure.Code).toBe "index_locked"
+                        Vitest.expect(failure.Details |> Array.contains $"Lock file: {lockPath}").toBe true
+                        Vitest.expect(
+                            failure.Details |> Array.exists (fun detail -> detail.StartsWith "Lock file age:")
+                        ).toBe true
+                        Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "reconcile_index")
+                        Vitest.expect(outcome.ResultingRevision.IsSome).toBe true
+                    | _ -> failwith "Expected a partial revision after the committed ref could not reconcile the index."
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
             "tracking then untracking a literal path removes exactly its rule",
             TestOptions(timeout = 120000),
             fun () -> promise {

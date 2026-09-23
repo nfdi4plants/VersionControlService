@@ -13,7 +13,7 @@ module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 
 type GitProgressCallback = GitProgressDto -> unit
 
-let private indexLockFailurePattern = Regex(@"Unable to create '([^']*index\.lock)': File exists", RegexOptions.Singleline)
+let private indexLockFailurePattern = Regex(@"Unable to create '(.*index\.lock)': File exists", RegexOptions.Singleline)
 
 [<Emit("Date.now()")>]
 let private nowMilliseconds () : float = jsNative

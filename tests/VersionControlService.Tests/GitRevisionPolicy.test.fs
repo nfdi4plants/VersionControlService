@@ -102,6 +102,7 @@ type private GitRevisionPolicyFixture = {
     Root: string
     WorkPath: string
     Session: WorkspaceSession
+    Binding: WorkspaceBinding
 }
 
 let private createGitFixture
@@ -151,6 +152,7 @@ let private createGitFixture
             Root = root
             WorkPath = workPath
             Session = session
+            Binding = binding
         }
     }
 
@@ -674,6 +676,137 @@ Vitest.describe (
                     let! status = runGitOk fixture.WorkPath [| "status"; "--porcelain" |]
                     Vitest.expect(committed).toBe original
                     Vitest.expect(status.Trim()).toBe ""
+                })
+        )
+
+        Vitest.test (
+            "unmarking fails when Git LFS reports checkout success and leaves a pointer",
+            TestOptions(timeout = 180000),
+            fun () ->
+                withGitFixture RevisionPolicyStrategy.automatic (Some "\n") (fun fixture -> promise {
+                    let path = "manual/unmark-checkout-stays-pointer.bin"
+                    let absolutePath = join [| fixture.WorkPath; path |]
+                    let original = "local object content\n"
+                    do! writeUtf8FileAsync absolutePath original
+
+                    let! initial = createRevision fixture "test: commit path before checkout simulation" [| path |]
+                    expectSucceeded "initial plain revision" initial |> ignore
+
+                    let storagePolicy =
+                        fixture.Session.StoragePolicy
+                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
+
+                    let! markResult =
+                        storagePolicy.SetPathPolicy (repositoryPath path) true (context "mark-checkout-simulation")
+                        |> Async.StartAsPromise
+
+                    expectSucceeded "mark before checkout simulation" markResult |> ignore
+
+                    let! lfsRevision =
+                        createRevision fixture "test: commit path before checkout simulation" [| path; ".gitattributes" |]
+
+                    expectSucceeded "LFS revision before checkout simulation" lfsRevision |> ignore
+                    let! pointer = runGitOk fixture.WorkPath [| "cat-file"; "-p"; $"HEAD:{path}" |]
+                    do! writeUtf8FileAsync absolutePath pointer
+
+                    let mutable checkoutAttempted = false
+                    let hooks = {
+                        GitWorkspaceSession.GitSessionHooks.none with
+                            RunProcess =
+                                Some(fun request processContext ->
+                                    async {
+                                        match request.Arguments with
+                                        | [| "lfs"; "checkout"; "--"; _ |] ->
+                                            checkoutAttempted <- true
+
+                                            return
+                                                OperationResult.succeeded {
+                                                    ExitCode = 0
+                                                    StdOut = ""
+                                                    StdErr = ""
+                                                }
+                                        | _ -> return! NodeProcess.run request processContext
+                                    })
+                    }
+
+                    let hookedSession = GitWorkspaceSession.createSession hooks fixture.Binding
+                    let hookedStoragePolicy =
+                        hookedSession.StoragePolicy
+                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
+                    let attributesPath = join [| fixture.WorkPath; ".gitattributes" |]
+                    let! attributesBefore = readUtf8FileAsync attributesPath
+
+                    let! unmarkResult =
+                        hookedStoragePolicy.SetPathPolicy
+                            (repositoryPath path)
+                            false
+                            (context "unmark-checkout-simulation")
+                        |> Async.StartAsPromise
+
+                    match unmarkResult with
+                    | Failed failure ->
+                        Vitest.expect(failure.Code).toBe "object_materialization_failed"
+                        Vitest.expect(failure.StateChanged).toBe false
+                    | Succeeded _
+                    | PartiallySucceeded _ -> failwith "Expected unmarking to fail while the file remains a pointer."
+
+                    Vitest.expect(checkoutAttempted).toBe true
+                    let! attributesAfter = readUtf8FileAsync attributesPath
+                    let! worktreeAfter = readUtf8FileAsync absolutePath
+                    Vitest.expect(attributesAfter).toBe attributesBefore
+                    Vitest.expect(worktreeAfter).toBe pointer
+                })
+        )
+
+        Vitest.test (
+            "unmarking a root file leaves a same-named subfolder pointer untouched",
+            TestOptions(timeout = 180000),
+            fun () ->
+                withGitFixture RevisionPolicyStrategy.automatic (Some "\n") (fun fixture -> promise {
+                    let rootPath = "same-name.bin"
+                    let nestedPath = "sub/same-name.bin"
+                    let rootContent = "root object content\n"
+                    let nestedContent = "nested object content\n"
+                    let rootAbsolutePath = join [| fixture.WorkPath; rootPath |]
+                    let nestedAbsolutePath = join [| fixture.WorkPath; nestedPath |]
+                    do! writeUtf8FileAsync rootAbsolutePath rootContent
+                    do! writeUtf8FileAsync nestedAbsolutePath nestedContent
+
+                    let storagePolicy =
+                        fixture.Session.StoragePolicy
+                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
+
+                    for path in [| rootPath; nestedPath |] do
+                        let! markResult =
+                            storagePolicy.SetPathPolicy
+                                (repositoryPath path)
+                                true
+                                (context $"mark-{path}")
+                            |> Async.StartAsPromise
+
+                        expectSucceeded $"mark {path}" markResult |> ignore
+
+                    let! lfsRevision =
+                        createRevision fixture "test: commit same-named LFS paths" [| rootPath; nestedPath; ".gitattributes" |]
+
+                    expectSucceeded "same-named LFS revision" lfsRevision |> ignore
+                    let! rootPointer = runGitOk fixture.WorkPath [| "cat-file"; "-p"; $"HEAD:{rootPath}" |]
+                    let! nestedPointer = runGitOk fixture.WorkPath [| "cat-file"; "-p"; $"HEAD:{nestedPath}" |]
+                    do! writeUtf8FileAsync rootAbsolutePath rootPointer
+                    do! writeUtf8FileAsync nestedAbsolutePath nestedPointer
+
+                    let! unmarkResult =
+                        storagePolicy.SetPathPolicy
+                            (repositoryPath rootPath)
+                            false
+                            (context "unmark-root-same-name")
+                        |> Async.StartAsPromise
+
+                    expectSucceeded "unmark root same-named file" unmarkResult |> ignore
+                    let! materializedRoot = readUtf8FileAsync rootAbsolutePath
+                    let! untouchedNested = readUtf8FileAsync nestedAbsolutePath
+                    Vitest.expect(materializedRoot).toBe rootContent
+                    Vitest.expect(untouchedNested).toBe nestedPointer
                 })
         )
 
