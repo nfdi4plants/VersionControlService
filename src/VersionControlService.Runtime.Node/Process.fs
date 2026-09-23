@@ -101,6 +101,8 @@ let run (request: ProcessRequest) (context: OperationContext) : Async<OperationR
             | None -> ()
 
             let mutable finished = false
+            let mutable exited = false
+            let mutable exitCode = -1
 
             let child: obj =
                 try
@@ -147,6 +149,11 @@ let run (request: ProcessRequest) (context: OperationContext) : Async<OperationR
                 observeStream child?stdout stdoutDecoder stdout
                 observeStream child?stderr stderrDecoder stderr
 
+                child?on ("exit", fun (code: obj) ->
+                    exited <- true
+                    exitCode <- if isNull code then -1 else unbox<int> code)
+                |> ignore
+
                 child?on ("error", fun (error: obj) ->
                     if not finished then
                         finished <- true
@@ -161,7 +168,7 @@ let run (request: ProcessRequest) (context: OperationContext) : Async<OperationR
                         ))
                 |> ignore
 
-                child?on ("close", fun (code: obj) ->
+                child?on ("close", fun (_code: obj) ->
                     if not finished then
                         finished <- true
 
@@ -182,7 +189,7 @@ let run (request: ProcessRequest) (context: OperationContext) : Async<OperationR
 
                             resolve (
                                 OperationResult.succeeded {
-                                    ExitCode = (if isNull code then -1 else unbox<int> code)
+                                    ExitCode = exitCode
                                     StdOut = stdout.ToString()
                                     StdErr = stderr.ToString()
                                 }
@@ -190,7 +197,8 @@ let run (request: ProcessRequest) (context: OperationContext) : Async<OperationR
                 |> ignore
 
                 context.Cancellation.Register(fun () ->
-                    if not finished then
+                    // A cancel after exit must not turn a finished process into a canceled one.
+                    if not finished && not exited then
                         canceled <- true
                         killProcessTree (unbox<int> child?pid))
 
@@ -222,6 +230,8 @@ let runBytes
             | None -> ()
 
             let mutable finished = false
+            let mutable exited = false
+            let mutable exitCode = -1
 
             let child: obj =
                 try
@@ -252,6 +262,11 @@ let runBytes
                 observeBytes child?stdout stdout
                 observeBytes child?stderr stderr
 
+                child?on ("exit", fun (code: obj) ->
+                    exited <- true
+                    exitCode <- if isNull code then -1 else unbox<int> code)
+                |> ignore
+
                 child?on ("error", fun (error: obj) ->
                     if not finished then
                         finished <- true
@@ -266,7 +281,7 @@ let runBytes
                         ))
                 |> ignore
 
-                child?on ("close", fun (code: obj) ->
+                child?on ("close", fun (_code: obj) ->
                     if not finished then
                         finished <- true
 
@@ -293,7 +308,7 @@ let runBytes
 
                             resolve (
                                 OperationResult.succeeded {
-                                    ExitCode = (if isNull code then -1 else unbox<int> code)
+                                    ExitCode = exitCode
                                     StdOut = stdout.ToArray() |> Interop.bufferConcat
                                     StdErr = stderrText
                                 }
@@ -301,7 +316,7 @@ let runBytes
                 |> ignore
 
                 context.Cancellation.Register(fun () ->
-                    if not finished then
+                    if not finished && not exited then
                         canceled <- true
                         killProcessTree (unbox<int> child?pid))
 

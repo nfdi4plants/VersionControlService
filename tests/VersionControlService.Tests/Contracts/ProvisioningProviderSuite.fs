@@ -6,6 +6,8 @@ open VersionControlService.Tests.Contracts.ProviderHarness
 open VersionControlService.Tests.Contracts.ProviderHarness.SuiteHelpers
 open Vitest
 
+module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
+
 /// Provisioning profile: initialize, clone, bind/re-target, nonempty-target behavior,
 /// access-intent verification, and dependency diagnostics.
 let register (harness: ProviderTestHarness) : string * (unit -> int) =
@@ -71,6 +73,47 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 match status.Synchronization with
                 | Some sync -> Vitest.expect(sync.Relationship).toEqual (UpToDate)
                 | None -> failwith "Expected synchronization state in a cloned workspace."
+            }
+
+            profileTest "a pre-canceled clone leaves its fresh target unchanged"
+            <| fun () -> promise {
+                let! anchor = harness.CreateWorkspace()
+                let! targetPath = harness.CreateLocalPath()
+                let targetExistedBefore = NodeFileSystem.existsSync targetPath
+                let entriesBefore =
+                    if targetExistedBefore then
+                        NodeFileSystem.readdirSync targetPath
+                    else
+                        [||]
+
+                if targetExistedBefore then
+                    Vitest.expect(entriesBefore).toEqual [||]
+
+                let cancellation = OperationCancellation.Source()
+                cancellation.Cancel()
+                let cloneContext =
+                    OperationContext.create "pre-canceled-clone" cancellation.Cancellation ignore
+
+                let! cloneResult =
+                    run (
+                        harness.Factory.Clone
+                            {
+                                Location = anchor.Binding.Location
+                                TargetPath = targetPath
+                                TargetRef = None
+                                MaterializeAllObjects = true
+                            }
+                            cloneContext
+                    )
+
+                let failure = expectFailure "pre-canceled clone" cloneResult
+                Vitest.expect(failure.Category).toEqual (Canceled)
+                Vitest.expect(failure.Code).toBe "operation_canceled"
+                Vitest.expect(failure.StateChanged).toBe false
+                Vitest.expect(NodeFileSystem.existsSync targetPath).toBe(targetExistedBefore)
+
+                if targetExistedBefore then
+                    Vitest.expect(NodeFileSystem.readdirSync targetPath).toEqual entriesBefore
             }
 
             profileTest "bind re-targets an existing workspace without cloning"

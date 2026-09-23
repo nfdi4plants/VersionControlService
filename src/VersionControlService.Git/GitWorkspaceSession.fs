@@ -6393,10 +6393,15 @@ let createFactoryWithCredentialsIdentityAndPolicy
                     with _ ->
                         true, false
 
+                let mutable targetCreatedByClone = false
+                // Rollback runs only after git started, so a refusal or a cancel before
+                // the clone never touches what someone else put into the target.
+                let mutable cloneStarted = false
+
                 let removeCloneResidue () =
                     async {
                         try
-                            if not targetExistedBefore then
+                            if targetCreatedByClone then
                                 if NodeFileSystem.existsSync request.TargetPath then
                                     do!
                                         NodeFileSystem.rmAsync
@@ -6408,7 +6413,7 @@ let createFactoryWithCredentialsIdentityAndPolicy
                                                 retryDelay = 100
                                             ))
                                         |> Async.AwaitPromise
-                            elif targetWasEmptyDirectory then
+                            elif targetExistedBefore && targetWasEmptyDirectory then
                                 for entry in NodeFileSystem.readdirSync request.TargetPath do
                                     do!
                                         NodeFileSystem.rmAsync
@@ -6446,29 +6451,90 @@ let createFactoryWithCredentialsIdentityAndPolicy
                                     }
                         }
 
-                // Large objects stay as pointers during the Git transfer; hydration is a
-                // separate step so its failure can be reported as partial success.
+                let targetNotEmptyFailure () =
+                    OperationFailure.create
+                        Validation
+                        "target_not_empty"
+                        "The clone target directory is not empty."
+
                 let! result =
-                    runGitEnv
-                        hooks
-                        "."
-                        [|
-                            yield! authentication.ConfigArgs
-                            "clone"
-                            "--"
-                            location.ProviderLocation
-                            request.TargetPath
-                        |]
-                        None
-                        [|
-                            "GIT_TERMINAL_PROMPT", "0"
-                            "GIT_LFS_SKIP_SMUDGE", "1"
-                        |]
-                        context
+                    async {
+                        if context.Cancellation.IsCancellationRequested() then
+                            return
+                                Error(
+                                    OperationFailure.create
+                                        Canceled
+                                        "operation_canceled"
+                                        "The clone was canceled before it started."
+                                )
+                        elif targetExistedBefore && not targetWasEmptyDirectory then
+                            return Error(targetNotEmptyFailure ())
+                        else
+                            let targetSetup =
+                                try
+                                    if not targetExistedBefore then
+                                        let parentPath = NodePath.dirname request.TargetPath
+
+                                        if not (NodeFileSystem.existsSync parentPath) then
+                                            NodeFileSystem.mkdirSync
+                                                parentPath
+                                                (NodeFileSystem.MkdirOptions(recursive = true))
+
+                                        NodeFileSystem.mkdirSync
+                                            request.TargetPath
+                                            (NodeFileSystem.MkdirOptions(recursive = false))
+
+                                        targetCreatedByClone <- true
+
+                                    Ok()
+                                with error ->
+                                    if tryGetNodeErrorCode error = Some "EEXIST" then
+                                        Error(targetNotEmptyFailure ())
+                                    else
+                                        Error(
+                                            OperationFailure.createRedacted
+                                                ProviderError
+                                                "clone_failed"
+                                                $"Could not create the clone target directory: {error.Message}"
+                                        )
+
+                            match targetSetup with
+                            | Error failure -> return Error failure
+                            | Ok () ->
+                                cloneStarted <- true
+
+                                // Git keeps large objects as pointers until hydration so a download
+                                // failure can be reported as partial success.
+                                return!
+                                    runGitEnv
+                                        hooks
+                                        "."
+                                        [|
+                                            yield! authentication.ConfigArgs
+                                            "clone"
+                                            "--"
+                                            location.ProviderLocation
+                                            request.TargetPath
+                                        |]
+                                        None
+                                        [|
+                                            "GIT_TERMINAL_PROMPT", "0"
+                                            "GIT_LFS_SKIP_SMUDGE", "1"
+                                        |]
+                                        context
+                    }
 
                 match result with
+                | Error failure when not cloneStarted -> return Failed failure
                 | Error failure ->
                     let! cleanupError = removeCloneResidue ()
+
+                    let failure =
+                        if failure.Category = Canceled then
+                            OperationFailure.create Canceled "operation_canceled" failure.Message
+                        else
+                            failure
+
                     return Failed(withResidue failure cleanupError)
                 | Ok output when output.ExitCode <> 0 ->
                     let combined = output.StdErr + output.StdOut
@@ -6476,13 +6542,7 @@ let createFactoryWithCredentialsIdentityAndPolicy
                     if combined.Contains "already exists and is not an empty directory" then
                         // git refused before writing anything. Whatever is in the target
                         // now belongs to someone else, so nothing is removed.
-                        return
-                            Failed(
-                                OperationFailure.create
-                                    Validation
-                                    "target_not_empty"
-                                    "The clone target directory is not empty."
-                            )
+                        return Failed(targetNotEmptyFailure ())
                     else
                         let! cleanupError = removeCloneResidue ()
 
@@ -6505,18 +6565,28 @@ let createFactoryWithCredentialsIdentityAndPolicy
                         // partial success with a retry action, never an overall error
                         // that hides the changed workspace.
                         let! hydration =
-                            runGitEnv
-                                hooks
-                                request.TargetPath
-                                [|
-                                    yield! authentication.ConfigArgs
-                                    "lfs"
-                                    "pull"
-                                    "origin"
-                                |]
-                                None
-                                [| "GIT_TERMINAL_PROMPT", "0" |]
-                                context
+                            if context.Cancellation.IsCancellationRequested() then
+                                async.Return(
+                                    Error(
+                                        OperationFailure.create
+                                            Canceled
+                                            "operation_canceled"
+                                            "The clone was canceled before large-object download started."
+                                    )
+                                )
+                            else
+                                runGitEnv
+                                    hooks
+                                    request.TargetPath
+                                    [|
+                                        yield! authentication.ConfigArgs
+                                        "lfs"
+                                        "pull"
+                                        "origin"
+                                    |]
+                                    None
+                                    [| "GIT_TERMINAL_PROMPT", "0" |]
+                                    context
 
                         match hydration with
                         | Ok hydrationOutput when hydrationOutput.ExitCode = 0 ->
@@ -6536,11 +6606,18 @@ let createFactoryWithCredentialsIdentityAndPolicy
                                     failure
                                     (materializationRecovery failure)
                         | Error hydrationFailure ->
-                            return
-                                OperationResult.partiallySucceeded
-                                    (OperationOutcome.performed binding)
-                                    hydrationFailure
-                                    (materializationRecovery hydrationFailure)
+                            if hydrationFailure.Category = Canceled then
+                                let! cleanupError = removeCloneResidue ()
+                                let canceledFailure =
+                                    OperationFailure.create Canceled "operation_canceled" hydrationFailure.Message
+
+                                return Failed(withResidue canceledFailure cleanupError)
+                            else
+                                return
+                                    OperationResult.partiallySucceeded
+                                        (OperationOutcome.performed binding)
+                                        hydrationFailure
+                                        (materializationRecovery hydrationFailure)
         }
     Adopt =
         fun request context ->

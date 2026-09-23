@@ -27,6 +27,25 @@ let private filledBuffer (_length: int) (_value: int) : obj = jsNative
 [<Emit("$0.toString('base64')")>]
 let private bufferBase64 (_buffer: obj) : string = jsNative
 
+[<Emit("""
+(() => {
+    const childProcess = require('node:child_process');
+    const moduleApi = require('node:module');
+    const originalSpawn = childProcess.spawn;
+    childProcess.spawn = function(command, args, options) {
+        const child = originalSpawn.call(childProcess, command, args, options);
+        process.nextTick(() => child.once('exit', () => $0()));
+        return child;
+    };
+    moduleApi.syncBuiltinESMExports();
+    return () => {
+        childProcess.spawn = originalSpawn;
+        moduleApi.syncBuiltinESMExports();
+    };
+})()
+""")>]
+let private cancelAfterChildExit (_cancel: unit -> unit) : unit -> unit = jsNative
+
 let private createTempDirectoryAsync () : JS.Promise<string> =
     let prefix = NodePath.join [| osDynamic?tmpdir () |> unbox<string>; "vcs-node-runtime-" |]
     fsPromisesDynamic?mkdtemp (prefix) |> unbox<JS.Promise<string>>
@@ -57,6 +76,27 @@ Vitest.describe (
                     Vitest.expect(outcome.Value.StdOut.Contains "hello runtime").toBe (true)
                 | PartiallySucceeded _
                 | Failed _ -> failwith "Expected the process to succeed."
+            }
+        )
+
+        Vitest.test (
+            "cancellation after child exit preserves success",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let request = NodeProcess.ProcessRequest.create nodeExecutable [| "-e"; "" |]
+                let source = OperationCancellation.Source()
+                let context = OperationContext.create "runtime-late-cancel" source.Cancellation ignore
+                let restore = cancelAfterChildExit source.Cancel
+
+                try
+                    let! result = run (NodeProcess.run request context)
+
+                    match result with
+                    | Succeeded outcome -> Vitest.expect(outcome.Value.ExitCode).toBe (0)
+                    | PartiallySucceeded _
+                    | Failed _ -> failwith "Expected late cancellation to preserve process success."
+                finally
+                    restore ()
             }
         )
 

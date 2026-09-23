@@ -10,6 +10,10 @@ open Vitest
 module GitWorkspaceSession = VersionControlService.Git.GitWorkspaceSession
 module GitExecution = VersionControlService.Git.GitExecution
 module NodeProcess = VersionControlService.Runtime.Node.Process
+module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
+
+[<Emit("process.execPath")>]
+let private nodeExecutablePath: string = jsNative
 
 let private fsPromisesDynamic: obj = importAll "fs/promises"
 let private osDynamic: obj = importAll "os"
@@ -203,6 +207,31 @@ let private createPublishFixture hooks = promise {
     }
 
     return root, workPath, barePath, GitWorkspaceSession.createSession hooks binding
+}
+
+let private isLfsPullRequest (request: NodeProcess.ProcessRequest) =
+    request.Arguments
+    |> Array.windowed 2
+    |> Array.exists (fun pair -> pair.[0] = "lfs" && pair.[1] = "pull")
+
+let private createLfsCloneFixture () = promise {
+    let! root = createTempDirectoryAsync ()
+    let barePath = join [| root; "origin.git" |]
+    let workPath = join [| root; "work" |]
+
+    let! _ = runGitOk root [| "init"; "--bare"; "-b"; "main"; barePath |]
+    let! _ = runGitOk root [| "init"; "-b"; "main"; workPath |]
+    let! _ = runGitOk workPath [| "config"; "user.name"; "VCS Partial Tests" |]
+    let! _ = runGitOk workPath [| "config"; "user.email"; "partial@example.org" |]
+    let! _ = runGitOk workPath [| "config"; "core.autocrlf"; "false" |]
+    let! _ = runGitOk workPath [| "lfs"; "install"; "--local" |]
+    let! _ = runGitOk workPath [| "lfs"; "track"; "*.bin" |]
+    do! writeUtf8FileAsync (join [| workPath; "large.bin" |]) "large binary payload\n"
+    let! _ = runGitOk workPath [| "add"; "-A" |]
+    let! _ = runGitOk workPath [| "commit"; "-m"; "init: lfs base" |]
+    let! _ = runGitOk workPath [| "remote"; "add"; "origin"; barePath |]
+    let! _ = runGitOk workPath [| "push"; "-u"; "origin"; "main" |]
+    return root, barePath
 }
 
 let private createTextPublishRevision
@@ -536,30 +565,26 @@ Vitest.describe (
                 match lfsProbe with
                 | Error _ -> Vitest.expect(true).toBe (true)
                 | Ok _ ->
-                    let! root = createTempDirectoryAsync ()
+                    let! root, barePath = createLfsCloneFixture ()
 
                     try
-                        let barePath = join [| root; "origin.git" |]
-                        let workPath = join [| root; "work" |]
+                        let hooks = {
+                            GitWorkspaceSession.GitSessionHooks.none with
+                                RunProcess =
+                                    Some(fun request context ->
+                                        if isLfsPullRequest request then
+                                            async.Return(
+                                                OperationResult.succeeded {
+                                                    ExitCode = 2
+                                                    StdOut = ""
+                                                    StdErr = "injected lfs pull failure"
+                                                }
+                                            )
+                                        else
+                                            NodeProcess.run request context)
+                        }
 
-                        let! _ = runGitOk root [| "init"; "--bare"; "-b"; "main"; barePath |]
-                        let! _ = runGitOk root [| "init"; "-b"; "main"; workPath |]
-                        let! _ = runGitOk workPath [| "config"; "user.name"; "VCS Partial Tests" |]
-                        let! _ = runGitOk workPath [| "config"; "user.email"; "partial@example.org" |]
-                        let! _ = runGitOk workPath [| "config"; "core.autocrlf"; "false" |]
-                        let! _ = runGitOk workPath [| "lfs"; "install"; "--local" |]
-                        let! _ = runGitOk workPath [| "lfs"; "track"; "*.bin" |]
-                        do! writeUtf8FileAsync (join [| workPath; "large.bin" |]) "large binary payload\n"
-                        let! _ = runGitOk workPath [| "add"; "-A" |]
-                        let! _ = runGitOk workPath [| "commit"; "-m"; "init: lfs base" |]
-                        let! _ = runGitOk workPath [| "remote"; "add"; "origin"; barePath |]
-                        let! _ = runGitOk workPath [| "push"; "-u"; "origin"; "main" |]
-
-                        // Break hydration: remove the target's LFS object store.
-                        do! removeDirectoryAsync (join [| barePath; "lfs" |])
-
-                        let factory =
-                            GitWorkspaceSession.createFactory GitWorkspaceSession.GitSessionHooks.none
+                        let factory = GitWorkspaceSession.createFactory hooks
 
                         let clonePath = join [| root; "hydration-clone" |]
 
@@ -601,6 +626,91 @@ Vitest.describe (
                         | Failed failure ->
                             failwith
                                 $"Expected partial success but the whole clone failed ({failure.Code}): {failure.Message}"
+
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "canceled LFS clone removes only a target it created",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe (true)
+                | Ok _ ->
+                    let! root, barePath = createLfsCloneFixture ()
+
+                    try
+                        let blockedTransfer =
+                            NodeProcess.ProcessRequest.create
+                                nodeExecutablePath
+                                [| "-e"; "console.log('lfs-transfer-started'); setInterval(()=>{}, 1000)" |]
+
+                        let hooks = {
+                            GitWorkspaceSession.GitSessionHooks.none with
+                                RunProcess =
+                                    Some(fun request context ->
+                                        if isLfsPullRequest request then
+                                            NodeProcess.run blockedTransfer context
+                                        else
+                                            NodeProcess.run request context)
+                        }
+
+                        let factory = GitWorkspaceSession.createFactory hooks
+
+                        let cloneTo targetPath operationId = promise {
+                            let source = OperationCancellation.Source()
+
+                            let context =
+                                OperationContext.create operationId source.Cancellation (fun progress ->
+                                    if progress.DisplayMessage = Some "lfs-transfer-started" then
+                                        source.Cancel())
+
+                            return!
+                                Async.StartAsPromise(
+                                    factory.Clone
+                                        {
+                                            Location = {
+                                                ProviderId = gitProviderId
+                                                DisplayName = None
+                                                ProviderLocation = barePath
+                                                ConnectionProfileId = None
+                                            }
+                                            TargetPath = targetPath
+                                            TargetRef = None
+                                            MaterializeAllObjects = true
+                                        }
+                                        context
+                                )
+                        }
+
+                        let expectCanceled result =
+                            match result with
+                            | Failed failure ->
+                                Vitest.expect(failure.Category).toEqual (Canceled)
+                                Vitest.expect(failure.Code).toBe ("operation_canceled")
+                                Vitest.expect(failure.StateChanged).toBe (false)
+                            | Succeeded _
+                            | PartiallySucceeded _ -> failwith "Expected the clone to be canceled."
+
+                        let missingTarget = join [| root; "cancel-missing-clone" |]
+                        let! missingResult = cloneTo missingTarget "cancel-missing-clone"
+                        expectCanceled missingResult
+                        let! missingExists = pathExistsAsync missingTarget
+                        Vitest.expect(missingExists).toBe (false)
+
+                        let emptyTarget = join [| root; "cancel-empty-clone" |]
+                        NodeFileSystem.mkdirSync emptyTarget (NodeFileSystem.MkdirOptions(recursive = false))
+                        let! emptyResult = cloneTo emptyTarget "cancel-empty-clone"
+                        expectCanceled emptyResult
+                        let! emptyExists = pathExistsAsync emptyTarget
+                        Vitest.expect(emptyExists).toBe (true)
+                        Vitest.expect(NodeFileSystem.readdirSync emptyTarget).toHaveLength (0)
 
                         do! removeDirectoryAsync root
                     with error ->

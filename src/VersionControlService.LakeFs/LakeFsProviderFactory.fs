@@ -191,6 +191,8 @@ let createFactory
                                 "target_not_empty"
                                 "The clone target directory is not empty."
                         )
+                elif context.Cancellation.IsCancellationRequested() then
+                    return OperationResult.canceled "The lakeFS clone was canceled before provisioning."
                 else
                     if not targetExists then
                         NodeFileSystem.mkdirSync request.TargetPath (NodeFileSystem.MkdirOptions(recursive = true))

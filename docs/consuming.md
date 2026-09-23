@@ -165,6 +165,8 @@ let cloneWorkspace (factory: ProviderFactory) location targetPath (context: Oper
 }
 ```
 
+A clone canceled before it completes rolls back and fails as `Canceled`. A pre-existing empty target stays empty, and a clone that finished before cancellation took effect succeeds. A download failure that is not a cancellation returns `PartiallySucceeded` with `retry_materialization`, so the workspace exists and its large objects are not materialized.
+
 `Initialize` takes a directory the provider does not already own, keeps the files already in
 it, and reports them as ordinary workspace changes. `Location` is optional in the contract and
 Git accepts `None`, so a Git workspace can start with no target and get one through `Bind`

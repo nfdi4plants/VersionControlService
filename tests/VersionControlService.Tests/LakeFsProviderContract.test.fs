@@ -790,6 +790,54 @@ let private registrations =
 
         [||]
 
+Vitest.describe (
+    "lakeFS clone cancellation",
+    fun () ->
+        Vitest.test (
+            "a pre-canceled clone leaves a missing target missing",
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
+            fun () -> promise {
+                if not (integrationEnabled ()) then
+                    return failwith "lakeFS integration skipped: Docker not available"
+
+                let harness = createLakeFsHarness ()
+
+                try
+                    let! anchor = harness.CreateWorkspace()
+                    let! targetRoot = harness.CreateLocalPath()
+                    let targetPath = RuntimeNodePath.join [| targetRoot; "pre-canceled-clone" |]
+                    let cancellation = OperationCancellation.Source()
+                    cancellation.Cancel()
+
+                    let! result =
+                        harness.Factory.Clone
+                            {
+                                Location = anchor.Binding.Location
+                                TargetPath = targetPath
+                                TargetRef = None
+                                MaterializeAllObjects = true
+                            }
+                            (OperationContext.create "pre-canceled-clone" cancellation.Cancellation ignore)
+                        |> Async.StartAsPromise
+
+                    match result with
+                    | Failed failure ->
+                        Vitest.expect(failure.Category).toEqual FailureCategory.Canceled
+                        Vitest.expect(failure.Code).toBe "operation_canceled"
+                        Vitest.expect(failure.StateChanged).toBe false
+                    | Succeeded _
+                    | PartiallySucceeded _ ->
+                        failwith "A pre-canceled lakeFS clone unexpectedly succeeded."
+
+                    Vitest.expect(RuntimeNodeFileSystem.existsSync targetPath).toBe(false)
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+)
+
 let private expectOperationValue operation = function
     | Succeeded outcome -> outcome.Value
     | PartiallySucceeded(_, failure)

@@ -1360,8 +1360,10 @@ module FakeHarness =
                     return OperationResult.succeeded (bindingFor request.TargetPath location)
                 }
             Clone =
-                fun request _ -> async {
-                    if workspacesByRoot.ContainsKey request.TargetPath then
+                fun request context -> async {
+                    if context.Cancellation.IsCancellationRequested() then
+                        return OperationResult.canceled "The clone was canceled before it started."
+                    elif workspacesByRoot.ContainsKey request.TargetPath then
                         return
                             OperationResult.failed (
                                 OperationFailure.create

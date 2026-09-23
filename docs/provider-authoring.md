@@ -12,6 +12,7 @@ Hosts that spawn git beside the library can use `GitExecution.resolvedEnvironmen
 - `VerifyLocation` checks explicit access intents against a repository location.
 - `Initialize` creates provider state in place and preserves existing user files.
 - `Clone` requires a missing or empty destination.
+- A clone canceled before it completes rolls back and returns `Canceled`, and a pre-existing empty target stays empty. A clone that finished before the cancellation took effect succeeds. A download failure that is not a cancellation returns `PartiallySucceeded` with `retry_materialization`.
 - `Adopt` derives a binding from an existing provider-owned workspace without cloning. Return an `Unsupported` failure if the provider cannot do that safely.
 - `Bind` attaches or retargets an existing local workspace without cloning.
 - `Open` creates one session for one persisted binding.
