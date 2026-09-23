@@ -211,16 +211,19 @@ The four resolutions and what a host does with each:
 | `AmbiguousWorkspace` | Several providers claim the same root. | Ask which one. Registration order is not a tie-breaker. |
 | `UnmanagedWorkspace` | No provider claims it, or the stored binding named a provider the catalog does not hold. | Read the diagnostics before treating it as a fresh directory. Then offer `Initialize` or `Clone`. |
 
-A failing probe never breaks resolution. The failure becomes data in
-`report.Diagnostics`, which collects four kinds: a probe that threw, `probe_invalid` from
-a probe that reported an invalid workspace, `probe_root_outside_workspace` when a probe
-claimed a root that does not own the path, and `provider_not_registered` when a stored
-binding names a provider the catalog does not hold.
+A probe never breaks resolution, and neither does a binding the catalog cannot serve. Both
+become data in `report.Diagnostics`. A probe contributes its own failure when it returns
+`ProbeFailed`, `probe_exception` when it throws, `probe_invalid` when it reports an invalid
+workspace, and `probe_root_outside_workspace` when it claims a root that does not own the
+path. The binding path contributes `provider_not_registered` when a stored binding names a
+provider the catalog does not hold. Only the `ProbeFailed` entry carries a provider's own
+code, so treat that one by its category.
 
-That last one matters. A workspace whose provider was dropped from the catalog resolves
-as `UnmanagedWorkspace` with a `provider_not_registered` diagnostic, and it is a managed
-workspace, not an empty directory. A host that offers `Initialize` on it without reading
-the diagnostics is offering to initialize over someone's repository.
+The `provider_not_registered` case is the one to handle first. A workspace whose provider
+was dropped from the catalog resolves as `UnmanagedWorkspace` carrying that diagnostic,
+and it is still a managed workspace holding someone's history. A host that offers
+`Initialize` on it without reading the diagnostics is offering to initialize over a
+repository.
 
 Persist the binding `Adopt` returned, keyed by the normalized workspace root, and give it
 back unchanged on the next open. Details are in
