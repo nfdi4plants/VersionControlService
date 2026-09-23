@@ -824,8 +824,9 @@ last changed the file.
 Picking a candidate with no preview and no stored object resolves the item by deleting the file.
 A pick of a stored object whose bytes are not local succeeds with the warning
 `object_not_materialized`. A pick whose local materialization fails returns `PartiallySucceeded`
-with `object_materialization_failed` and `retry_materialization`. Git refuses to materialize a path
-while the merge is open, so the host materializes such paths after `Finalize`.
+with `object_materialization_failed` and `retry_materialization`. Git's Materialize refuses a path
+that has an uncommitted change, which every picked path has until Finalize, so the host materializes
+such paths after `Finalize`.
 
 ## Cancellation and progress
 

@@ -1994,57 +1994,58 @@ let private restorePaths (state: SessionState) (request: RestoreRequest) (contex
             return OperationResult.validationFailed "no_paths_selected" "Select at least one path."
         else
             let runner = conflictRunner state context
-            let unmergedRequestedPaths = ResizeArray<string>()
-            let mutable listingFailure: OperationFailure option = None
+            let requestedPaths = request.Paths |> Array.map RepositoryPath.value
 
-            for path in request.Paths do
-                if listingFailure.IsNone then
-                    let pathValue = RepositoryPath.value path
+            // ls-files has no pathspec-from-file option. Listing every unmerged entry once
+            // stays cheap, because a merge leaves few of them. A request covers an unmerged
+            // entry when it names the entry or a directory above it.
+            let! result = runner [| "ls-files"; "-u"; "-z" |] None
 
-                    let! result =
-                        runner
-                            [|
-                                "ls-files"
-                                "-u"
-                                "-z"
-                                "--"
-                                GitPathTransport.literalPathspec path
-                            |]
+            match result with
+            | Error failure -> return Failed failure
+            | Ok output when output.ExitCode <> 0 ->
+                return
+                    Failed(
+                        OperationFailure.createRedacted
+                            ProviderError
+                            "git_failure"
+                            $"Checking unmerged paths failed: {output.StdErr}"
+                        |> fun failure -> { failure with AffectedPaths = requestedPaths }
+                    )
+            | Ok output ->
+                let unmergedPathSet =
+                    output.StdOut.Split('\000', StringSplitOptions.RemoveEmptyEntries)
+                    |> Array.choose (fun entry ->
+                        let separatorIndex = entry.IndexOf('\t')
+
+                        if separatorIndex < 0 then
                             None
+                        else
+                            Some(entry.Substring(separatorIndex + 1)))
+                    |> Set.ofArray
+
+                let coversUnmerged (requested: string) =
+                    unmergedPathSet
+                    |> Set.exists (fun unmerged ->
+                        unmerged = requested || unmerged.StartsWith(requested.TrimEnd('/') + "/", StringComparison.Ordinal))
+
+                let unmergedRequestedPaths = requestedPaths |> Array.filter coversUnmerged
+
+                if unmergedRequestedPaths.Length > 0 then
+                    return
+                        Failed {
+                            OperationFailure.create
+                                Validation
+                                "restore_unmerged_paths"
+                                "Resolve or abandon the merge before discarding changes to conflicted files." with
+                                AffectedPaths = unmergedRequestedPaths
+                        }
+                else
+                    let! result = awaitGit (GitService.discardPaths state.RepoPath requestedPaths)
 
                     match result with
-                    | Error failure -> listingFailure <- Some failure
-                    | Ok output when output.ExitCode <> 0 ->
-                        listingFailure <-
-                            Some(
-                                OperationFailure.createRedacted
-                                    ProviderError
-                                    "git_failure"
-                                    $"Checking unmerged path '{pathValue}' failed: {output.StdErr}"
-                                |> fun failure -> { failure with AffectedPaths = [| pathValue |] }
-                            )
-                    | Ok output when not (String.IsNullOrEmpty output.StdOut) ->
-                        unmergedRequestedPaths.Add pathValue
-                    | Ok _ -> ()
-
-            match listingFailure with
-            | Some failure -> return Failed failure
-            | None when unmergedRequestedPaths.Count > 0 ->
-                return
-                    Failed {
-                        OperationFailure.create
-                            Validation
-                            "restore_unmerged_paths"
-                            "Resolve or abandon the merge before discarding changes to conflicted files." with
-                            AffectedPaths = unmergedRequestedPaths.ToArray()
-                    }
-            | None ->
-                let requestedPaths = request.Paths |> Array.map RepositoryPath.value
-                let! result = awaitGit (GitService.discardPaths state.RepoPath requestedPaths)
-
-                match result with
-                | Error failure -> return Failed failure
-                | Ok() -> return OperationResult.succeeded ()
+                    | Error failure -> return Failed failure
+                    | Ok() -> return OperationResult.succeeded ()
     }
 
 let private listRefs (state: SessionState) (context: OperationContext) =
