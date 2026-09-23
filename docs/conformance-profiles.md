@@ -23,6 +23,7 @@ The consumer workflow profile is not an application-specific layer. It combines 
 Restore .NET tools and JavaScript dependencies once:
 
 ```console
+dotnet tool restore
 dotnet restore VersionControlService.slnx
 npm ci
 ```

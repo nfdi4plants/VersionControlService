@@ -7,10 +7,15 @@ VersionControlService defines portable version-control workspace contracts for F
 The packages are not on nuget.org yet. Build the five coordinated packages into a local feed and restore from there:
 
 ```console
+dotnet restore VersionControlService.slnx
 dotnet run --project build/Build.fsproj -- pack --version=0.0.1-local --output=<feed-dir>
 dotnet nuget add source <feed-dir> --name vcs-local
 dotnet add package VersionControlService --version 0.0.1-local
 ```
+
+Run the pack from the repository root. It packs with `--no-restore`, so the restore above is
+what makes it work on a fresh clone, and it resolves the repository root from the current
+directory.
 
 The umbrella package is dependency-only and carries the public abstractions, the Node runtime, the Git provider, and the lakeFS provider at one coordinated version. An external provider that does not need the built-in implementations can reference `VersionControlService.Abstractions` alone. Once the packages are published, `dotnet add package VersionControlService --prerelease` replaces the three commands above.
 
