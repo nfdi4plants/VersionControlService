@@ -65,6 +65,7 @@ See:
 ## Build and test
 
 ```console
+dotnet tool restore
 dotnet restore VersionControlService.slnx
 npm ci
 dotnet build VersionControlService.slnx --no-restore -c Release

@@ -13,9 +13,13 @@
 Set up the repository before running a matrix row:
 
 ```console
+dotnet tool restore
 dotnet restore VersionControlService.slnx
 npm ci
 ```
+
+`dotnet tool restore` installs the pinned Fable, Femto and Fantomas tools from
+`.config/dotnet-tools.json`. Every row below that compiles with Fable needs it first.
 
 Docker is required only for the live lakeFS row.
 

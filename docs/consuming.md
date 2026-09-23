@@ -9,7 +9,8 @@ Writing a provider is a different job, covered in [provider authoring](provider-
 
 ## What the host owns
 
-The library has no settings store, no credential store and no UI state of its own. The host keeps:
+The library stores nothing of its own. There is no settings store, no credential store, no
+UI state, and no registry of known workspaces. The host keeps:
 
 - the bindings, one for each workspace root it manages
 - the credentials, behind a strategy the factory calls when it needs one
@@ -210,9 +211,9 @@ The four resolutions and what a host does with each:
 | `AmbiguousWorkspace` | Several providers claim the same root. | Ask which one. Registration order is not a tie-breaker. |
 | `UnmanagedWorkspace` | No provider claims it, or the stored binding named a provider the catalog does not hold. | Read the diagnostics before treating it as a fresh directory. Then offer `Initialize` or `Clone`. |
 
-`report.Diagnostics` carries structured failures that resolution collected instead of
-throwing. A probe that failed or threw appears there, as does `probe_invalid` from a
-probe that reported an invalid workspace, `probe_root_outside_workspace` when a probe
+A failing probe never breaks resolution. The failure becomes data in
+`report.Diagnostics`, which collects four kinds: a probe that threw, `probe_invalid` from
+a probe that reported an invalid workspace, `probe_root_outside_workspace` when a probe
 claimed a root that does not own the path, and `provider_not_registered` when a stored
 binding names a provider the catalog does not hold.
 
@@ -523,8 +524,8 @@ workspace content. `PreviewUpdate` reports what an update would change. `Update`
 workspace needs, and the publish of its revisions as one operation under the provider's
 lock.
 
-Prefer `Synchronize` for a button that means "bring me up to date". It refuses rather
-than guessing, and the refusal says what the host has to ask the user:
+Prefer `Synchronize` for a button that means "bring me up to date". It refuses when it cannot
+decide safely, and the refusal says what the host has to ask the user:
 
 ```fsharp
 let synchronize
@@ -708,9 +709,15 @@ A Fable host also needs the npm side and a Fable compile step:
 
 ```console
 npm install simple-git @fable-org/fable-library-js
-dotnet fable YourApp.fsproj --outDir output
+dotnet new tool-manifest
+dotnet tool install fable
+dotnet tool run fable YourApp.fsproj --outDir output
 node output/App.js
 ```
+
+Fable is a dotnet tool, so a consumer needs its own manifest. This repository pins fable
+5.5.0 in `.config/dotnet-tools.json` and CI runs `dotnet tool restore` before any target
+that compiles with it, which is why the command works here without the install step.
 
 The Git provider shells out to the real tools on top of that. It wants Git 2.38 or newer,
 because it uses `merge-tree --write-tree`, and Git LFS 3.7 or newer. `CheckDependencies`
