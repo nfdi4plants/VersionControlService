@@ -20,6 +20,7 @@
     <Compile Include="Git\GitService.fs" />
     <Compile Include="Git\GitProvisioningService.fs" />
     <Compile Include="GitRefs.fs" />
+    <Compile Include="GitLfsObjects.fs" />
     <Compile Include="GitConflictSession.fs" />
     <Compile Include="GitLfsExtensions.fs" />
     <Compile Include="GitSelectedRevision.fs" />

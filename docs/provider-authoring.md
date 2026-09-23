@@ -74,6 +74,8 @@ Everything outside an opened session (`Probe`, `VerifyLocation`, `Initialize`, `
 
 The conflict service keeps handle validation and each mutation under the session lock. Read operations leave the lock available for status and session inspection. A successful resolution writes the worktree content and stages it before the handle rotates. The service reads the refreshed summary after rotation. A failure after the worktree write reports `StateChanged = true` with `refresh_conflict_session`. A write failure reports `file_write_failed` with `StateChanged = true` and `refresh_conflict_session` because the write can truncate the file before it fails.
 
+Candidates carry `Object` when their content is a separately stored object. Git fills `Object` for LFS pointers with their size and object id. It also reports whether each object is in local LFS storage. Git marks those items pick-only with `SupportsResolvedContent = false`. The pointer text is available for comparison and cannot be supplied back as edited content. A pick stages the exact candidate blob and materializes a stored object from local storage when available. Git does not download during that pick. lakeFS returns `Object = None` and resolves binary items by picking as before.
+
 Codes the conflict service reports, shared by the providers unless a provider is named:
 
 | Code | Category | Recovery | Meaning |
@@ -87,6 +89,9 @@ Codes the conflict service reports, shared by the providers unless a provider is
 | `symlink_not_supported` | `Validation` | None | A candidate or workspace file is not a regular file, or the path changed while it was being read (lakeFS). |
 | `conflicts_unresolved` | `Validation` | None | Finalize was called while items remain unresolved. The affected paths name them. |
 | `detached_head` | `Validation` | None | Finalize needs a current branch (Git). |
+| `object_not_materialized` | (warning) | None | A successful Git pick left the file as a pointer because its object is not in local storage. |
+| `object_materialization_failed` | `ProviderError` | `retry_materialization` | Git staged the pick, then failed to materialize its object. The operation returns partial success. |
+| `restore_unmerged_paths` | `Validation` | None | Git RestorePaths was asked to discard a conflicted path. |
 
 Finalize checks whether HEAD already has the recorded merge target as a parent and whether the index tree equals the tree of HEAD. When both hold, it cleans up the Git merge state and closes the session without a second commit. A re-resolution after the commit changes the index, so Finalize commits it. A ref-update failure is inspected on the branch ref before the provider reports it. A cleanup failure keeps the session open and returns `inspect_workspace` with the state-file path.
 

@@ -1,0 +1,142 @@
+module internal VersionControlService.Git.GitLfsObjects
+
+open System
+open VersionControlService.Abstractions
+
+module NodeProcess = VersionControlService.Runtime.Node.Process
+module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
+module NodePath = VersionControlService.Runtime.Node.Path
+
+type internal LfsPointerInfo = {
+    Oid: string
+    SizeInBytes: float
+}
+
+/// Parses a validated Git LFS pointer and returns its content identity and size.
+let internal tryParseLfsPointer (pointerText: string) =
+    let lines =
+        pointerText.Replace("\r\n", "\n").Split('\n', StringSplitOptions.RemoveEmptyEntries)
+        |> Array.map _.Trim()
+        |> Array.filter (String.IsNullOrWhiteSpace >> not)
+
+    let oid =
+        lines
+        |> Array.tryPick (fun line ->
+            let prefix = "oid sha256:"
+
+            if line.StartsWith(prefix, StringComparison.Ordinal) && line.Length = prefix.Length + 64 then
+                let value = line.Substring(prefix.Length)
+
+                if value |> Seq.forall (fun character -> Char.IsDigit character || ('a' <= character && character <= 'f')) then
+                    Some value
+                else
+                    None
+            else
+                None)
+
+    let size =
+        lines
+        |> Array.tryPick (fun line ->
+            let prefix = "size "
+
+            if line.StartsWith(prefix, StringComparison.Ordinal) then
+                let value = line.Substring(prefix.Length)
+
+                if value.Length > 0 && value |> Seq.forall Char.IsDigit then
+                    match Int64.TryParse value with
+                    | true, parsed when parsed >= 0L -> Some(float parsed)
+                    | _ -> None
+                else
+                    None
+            else
+                None)
+
+    if
+        lines.Length >= 3
+        && lines.[0].Equals("version https://git-lfs.github.com/spec/v1", StringComparison.Ordinal)
+    then
+        match oid, size with
+        | Some oidValue, Some sizeValue ->
+            Some {
+                Oid = oidValue
+                SizeInBytes = sizeValue
+            }
+        | _ -> None
+    else
+        None
+
+let private runCommonDirectoryFallback
+    (runGit: string[] -> Async<Result<NodeProcess.ProcessOutput, OperationFailure>>)
+    (repoPath: string)
+    : Async<Result<string, OperationFailure>> =
+    async {
+        let! result = runGit [| "rev-parse"; "--git-common-dir" |]
+
+        match result with
+        | Error failure -> return Error failure
+        | Ok output when output.ExitCode <> 0 ->
+            return
+                Error(
+                    OperationFailure.createRedacted
+                        ProviderError
+                        "git_failure"
+                        $"Resolving Git common directory failed: {output.StdErr}"
+                )
+        | Ok output ->
+            let commonDirectory = output.StdOut.Trim()
+
+            if String.IsNullOrWhiteSpace commonDirectory then
+                return
+                    Error(
+                        OperationFailure.createRedacted
+                            ProviderError
+                            "invalid_git_output"
+                            "Git returned an empty common directory."
+                    )
+            else
+                let absoluteCommonDirectory =
+                    if NodePath.isAbsolute commonDirectory then commonDirectory else NodePath.resolve [| repoPath; commonDirectory |]
+
+                return Ok(NodePath.join [| absoluteCommonDirectory; "lfs"; "objects" |])
+    }
+
+/// Resolves Git LFS media storage, falling back to the repository's common Git directory.
+let resolveLocalMediaDirectory
+    (runGit: string[] -> Async<Result<NodeProcess.ProcessOutput, OperationFailure>>)
+    (repoPath: string)
+    : Async<Result<string, OperationFailure>> =
+    async {
+        let! lfsEnvironment = runGit [| "lfs"; "env" |]
+
+        let localMediaDirectory =
+            match lfsEnvironment with
+            | Ok output when output.ExitCode = 0 ->
+                output.StdOut.Split '\n'
+                |> Array.tryPick (fun line ->
+                    let trimmed = line.TrimEnd '\r'
+                    let prefix = "LocalMediaDir="
+
+                    if trimmed.StartsWith(prefix, StringComparison.Ordinal) then
+                        Some(trimmed.Substring(prefix.Length).Trim())
+                    else
+                        None)
+            | _ -> None
+
+        match localMediaDirectory with
+        | Some directory when not (String.IsNullOrWhiteSpace directory) ->
+            return Ok(if NodePath.isAbsolute directory then directory else NodePath.resolve [| repoPath; directory |])
+        | _ -> return! runCommonDirectoryFallback runGit repoPath
+    }
+
+/// Builds the content-addressed Git LFS object path for a SHA-256 identity.
+let objectPath (mediaDirectory: string) (oid: string) =
+    NodePath.join [| mediaDirectory; oid.Substring(0, 2); oid.Substring(2, 2); oid |]
+
+/// Checks for a regular local LFS object file with the expected size.
+let isObjectLocallyAvailable (mediaDirectory: string) (oid: string) (sizeBytes: float) : bool =
+    try
+        match NodeFileSystem.tryLstatSync (objectPath mediaDirectory oid) with
+        | Some stats -> stats.isFile () && stats.size = sizeBytes
+        | None -> false
+    with _ ->
+        false

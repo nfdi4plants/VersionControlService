@@ -87,6 +87,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 Vitest.expect(RepositoryPath.value item.Path).toBe ("base.txt")
                 Vitest.expect(item.Candidates.Length >= 2).toBe (true)
                 Vitest.expect(item.SupportsResolvedContent).toBe (true)
+                Vitest.expect(item.Candidates |> Array.forall (fun candidate -> Option.isNone candidate.Object)).toBe (true)
 
                 let candidateIds = item.Candidates |> Array.map _.CandidateId
                 Vitest.expect(candidateIds |> Array.contains "workspace").toBe (true)

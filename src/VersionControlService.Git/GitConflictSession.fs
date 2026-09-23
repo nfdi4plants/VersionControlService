@@ -10,6 +10,7 @@ module NodeProcess = VersionControlService.Runtime.Node.Process
 type GitRunner = string[] -> string option -> Async<Result<NodeProcess.ProcessOutput, OperationFailure>>
 type StagePreviewReader = int -> string -> Async<Result<ConflictPreview option, OperationFailure>>
 type CombinedPreviewReader = string -> Async<Result<ConflictPreview option, OperationFailure>>
+type StagePointerReader = int -> string -> Async<Result<ConflictCandidateObject option, OperationFailure>>
 
 /// Stale, foreign, or closed handles are rejected before provider state changes.
 let handleRejection () =
@@ -55,6 +56,7 @@ let listUnmergedPaths (runGit: GitRunner) : Async<Result<string[], OperationFail
 let buildConflictItems
     (readStagePreview: StagePreviewReader)
     (readCombinedPreview: CombinedPreviewReader)
+    (readStagePointer: StagePointerReader)
     (mergeHeadRevision: RevisionId option)
     (unmergedPaths: string[])
     : Async<Result<ConflictItem[], OperationFailure>> =
@@ -71,13 +73,27 @@ let buildConflictItems
                 let! workspacePreviewResult = readStagePreview 2 pathValue
                 let! targetPreviewResult = readStagePreview 3 pathValue
                 let! combinedPreviewResult = readCombinedPreview pathValue
+                let! basePointerResult = readStagePointer 1 pathValue
+                let! workspacePointerResult = readStagePointer 2 pathValue
+                let! targetPointerResult = readStagePointer 3 pathValue
 
-                match basePreviewResult, workspacePreviewResult, targetPreviewResult, combinedPreviewResult with
-                | Error failure, _, _, _
-                | _, Error failure, _, _
-                | _, _, Error failure, _
-                | _, _, _, Error failure -> previewFailure <- Some failure
-                | Ok basePreview, Ok workspacePreview, Ok targetPreview, Ok combinedPreview ->
+                match
+                    basePreviewResult,
+                    workspacePreviewResult,
+                    targetPreviewResult,
+                    combinedPreviewResult,
+                    basePointerResult,
+                    workspacePointerResult,
+                    targetPointerResult
+                with
+                | Error failure, _, _, _, _, _, _
+                | _, Error failure, _, _, _, _, _
+                | _, _, Error failure, _, _, _, _
+                | _, _, _, Error failure, _, _, _
+                | _, _, _, _, Error failure, _, _
+                | _, _, _, _, _, Error failure, _
+                | _, _, _, _, _, _, Error failure -> previewFailure <- Some failure
+                | Ok basePreview, Ok workspacePreview, Ok targetPreview, Ok combinedPreview, Ok basePointer, Ok workspacePointer, Ok targetPointer ->
                     let isUnsupported = function
                         | Some(UnsupportedPreview _) -> true
                         | _ -> false
@@ -88,6 +104,11 @@ let buildConflictItems
                         || isUnsupported targetPreview
                         || isUnsupported combinedPreview
 
+                    let anyObject =
+                        Option.isSome basePointer
+                        || Option.isSome workspacePointer
+                        || Option.isSome targetPointer
+
                     items.Add {
                         Path = path
                         Candidates = [|
@@ -96,12 +117,14 @@ let buildConflictItems
                                 Label = "Workspace version"
                                 Revision = None
                                 Preview = workspacePreview
+                                Object = workspacePointer
                             }
                             {
                                 CandidateId = "target"
                                 Label = "Target version"
                                 Revision = mergeHeadRevision
                                 Preview = targetPreview
+                                Object = targetPointer
                             }
                             yield!
                                 match basePreview with
@@ -112,12 +135,13 @@ let buildConflictItems
                                             Label = "Base version"
                                             Revision = None
                                             Preview = Some preview
+                                            Object = basePointer
                                         }
                                     |]
                                 | None -> [||]
                         |]
                         CombinedPreview = combinedPreview
-                        SupportsResolvedContent = not requiresManualResolution
+                        SupportsResolvedContent = not requiresManualResolution && not anyObject
                     }
 
         match previewFailure with

@@ -803,6 +803,11 @@ Supply merged text with `SupplyResolvedContent`, and only when the item's
 revision it created, which is `None` when the provider closed the session without needing
 a second commit. `Cancel` abandons the session. Both close the handle.
 
+When `SupportsResolvedContent` is false, offer a choice between candidates and call `PickCandidate`.
+Use `Object` to show a stored object's size and download state. Use `Revision` for the candidate's
+source revision, which identifies the revision it came from and may differ from the revision that
+last changed the file.
+
 ## Cancellation and progress
 
 Every operation takes an `OperationContext`. `OperationContext.detached` is enough for a

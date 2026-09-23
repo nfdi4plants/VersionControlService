@@ -398,12 +398,14 @@ module FakeHarness =
                             Label = "Workspace version"
                             Revision = None
                             Preview = Some(TextPreview item.OursContent)
+                            Object = None
                         }
                         {
                             CandidateId = "target"
                             Label = "Target version"
                             Revision = Some(mkRevisionId session.TheirRevisionId)
                             Preview = Some(TextPreview item.TheirsContent)
+                            Object = None
                         }
                         yield!
                             match item.BaseContent with
@@ -414,6 +416,7 @@ module FakeHarness =
                                         Label = "Base version"
                                         Revision = None
                                         Preview = Some(TextPreview baseContent)
+                                        Object = None
                                     }
                                 |]
                             | None -> [||]

@@ -79,69 +79,12 @@ type private SelectedLfsPlan = {
     AttributesOriginalContent: string
 }
 
-type private LfsPointerInfo = {
-    Oid: string
-    SizeInBytes: float
-}
-
 type private SelectedPathPolicy = {
     Path: string
     SizeInBytes: float
     IsLfsPointer: bool
     Policy: RevisionPathPolicy
 }
-
-let private tryParseLfsPointer (pointerText: string) =
-    let lines =
-        pointerText.Replace("\r\n", "\n").Split('\n', StringSplitOptions.RemoveEmptyEntries)
-        |> Array.map _.Trim()
-        |> Array.filter (String.IsNullOrWhiteSpace >> not)
-
-    let oid =
-        lines
-        |> Array.tryPick (fun line ->
-            let prefix = "oid sha256:"
-
-            if line.StartsWith(prefix, StringComparison.Ordinal) && line.Length = prefix.Length + 64 then
-                let value = line.Substring(prefix.Length)
-
-                if value |> Seq.forall (fun character -> Char.IsDigit character || ('a' <= character && character <= 'f')) then
-                    Some value
-                else
-                    None
-            else
-                None)
-
-    let size =
-        lines
-        |> Array.tryPick (fun line ->
-            let prefix = "size "
-
-            if line.StartsWith(prefix, StringComparison.Ordinal) then
-                let value = line.Substring(prefix.Length)
-
-                if value.Length > 0 && value |> Seq.forall Char.IsDigit then
-                    match Int64.TryParse value with
-                    | true, parsed when parsed >= 0L -> Some(float parsed)
-                    | _ -> None
-                else
-                    None
-            else
-                None)
-
-    if
-        lines.Length >= 3
-        && lines.[0].Equals("version https://git-lfs.github.com/spec/v1", StringComparison.Ordinal)
-    then
-        match oid, size with
-        | Some oidValue, Some sizeValue ->
-            Some {
-                Oid = oidValue
-                SizeInBytes = sizeValue
-            }
-        | _ -> None
-    else
-        None
 
 let private readLfsPointerProbe (path: string) (knownStats: NodeFileSystem.Stats option) =
     if knownStats |> Option.exists (fun stats -> stats.size > maxLfsPointerProbeBytes) then
@@ -268,7 +211,7 @@ let private resolveSelectedPathPolicies
                                 let absolutePath = NodePath.join [| repoPath; candidate |]
                                 Ok(
                                     readLfsPointerProbe absolutePath (Some fileStats)
-                                    |> Option.bind tryParseLfsPointer
+                                    |> Option.bind GitLfsObjects.tryParseLfsPointer
                                 )
                             with error ->
                                 Error(selectedFileStatFailure candidate error)
@@ -661,7 +604,7 @@ let private checkSelectedMetadata
     }
 
 let private tryPointerOid (pointerText: string) =
-    tryParseLfsPointer pointerText |> Option.map _.Oid
+    GitLfsObjects.tryParseLfsPointer pointerText |> Option.map _.Oid
 
 let private hashTextBlob (runGit: GitRunner) (content: string) =
     async {
@@ -704,7 +647,7 @@ let private prepareLfsPointerBlob
 
             match sourceContentResult with
             | Error failure -> return Error failure
-            | Ok(Some sourceContent) when tryParseLfsPointer sourceContent |> Option.isSome ->
+            | Ok(Some sourceContent) when GitLfsObjects.tryParseLfsPointer sourceContent |> Option.isSome ->
                 return! hashTextBlob runGit sourceContent
             // git-lfs stores an empty file as empty content (its clean filter writes no pointer),
             // so the empty blob is what git add would produce.

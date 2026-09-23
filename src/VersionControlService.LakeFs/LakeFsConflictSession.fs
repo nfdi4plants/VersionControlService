@@ -100,12 +100,14 @@ let summary
                                 Label = "Workspace version"
                                 Revision = workspaceRevision
                                 Preview = item.WorkspaceContent |> Option.map _.Preview
+                                Object = None
                             }
                             {
                                 CandidateId = "target"
                                 Label = "Target version"
                                 Revision = Some(revisionId active.TargetRevisionAtOpen)
                                 Preview = item.TargetContent |> Option.map _.Preview
+                                Object = None
                             }
                             yield!
                                 match item.BaseContent with
@@ -116,6 +118,7 @@ let summary
                                             Label = "Base version"
                                             Revision = baseRevision
                                             Preview = Some baseContent.Preview
+                                            Object = None
                                         }
                                     |]
                                 | None -> [||]

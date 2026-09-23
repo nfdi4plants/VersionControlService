@@ -12,11 +12,22 @@ type ConflictPreview =
     | TextPreview of content: string
     | UnsupportedPreview of reason: string option
 
+/// The stored object behind a conflict candidate, for content a provider keeps outside the ordinary file history (a Git LFS object, say). Consumers render it without a download.
+type ConflictCandidateObject = {
+    SizeBytes: float option
+    /// Content identity, such as an LFS object id. Not a revision.
+    ObjectId: string option
+    /// Whether the object's bytes are in provider-local storage, observed when the summary was read.
+    IsLocallyAvailable: bool
+}
+
 type ConflictCandidate = {
     CandidateId: string
     Label: string
     Revision: RevisionId option
     Preview: ConflictPreview option
+    /// Some when the candidate's content is a separately stored object. None when the provider advertises no such object for it.
+    Object: ConflictCandidateObject option
 }
 
 type ConflictItem = {
@@ -24,7 +35,7 @@ type ConflictItem = {
     Candidates: ConflictCandidate[]
     /// Provider-owned combined representation, e.g. Git conflict-marker text.
     CombinedPreview: ConflictPreview option
-    /// True when the provider accepts caller-supplied resolved content for this item.
+    /// True when the provider accepts caller-supplied resolved content. False for items whose candidates include a stored object, which are resolved by picking a candidate.
     SupportsResolvedContent: bool
 }
 
