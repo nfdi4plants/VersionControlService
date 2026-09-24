@@ -950,7 +950,7 @@ let storagePruneArgs = [|
     "lfs"
     "prune"
     "--verify-remote"
-    "--verify-unreachable"
+    "--no-verify-unreachable"
     "--when-unverified=halt"
 |]
 

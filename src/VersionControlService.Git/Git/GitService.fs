@@ -2282,7 +2282,7 @@ let downloadLfsFile
 }
 
 /// Discards validated pathspecs by restoring tracked paths from HEAD and cleaning selected untracked files.
-let discardPaths (arcPath: string) (pathSpecs: string[]) : JS.Promise<GitResult<unit>> = promise {
+let discardPaths (arcPath: string) (pathSpecs: string[]) : JS.Promise<GitResult<string[]>> = promise {
     match validatePathspecs pathSpecs with
     | Error validationError -> return errorResult validationError
     | Ok safePathSpecs ->
@@ -2293,6 +2293,7 @@ let discardPaths (arcPath: string) (pathSpecs: string[]) : JS.Promise<GitResult<
                     let! status = git.status ()
                     let discardPathSpecs = discardPathspecsWithOriginals arcPath status safePathSpecs
                     let! hasHead = hasHeadCommit git
+                    let mutable restoredHeadPaths = [||]
 
                     if hasHead then
                         let! resetResult =
@@ -2304,6 +2305,7 @@ let discardPaths (arcPath: string) (pathSpecs: string[]) : JS.Promise<GitResult<
                         | Error failure -> return abortGitPromise failure.Message
                         | Ok _ ->
                             let! headPaths = headPathsForPathspecs git discardPathSpecs
+                            restoredHeadPaths <- headPaths
 
                             if headPaths.Length > 0 then
                                 let restoreGit = applyLfsSkipSmudge git
@@ -2341,7 +2343,7 @@ let discardPaths (arcPath: string) (pathSpecs: string[]) : JS.Promise<GitResult<
 
                     match cleanResult with
                     | Error failure -> return abortGitPromise failure.Message
-                    | Ok _ -> return ()
+                    | Ok _ -> return restoredHeadPaths
                 })
 }
 

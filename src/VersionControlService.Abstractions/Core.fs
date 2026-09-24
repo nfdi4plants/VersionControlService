@@ -81,6 +81,8 @@ type CoreVersionControl = {
     SwitchRef: SwitchRefRequest -> OperationContext -> Async<OperationResult<WorkspaceStatus>>
     /// Creates a revision from exact selected paths and an expected workspace version.
     CreateRevision: CreateRevisionRequest -> OperationContext -> Async<OperationResult<RevisionId>>
+    /// Restores the paths to their base revision. A path whose object is available locally stays
+    /// materialized.
     RestorePaths: RestoreRequest -> OperationContext -> Async<OperationResult<unit>>
     GetDiffSummary: OperationContext -> Async<OperationResult<DiffSummary>>
 }

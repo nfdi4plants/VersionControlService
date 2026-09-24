@@ -872,6 +872,8 @@ Vitest.describe (
 
                     let! commitIdentity = runGitIn workPath [| "log"; "-1"; "--format=%an;%ae;%cn;%ce" |]
                     Vitest.expect(commitIdentity.Trim()).toBe "Merge Author;merge@example.org;Merge Author;merge@example.org"
+                    let! commitSubject = runGitIn workPath [| "log"; "-1"; "--format=%s" |]
+                    Vitest.expect(commitSubject.Trim()).toBe "Merge online changes"
                     do! removeDirectoryAsync root
                 with error ->
                     do! removeDirectoryAsync root
@@ -3839,13 +3841,15 @@ Vitest.describe (
                                 {
                                     Handle = liveSummary.Handle
                                     ExpectedWorkspaceVersion = retryStatus.WorkspaceVersion
-                                    Message = Some "finalize after refresh"
+                                    Message = None
                                 }
                                 (ctx "retry-finalize")
                         )
 
                     let mergedRevision = expectValue "verified finalize" retryFinalize
                     Vitest.expect(mergedRevision.IsSome).toBe (true)
+                    let! commitSubject = runGitIn workPath [| "log"; "-1"; "--format=%s" |]
+                    Vitest.expect(commitSubject.Trim()).toBe "Merge online changes"
 
                     // The session is closed: replaying finalize is rejected without mutation.
                     let! closedSession = Async.StartAsPromise(conflicts.GetActiveSession(ctx "closed-session"))

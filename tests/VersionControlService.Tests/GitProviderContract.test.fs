@@ -3733,6 +3733,43 @@ let private createLfsBaseContentFixture () = promise {
     return root, repoPath, GitWorkspaceSession.createSession GitWorkspaceSession.GitSessionHooks.none binding
 }
 
+let private createDownloadedLfsRestoreFixture () = promise {
+    let! root = createTempDirectoryAsync ()
+    let barePath = join [| root; "origin.git" |]
+    let sourcePath = join [| root; "source" |]
+    let repoPath = join [| root; "downloaded" |]
+
+    let! _ = runGitIn root [||] [| "init"; "--bare"; "-b"; "main"; barePath |] None
+    let! _ = runGitIn root [||] [| "init"; "-b"; "main"; sourcePath |] None
+    do! configureUser sourcePath
+    let! _ = runGitIn sourcePath [||] [| "lfs"; "install"; "--local" |] None
+    let! _ = runGitIn sourcePath [||] [| "lfs"; "track"; "*.bin" |] None
+    do! writeUtf8FileAsync (join [| sourcePath; "large.bin" |]) "large binary payload\n"
+    let! _ = runGitIn sourcePath [||] [| "add"; "-A" |] None
+    let! _ = runGitIn sourcePath [||] [| "commit"; "-m"; "test: downloaded LFS object" |] None
+    let! _ = runGitIn sourcePath [||] [| "remote"; "add"; "origin"; barePath |] None
+    let! _ = runGitIn sourcePath [||] [| "push"; "-u"; "origin"; "main" |] None
+    let! _ = runGitIn root [||] [| "clone"; barePath; repoPath |] None
+    let! _ = runGitIn repoPath [||] [| "lfs"; "install"; "--local" |] None
+    let! _ = runGitIn repoPath [||] [| "lfs"; "pull"; "origin" |] None
+
+    let binding: WorkspaceBinding = {
+        SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
+        ProviderId = gitProviderId
+        WorkspaceRoot = repoPath
+        ProviderStateRef = None
+        Location = {
+            ProviderId = gitProviderId
+            DisplayName = None
+            ProviderLocation = barePath
+            ConnectionProfileId = None
+        }
+        ConnectionProfileId = None
+    }
+
+    return root, repoPath, GitWorkspaceSession.createSession GitWorkspaceSession.GitSessionHooks.none binding
+}
+
 let private createBaseContentFixture () =
     createBaseContentFixtureWithHooks GitWorkspaceSession.GitSessionHooks.none
 
@@ -4071,6 +4108,90 @@ Vitest.describe (
                     | Some synchronization -> Vitest.expect(synchronization.Relationship).toEqual (NoTarget)
                     | None -> failwith "Expected synchronization information for the adopted local repository."
 
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "Clone and Bind normalize workspace roots to Initialize and Adopt roots",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root = createTempDirectoryAsync ()
+
+                try
+                    let barePath = join [| root; "origin.git" |]
+                    let sourcePath = join [| root; "source" |]
+                    let clonePath = join [| root; "clone" |]
+                    let initializedPath = join [| root; "initialized" |]
+                    let pathWithTrailingForwardSlash (path: string) = path.Replace("\\", "/").TrimEnd('/') + "/"
+
+                    let! _ = runGitIn root [||] [| "init"; "--bare"; "-b"; "main"; barePath |] None
+                    let! _ = runGitIn root [||] [| "init"; "-b"; "main"; sourcePath |] None
+                    do! configureUser sourcePath
+                    do! writeUtf8FileAsync (join [| sourcePath; "base.txt" |]) "base\n"
+                    let! _ = runGitIn sourcePath [||] [| "add"; "-A" |] None
+                    let! _ = runGitIn sourcePath [||] [| "commit"; "-m"; "test: base" |] None
+                    let! _ = runGitIn sourcePath [||] [| "remote"; "add"; "origin"; barePath |] None
+                    let! _ = runGitIn sourcePath [||] [| "push"; "-u"; "origin"; "main" |] None
+
+                    let location = {
+                        ProviderId = gitProviderId
+                        DisplayName = None
+                        ProviderLocation = barePath
+                        ConnectionProfileId = None
+                    }
+
+                    let factory = GitWorkspaceSession.createFactory GitWorkspaceSession.GitSessionHooks.none
+                    let cloneTarget = pathWithTrailingForwardSlash clonePath
+                    let! cloneResult =
+                        factory.Clone
+                            {
+                                Location = location
+                                TargetPath = cloneTarget
+                                TargetRef = None
+                                MaterializeAllObjects = false
+                            }
+                            (OperationContext.detached "normalize-clone-root")
+                        |> Async.StartAsPromise
+
+                    let cloneBinding = expectProviderValue "clone with trailing path separator" cloneResult
+                    let! adoptResult =
+                        factory.Adopt
+                            {
+                                WorkspaceRoot = cloneTarget
+                                ConnectionProfileId = None
+                            }
+                            (OperationContext.detached "normalize-adopt-root")
+                        |> Async.StartAsPromise
+
+                    let adoptedBinding = expectProviderValue "adopt cloned workspace" adoptResult
+                    Vitest.expect(cloneBinding.WorkspaceRoot).toBe adoptedBinding.WorkspaceRoot
+
+                    let! initializeResult =
+                        factory.Initialize
+                            {
+                                TargetPath = initializedPath
+                                Location = None
+                            }
+                            (OperationContext.detached "normalize-initialize-root")
+                        |> Async.StartAsPromise
+
+                    let initializedBinding = expectProviderValue "initialize workspace" initializeResult
+                    let bindTarget = pathWithTrailingForwardSlash initializedPath
+                    let! bindResult =
+                        factory.Bind
+                            {
+                                WorkspaceRoot = bindTarget
+                                Location = location
+                            }
+                            (OperationContext.detached "normalize-bind-root")
+                        |> Async.StartAsPromise
+
+                    let boundBinding = expectProviderValue "bind initialized workspace" bindResult
+                    Vitest.expect(boundBinding.WorkspaceRoot).toBe initializedBinding.WorkspaceRoot
                     do! removeDirectoryAsync root
                 with error ->
                     do! removeDirectoryAsync root
@@ -4524,6 +4645,91 @@ Vitest.describe (
                         | TextContent text -> Vitest.expect(text.StartsWith(lfsPointerPrefix)).toBe true
                         | UnsupportedContent _ -> failwith "Expected the textual LFS pointer base content."
 
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "RestorePaths materializes a downloaded LFS object from the local cache",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGitResultIn "." [| "lfs"; "version" |]
+
+                if lfsProbe.ExitCode <> 0 then
+                    Vitest.expect(true).toBe true
+                else
+                    let! root, repoPath, session = createDownloadedLfsRestoreFixture ()
+
+                    try
+                        do! writeUtf8FileAsync (join [| repoPath; "large.bin" |]) "local edit\n"
+                        let! statusResult =
+                            session.Core.GetStatus(OperationContext.detached "restore-downloaded-lfs-status")
+                            |> Async.StartAsPromise
+
+                        let status = expectProviderValue "status before restoring the LFS file" statusResult
+
+                        let! restoreResult =
+                            session.Core.RestorePaths
+                                {
+                                    Paths = [| repositoryPath "large.bin" |]
+                                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                }
+                                (OperationContext.detached "restore-downloaded-lfs")
+                            |> Async.StartAsPromise
+
+                        expectProviderValue "restore downloaded LFS file" restoreResult |> ignore
+                        let! restored = tryReadUtf8FileAsync (join [| repoPath; "large.bin" |])
+                        Vitest.expect(restored).toEqual (Some "large binary payload\n")
+
+                        let! status = runGitIn repoPath [||] [| "status"; "--porcelain" |] None
+                        Vitest.expect(status.Trim()).toBe ""
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "RestorePaths leaves a pointer when its LFS object is absent locally",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGitResultIn "." [| "lfs"; "version" |]
+
+                if lfsProbe.ExitCode <> 0 then
+                    Vitest.expect(true).toBe true
+                else
+                    let! root, repoPath, session = createDownloadedLfsRestoreFixture ()
+
+                    try
+                        let! pointer = runGitIn repoPath [||] [| "show"; "HEAD:large.bin" |] None
+                        let! lfsEnvironment = runGitIn repoPath [||] [| "lfs"; "env" |] None
+                        let mediaDirectory = lfsMediaDirectoryFromEnvironment lfsEnvironment
+                        let objectId = lfsOidFromPointer pointer
+                        do! removeFileAsync (lfsObjectPath mediaDirectory objectId)
+                        do! writeUtf8FileAsync (join [| repoPath; "large.bin" |]) "local edit\n"
+
+                        let! statusResult =
+                            session.Core.GetStatus(OperationContext.detached "restore-lfs-without-local-object-status")
+                            |> Async.StartAsPromise
+
+                        let status = expectProviderValue "status before restoring the LFS file" statusResult
+
+                        let! restoreResult =
+                            session.Core.RestorePaths
+                                {
+                                    Paths = [| repositoryPath "large.bin" |]
+                                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                }
+                                (OperationContext.detached "restore-lfs-without-local-object")
+                            |> Async.StartAsPromise
+
+                        expectProviderValue "restore LFS path without a local object" restoreResult |> ignore
+                        let! restored = tryReadUtf8FileAsync (join [| repoPath; "large.bin" |])
+                        Vitest.expect(restored |> Option.exists (fun content -> content.StartsWith lfsPointerPrefix)).toBe true
                         do! removeDirectoryAsync root
                     with error ->
                         do! removeDirectoryAsync root

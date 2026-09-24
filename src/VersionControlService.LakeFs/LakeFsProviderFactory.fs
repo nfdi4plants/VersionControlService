@@ -56,7 +56,7 @@ let private bindingFor
     |> Result.map (fun state -> {
         SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
         ProviderId = lakeFsProviderId
-        WorkspaceRoot = workspaceRoot
+        WorkspaceRoot = NodePath.normalizeWorkspaceRoot workspaceRoot
         ProviderStateRef = Some state.StateId
         Location = {
             location with

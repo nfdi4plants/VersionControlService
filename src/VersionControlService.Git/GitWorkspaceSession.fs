@@ -125,6 +125,11 @@ let private materializationRecovery (failure: OperationFailure) : RecoveryAction
         )
 }
 
+let private localMaterializationRecovery () : RecoveryAction = {
+    Code = "retry_materialization"
+    Instructions = Some "Materialize the path again to replace the pointer with the object's content."
+}
+
 let private awaitGit (operation: JS.Promise<GitService.GitResult<'T>>) : Async<Result<'T, OperationFailure>> =
     async {
         let! result = Async.AwaitPromise operation
@@ -2017,6 +2022,72 @@ let private createRevision (state: SessionState) (request: CreateRevisionRequest
             | Ok() -> return! createRevisionTransaction state request context
     }
 
+type private LocalLfsMaterializationResult =
+    | LocalLfsObjectUnavailable
+    | LocalLfsStoreUnavailable of OperationFailure
+    | LocalLfsCheckoutCompleted of bool
+    | LocalLfsCheckoutFailed of OperationFailure
+
+let private materializeLocalLfsObject
+    (state: SessionState)
+    (pathValue: string)
+    (objectId: string)
+    (sizeBytes: float)
+    (context: OperationContext)
+    : Async<LocalLfsMaterializationResult> =
+    async {
+        let! mediaDirectoryResult =
+            resolveSessionMediaDirectory
+                state
+                (fun arguments -> runGit state.Hooks state.RepoPath arguments None context)
+
+        match mediaDirectoryResult with
+        | Error failure -> return LocalLfsStoreUnavailable failure
+        | Ok mediaDirectory when not (GitLfsObjects.isObjectLocallyAvailable mediaDirectory objectId sizeBytes) ->
+            return LocalLfsObjectUnavailable
+        | Ok _ ->
+            let! checkoutResult =
+                runGit
+                    state.Hooks
+                    state.RepoPath
+                    [|
+                        "lfs"
+                        "checkout"
+                        "--"
+                        GitLfsObjects.lfsCheckoutPattern pathValue
+                    |]
+                    None
+                    context
+
+            match checkoutResult with
+            | Error failure -> return LocalLfsCheckoutFailed failure
+            | Ok output when output.ExitCode = 0 ->
+                let absolutePath = NodePath.join [| state.RepoPath; pathValue |]
+
+                let materialized =
+                    try
+                        NodeFileSystem.tryLstatSync absolutePath
+                        |> Option.exists (fun stats -> stats.isFile () && stats.size = sizeBytes)
+                    with _ ->
+                        false
+
+                return LocalLfsCheckoutCompleted materialized
+            | Ok output ->
+                let detail =
+                    if String.IsNullOrWhiteSpace output.StdErr then
+                        $"Git exited with code {output.ExitCode}."
+                    else
+                        output.StdErr.Trim()
+
+                return
+                    LocalLfsCheckoutFailed(
+                        OperationFailure.createRedacted
+                            ProviderError
+                            "lfs_checkout_failed"
+                            $"Git LFS checkout failed: {detail}"
+                    )
+    }
+
 let private restorePaths (state: SessionState) (request: RestoreRequest) (context: OperationContext) =
     async {
         if request.Paths.Length = 0 then
@@ -2074,7 +2145,54 @@ let private restorePaths (state: SessionState) (request: RestoreRequest) (contex
 
                     match result with
                     | Error failure -> return Failed failure
-                    | Ok() -> return OperationResult.succeeded ()
+                    | Ok restoredPaths ->
+                        let mutable materializationFailure: (string * string) option = None
+
+                        for pathValue in restoredPaths do
+                            if materializationFailure.IsNone then
+                                let! pointerResult = GitLfsObjects.readWorktreePointer state.RepoPath pathValue
+
+                                match pointerResult with
+                                | Error failure -> materializationFailure <- Some(pathValue, failure.Message)
+                                | Ok None -> ()
+                                | Ok(Some pointer) ->
+                                    let! result =
+                                        materializeLocalLfsObject
+                                            state
+                                            pathValue
+                                            pointer.Oid
+                                            pointer.SizeInBytes
+                                            context
+
+                                    match result with
+                                    | LocalLfsObjectUnavailable
+                                    | LocalLfsCheckoutCompleted true -> ()
+                                    | LocalLfsStoreUnavailable failure
+                                    | LocalLfsCheckoutFailed failure ->
+                                        materializationFailure <- Some(pathValue, failure.Message)
+                                    | LocalLfsCheckoutCompleted false ->
+                                        materializationFailure <-
+                                            Some(pathValue, "Git LFS checkout did not write the expected object content.")
+
+                        match materializationFailure with
+                        | None -> return OperationResult.succeeded ()
+                        | Some(pathValue, detail) ->
+                            let failure =
+                                OperationFailure.createRedacted
+                                    ProviderError
+                                    "object_materialization_failed"
+                                    $"Materializing restored path '{pathValue}' failed: {detail}"
+                                |> fun failure -> {
+                                    failure with
+                                        StateChanged = true
+                                        AffectedPaths = [| pathValue |]
+                                }
+
+                            return
+                                OperationResult.partiallySucceeded
+                                    (OperationOutcome.performed ())
+                                    failure
+                                    (localMaterializationRecovery ())
     }
 
 let private listRefs (state: SessionState) (context: OperationContext) =
@@ -3265,6 +3383,8 @@ let private updateFromState
                                         yield! identityArguments
                                         "merge"
                                         "--no-edit"
+                                        "-m"
+                                        "Merge online changes"
                                         "--no-overwrite-ignore"
                                         "--no-autostash"
                                         targetReference
@@ -5073,69 +5193,28 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
 
                                                                 match objectInfo.ObjectId, objectInfo.SizeBytes with
                                                                 | Some objectId, Some sizeBytes ->
-                                                                    let! mediaDirectoryResult =
-                                                                        resolveSessionMediaDirectory
+                                                                    let! result =
+                                                                        materializeLocalLfsObject
                                                                             state
-                                                                            (fun arguments ->
-                                                                                runGit
-                                                                                    state.Hooks
-                                                                                    state.RepoPath
-                                                                                    arguments
-                                                                                    None
-                                                                                    context)
+                                                                            pathValue
+                                                                            objectId
+                                                                            sizeBytes
+                                                                            context
 
-                                                                    match mediaDirectoryResult with
-                                                                    | Error _ -> return Ok(objectNotMaterialized (), None)
-                                                                    | Ok mediaDirectory when
-                                                                        not (GitLfsObjects.isObjectLocallyAvailable mediaDirectory objectId sizeBytes) ->
+                                                                    match result with
+                                                                    | LocalLfsObjectUnavailable
+                                                                    | LocalLfsStoreUnavailable _
+                                                                    | LocalLfsCheckoutCompleted false ->
                                                                         return Ok(objectNotMaterialized (), None)
-                                                                    | Ok _ ->
-                                                                        let! checkoutResult =
-                                                                            runGit
-                                                                                state.Hooks
-                                                                                state.RepoPath
-                                                                                [|
-                                                                                    "lfs"
-                                                                                    "checkout"
-                                                                                    "--"
-                                                                                    GitLfsObjects.lfsCheckoutPattern pathValue
-                                                                                |]
-                                                                                None
-                                                                                context
-
-                                                                        match checkoutResult with
-                                                                        | Error failure when failure.Category = Canceled ->
-                                                                            return Ok([||], Some(canceledMaterializationFailure failure.Message))
-                                                                        | Error failure when context.Cancellation.IsCancellationRequested() ->
-                                                                            return Ok([||], Some(canceledMaterializationFailure failure.Message))
-                                                                        | Error failure -> return Ok([||], Some(materializationFailure failure.Message))
-                                                                        | Ok output when output.ExitCode = 0 ->
-                                                                            let absolutePath = NodePath.join [| state.RepoPath; pathValue |]
-
-                                                                            let materialized =
-                                                                                try
-                                                                                    NodeFileSystem.tryLstatSync absolutePath
-                                                                                    |> Option.exists (fun stats -> stats.isFile () && stats.size = sizeBytes)
-                                                                                with _ ->
-                                                                                    false
-
-                                                                            if materialized then
-                                                                                return Ok([||], None)
-                                                                            else
-                                                                                return Ok(objectNotMaterialized (), None)
-                                                                        | Ok output ->
-                                                                            let detail =
-                                                                                if String.IsNullOrWhiteSpace output.StdErr then
-                                                                                    $"Git exited with code {output.ExitCode}."
-                                                                                else
-                                                                                    output.StdErr.Trim()
-
-                                                                            if context.Cancellation.IsCancellationRequested() then
-                                                                                return Ok([||], Some(canceledMaterializationFailure detail))
-                                                                            else
-                                                                                return Ok([||], Some(materializationFailure detail))
-                                                                | _ ->
-                                                                    return Ok(objectNotMaterialized (), None)
+                                                                    | LocalLfsCheckoutCompleted true -> return Ok([||], None)
+                                                                    | LocalLfsCheckoutFailed failure when failure.Category = Canceled ->
+                                                                        return Ok([||], Some(canceledMaterializationFailure failure.Message))
+                                                                    | LocalLfsCheckoutFailed failure
+                                                                        when context.Cancellation.IsCancellationRequested() ->
+                                                                        return Ok([||], Some(canceledMaterializationFailure failure.Message))
+                                                                    | LocalLfsCheckoutFailed failure ->
+                                                                        return Ok([||], Some(materializationFailure failure.Message))
+                                                                | _ -> return Ok(objectNotMaterialized (), None)
                                                 }
 
                                             match stagedResult with
@@ -5173,11 +5252,7 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                             OperationResult.partiallySucceeded
                                                                 outcome
                                                                 failure
-                                                                {
-                                                                    Code = "retry_materialization"
-                                                                    Instructions =
-                                                                        Some "Materialize the path again to replace the pointer with the object's content."
-                                                                }
+                                                                (localMaterializationRecovery ())
                 })
         Finalize =
             fun request context ->
@@ -5322,7 +5397,7 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                         | Error failure -> return Failed failure
                                                         | Ok treeOutput ->
                                                             let message =
-                                                                request.Message |> Option.defaultValue "merge: finalize conflict session"
+                                                                request.Message |> Option.defaultValue "Merge online changes"
 
                                                             let! commitResult =
                                                                 runGitChecked
@@ -6065,7 +6140,7 @@ let private probe (workspacePath: string) : Async<ProbeResult> =
 let private bindingFor (workspaceRoot: string) (location: RepositoryLocation) : WorkspaceBinding = {
     SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
     ProviderId = gitProviderId
-    WorkspaceRoot = workspaceRoot
+    WorkspaceRoot = NodePath.normalizeWorkspaceRoot workspaceRoot
     ProviderStateRef = None
     Location = {
         location with

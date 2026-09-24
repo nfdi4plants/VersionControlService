@@ -1225,7 +1225,7 @@ module FakeHarness =
                                         workspace.Target
                                         [ localHead; session.TheirRevisionId ]
                                         workspace.LocalFiles
-                                        (request.Message |> Option.defaultValue "merge: finalize conflict session")
+                                        (request.Message |> Option.defaultValue "Merge online changes")
 
                                 workspace.LocalRefs <- workspace.LocalRefs |> Map.add workspace.CurrentRef mergedRevision
                                 workspace.BaseRevisionId <- session.TheirRevisionId

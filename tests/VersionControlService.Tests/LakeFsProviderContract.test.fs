@@ -1188,6 +1188,82 @@ Vitest.describe (
     "lakeFS provisioning profile external state",
     fun () ->
         Vitest.test (
+            "Clone and Bind normalize workspace roots to Initialize",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root = createTempDirectoryAsync ()
+                let workspaceRoot = join [| root; "workspace" |]
+                let stateRoot = join [| root; "provider-state" |]
+
+                try
+                    do! ensureDirectoryAsync stateRoot
+
+                    let options: LakeFsProviderOptions.LakeFsProviderOptions = {
+                        StateRoot = stateRoot
+                        PathCaseSensitivity = CaseInsensitive
+                    }
+
+                    let credentials =
+                        LakeFsCredentials.fixedConnection {
+                            Endpoint = "http://127.0.0.1:1"
+                            AccessKeyId = "unused"
+                            SecretAccessKey = "unused"
+                        }
+
+                    let providerId = ProviderId.tryCreate "lakefs" |> Result.defaultWith failwith
+                    let location = {
+                        ProviderId = providerId
+                        DisplayName = Some "repo"
+                        ProviderLocation = "lakefs://repo/main"
+                        ConnectionProfileId = None
+                    }
+
+                    let factory = LakeFsWorkspaceSession.createFactory options credentials
+                    let! initializeResult =
+                        factory.Initialize
+                            {
+                                TargetPath = workspaceRoot
+                                Location = Some location
+                            }
+                            (context "normalize-initialize-root")
+                        |> Async.StartAsPromise
+
+                    let initialized = expectOperationValue "initialize workspace root" initializeResult
+                    let suppliedRoot = workspaceRoot.Replace("\\", "/").TrimEnd('/') + "/"
+                    let! cloneResult =
+                        factory.Clone
+                            {
+                                Location = location
+                                TargetPath = suppliedRoot
+                                TargetRef = None
+                                MaterializeAllObjects = false
+                            }
+                            (context "normalize-clone-root")
+                        |> Async.StartAsPromise
+
+                    let cloned = expectOperationValue "clone workspace root" cloneResult
+                    let! bindResult =
+                        factory.Bind
+                            {
+                                WorkspaceRoot = suppliedRoot
+                                Location = location
+                            }
+                            (context "normalize-bind-root")
+                        |> Async.StartAsPromise
+
+                    let bound = expectOperationValue "bind workspace root" bindResult
+                    let normalizedRoot = RuntimeNodePath.normalizeWorkspaceRoot workspaceRoot
+                    Vitest.expect(initialized.WorkspaceRoot).toBe normalizedRoot
+                    Vitest.expect(cloned.WorkspaceRoot).toBe normalizedRoot
+                    Vitest.expect(bound.WorkspaceRoot).toBe normalizedRoot
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
             "provisioning keeps opaque state outside existing workspaces and rejects invalid reopen state",
             TestOptions(timeout = 120000),
             fun () -> promise {
@@ -3138,12 +3214,27 @@ Vitest.describe (
                             {
                                 Handle = secondResolution.RefreshedHandle
                                 ExpectedWorkspaceVersion = finalizeStatus.WorkspaceVersion
-                                Message = Some "finalize versioned conflict session"
+                                Message = None
                             }
                             (context "conflict-cycle-finalize")
                         |> Async.StartAsPromise
 
-                    expectOperationValue "finalize conflict session" finalizeResult |> ignore
+                    let finalizedRevision = expectOperationValue "finalize conflict session" finalizeResult
+                    let commitId =
+                        finalizedRevision
+                        |> Option.map RevisionId.value
+                        |> Option.defaultWith (fun () -> failwith "Expected the conflict finalizer to create a commit.")
+
+                    let! finalizedCommitResult =
+                        LakeFsApi.getCommit
+                            (connection ())
+                            parsed.Repository
+                            commitId
+                            (context "conflict-cycle-finalized-commit")
+                        |> Async.StartAsPromise
+
+                    let finalizedCommit = expectApi "finalized conflict commit" finalizedCommitResult
+                    Vitest.expect(finalizedCommit.Message).toBe "Merge online changes"
 
                     let! closedResult =
                         conflicts.GetActiveSession(context "conflict-cycle-closed-session")

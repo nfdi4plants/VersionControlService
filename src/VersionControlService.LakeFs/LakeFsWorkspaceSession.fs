@@ -2724,7 +2724,7 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                             state.Index.Repository
                                             observedTarget
                                             state.Index.WorkspaceBranch
-                                            "merge: finalize conflict session"
+                                            "Merge online changes"
                                             (Some "dest-wins")
                                             context
 
@@ -2958,7 +2958,7 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                                             state.Index.WorkspaceBranch
                                                                             (request.Message
                                                                              |> Option.defaultValue
-                                                                                 "merge: finalize conflict session")
+                                                                                 "Merge online changes")
                                                                             context
 
                                                                     return commit |> Result.map _.Id
