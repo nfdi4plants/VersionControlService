@@ -166,6 +166,29 @@ let internal buildScopedCommandAuthentication
         Environment = GitAuthAdapter.createNonInteractiveEnv ()
     }
 
+/// LFS batch actions supply their own authorization, so transfer commands omit Git's scoped header.
+let filterLfsTransferConfigArgs (arguments: string[]) =
+    let filtered = ResizeArray<string>()
+    let mutable index = 0
+
+    while index < arguments.Length do
+        let isHttpExtraHeaderPair =
+            index + 1 < arguments.Length
+            && arguments.[index] = "-c"
+            && arguments.[index + 1].StartsWith("http.", StringComparison.OrdinalIgnoreCase)
+            && arguments.[index + 1].IndexOf("/.extraHeader=", StringComparison.OrdinalIgnoreCase) >= 0
+
+        if isHttpExtraHeaderPair then
+            index <- index + 2
+        else
+            filtered.Add arguments.[index]
+            index <- index + 1
+
+    filtered.ToArray()
+
+let buildLfsTransferArguments (configArgs: string[]) (arguments: string[]) =
+    Array.append (filterLfsTransferConfigArgs configArgs) arguments
+
 let internal buildScopedHeaderAuthentication
     (remoteUrl: string)
     (credential: GitCredential option)

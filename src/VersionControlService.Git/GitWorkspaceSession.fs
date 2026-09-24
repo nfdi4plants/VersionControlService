@@ -3651,13 +3651,14 @@ let private updateFromState
                                             runGitEnv
                                                 state.Hooks
                                                 state.RepoPath
-                                                [|
-                                                    yield! authentication.ConfigArgs
-                                                    "lfs"
-                                                    "pull"
-                                                    remote
-                                                    yield! hydrationRef |> Option.toArray
-                                                |]
+                                                (GitCredentialStrategy.buildLfsTransferArguments
+                                                    authentication.ConfigArgs
+                                                    [|
+                                                        "lfs"
+                                                        "pull"
+                                                        remote
+                                                        yield! hydrationRef |> Option.toArray
+                                                    |])
                                                 None
                                                 [| "GIT_TERMINAL_PROMPT", "0" |]
                                                 context
@@ -6953,12 +6954,9 @@ let createFactoryWithCredentialsIdentityAndPolicy
                                 runGitEnv
                                     hooks
                                     request.TargetPath
-                                    [|
-                                        yield! authentication.ConfigArgs
-                                        "lfs"
-                                        "pull"
-                                        "origin"
-                                    |]
+                                    (GitCredentialStrategy.buildLfsTransferArguments
+                                        authentication.ConfigArgs
+                                        [| "lfs"; "pull"; "origin" |])
                                     None
                                     [| "GIT_TERMINAL_PROMPT", "0" |]
                                     context

@@ -5566,6 +5566,9 @@ Vitest.describe (
             TestOptions(timeout = 120000),
             fun () -> promise {
                 let observed = ResizeArray<NodeProcess.ProcessRequest>()
+                let cloneUrl = "https://git.local.test/origin.git"
+                let cloneSecret = "clone-token-123"
+                let mutable cloneSource = ""
 
                 let hooks: GitWorkspaceSession.GitSessionHooks = {
                     RunBytesProcess = None
@@ -5574,7 +5577,14 @@ Vitest.describe (
                             async {
                                 observed.Add request
 
-                                if
+                                if request.Arguments |> Array.contains "clone" then
+                                    let cloneArguments =
+                                        request.Arguments
+                                        |> Array.map (fun argument ->
+                                            if argument = cloneUrl then cloneSource else argument)
+
+                                    return! NodeProcess.run { request with Arguments = cloneArguments } processContext
+                                elif
                                     request.Arguments |> Array.contains "lfs"
                                     && request.Arguments |> Array.contains "pull"
                                 then
@@ -5592,9 +5602,25 @@ Vitest.describe (
 
                 let! root, _, barePath, _ = createSyncFixture hooks
                 let clonePath = join [| root; "hydrated-clone" |]
+                cloneSource <- barePath
+                let credential: GitCredentialStrategy.GitCredential = {
+                    Username = "oauth2"
+                    Secret = cloneSecret
+                }
+
+                let credentials: GitCredentialStrategy.GitCredentialStrategy = {
+                    ResolveCredential =
+                        fun host _profileId ->
+                            async {
+                                if host = "git.local.test" then
+                                    return Some credential
+                                else
+                                    return None
+                            }
+                }
 
                 try
-                    let factory = GitWorkspaceSession.createFactory hooks
+                    let factory = GitWorkspaceSession.createFactoryWithCredentials hooks credentials
 
                     let! cloneResult =
                         factory.Clone
@@ -5602,7 +5628,7 @@ Vitest.describe (
                                 Location = {
                                     ProviderId = gitProviderId
                                     DisplayName = None
-                                    ProviderLocation = barePath
+                                    ProviderLocation = cloneUrl
                                     ConnectionProfileId = None
                                 }
                                 TargetPath = clonePath
@@ -5625,6 +5651,26 @@ Vitest.describe (
                     Vitest
                         .expect(cloneRequest.Environment |> Array.contains ("GIT_LFS_SKIP_SMUDGE", "1"))
                         .toBe true
+
+                    let hydrationRequest =
+                        observed
+                        |> Seq.find (fun request ->
+                            request.Arguments |> Array.contains "lfs"
+                            && request.Arguments |> Array.contains "pull")
+
+                    let expectedLfsUrl =
+                        $"lfs.url=https://{credential.Username}:{credential.Secret}@git.local.test/origin.git/info/lfs"
+
+                    Vitest
+                        .expect(hydrationRequest.Arguments |> Array.contains expectedLfsUrl)
+                        .toBe true
+
+                    Vitest
+                        .expect(
+                            hydrationRequest.Arguments
+                            |> Array.exists (fun argument -> argument.Contains "extraHeader")
+                        )
+                        .toBe false
 
                     do! removeDirectoryAsync root
                 with error ->

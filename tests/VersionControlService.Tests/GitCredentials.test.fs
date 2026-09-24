@@ -87,6 +87,101 @@ let private testHttpsUrl = $"https://{testHost}/origin.git"
 let private testSecret = "secret-token-123"
 
 Vitest.describe (
+    "Git LFS transfer authentication",
+    fun () ->
+        Vitest.test (
+            "filters scoped extraHeader pairs and preserves the remaining argument order",
+            fun () ->
+                let lfsUrl = $"https://oauth2:{testSecret}@{testHost}/origin.git/info/lfs"
+                let arguments = [|
+                    "-c"
+                    "first.setting=before"
+                    "-c"
+                    $"http.https://{testHost}/.extraHeader=Authorization: Basic token"
+                    "-c"
+                    $"remote.origin.lfsurl={lfsUrl}"
+                    "-c"
+                    $"lfs.url={lfsUrl}"
+                    "-c"
+                    "http.https://other.test/.extraHeader=Authorization: Basic other"
+                    "last.setting=after"
+                |]
+
+                let filtered = GitCredentialStrategy.filterLfsTransferConfigArgs arguments
+
+                Vitest.expect(filtered).toEqual [|
+                    "-c"
+                    "first.setting=before"
+                    "-c"
+                    $"remote.origin.lfsurl={lfsUrl}"
+                    "-c"
+                    $"lfs.url={lfsUrl}"
+                    "last.setting=after"
+                |]
+        )
+
+        Vitest.test (
+            "builds upload and smudge arguments with the credential LFS URL and no extraHeader",
+            fun () ->
+                let lfsUrl = $"https://oauth2:{testSecret}@{testHost}/origin.git/info/lfs"
+                let configArgs = [|
+                    "-c"
+                    $"http.https://{testHost}/.extraHeader=Authorization: Basic token"
+                    "-c"
+                    $"remote.origin.lfsurl={lfsUrl}"
+                    "-c"
+                    $"lfs.url={lfsUrl}"
+                |]
+
+                let uploadArguments =
+                    GitCredentialStrategy.buildLfsTransferArguments
+                        configArgs
+                        [| "lfs"; "push"; "--object-id"; "origin"; "--stdin" |]
+
+                Vitest.expect(uploadArguments).toEqual [|
+                    "-c"
+                    $"remote.origin.lfsurl={lfsUrl}"
+                    "-c"
+                    $"lfs.url={lfsUrl}"
+                    "lfs"
+                    "push"
+                    "--object-id"
+                    "origin"
+                    "--stdin"
+                |]
+
+                let smudgeArguments =
+                    GitCredentialStrategy.buildLfsTransferArguments
+                        configArgs
+                        [|
+                            "-c"
+                            "lfs.fetchinclude="
+                            "-c"
+                            "lfs.fetchexclude="
+                            "lfs"
+                            "smudge"
+                            "--"
+                            "materialized.bin"
+                        |]
+
+                Vitest.expect(smudgeArguments).toEqual [|
+                    "-c"
+                    $"remote.origin.lfsurl={lfsUrl}"
+                    "-c"
+                    $"lfs.url={lfsUrl}"
+                    "-c"
+                    "lfs.fetchinclude="
+                    "-c"
+                    "lfs.fetchexclude="
+                    "lfs"
+                    "smudge"
+                    "--"
+                    "materialized.bin"
+                |]
+        )
+)
+
+Vitest.describe (
     "credential redaction",
     fun () ->
         let cases = [|

@@ -12,6 +12,8 @@ open VersionControlService.Bindings.SimpleGit
 open VersionControlService.Git.GitLfsAdapter
 open VersionControlService.Git.GitAuthAdapter
 
+module GitCredentialStrategy = VersionControlService.Git.GitCredentialStrategy
+
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodePath = VersionControlService.Runtime.Node.Path
 module NodeProcess = VersionControlService.Runtime.Node.Process
@@ -1268,10 +1270,7 @@ let internal runAuthenticatedMaintenance
                 observeOutput
                 {
                     WorkingDirectory = Some repoPath
-                    Arguments = [|
-                        yield! commandAuth.ConfigArgs
-                        yield! arguments
-                    |]
+                    Arguments = GitCredentialStrategy.buildLfsTransferArguments commandAuth.ConfigArgs arguments
                     Environment = Some commandAuth.Environment
                     StandardInput = None
                     CancelCheck = Some cancelCheck
@@ -1300,10 +1299,10 @@ let fetchRefetchForPath
                 onStarted
                 {
                     WorkingDirectory = Some repoPath
-                    Arguments = [|
-                        yield! commandAuth.ConfigArgs
-                        yield! buildFetchRefetchArgs relativePath
-                    |]
+                    Arguments =
+                        GitCredentialStrategy.buildLfsTransferArguments
+                            commandAuth.ConfigArgs
+                            (buildFetchRefetchArgs relativePath)
                     Environment = Some commandAuth.Environment
                     StandardInput = None
                     CancelCheck = cancelCheck
@@ -1336,10 +1335,10 @@ let downloadObjectFromListing
         let! result =
             runGitDiscardingStdoutWithStarted onStarted {
                 WorkingDirectory = Some repoPath
-                Arguments = [|
-                    yield! commandAuth.ConfigArgs
-                    yield! buildSmudgePointerArgs relativePath
-                |]
+                Arguments =
+                    GitCredentialStrategy.buildLfsTransferArguments
+                        commandAuth.ConfigArgs
+                        (buildSmudgePointerArgs relativePath)
                 Environment = Some commandAuth.Environment
                 StandardInput = Some(buildPointerInput listing)
                 CancelCheck = cancelCheck
@@ -1681,14 +1680,10 @@ let uploadObjects
             let! exactUploadResult =
                 runSpawnedGit {
                     WorkingDirectory = Some repoPath
-                    Arguments = [|
-                        yield! commandAuth.ConfigArgs
-                        "lfs"
-                        "push"
-                        "--object-id"
-                        remoteName
-                        "--stdin"
-                    |]
+                    Arguments =
+                        GitCredentialStrategy.buildLfsTransferArguments
+                            commandAuth.ConfigArgs
+                            [| "lfs"; "push"; "--object-id"; remoteName; "--stdin" |]
                     Environment = Some uploadEnvironment
                     StandardInput = Some(String.concat "\n" [| yield! lfsObjectIds; yield "" |])
                     CancelCheck = Some cancelCheck
@@ -1704,13 +1699,10 @@ let uploadObjects
                     let! fallbackResult =
                         runSpawnedGit {
                             WorkingDirectory = Some repoPath
-                            Arguments = [|
-                                yield! commandAuth.ConfigArgs
-                                "lfs"
-                                "push"
-                                remoteName
-                                refSpec
-                            |]
+                            Arguments =
+                                GitCredentialStrategy.buildLfsTransferArguments
+                                    commandAuth.ConfigArgs
+                                    [| "lfs"; "push"; remoteName; refSpec |]
                             Environment = Some uploadEnvironment
                             StandardInput = None
                             CancelCheck = Some cancelCheck
