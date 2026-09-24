@@ -5932,6 +5932,36 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "update reports a held index lock when the remote has advanced",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, barePath, session = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+
+                try
+                    do! advanceTarget root barePath [ "remote.txt", "remote update\n" ]
+                    let! status = sessionStatus session
+                    do! writeUtf8FileAsync (join [| workPath; ".git"; "index.lock" |]) ""
+
+                    let! updateResult =
+                        (syncService session).Update
+                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                            (ctx "update-held-index-lock")
+                        |> Async.StartAsPromise
+
+                    let failure = expectProviderFailure "update with a held index lock" updateResult
+                    Vitest.expect(failure.Category).toEqual (Concurrency)
+                    Vitest.expect(failure.Code).toBe "index_locked"
+                    Vitest.expect(failure.StateChanged).toBe false
+                    Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "remove_index_lock")
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+
+                do! removeDirectoryAsync root
+            }
+        )
+
+        Vitest.test (
             "a rejected non-conflicting merge reports update_rejected without a conflict session",
             TestOptions(timeout = 120000),
             fun () -> promise {

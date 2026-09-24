@@ -3736,41 +3736,47 @@ let private updateFromState
                                 "The update produced conflicts that need resolution.")
                             conflictRecovery
                 | Ok None ->
-                    let! workspaceVersionAfter = computeWorkspaceVersion state inspectionContext
-                    inspectionCompleted <- true
-                    stopInspectionDeadline ()
+                    match GitInternals.tryIndexLockFailure output.StdErr with
+                    | Some(path, ageSeconds) ->
+                        inspectionCompleted <- true
+                        stopInspectionDeadline ()
+                        return Failed(GitInternals.indexLockFailure path ageSeconds)
+                    | None ->
+                        let! workspaceVersionAfter = computeWorkspaceVersion state inspectionContext
+                        inspectionCompleted <- true
+                        stopInspectionDeadline ()
 
-                    let stateChanged, recoveryAction =
-                        match workspaceVersionAfter with
-                        | Ok version -> version <> start.WorkspaceVersion, None
-                        | Error _ ->
-                            true,
-                            Some {
-                                Code = "inspect_workspace"
-                                Instructions = Some "The state after the rejected update could not be read. Inspect the workspace before retrying."
+                        let stateChanged, recoveryAction =
+                            match workspaceVersionAfter with
+                            | Ok version -> version <> start.WorkspaceVersion, None
+                            | Error _ ->
+                                true,
+                                Some {
+                                    Code = "inspect_workspace"
+                                    Instructions = Some "The state after the rejected update could not be read. Inspect the workspace before retrying."
+                                }
+
+                        // The rejection is certain (nonzero exit, no MERGE_HEAD), so a timed-out version
+                        // read keeps update_rejected and adds the deadline to the details.
+                        let details =
+                            Array.append
+                                (output.StdErr.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries))
+                                (if inspectionTimedOut then
+                                     [| (inspectionTimeoutFailure recoveryAction).Message |]
+                                 else
+                                     [||])
+
+                        let rejected =
+                            OperationFailure.createRedacted ProviderError "update_rejected" "Git rejected the update."
+                            |> OperationFailure.withDetails details
+
+                        return
+                            Failed {
+                                rejected with
+                                    StateChanged = stateChanged
+                                    Retryable = false
+                                    RecoveryAction = recoveryAction
                             }
-
-                    // The rejection is certain (nonzero exit, no MERGE_HEAD), so a timed-out version
-                    // read keeps update_rejected and adds the deadline to the details.
-                    let details =
-                        Array.append
-                            (output.StdErr.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries))
-                            (if inspectionTimedOut then
-                                 [| (inspectionTimeoutFailure recoveryAction).Message |]
-                             else
-                                 [||])
-
-                    let rejected =
-                        OperationFailure.createRedacted ProviderError "update_rejected" "Git rejected the update."
-                        |> OperationFailure.withDetails details
-
-                    return
-                        Failed {
-                            rejected with
-                                StateChanged = stateChanged
-                                Retryable = false
-                                RecoveryAction = recoveryAction
-                        }
     }
 
 let private update (state: SessionState) (request: UpdateRequest) (context: OperationContext) =
@@ -5738,6 +5744,11 @@ type private BaseBlobProbe = {
     IsBlob: bool
 }
 
+type private BaseContentEvidence = {
+    Content: ContentView
+    VerifiedLfsObjectPath: string option
+}
+
 let private probeBaseHead
     (state: SessionState)
     (literalPath: string)
@@ -5860,11 +5871,11 @@ let private readBaseBlob
 // It returns the pointer text when the object exceeds the limit or local verification fails.
 let private maximumBaseTextDiffBytes = 10.0 * 1024.0 * 1024.0
 
-let private getBaseContent
+let private getBaseContentEvidence
     (state: SessionState)
     (path: RepositoryPath)
     (context: OperationContext)
-    : Async<OperationResult<ContentView>> =
+    : Async<OperationResult<BaseContentEvidence>> =
     async {
         let requestedPath = RepositoryPath.value path
 
@@ -5949,9 +5960,10 @@ let private getBaseContent
                                     || GitService.isExplicitlyUnsupportedPath basePath
                                     ->
                                     return
-                                        OperationResult.succeeded (
-                                            UnsupportedContent(Some $"Unsupported git content for '{literalPath}'.")
-                                        )
+                                        OperationResult.succeeded {
+                                            Content = UnsupportedContent(Some $"Unsupported git content for '{literalPath}'.")
+                                            VerifiedLfsObjectPath = None
+                                        }
                                 | Ok probe ->
                                     let! baseBlob = readBaseBlob state literalPath probe.ObjectId context
 
@@ -5972,7 +5984,7 @@ let private getBaseContent
                                                     state
                                                     (fun arguments -> runGit state.Hooks state.RepoPath arguments None context)
 
-                                            let materializedBuffer =
+                                            let materializedObject =
                                                 match mediaDirectoryResult with
                                                 | Ok mediaDirectory ->
                                                     GitLfsObjects.tryReadLocalObject
@@ -5980,33 +5992,76 @@ let private getBaseContent
                                                         pointer.Oid
                                                         pointer.SizeInBytes
                                                         maximumBaseTextDiffBytes
+                                                    |> Option.map (fun content -> mediaDirectory, content)
                                                 | Error _ -> None
 
-                                            match materializedBuffer with
-                                            | Some content when GitService.isLikelyBinaryBuffer content ->
+                                            match materializedObject with
+                                            | Some(_, content) when GitService.isLikelyBinaryBuffer content ->
                                                 return
                                                     OperationResult.succeeded (
-                                                        UnsupportedContent(Some $"Unsupported git content for '{literalPath}'.")
+                                                        {
+                                                            Content = UnsupportedContent(Some $"Unsupported git content for '{literalPath}'.")
+                                                            VerifiedLfsObjectPath = None
+                                                        }
                                                     )
-                                            | Some content ->
+                                            | Some(mediaDirectory, content) ->
                                                 return
                                                     OperationResult.succeeded (
-                                                        TextContent(NodeInterop.bufferToUtf8String content)
+                                                        {
+                                                            Content = TextContent(NodeInterop.bufferToUtf8String content)
+                                                            VerifiedLfsObjectPath = Some(GitLfsObjects.objectPath mediaDirectory pointer.Oid)
+                                                        }
                                                     )
                                             | None ->
-                                                return OperationResult.succeeded (TextContent pointerText)
+                                                return
+                                                    OperationResult.succeeded {
+                                                        Content = TextContent pointerText
+                                                        VerifiedLfsObjectPath = None
+                                                    }
                                         | _ when GitService.isLikelyBinaryBuffer buffer ->
                                             return
                                                 OperationResult.succeeded (
-                                                    UnsupportedContent(Some $"Unsupported git content for '{literalPath}'.")
+                                                    {
+                                                        Content = UnsupportedContent(Some $"Unsupported git content for '{literalPath}'.")
+                                                        VerifiedLfsObjectPath = None
+                                                    }
                                                 )
                                         | Some(pointerText, None) ->
-                                            return OperationResult.succeeded (TextContent pointerText)
+                                            return
+                                                OperationResult.succeeded {
+                                                    Content = TextContent pointerText
+                                                    VerifiedLfsObjectPath = None
+                                                }
                                         | None ->
-                                            return OperationResult.succeeded (TextContent(NodeInterop.bufferToUtf8String buffer))
+                                            return
+                                                OperationResult.succeeded {
+                                                    Content = TextContent(NodeInterop.bufferToUtf8String buffer)
+                                                    VerifiedLfsObjectPath = None
+                                                }
                 }
 
             return! readStableBase 2
+    }
+
+let private getBaseContent state path context =
+    async {
+        let! result = getBaseContentEvidence state path context
+
+        let toContent (outcome: OperationOutcome<BaseContentEvidence>) : OperationOutcome<ContentView> = {
+            Value = outcome.Value.Content
+            Effect = outcome.Effect
+            Warnings = outcome.Warnings
+            AffectedPaths = outcome.AffectedPaths
+            ResultingRevision = outcome.ResultingRevision
+            ResultingWorkspaceVersion = outcome.ResultingWorkspaceVersion
+            Publication = outcome.Publication
+        }
+
+        return
+            match result with
+            | Succeeded outcome -> Succeeded(toContent outcome)
+            | PartiallySucceeded(outcome, failure) -> PartiallySucceeded(toContent outcome, failure)
+            | Failed failure -> Failed failure
     }
 
 let private createTextDiff (state: SessionState) : TextDiffService =
@@ -6031,13 +6086,117 @@ let private createTextDiff (state: SessionState) : TextDiffService =
                     )
         }
 
+    let replaceWordDiffHeaders (path: string) (gitDiff: string) (objectDiff: string) =
+        let splitLines (value: string) =
+            value.Split '\n' |> Array.map (fun line -> line.TrimEnd '\r')
+
+        let gitLines = splitLines gitDiff
+        let diffLines = splitLines objectDiff
+
+        let header prefix fallback =
+            gitLines
+            |> Array.tryFind (fun line -> line.StartsWith(prefix, StringComparison.Ordinal))
+            |> Option.defaultValue fallback
+
+        let diffHeader = header "diff --git " $"diff --git a/{path} b/{path}"
+        let oldHeader = header "--- " $"--- a/{path}"
+        let newHeader = header "+++ " $"+++ b/{path}"
+        let mutable replacedDiffHeader = false
+        let mutable replacedOldHeader = false
+        let mutable replacedNewHeader = false
+
+        diffLines
+        |> Array.map (fun line ->
+            if not replacedDiffHeader && line.StartsWith("diff --git ", StringComparison.Ordinal) then
+                replacedDiffHeader <- true
+                diffHeader
+            elif not replacedOldHeader && line.StartsWith("--- ", StringComparison.Ordinal) then
+                replacedOldHeader <- true
+                oldHeader
+            elif not replacedNewHeader && line.StartsWith("+++ ", StringComparison.Ordinal) then
+                replacedNewHeader <- true
+                newHeader
+            else
+                line)
+        |> String.concat "\n"
+
+    let mapWordDiff (path: RepositoryPath) (context: OperationContext) =
+        async {
+            try
+                if context.Cancellation.IsCancellationRequested() then
+                    return OperationResult.canceled "The Git text diff was canceled."
+                else
+                    let pathValue = RepositoryPath.value path
+                    let! gitDiffResult = awaitGit (GitService.getWordDiff state.RepoPath [| pathValue |])
+
+                    match context.Cancellation.IsCancellationRequested(), gitDiffResult with
+                    | true, _ -> return OperationResult.canceled "The Git text diff was canceled."
+                    | false, Error failure -> return Failed failure
+                    | false, Ok gitDiff when String.IsNullOrWhiteSpace gitDiff ->
+                        return OperationResult.succeeded (TextContent gitDiff)
+                    | false, Ok gitDiff ->
+                        let! baseResult = getBaseContentEvidence state path context
+
+                        let lfsWordDiff = async {
+                            match baseResult with
+                            | Succeeded outcome when outcome.Value.VerifiedLfsObjectPath.IsSome ->
+                                let! worktreePointer = GitLfsObjects.readWorktreePointer state.RepoPath pathValue
+                                let worktreePath = NodePath.resolve [| state.RepoPath; pathValue |]
+                                let isRegularWorktreeFile =
+                                    NodeFileSystem.tryLstatSync worktreePath
+                                    |> Option.exists (fun stats -> stats.isFile ())
+
+                                match worktreePointer with
+                                | Ok None when isRegularWorktreeFile ->
+                                    let! objectDiff =
+                                        runGit
+                                            state.Hooks
+                                            state.RepoPath
+                                            // The repository's LFS rules would clean the worktree file
+                                            // back to its pointer, so this diff reads both files as they are.
+                                            [|
+                                                "-c"
+                                                "filter.lfs.process="
+                                                "-c"
+                                                "filter.lfs.clean=cat"
+                                                "-c"
+                                                "filter.lfs.required=false"
+                                                "diff"
+                                                "--no-index"
+                                                "--word-diff=porcelain"
+                                                "-U0"
+                                                "--"
+                                                outcome.Value.VerifiedLfsObjectPath.Value
+                                                worktreePath
+                                            |]
+                                            None
+                                            context
+
+                                    match objectDiff with
+                                    | Ok output when output.ExitCode = 0 || output.ExitCode = 1 ->
+                                        return replaceWordDiffHeaders pathValue gitDiff output.StdOut
+                                    | _ -> return gitDiff
+                                | _ -> return gitDiff
+                            | _ -> return gitDiff
+                        }
+
+                        let! diffText = lfsWordDiff
+
+                        if context.Cancellation.IsCancellationRequested() then
+                            return OperationResult.canceled "The Git text diff was canceled."
+                        else
+                            return OperationResult.succeeded (TextContent diffText)
+            with error ->
+                return Failed(OperationFailure.createRedacted ProviderError "git_failure" error.Message)
+        }
+
     {
         GetDiff =
             fun path context ->
                 mapDiff context (fun () -> GitService.getDiff state.RepoPath [| RepositoryPath.value path |])
         GetWordDiff =
             fun path context ->
-                mapDiff context (fun () -> GitService.getWordDiff state.RepoPath [| RepositoryPath.value path |])
+                mapWordDiff path context
         GetBaseContent = fun path context -> getBaseContent state path context
     }
 

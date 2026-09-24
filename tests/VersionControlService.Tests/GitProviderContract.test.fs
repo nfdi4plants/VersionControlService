@@ -3770,6 +3770,44 @@ let private createDownloadedLfsRestoreFixture () = promise {
     return root, repoPath, GitWorkspaceSession.createSession GitWorkspaceSession.GitSessionHooks.none binding
 }
 
+let private createDownloadedLfsTextFixture (content: string) = promise {
+    let! root = createTempDirectoryAsync ()
+    let barePath = join [| root; "origin.git" |]
+    let sourcePath = join [| root; "source" |]
+    let repoPath = join [| root; "downloaded" |]
+
+    let! _ = runGitIn root [||] [| "init"; "--bare"; "-b"; "main"; barePath |] None
+    let! _ = runGitIn root [||] [| "init"; "-b"; "main"; sourcePath |] None
+    do! configureUser sourcePath
+    let! _ = runGitIn sourcePath [||] [| "lfs"; "install"; "--local" |] None
+    // A basename rule, as git lfs track writes it, also matches the absolute worktree path.
+    let! _ = runGitIn sourcePath [||] [| "lfs"; "track"; "*.csv" |] None
+    do! writeUtf8FileAsync (join [| sourcePath; "data.csv" |]) content
+    let! _ = runGitIn sourcePath [||] [| "add"; "-A" |] None
+    let! _ = runGitIn sourcePath [||] [| "commit"; "-m"; "test: downloaded LFS text" |] None
+    let! _ = runGitIn sourcePath [||] [| "remote"; "add"; "origin"; barePath |] None
+    let! _ = runGitIn sourcePath [||] [| "push"; "-u"; "origin"; "main" |] None
+    let! _ = runGitIn root [||] [| "clone"; barePath; repoPath |] None
+    let! _ = runGitIn repoPath [||] [| "lfs"; "install"; "--local" |] None
+    let! _ = runGitIn repoPath [||] [| "lfs"; "pull"; "origin" |] None
+
+    let binding: WorkspaceBinding = {
+        SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
+        ProviderId = gitProviderId
+        WorkspaceRoot = repoPath
+        ProviderStateRef = None
+        Location = {
+            ProviderId = gitProviderId
+            DisplayName = None
+            ProviderLocation = barePath
+            ConnectionProfileId = None
+        }
+        ConnectionProfileId = None
+    }
+
+    return root, repoPath, GitWorkspaceSession.createSession GitWorkspaceSession.GitSessionHooks.none binding
+}
+
 let private createBaseContentFixture () =
     createBaseContentFixtureWithHooks GitWorkspaceSession.GitSessionHooks.none
 
@@ -4663,6 +4701,59 @@ Vitest.describe (
                         match expectProviderValue "missing local LFS base content" result with
                         | TextContent text -> Vitest.expect(text.StartsWith(lfsPointerPrefix)).toBe true
                         | UnsupportedContent _ -> failwith "Expected the textual LFS pointer base content."
+
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "word diff for a downloaded LFS file only removes the deleted row",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGitResultIn "." [| "lfs"; "version" |]
+
+                if lfsProbe.ExitCode <> 0 then
+                    Vitest.expect(true).toBe true
+                else
+                    let rows = [| for lineNumber in 1..10 -> $"row-{lineNumber},value-{lineNumber}" |]
+                    let baseContent = String.concat "\n" rows + "\n"
+
+                    let worktreeContent =
+                        rows
+                        |> Array.filter (fun row -> row <> "row-3,value-3")
+                        |> String.concat "\n"
+                        |> fun content -> content + "\n"
+
+                    let! root, repoPath, session = createDownloadedLfsTextFixture baseContent
+
+                    try
+                        do! writeUtf8FileAsync (join [| repoPath; "data.csv" |]) worktreeContent
+
+                        let! wordResult =
+                            (textDiffService session).GetWordDiff
+                                (repositoryPath "data.csv")
+                                (OperationContext.detached "word-diff-downloaded-lfs")
+                            |> Async.StartAsPromise
+
+                        let wordText =
+                            match expectProviderValue "downloaded LFS word diff" wordResult with
+                            | TextContent text -> text
+                            | UnsupportedContent _ -> failwith "Expected a text word diff."
+
+                        let diffLines = wordText.Replace("\r\n", "\n").Split('\n')
+
+                        Vitest
+                            .expect(
+                                diffLines
+                                |> Array.exists (fun line ->
+                                    line.StartsWith("-row-3,value-3", StringComparison.Ordinal))
+                            )
+                            .toBe true
+
+                        Vitest.expect(wordText.Contains("row-4,value-4")).toBe false
 
                         do! removeDirectoryAsync root
                     with error ->
