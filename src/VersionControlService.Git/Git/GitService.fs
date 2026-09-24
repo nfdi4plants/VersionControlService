@@ -416,15 +416,26 @@ let tryGetRepositoryWebUrlFromRemoteUrl (remoteUrl: string) : Result<string, exn
 
         if not (Uri.TryCreate(safeRemoteUrl, UriKind.Absolute, &uri)) then
             Error(exn $"Remote URL '{safeRemoteUrl}' is not a valid absolute URI.")
-        elif String.IsNullOrWhiteSpace uri.Host then
-            Error(exn "Remote URL is missing a host.")
         else
-            let normalizedPath = uri.AbsolutePath.TrimEnd('/') |> trimTrailingGitSuffix
+            match GitAuthAdapter.tryParseRemoteAuthority safeRemoteUrl with
+            | None -> Error(exn "Remote URL is missing a host.")
+            | Some(host, port) ->
+                // An ssh port belongs to the ssh server, so the web URL never carries it.
+                let webAuthority =
+                    match port with
+                    | Some value when
+                        not (String.Equals(uri.Scheme, "ssh", StringComparison.OrdinalIgnoreCase))
+                        && not (GitAuthAdapter.isDefaultHttpsPort value)
+                        ->
+                        $"{host}:{value}"
+                    | _ -> host
 
-            if String.IsNullOrWhiteSpace normalizedPath || normalizedPath = "/" then
-                Error(exn "Remote URL does not contain a repository path.")
-            else
-                Ok($"https://{uri.Host}{normalizedPath}".TrimEnd('/'))
+                let normalizedPath = uri.AbsolutePath.TrimEnd('/') |> trimTrailingGitSuffix
+
+                if String.IsNullOrWhiteSpace normalizedPath || normalizedPath = "/" then
+                    Error(exn "Remote URL does not contain a repository path.")
+                else
+                    Ok($"https://{webAuthority}{normalizedPath}".TrimEnd('/'))
 
 let private unsupportedGitContentMessage (path: string) =
     $"Unsupported git content for '{path}'."

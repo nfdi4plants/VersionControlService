@@ -39,6 +39,29 @@ let identifierTests =
     ]
 
 [<Tests>]
+let repositoryLocationTests =
+    testList "Repository locations" [
+        testCase "removes URL userinfo without changing other location forms"
+        <| fun () ->
+            let cases = [
+                "https://user:token@host/org/repo.git/", "https://host/org/repo.git/"
+                "https://token@host/org/repo.git", "https://host/org/repo.git"
+                "HTTPS://USER:TOKEN@Host:8443/org/repo.git", "HTTPS://Host:8443/org/repo.git"
+                "https://user:token@host:3443/org/repo.git", "https://host:3443/org/repo.git"
+                "http://user:token@host/org/repo.git", "http://host/org/repo.git"
+                "https://host/group/@repo.git", "https://host/group/@repo.git"
+                "ssh://git:secret@host:2222/group/repo.git", "ssh://git@host:2222/group/repo.git"
+                "ssh://git@host:2222/group/repo.git", "ssh://git@host:2222/group/repo.git"
+                "git@host:group/repo.git", "git@host:group/repo.git"
+                @"C:\repos\repo", @"C:\repos\repo"
+                "lakefs://repo/main", "lakefs://repo/main"
+            ]
+
+            for input, expected in cases do
+                Expect.equal (RepositoryLocation.withoutUserInfo input) expected $"Location stays correct for '{input}'."
+    ]
+
+[<Tests>]
 let pathTests =
     testList "Paths" [
         testCase "accepts exact relative paths including metacharacters"

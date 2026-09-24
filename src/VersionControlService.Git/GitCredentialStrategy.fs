@@ -120,13 +120,13 @@ let internal buildScopedAuthArguments (remoteUrl: string) (credential: GitCreden
     match credential with
     | None -> [||]
     | Some resolved ->
-        match GitAuthAdapter.tryExtractHostFromRemoteUrl remoteUrl with
-        | Ok host when remoteUrl.StartsWith "https://" ->
+        match GitAuthAdapter.tryExtractAuthorityFromRemoteUrl remoteUrl with
+        | Ok authority when remoteUrl.StartsWith "https://" ->
             let basicValue = toBase64 $"{resolved.Username}:{resolved.Secret}"
 
             [|
                 "-c"
-                $"http.https://{host}/.extraHeader=Authorization: Basic {basicValue}"
+                $"http.https://{authority}/.extraHeader=Authorization: Basic {basicValue}"
             |]
         | _ -> [||]
 

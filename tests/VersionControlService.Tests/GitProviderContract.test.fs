@@ -1744,6 +1744,9 @@ Vitest.describe (
                         "https://gitlab.example/group/project"
                         "https://oauth2:secret@gitlab.example/group/project.git",
                         "https://gitlab.example/group/project"
+                        "https://localhost:3443/a/b.git", "https://localhost:3443/a/b"
+                        "https://host:443/a/b", "https://host/a/b"
+                        "ssh://git@host:2222/a/b.git", "https://host/a/b"
                     |]
 
                     for remoteUrl, expectedUrl in cases do
@@ -4067,6 +4070,45 @@ Vitest.describe (
                     match status.Synchronization with
                     | Some synchronization -> Vitest.expect(synchronization.Relationship).toEqual (NoTarget)
                     | None -> failwith "Expected synchronization information for the adopted local repository."
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "Git adoption strips origin userinfo from the binding and keeps the remote unchanged",
+            fun () -> promise {
+                let! root = createTempDirectoryAsync ()
+
+                try
+                    let repoPath = join [| root; "credential-origin" |]
+                    let credentialUrl = "https://user:secret@example.invalid/org/repo.git"
+
+                    let! _ = runGitIn root [||] [| "init"; "-b"; "main"; repoPath |] None
+                    let! _ = runGitIn repoPath [||] [| "remote"; "add"; "origin"; credentialUrl |] None
+
+                    let factory = GitWorkspaceSession.createFactory GitWorkspaceSession.GitSessionHooks.none
+
+                    let! adoptionResult =
+                        Async.StartAsPromise(
+                            factory.Adopt
+                                {
+                                    WorkspaceRoot = repoPath
+                                    ConnectionProfileId = None
+                                }
+                                (OperationContext.detached "adopt-credential-origin")
+                        )
+
+                    let binding = expectProviderValue "adopt credential-bearing Git origin" adoptionResult
+                    Vitest.expect(binding.Location.ProviderLocation).toBe "https://example.invalid/org/repo.git"
+
+                    let! configuredRemote =
+                        runGitIn repoPath [||] [| "config"; "--get"; "remote.origin.url" |] None
+
+                    Vitest.expect(configuredRemote.Trim()).toBe credentialUrl
 
                     do! removeDirectoryAsync root
                 with error ->

@@ -115,6 +115,66 @@ let tryExtractHostFromRemoteUrl (remoteUrl: string) : Result<string, exn> =
     else
         Error(exn "Remote URL must use https:// or ssh://.")
 
+/// Splits the authority of a `scheme://` URL into its host and optional port.
+/// Userinfo is skipped and IPv6 literals keep their brackets. Fable's Uri drops
+/// the port from Host and reports 80 as the port of every URL without one, so
+/// the authority is read from the string.
+let internal tryParseRemoteAuthority (remoteUrl: string) : (string * string option) option =
+    let schemeSeparatorIndex = remoteUrl.IndexOf("://", StringComparison.Ordinal)
+
+    if schemeSeparatorIndex < 0 then
+        None
+    else
+        let authorityStart = schemeSeparatorIndex + 3
+
+        let authorityEnd =
+            match remoteUrl.IndexOfAny([| '/'; '?'; '#' |], authorityStart) with
+            | -1 -> remoteUrl.Length
+            | index -> index
+
+        let authority = remoteUrl.Substring(authorityStart, authorityEnd - authorityStart)
+        let hostAndPort = authority.Substring(authority.LastIndexOf('@') + 1)
+
+        let lastColonIndex = hostAndPort.LastIndexOf(':')
+        let portSeparatorIndex = if lastColonIndex > hostAndPort.LastIndexOf(']') then lastColonIndex else -1
+
+        let host, port =
+            if portSeparatorIndex < 0 then
+                hostAndPort, None
+            else
+                hostAndPort.Substring(0, portSeparatorIndex), Some(hostAndPort.Substring(portSeparatorIndex + 1))
+
+        if String.IsNullOrWhiteSpace host then
+            None
+        else
+            Some(host.ToLowerInvariant(), port)
+
+let internal isDefaultHttpsPort (port: string) =
+    let mutable parsedPort = 0
+    Int32.TryParse(port, &parsedPort) && parsedPort = 443
+
+/// Extracts the URL authority used by Git's http.<url>.* matching. Git matches the
+/// port too, so a non-default port stays, and https's default port 443 is left out.
+let tryExtractAuthorityFromRemoteUrl (remoteUrl: string) : Result<string, exn> =
+    let normalized = remoteUrl.Trim()
+
+    if String.IsNullOrWhiteSpace normalized then
+        Error(exn "Remote URL is empty.")
+    elif
+        normalized.StartsWith("https://", StringComparison.OrdinalIgnoreCase)
+        || normalized.StartsWith("ssh://", StringComparison.OrdinalIgnoreCase)
+    then
+        match tryExtractHostFromAbsoluteUri normalized, tryParseRemoteAuthority normalized with
+        | Error error, _ -> Error error
+        | Ok _, None -> Error(exn "Remote URL is missing a host.")
+        | Ok _, Some(host, Some port) when
+            not (normalized.StartsWith("https://", StringComparison.OrdinalIgnoreCase) && isDefaultHttpsPort port)
+            ->
+            Ok $"{host}:{port}"
+        | Ok _, Some(host, _) -> Ok host
+    else
+        Error(exn "Remote URL must use https:// or ssh://.")
+
 /// Applies already-resolved command authentication to a simple-git instance.
 /// This lets provider sessions resolve an injected strategy once and reuse the
 /// same scoped material for planning, explicit LFS transfer, and ref publish.

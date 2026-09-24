@@ -117,6 +117,82 @@ Vitest.describe (
     "Git workspace credential strategies",
     fun () ->
         Vitest.test (
+            "scopes HTTPS auth headers to a non-default port and omits the default port",
+            fun () -> promise {
+                let observedCommands = ResizeArray<string[]>()
+                let strategyCalls = ResizeArray<string>()
+
+                let strategy: GitCredentialStrategy.GitCredentialStrategy = {
+                    ResolveCredential =
+                        fun host _profileId ->
+                            async {
+                                strategyCalls.Add host
+                                return Some { Username = "user"; Secret = "secret" }
+                            }
+                }
+
+                let hooks = {
+                    GitWorkspaceSession.GitSessionHooks.none with
+                        RunProcess =
+                            Some(fun request _processContext ->
+                                async {
+                                    observedCommands.Add request.Arguments
+
+                                    let output: NodeProcess.ProcessOutput = {
+                                        ExitCode = 0
+                                        StdOut =
+                                            if request.Arguments |> Array.contains "--get-url" then
+                                                request.Arguments |> Array.last |> fun url -> url + "\n"
+                                            else
+                                                ""
+                                        StdErr = ""
+                                    }
+
+                                    return OperationResult.succeeded output
+                                })
+                }
+
+                let factory = GitWorkspaceSession.createFactoryWithCredentials hooks strategy
+
+                let cases = [
+                    "https://example.invalid:3443/org/repo.git",
+                    "http.https://example.invalid:3443/.extraHeader=Authorization: Basic "
+                    "https://example.invalid:443/org/repo.git",
+                    "http.https://example.invalid/.extraHeader=Authorization: Basic "
+                    "https://[2001:db8::1]:3443/org/repo.git",
+                    "http.https://[2001:db8::1]:3443/.extraHeader=Authorization: Basic "
+                ]
+
+                for remoteUrl, expectedHeaderPrefix in cases do
+                    let request: VerifyLocationRequest = {
+                        Location = {
+                            ProviderId = gitProviderId
+                            DisplayName = None
+                            ProviderLocation = remoteUrl
+                            ConnectionProfileId = None
+                        }
+                        Intents = [| ReadIntent |]
+                    }
+
+                    let! result =
+                        Async.StartAsPromise(factory.VerifyLocation request (ctx "port-scoped-auth-header"))
+
+                    expectValue "verify port-scoped credential header" result |> ignore
+
+                    let headerWasObserved =
+                        observedCommands
+                        |> Seq.exists (fun arguments ->
+                            arguments
+                            |> Array.exists (fun argument ->
+                                argument.StartsWith(expectedHeaderPrefix, StringComparison.Ordinal)))
+
+                    Vitest.expect(headerWasObserved).toBe true
+
+                Vitest.expect(strategyCalls.ToArray() |> Array.take 2).toEqual [| "example.invalid"; "example.invalid" |]
+            }
+        )
+
+        Vitest.test (
             "lfs materialization credentials use the injected strategy like publish",
             TestOptions(timeout = 120000),
             fun () -> promise {

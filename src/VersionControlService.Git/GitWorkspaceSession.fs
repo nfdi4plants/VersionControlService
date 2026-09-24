@@ -6067,7 +6067,10 @@ let private bindingFor (workspaceRoot: string) (location: RepositoryLocation) : 
     ProviderId = gitProviderId
     WorkspaceRoot = workspaceRoot
     ProviderStateRef = None
-    Location = location
+    Location = {
+        location with
+            ProviderLocation = RepositoryLocation.withoutUserInfo location.ProviderLocation
+    }
     ConnectionProfileId = location.ConnectionProfileId
 }
 

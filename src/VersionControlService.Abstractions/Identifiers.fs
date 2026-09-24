@@ -83,3 +83,57 @@ type RepositoryLocation = {
     ProviderLocation: string
     ConnectionProfileId: string option
 }
+
+module RepositoryLocation =
+
+    /// Removes HTTP(S) userinfo and passwords from SSH userinfo. Providers use this when creating bindings so credentials do not reach a stored binding.
+    let withoutUserInfo (location: string) : string =
+        if isNull location then
+            location
+        else
+            let schemeSeparatorIndex = location.IndexOf("://", StringComparison.Ordinal)
+
+            if schemeSeparatorIndex < 0 then
+                location
+            else
+                let scheme = location.Substring(0, schemeSeparatorIndex)
+                let authorityStart = schemeSeparatorIndex + 3
+                let mutable authorityEnd = location.Length
+                let mutable index = authorityStart
+
+                while index < location.Length && authorityEnd = location.Length do
+                    match location[index] with
+                    | '/'
+                    | '?'
+                    | '#' -> authorityEnd <- index
+                    | _ -> ()
+
+                    index <- index + 1
+
+                let authority = location.Substring(authorityStart, authorityEnd - authorityStart)
+                let userInfoEnd = authority.LastIndexOf('@')
+
+                if
+                    String.Equals(scheme, "http", StringComparison.OrdinalIgnoreCase)
+                    || String.Equals(scheme, "https", StringComparison.OrdinalIgnoreCase)
+                then
+                    if userInfoEnd < 0 then
+                        location
+                    else
+                        location.Substring(0, authorityStart)
+                        + authority.Substring(userInfoEnd + 1)
+                        + location.Substring(authorityEnd)
+                elif String.Equals(scheme, "ssh", StringComparison.OrdinalIgnoreCase) && userInfoEnd >= 0 then
+                    let userInfo = authority.Substring(0, userInfoEnd)
+                    let passwordSeparator = userInfo.IndexOf(':')
+
+                    if passwordSeparator < 0 then
+                        location
+                    else
+                        location.Substring(0, authorityStart)
+                        + userInfo.Substring(0, passwordSeparator)
+                        + "@"
+                        + authority.Substring(userInfoEnd + 1)
+                        + location.Substring(authorityEnd)
+                else
+                    location

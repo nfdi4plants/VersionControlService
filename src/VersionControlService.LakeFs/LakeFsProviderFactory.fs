@@ -58,7 +58,10 @@ let private bindingFor
         ProviderId = lakeFsProviderId
         WorkspaceRoot = workspaceRoot
         ProviderStateRef = Some state.StateId
-        Location = location
+        Location = {
+            location with
+                ProviderLocation = RepositoryLocation.withoutUserInfo location.ProviderLocation
+        }
         ConnectionProfileId = location.ConnectionProfileId
     })
 
