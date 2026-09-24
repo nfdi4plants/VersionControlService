@@ -89,15 +89,16 @@ let internal reportOutputText (progressCallback: GitProgressCallback option) (te
     match NodeProcess.tryParseProgressMeter text with
     | Some meter ->
         let output = NodeProcess.formatProgressMeter meter |> Redaction.redact
+        let completedTotal = NodeProcess.progressMeterCompletedTotal meter
 
         progressCallback
         |> Option.iter (fun report ->
             createProgressDto
                 None
                 None
-                (Some meter.Percent)
-                (Some meter.Percent)
-                (Some 100.0)
+                (completedTotal |> Option.map fst)
+                (completedTotal |> Option.map fst)
+                (completedTotal |> Option.map snd)
                 (Some output)
             |> report)
     | None -> ()

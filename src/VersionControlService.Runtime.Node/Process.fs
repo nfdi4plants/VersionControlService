@@ -50,11 +50,12 @@ type ProgressMeter = {
     Label: string
     Percent: float
     Count: (int * int) option
+    Transferred: string option
 }
 
 let private progressMeterPattern =
     Regex(
-        @"^(?<label>[A-Za-z][^:%\r\n]*?):\s+(?<percent>\d{1,3}(?:\.\d+)?)%(?:\s*\((?<done>\d+)/(?<total>\d+)\))?"
+        @"^(?<label>[A-Za-z][^:%\r\n]*?):\s+(?<percent>\d{1,3}(?:\.\d+)?)%(?:\s*\((?<done>\d+)/(?<total>\d+)\)(?:,\s*(?<transferred>[^|\r\n]+)\s*\|)?)?"
     )
 
 let tryParseProgressMeter (line: string) =
@@ -85,23 +86,38 @@ let tryParseProgressMeter (line: string) =
                 else
                     None
 
+            let transferred =
+                if count.IsSome && matched.Groups["transferred"].Success then
+                    Some(matched.Groups["transferred"].Value.Trim())
+                else
+                    None
+
             Some {
                 Label = matched.Groups["label"].Value.Trim()
                 Percent = max 0.0 (min 100.0 percent)
                 Count = count
+                Transferred = transferred
             }
 
 let formatProgressMeter (meter: ProgressMeter) =
+    match meter.Count, meter.Transferred with
+    | Some(completed, total), Some transferred -> $"{meter.Label} ({completed}/{total}), {transferred}"
+    | Some(completed, total), None -> $"{meter.Label} ({completed}/{total})"
+    | None, _ -> meter.Label
+
+let progressMeterCompletedTotal (meter: ProgressMeter) =
     match meter.Count with
-    | Some(completed, total) -> $"{meter.Label} ({completed}/{total})"
-    | None -> meter.Label
+    | Some(_, 1) -> None
+    | _ -> Some(meter.Percent, 100.0)
 
 let private reportProgressMeter (phaseCode: string) (context: OperationContext) (meter: ProgressMeter) =
+    let completedTotal = progressMeterCompletedTotal meter
+
     context.ReportProgress {
         PhaseCode = phaseCode
         Item = None
-        Completed = Some meter.Percent
-        Total = Some 100.0
+        Completed = completedTotal |> Option.map fst
+        Total = completedTotal |> Option.map snd
         DisplayMessage = Some(Redaction.redact (formatProgressMeter meter))
     }
 

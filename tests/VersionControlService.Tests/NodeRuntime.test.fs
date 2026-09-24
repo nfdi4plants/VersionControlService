@@ -70,36 +70,49 @@ Vitest.describe (
                         Label = "Uploading LFS objects"
                         Percent = 45.0
                         Count = Some(9, 20)
+                        Transferred = Some "1.2 MB"
+                    };
+                    "Uploading LFS objects:   0% (0/1), 1.2 MB | 1.0 MB/s",
+                    Some {
+                        Label = "Uploading LFS objects"
+                        Percent = 0.0
+                        Count = Some(0, 1)
+                        Transferred = Some "1.2 MB"
                     };
                     "Downloading LFS objects: 100% (3/3), 3.1 MB | 2 MB/s, done.",
                     Some {
                         Label = "Downloading LFS objects"
                         Percent = 100.0
                         Count = Some(3, 3)
+                        Transferred = Some "3.1 MB"
                     };
                     "Writing objects: 100% (3/3), 250 bytes | 250.00 KiB/s, done.",
                     Some {
                         Label = "Writing objects"
                         Percent = 100.0
                         Count = Some(3, 3)
+                        Transferred = Some "250 bytes"
                     };
                     "Receiving objects: 12.5% (1/8)",
                     Some {
                         Label = "Receiving objects"
                         Percent = 12.5
                         Count = Some(1, 8)
+                        Transferred = None
                     };
                     "Receiving objects: 7% complete",
                     Some {
                         Label = "Receiving objects"
                         Percent = 7.0
                         Count = None
+                        Transferred = None
                     };
                     "Uploading LFS objects: 150% (3/2)",
                     Some {
                         Label = "Uploading LFS objects"
                         Percent = 100.0
                         Count = Some(3, 2)
+                        Transferred = None
                     };
                     "remote: Counting objects: 100% (5/5)", None;
                     "To https://localhost:3443/e2eadmin/arc.git", None;
@@ -112,6 +125,41 @@ Vitest.describe (
 
                 for line, expected in cases do
                     Vitest.expect(NodeProcess.tryParseProgressMeter line).toEqual expected
+
+                let formatted =
+                    NodeProcess.tryParseProgressMeter "Uploading LFS objects:   0% (0/1), 1.2 MB | 1.0 MB/s"
+                    |> Option.map NodeProcess.formatProgressMeter
+
+                Vitest.expect(formatted).toEqual (Some "Uploading LFS objects (0/1), 1.2 MB")
+        )
+
+        Vitest.test (
+            "uses meter counts to decide whether to report percentages",
+            fun () ->
+                let singleObject: NodeProcess.ProgressMeter = {
+                    Label = "Uploading LFS objects"
+                    Percent = 0.0
+                    Count = Some(0, 1)
+                    Transferred = Some "1.2 MB"
+                }
+
+                let multipleObjects: NodeProcess.ProgressMeter = {
+                    Label = "Uploading LFS objects"
+                    Percent = 33.0
+                    Count = Some(1, 3)
+                    Transferred = None
+                }
+
+                let countlessMeter: NodeProcess.ProgressMeter = {
+                    Label = "Receiving objects"
+                    Percent = 7.0
+                    Count = None
+                    Transferred = None
+                }
+
+                Vitest.expect(NodeProcess.progressMeterCompletedTotal singleObject).toEqual None
+                Vitest.expect(NodeProcess.progressMeterCompletedTotal multipleObjects).toEqual (Some(33.0, 100.0))
+                Vitest.expect(NodeProcess.progressMeterCompletedTotal countlessMeter).toEqual (Some(7.0, 100.0))
         )
 
         Vitest.test (
@@ -162,10 +210,10 @@ Vitest.describe (
                 | Failed _ -> failwith "Expected the process to succeed."
 
                 Vitest.expect(reports.Count).toBe 2
-                Vitest.expect(reports[0].DisplayMessage).toEqual (Some "Uploading LFS objects (9/20)")
+                Vitest.expect(reports[0].DisplayMessage).toEqual (Some "Uploading LFS objects (9/20), 1.2 MB")
                 Vitest.expect(reports[0].Completed).toEqual (Some 45.0)
                 Vitest.expect(reports[0].Total).toEqual (Some 100.0)
-                Vitest.expect(reports[1].DisplayMessage).toEqual (Some "Uploading LFS objects (20/20)")
+                Vitest.expect(reports[1].DisplayMessage).toEqual (Some "Uploading LFS objects (20/20), 2.4 MB")
                 Vitest.expect(reports[1].Completed).toEqual (Some 100.0)
                 Vitest.expect(reports[1].Total).toEqual (Some 100.0)
             }
@@ -312,12 +360,12 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "progress headlines contain meter labels only",
+            "progress headlines include transfer sizes and redact secrets",
             TestOptions(timeout = 120000),
             fun () -> promise {
                 let script =
-                    "console.error('Uploading LFS objects: 50% (1/2), Authorization: Bearer topsecret123');" +
-                    "console.error('Downloading LFS objects: 100% (2/2), fetch https://user:hunter2@host.example/repo.git')"
+                    "console.error('Uploading LFS objects: 50% (1/2), 1.2 MB | Authorization: Bearer topsecret123');" +
+                    "console.error('Downloading LFS objects: 100% (2/2), 2.4 MB | fetch https://user:hunter2@host.example/repo.git')"
 
                 let request = NodeProcess.ProcessRequest.create nodeExecutable [| "-e"; script |]
                 let progressMessages = ResizeArray<string>()
@@ -336,8 +384,8 @@ Vitest.describe (
                 | Failed _ -> failwith "Expected the redaction process to succeed."
 
                 Vitest.expect(progressMessages.Count).toBe 2
-                Vitest.expect(progressMessages[0]).toBe "Uploading LFS objects (1/2)"
-                Vitest.expect(progressMessages[1]).toBe "Downloading LFS objects (2/2)"
+                Vitest.expect(progressMessages[0]).toBe "Uploading LFS objects (1/2), 1.2 MB"
+                Vitest.expect(progressMessages[1]).toBe "Downloading LFS objects (2/2), 2.4 MB"
 
                 for message in progressMessages do
                     Vitest.expect(message.Contains "topsecret123").toBe (false)

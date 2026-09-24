@@ -769,6 +769,7 @@ let private runGitCapturedWithOutput progressCallback request =
         match NodeProcess.tryParseProgressMeter line with
         | Some meter ->
             let displayMessage = NodeProcess.formatProgressMeter meter |> Redaction.redact
+            let completedTotal = NodeProcess.progressMeterCompletedTotal meter
 
             progressCallback
             |> Option.iter (fun report ->
@@ -776,8 +777,8 @@ let private runGitCapturedWithOutput progressCallback request =
                     (Some "lfs")
                     (Some "upload")
                     None
-                    (Some meter.Percent)
-                    (Some 100.0)
+                    (completedTotal |> Option.map fst)
+                    (completedTotal |> Option.map snd)
                     (Some displayMessage)
                 |> report)
         | None -> ()
@@ -2002,8 +2003,8 @@ let private downloadMissingLfsFile
                         context.ReportProgress {
                             PhaseCode = "lfs-materialize-transfer"
                             Item = Some safePath
-                            Completed = Some 0.0
-                            Total = Some listing.size
+                            Completed = None
+                            Total = None
                             DisplayMessage = None
                         })
             with

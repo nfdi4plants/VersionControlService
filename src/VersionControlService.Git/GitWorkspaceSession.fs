@@ -177,6 +177,15 @@ let private runGitEnv
 let private runGit hooks repoPath arguments stdinData context =
     runGitEnv hooks repoPath arguments stdinData [||] context
 
+let private reportProgressReset (phaseCode: string) (context: OperationContext) =
+    context.ReportProgress {
+        PhaseCode = phaseCode
+        Item = None
+        Completed = None
+        Total = None
+        DisplayMessage = None
+    }
+
 let private runHookedBytesProcess
     (hooks: GitSessionHooks)
     (request: NodeProcess.ProcessRequest)
@@ -2617,7 +2626,9 @@ let private switchRef (state: SessionState) (request: SwitchRefRequest) (context
 
                     match checkoutResult with
                     | Error failure -> return Failed failure
-                    | Ok() -> return! getWorkspaceStatus state context
+                    | Ok() ->
+                        reportProgressReset "switch-status" context
+                        return! getWorkspaceStatus state context
         | Choice1Of2 localName ->
             let! nameValidation = GitRefs.validateBranchName refRunner localName
 
@@ -2641,7 +2652,9 @@ let private switchRef (state: SessionState) (request: SwitchRefRequest) (context
 
                         match checkoutResult with
                         | Error failure -> return Failed failure
-                        | Ok() -> return! getWorkspaceStatus state context
+                        | Ok() ->
+                            reportProgressReset "switch-status" context
+                            return! getWorkspaceStatus state context
     }
 
 /// Parses `git diff --name-status -z` output: NUL-delimited tokens of
@@ -3325,6 +3338,7 @@ let private refresh (state: SessionState) (context: OperationContext) =
                 match fetchResult with
                 | Error failure -> return Failed { failure with Retryable = true }
                 | Ok _ ->
+                    reportProgressReset "refresh-state" context
                     let! stateResult = synchronizationState state context
 
                     match stateResult with
@@ -3554,11 +3568,13 @@ let private updateFromState
 
             match mergeResult, startResult with
             | Error(failure, true), Ok start when failure.Category = Canceled ->
+                reportProgressReset "update-inspection" context
                 let! recovered = recoverCanceledMerge state start targetReference failure context
                 return Failed recovered
             | Error(failure, _), _ -> return Failed failure
             | Ok _, Error failure -> return Failed failure
             | Ok output, Ok start when output.ExitCode = 0 ->
+                reportProgressReset "update-inspection" context
                 let inspectionContext = startInspection ()
                 let! updatedState = synchronizationState state inspectionContext
 
@@ -3685,6 +3701,7 @@ let private updateFromState
                                         Code = "hydration_failed"
                                 }
             | Ok output, Ok start ->
+                reportProgressReset "update-inspection" context
                 let inspectionContext = startInspection ()
                 let! mergeHeadResult = tryGetMergeHead state inspectionContext
 
@@ -4135,6 +4152,8 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                     "GIT_LFS_SKIP_PUSH", "1"
                             |]
 
+                            reportProgressReset "push" context
+
                             let! pushResult =
                                 runGitEnv
                                     state.Hooks
@@ -4225,6 +4244,7 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                             // A push response is ambiguous until the exact target ref is read.
                             // This follow-up is deliberately read-only and ignores caller
                             // cancellation so a cancellation cannot conceal an accepted ref.
+                            reportProgressReset "publish-verification" context
                             let verificationCancellation = OperationCancellation.Source()
                             let mutable verificationCompleted = false
                             let mutable verificationTimedOut = false
@@ -4609,6 +4629,7 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                         Retryable = true
                                 }
                         | Ok _ ->
+                            reportProgressReset "publish-adoption" context
                             let! remoteTrackingRef =
                                 runGit
                                     state.Hooks
@@ -6928,6 +6949,7 @@ let createFactoryWithCredentialsIdentityAndPolicy
                                     )
                                 )
                             else
+                                reportProgressReset "clone-lfs-pull" context
                                 runGitEnv
                                     hooks
                                     request.TargetPath

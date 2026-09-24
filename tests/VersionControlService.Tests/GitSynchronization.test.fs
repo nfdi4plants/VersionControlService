@@ -5756,16 +5756,43 @@ Vitest.describe (
                         .expect(pushRequest.Environment |> Array.contains ("GIT_LFS_SKIP_PUSH", "1"))
                         .toBe true
 
-                    Vitest.expect(reports |> Seq.exists (fun report -> report.PhaseCode = "lfs-upload")).toBe true
-                    Vitest
-                        .expect(
-                            reports
-                            |> Seq.exists (fun (report: OperationProgress) ->
-                                report.PhaseCode = "lfs-upload"
-                                && report.Completed.IsSome
-                                && report.Total.IsSome)
-                        )
-                        .toBe true
+                    let reportEvents = reports.ToArray()
+                    let lfsUploadEvents =
+                        reportEvents
+                        |> Array.filter (fun report -> report.PhaseCode = "lfs-upload")
+
+                    Vitest.expect(lfsUploadEvents.Length > 0).toBe true
+
+                    let numericLfsUploadEvents =
+                        lfsUploadEvents
+                        |> Array.filter (fun report -> report.Completed.IsSome || report.Total.IsSome)
+
+                    for report in numericLfsUploadEvents do
+                        Vitest.expect(report.Total).toEqual (Some 100.0)
+
+                    let completedLfsUploadEvents =
+                        numericLfsUploadEvents
+                        |> Array.choose (fun report -> report.Completed)
+
+                    for index = 1 to completedLfsUploadEvents.Length - 1 do
+                        let previous = completedLfsUploadEvents[index - 1]
+                        let current = completedLfsUploadEvents[index]
+                        Vitest.expect(previous <= current).toBe true
+
+                    let lastLfsUploadIndex =
+                        reportEvents
+                        |> Array.findIndexBack (fun report -> report.PhaseCode = "lfs-upload")
+
+                    let pushEventIndex =
+                        reportEvents
+                        |> Array.findIndex (fun report ->
+                            report.PhaseCode = "push"
+                            && report.Completed.IsNone
+                            && report.Total.IsNone)
+
+                    Vitest.expect(reportEvents[pushEventIndex].Item).toEqual None
+                    Vitest.expect(reportEvents[pushEventIndex].DisplayMessage).toEqual None
+                    Vitest.expect(pushEventIndex > lastLfsUploadIndex).toBe true
 
                     let lfsObjectPath (oid: string) =
                         join [|

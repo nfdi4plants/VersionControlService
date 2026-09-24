@@ -1234,15 +1234,16 @@ let private createMaintenanceOutputObserver (progressCallback: (GitProgressDto -
         match NodeProcess.tryParseProgressMeter line with
         | Some meter ->
             let displayMessage = NodeProcess.formatProgressMeter meter |> Redaction.redact
+            let completedTotal = NodeProcess.progressMeterCompletedTotal meter
 
             progressCallback
             |> Option.iter (fun report ->
                 report {
                     Method = Some "lfs"
                     Stage = Some "maintenance"
-                    Progress = Some meter.Percent
-                    Processed = Some meter.Percent
-                    Total = Some 100.0
+                    Progress = completedTotal |> Option.map fst
+                    Processed = completedTotal |> Option.map fst
+                    Total = completedTotal |> Option.map snd
                     Output = Some displayMessage
                 })
         | None -> ()
