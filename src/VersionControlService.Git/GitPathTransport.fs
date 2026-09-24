@@ -6,6 +6,33 @@ module internal VersionControlService.Git.GitPathTransport
 
 open VersionControlService.Abstractions
 
+let private maxArgumentCharacters = 19000
+
+let chunkArguments (fixedArguments: string[]) (arguments: string[]) : string[][] =
+    let fixedLength = fixedArguments |> Array.sumBy (fun argument -> argument.Length + 1)
+    let chunks = ResizeArray<string[]>()
+    let current = ResizeArray<string>()
+    let mutable currentLength = fixedLength
+
+    for argument in arguments do
+        let argumentLength = argument.Length + 1
+
+        if current.Count > 0 && currentLength + argumentLength > maxArgumentCharacters then
+            chunks.Add(current.ToArray())
+            current.Clear()
+            currentLength <- fixedLength
+
+        current.Add argument
+        currentLength <- currentLength + argumentLength
+
+    if current.Count > 0 then
+        chunks.Add(current.ToArray())
+
+    if chunks.Count = 0 then
+        chunks.Add [||]
+
+    chunks.ToArray()
+
 /// Encodes one literal repository path as a Git pathspec that disables all
 /// wildcard/attribute magic.
 let literalPathspec (path: RepositoryPath) : string =

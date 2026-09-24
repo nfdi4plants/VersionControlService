@@ -338,12 +338,6 @@ let private splitGitOutputLines (text: string) =
     |> Array.map _.Trim()
     |> Array.filter (String.IsNullOrWhiteSpace >> not)
 
-let private withGitPathspecs (command: string[]) (pathSpecs: string[]) = [|
-    yield! command
-    yield "--"
-    yield! pathSpecs
-|]
-
 /// Validates a remote name and defaults blank input to `origin`.
 let validateRemoteName (remoteName: string) =
     let normalized =
@@ -742,6 +736,33 @@ let private reconcileTrackingBranchForCheckout
 let private runSimpleGit (operation: ISimpleGit -> JS.Promise<'T>) (git: ISimpleGit) : JS.Promise<GitResult<'T>> =
     GitInternals.runSimpleGit toFailure operation git
 
+let private runSimpleGitPathspecChunks
+    (command: string[])
+    (pathSpecs: string[])
+    (git: ISimpleGit)
+    : JS.Promise<GitResult<string>> =
+    promise {
+        let fixedArguments = Array.append command [| "--" |]
+        let chunks = GitPathTransport.chunkArguments fixedArguments (Array.distinct pathSpecs)
+        let outputs = ResizeArray<string>()
+        let mutable failure = None
+
+        for chunk in chunks do
+            match failure with
+            | Some _ -> ()
+            | None ->
+                let arguments = Array.append fixedArguments chunk
+                let! result = runSimpleGit (fun currentGit -> currentGit.raw arguments) git
+
+                match result with
+                | Error currentFailure -> failure <- Some currentFailure
+                | Ok output -> outputs.Add output
+
+        match failure with
+        | Some currentFailure -> return Error currentFailure
+        | None -> return Ok(String.concat "" outputs)
+    }
+
 let private exactTransferBytesPattern =
     Regex(
         @"(?<processed>\d+(?:\.\d+)?)\s*/\s*(?<total>\d+(?:\.\d+)?)\s*bytes",
@@ -1051,7 +1072,7 @@ let private enforceStageTimeLfsTrackingForPaths
                         else
                             let pathsToRestage = [| ".gitattributes"; yield! oversizedPaths |] |> Array.distinct
 
-                            let! restageResult = runSimpleGit (fun currentGit -> currentGit.add pathsToRestage) git
+                            let! restageResult = runSimpleGitPathspecChunks [| "add" |] pathsToRestage git
 
                             match restageResult with
                             | Ok _ -> return Ok()
@@ -1448,14 +1469,12 @@ let getDiff (arcPath: string) (pathSpecs: string[]) : JS.Promise<GitResult<strin
             withLocalGit
                 arcPath
                 (fun git -> promise {
-                    let diffArgs =
-                        [|
-                            "diff"
-                            "--"
-                            yield! literalPaths |> Array.map GitPathTransport.literalPathspec
-                        |]
-                    let! diff = git.raw diffArgs
-                    return diff
+                    let pathspecs = literalPaths |> Array.map GitPathTransport.literalPathspec
+                    let! result = runSimpleGitPathspecChunks [| "diff" |] pathspecs git
+
+                    match result with
+                    | Ok output -> return output
+                    | Error failure -> return abortGitPromise failure.Message
                 })
 }
 
@@ -1468,18 +1487,17 @@ let getWordDiff (arcPath: string) (pathSpecs: string[]) : JS.Promise<GitResult<s
             withLocalGit
                 arcPath
                 (fun git -> promise {
-                    let diffArgs = [|
-                        "diff"
-                        "--word-diff=porcelain"
-                        "-U0"
-                        "--"
-                        yield!
-                            literalPaths
-                            |> Array.map GitPathTransport.literalPathspec
-                    |]
+                    let pathspecs = literalPaths |> Array.map GitPathTransport.literalPathspec
 
-                    let! diff = git.raw diffArgs
-                    return diff
+                    let! result =
+                        runSimpleGitPathspecChunks
+                            [| "diff"; "--word-diff=porcelain"; "-U0" |]
+                            pathspecs
+                            git
+
+                    match result with
+                    | Ok output -> return output
+                    | Error failure -> return abortGitPromise failure.Message
                 })
 }
 
@@ -1838,12 +1856,16 @@ let stagePaths (arcPath: string) (pathSpecs: string[]) : JS.Promise<GitResult<un
             withLocalGit
                 arcPath
                 (fun git -> promise {
-                    let! _ = git.add safePathSpecs
-                    let! lfsResult = enforceStageTimeLfsTrackingForPaths arcPath safePathSpecs git
+                    let! stageResult = runSimpleGitPathspecChunks [| "add" |] safePathSpecs git
 
-                    match lfsResult with
-                    | Ok() -> return ()
+                    match stageResult with
                     | Error failure -> return abortGitPromise failure.Message
+                    | Ok _ ->
+                        let! lfsResult = enforceStageTimeLfsTrackingForPaths arcPath safePathSpecs git
+
+                        match lfsResult with
+                        | Ok() -> return ()
+                        | Error failure -> return abortGitPromise failure.Message
                 })
 }
 
@@ -1856,10 +1878,11 @@ let unstagePaths (arcPath: string) (pathSpecs: string[]) : JS.Promise<GitResult<
             withLocalGit
                 arcPath
                 (fun git -> promise {
-                    let resetOptions = [| yield "--"; yield! safePathSpecs |]
+                    let! resetResult = runSimpleGitPathspecChunks [| "reset"; "--mixed" |] safePathSpecs git
 
-                    let! _ = git.reset ("mixed", !^resetOptions)
-                    return ()
+                    match resetResult with
+                    | Ok _ -> return ()
+                    | Error failure -> return abortGitPromise failure.Message
                 })
 }
 
@@ -1870,13 +1893,13 @@ let private hasHeadCommit (git: ISimpleGit) = promise {
 
 let private headPathsForPathspecsWithGit (git: ISimpleGit) (pathSpecs: string[]) = promise {
     let! headPathsResult =
-        runSimpleGit
-            (fun currentGit ->
-                currentGit.raw (withGitPathspecs [| "ls-tree"; "-r"; "-z"; "--name-only"; "HEAD" |] pathSpecs))
-            git
+        runSimpleGitPathspecChunks [| "ls-tree"; "-r"; "-z"; "--name-only"; "HEAD" |] pathSpecs git
 
     match headPathsResult with
-    | Ok output -> return output.Split('\000', StringSplitOptions.RemoveEmptyEntries)
+    | Ok output ->
+        return
+            output.Split('\000', StringSplitOptions.RemoveEmptyEntries)
+            |> Array.distinct
     | Error failure -> return abortGitPromise failure.Message
 }
 
@@ -2298,9 +2321,7 @@ let discardPaths (arcPath: string) (pathSpecs: string[]) : JS.Promise<GitResult<
 
                     if hasHead then
                         let! resetResult =
-                            runSimpleGit
-                                (fun currentGit -> currentGit.raw (withGitPathspecs [| "reset" |] discardPathSpecs))
-                                git
+                            runSimpleGitPathspecChunks [| "reset" |] discardPathSpecs git
 
                         match resetResult with
                         | Error failure -> return abortGitPromise failure.Message
@@ -2312,25 +2333,16 @@ let discardPaths (arcPath: string) (pathSpecs: string[]) : JS.Promise<GitResult<
                                 let restoreGit = applyLfsSkipSmudge git
 
                                 let! restoreResult =
-                                    runSimpleGit
-                                        (fun currentGit ->
-                                            currentGit.raw (withGitPathspecs [| "restore"; "--worktree" |] headPaths)
-                                        )
-                                        restoreGit
+                                    runSimpleGitPathspecChunks [| "restore"; "--worktree" |] headPaths restoreGit
 
                                 match restoreResult with
                                 | Error failure -> return abortGitPromise failure.Message
                                 | Ok _ -> ()
                     else
                         let! rmCachedResult =
-                            runSimpleGit
-                                (fun currentGit ->
-                                    currentGit.raw (
-                                        withGitPathspecs
-                                            [| "rm"; "--cached"; "-r"; "--ignore-unmatch" |]
-                                            discardPathSpecs
-                                    )
-                                )
+                            runSimpleGitPathspecChunks
+                                [| "rm"; "--cached"; "-r"; "--ignore-unmatch" |]
+                                discardPathSpecs
                                 git
 
                         match rmCachedResult with
@@ -2338,9 +2350,7 @@ let discardPaths (arcPath: string) (pathSpecs: string[]) : JS.Promise<GitResult<
                         | Ok _ -> ()
 
                     let! cleanResult =
-                        runSimpleGit
-                            (fun currentGit -> currentGit.raw (withGitPathspecs [| "clean"; "-fd" |] discardPathSpecs))
-                            git
+                        runSimpleGitPathspecChunks [| "clean"; "-fd" |] discardPathSpecs git
 
                     match cleanResult with
                     | Error failure -> return abortGitPromise failure.Message

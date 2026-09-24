@@ -105,9 +105,10 @@ type private GitRevisionPolicyFixture = {
     Binding: WorkspaceBinding
 }
 
-let private createGitFixture
+let private createGitFixtureWithHooks
     (strategy: RevisionPolicyStrategy)
     (baseAttributes: string option)
+    (hooks: GitWorkspaceSession.GitSessionHooks)
     : JS.Promise<GitRevisionPolicyFixture> =
     promise {
         let! root = createTempDirectoryAsync ()
@@ -133,7 +134,7 @@ let private createGitFixture
 
         let factory =
             GitWorkspaceSession.createFactoryWithCredentialsIdentityAndPolicy
-                GitWorkspaceSession.GitSessionHooks.none
+                hooks
                 GitCredentialStrategy.anonymous
                 GitCredentialStrategy.anonymousIdentity
                 strategy
@@ -155,6 +156,12 @@ let private createGitFixture
             Binding = binding
         }
     }
+
+let private createGitFixture
+    (strategy: RevisionPolicyStrategy)
+    (baseAttributes: string option)
+    : JS.Promise<GitRevisionPolicyFixture> =
+    createGitFixtureWithHooks strategy baseAttributes GitWorkspaceSession.GitSessionHooks.none
 
 let private withGitFixture
     (strategy: RevisionPolicyStrategy)
@@ -334,6 +341,145 @@ Vitest.describe (
                     Vitest.expect(content.StartsWith(lfsPointerPrefix)).toBe true
                     Vitest.expect(attributes.Contains("\"/assets/small.bin\" filter=lfs")).toBe true
                 })
+        )
+
+        Vitest.test (
+            "the in-process LFS pointer matches git lfs pointer",
+            TestOptions(timeout = 120000),
+            fun () ->
+                let path = "assets/pointer-sample.bin"
+
+                let strategy: RevisionPolicyStrategy = {
+                    ResolvePathPolicy = fun request ->
+                        if RepositoryPath.value request.Path = path then
+                            RevisionPathPolicy.LargeObject
+                        else
+                            RevisionPathPolicy.Automatic
+                }
+
+                withGitFixture strategy None (fun fixture -> promise {
+                    let absolutePath = join [| fixture.WorkPath; path |]
+                    do! writeUtf8FileAsync absolutePath "sample LFS payload\n"
+
+                    let! revision = createRevision fixture "test: compare LFS pointer" [| path |]
+                    expectSucceeded "pointer comparison revision" revision |> ignore
+
+                    let! committedPointer = runGitOk fixture.WorkPath [| "cat-file"; "-p"; $"HEAD:{path}" |]
+                    let! expectedPointer = runGitOk fixture.WorkPath [| "lfs"; "pointer"; $"--file={absolutePath}" |]
+                    Vitest.expect(committedPointer).toBe expectedPointer
+                })
+        )
+
+        Vitest.test (
+            "CreateRevision handles 2000 new text files in 20 folders",
+            TestOptions(timeout = 300000),
+            fun () ->
+                withGitFixture RevisionPolicyStrategy.automatic None (fun fixture -> promise {
+                    let paths = ResizeArray<string>()
+
+                    for folderIndex in 0 .. 19 do
+                        let folder = $"bulk/folder-{folderIndex:D2}"
+                        do! ensureDirectoryAsync (join [| fixture.WorkPath; folder |])
+
+                        for fileIndex in 0 .. 99 do
+                            let path = $"{folder}/file-{fileIndex:D3}.txt"
+                            do!
+                                NodeFileSystem.writeFileAsync
+                                    (join [| fixture.WorkPath; path |])
+                                    "short content\n"
+                                    NodeFileSystem.TextEncoding.Utf8
+
+                            paths.Add path
+
+                    let! revision = createRevision fixture "test: create 2000 text files" (paths.ToArray())
+                    expectSucceeded "2000 file revision" revision |> ignore
+
+                    let! status = runGitOk fixture.WorkPath [| "status"; "--porcelain" |]
+                    Vitest.expect(status.Trim()).toBe ""
+                })
+        )
+
+        Vitest.test (
+            "CreateRevision starts fewer than 60 hooked Git processes for text and LFS paths",
+            TestOptions(timeout = 180000),
+            fun () -> promise {
+                let mutable countGitProcesses = false
+                let mutable gitProcessCount = 0
+
+                let hooks = {
+                    GitWorkspaceSession.GitSessionHooks.none with
+                        RunProcess =
+                            Some(fun request processContext ->
+                                async {
+                                    if countGitProcesses && request.Command = "git" then
+                                        gitProcessCount <- gitProcessCount + 1
+
+                                    return! NodeProcess.run request processContext
+                                })
+                }
+
+                let strategy: RevisionPolicyStrategy = {
+                    ResolvePathPolicy = fun request ->
+                        if (RepositoryPath.value request.Path).EndsWith(".bin", StringComparison.Ordinal) then
+                            RevisionPathPolicy.LargeObject
+                        else
+                            RevisionPathPolicy.Automatic
+                }
+
+                let! fixture = createGitFixtureWithHooks strategy None hooks
+
+                try
+                    let paths = ResizeArray<string>()
+                    let textFolder = join [| fixture.WorkPath; "bulk-text" |]
+                    let lfsFolder = join [| fixture.WorkPath; "bulk-lfs" |]
+                    do! ensureDirectoryAsync textFolder
+                    do! ensureDirectoryAsync lfsFolder
+
+                    for index in 0 .. 299 do
+                        let path = $"bulk-text/file-{index:D3}.txt"
+                        do!
+                            NodeFileSystem.writeFileAsync
+                                (join [| fixture.WorkPath; path |])
+                                "short content\n"
+                                NodeFileSystem.TextEncoding.Utf8
+
+                        paths.Add path
+
+                    for index in 0 .. 19 do
+                        let path = $"bulk-lfs/file-{index:D2}.bin"
+                        do!
+                            NodeFileSystem.writeFileAsync
+                                (join [| fixture.WorkPath; path |])
+                                (String.replicate 4096 "l")
+                                NodeFileSystem.TextEncoding.Utf8
+
+                        paths.Add path
+
+                    let! statusResult = fixture.Session.Core.GetStatus(context "process-count-status") |> Async.StartAsPromise
+                    let status = expectSucceeded "process count status" statusResult
+
+                    let request: CreateRevisionRequest = {
+                        Message = "test: count selected revision processes"
+                        Paths = paths.ToArray() |> Array.map repositoryPath
+                        ExpectedWorkspaceVersion = status.WorkspaceVersion
+                    }
+
+                    countGitProcesses <- true
+
+                    let! revision =
+                        fixture.Session.Core.CreateRevision request (context "process-count-create")
+                        |> Async.StartAsPromise
+
+                    countGitProcesses <- false
+                    expectSucceeded "process count revision" revision |> ignore
+                    Vitest.expect(gitProcessCount).toBeGreaterThan (0)
+                    Vitest.expect(gitProcessCount).toBeLessThan (60)
+                    do! removeDirectoryAsync fixture.Root
+                with error ->
+                    countGitProcesses <- false
+                    do! removeDirectoryAsync fixture.Root
+                    return raise error
+            }
         )
 
         Vitest.test (

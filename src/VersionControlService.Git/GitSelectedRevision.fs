@@ -142,30 +142,30 @@ let private listSelectedCandidateFiles
     (paths: RepositoryPath[])
     =
     async {
-        let! outputResult =
-            runGit
-                [|
-                    "ls-files"
-                    "-z"
-                    "--cached"
-                    "--others"
-                    "--exclude-standard"
-                    "--"
-                    yield! paths |> Array.map GitPathTransport.literalPathspec
-                |]
-                None
-                environment
+        let fixedArguments = [| "ls-files"; "-z"; "--cached"; "--others"; "--exclude-standard"; "--" |]
+        let pathspecs = paths |> Array.map GitPathTransport.literalPathspec
+        let argumentChunks = GitPathTransport.chunkArguments fixedArguments pathspecs
+        let candidates = ResizeArray<string>()
+        let mutable failure = None
 
-        match outputResult with
-        | Error failure -> return Error failure
-        | Ok output when output.ExitCode <> 0 ->
-            return Error(failedRun "git ls-files selected LFS candidates" output)
-        | Ok output ->
-            return
-                output.StdOut.Split '\000'
-                |> Array.filter (fun path -> path <> "")
-                |> Array.distinct
-                |> Ok
+        for chunk in argumentChunks do
+            match failure with
+            | Some _ -> ()
+            | None ->
+                let! outputResult = runGit (Array.append fixedArguments chunk) None environment
+
+                match outputResult with
+                | Error currentFailure -> failure <- Some currentFailure
+                | Ok output when output.ExitCode <> 0 ->
+                    failure <- Some(failedRun "git ls-files selected LFS candidates" output)
+                | Ok output ->
+                    output.StdOut.Split '\000'
+                    |> Array.filter (fun path -> path <> "")
+                    |> Array.iter candidates.Add
+
+        match failure with
+        | Some currentFailure -> return Error currentFailure
+        | None -> return candidates.ToArray() |> Array.distinct |> Ok
     }
 
 let private resolveSelectedPathPolicies
@@ -609,29 +609,15 @@ let private checkSelectedMetadata
                     selectedPolicies
     }
 
-let private tryPointerOid (pointerText: string) =
-    GitLfsObjects.tryParseLfsPointer pointerText |> Option.map _.Oid
-
-let private hashTextBlob (runGit: GitRunner) (content: string) =
-    async {
-        let! result = runGit [| "hash-object"; "-w"; "--stdin" |] (Some content) [||]
-
-        match result with
-        | Error failure -> return Error failure
-        | Ok output when output.ExitCode <> 0 -> return Error(failedRun "git hash-object" output)
-        | Ok output -> return Ok(output.StdOut.Trim())
-    }
-
 let private prepareLfsPointerBlob
-    (runGit: GitRunner)
     (repoPath: string)
     (getMediaDirectory: unit -> Async<Result<string, OperationFailure>>)
-    (commonGitDir: string)
     (relativePath: string)
-    : Async<Result<string, OperationFailure>> =
+    (pointerPath: string)
+    : Async<Result<unit, OperationFailure>> =
     async {
         let sourcePath = NodePath.join [| repoPath; relativePath |]
-        let snapshotPath = NodePath.join [| commonGitDir; $"vcs-lfs-snapshot-{DateTime.Now.Ticks}" |]
+        let snapshotPath = pointerPath + "-content"
 
         let cleanupSnapshot () =
             try
@@ -655,96 +641,73 @@ let private prepareLfsPointerBlob
             match sourceContentResult with
             | Error failure -> return Error failure
             | Ok(Some sourceContent) when GitLfsObjects.tryParseLfsPointer sourceContent |> Option.isSome ->
-                return! hashTextBlob runGit sourceContent
+                NodeFileSystem.writeFileSync pointerPath sourceContent NodeFileSystem.TextEncoding.Utf8
+                return Ok()
             // git-lfs stores an empty file as empty content (its clean filter writes no pointer),
             // so the empty blob is what git add would produce.
             | Ok(Some "") ->
-                return! hashTextBlob runGit ""
+                NodeFileSystem.writeFileSync pointerPath "" NodeFileSystem.TextEncoding.Utf8
+                return Ok()
             | Ok _ ->
-                    return!
-                        async {
+                try
+                    NodeFileSystem.copyFileSync sourcePath snapshotPath
+                    let! hashedFile = NodeFileSystem.hashFileSha256Async snapshotPath
+                    let oid = hashedFile.Sha256
+                    let size = int64 hashedFile.Stats.size
+                    let pointerText =
+                        $"version https://git-lfs.github.com/spec/v1\noid sha256:{oid}\nsize {size}\n"
+
+                    let! mediaDirectoryResult = getMediaDirectory ()
+
+                    match mediaDirectoryResult with
+                    | Error failure ->
+                        return
+                            Error(
+                                OperationFailure.createRedacted
+                                    ProviderError
+                                    "lfs_object_prepare_failed"
+                                    failure.Message
+                            )
+                    | Ok mediaDirectory ->
+                        let objectPath = GitLfsObjects.objectPath mediaDirectory oid
+                        let objectDirectory = NodePath.dirname objectPath
+
+                        NodeFileSystem.mkdirSync objectDirectory (NodeFileSystem.MkdirOptions(recursive = true))
+
+                        if NodeFileSystem.existsSync objectPath then
+                            cleanupSnapshot ()
+                        else
                             try
-                                NodeFileSystem.copyFileSync sourcePath snapshotPath
+                                NodeFileSystem.renameSync snapshotPath objectPath
+                            with error when errorCode (box error) = "EXDEV" ->
+                                NodeFileSystem.copyFileSync snapshotPath objectPath
+                                NodeFileSystem.unlinkSync snapshotPath
 
-                                let! pointerResult =
-                                    runGit [| "lfs"; "pointer"; $"--file={snapshotPath}" |] None [||]
-
-                                match pointerResult with
-                                | Error failure -> return Error(dependencyMissingFailure failure.Message)
-                                | Ok output when output.ExitCode <> 0 ->
-                                    let detail =
-                                        if String.IsNullOrWhiteSpace output.StdErr then output.StdOut else output.StdErr
-
-                                    return Error(dependencyMissingFailure detail)
-                                | Ok output ->
-                                    match tryPointerOid output.StdOut with
-                                    | None ->
-                                        return
-                                            Error(
-                                                OperationFailure.create
-                                                    ProviderError
-                                                    "lfs_pointer_invalid"
-                                                    "Git LFS did not return a canonical pointer for an oversized selected file."
-                                            )
-                                    | Some oid ->
-                                        let! mediaDirectoryResult = getMediaDirectory ()
-
-                                        match mediaDirectoryResult with
-                                        | Error failure ->
-                                            return
-                                                Error(
-                                                    OperationFailure.createRedacted
-                                                        ProviderError
-                                                        "lfs_object_prepare_failed"
-                                                        failure.Message
-                                                )
-                                        | Ok mediaDirectory ->
-                                            let objectPath = GitLfsObjects.objectPath mediaDirectory oid
-                                            let objectDirectory = NodePath.dirname objectPath
-
-                                            NodeFileSystem.mkdirSync
-                                                objectDirectory
-                                                (NodeFileSystem.MkdirOptions(recursive = true))
-
-                                            if NodeFileSystem.existsSync objectPath then
-                                                cleanupSnapshot ()
-                                            else
-                                                try
-                                                    NodeFileSystem.renameSync snapshotPath objectPath
-                                                with error when errorCode (box error) = "EXDEV" ->
-                                                    NodeFileSystem.copyFileSync snapshotPath objectPath
-                                                    NodeFileSystem.unlinkSync snapshotPath
-
-                                            let! pointerBlob =
-                                                runGit [| "hash-object"; "-w"; "--stdin" |] (Some output.StdOut) [||]
-
-                                            match pointerBlob with
-                                            | Error failure -> return Error failure
-                                            | Ok hashOutput when hashOutput.ExitCode <> 0 ->
-                                                return Error(failedRun "git hash-object (LFS pointer)" hashOutput)
-                                            | Ok hashOutput -> return Ok(hashOutput.StdOut.Trim())
-                            with error ->
-                                return
-                                    Error(
-                                        OperationFailure.createRedacted
-                                            ProviderError
-                                            "lfs_object_prepare_failed"
-                                            error.Message
-                                    )
-                        }
+                        NodeFileSystem.writeFileSync pointerPath pointerText NodeFileSystem.TextEncoding.Utf8
+                        return Ok()
+                with error ->
+                    return
+                        Error(
+                            OperationFailure.createRedacted
+                                ProviderError
+                                "lfs_object_prepare_failed"
+                                error.Message
+                        )
         finally
             cleanupSnapshot ()
     }
 
-let private updateTemporaryIndexEntry
+let private updateTemporaryIndexEntries
     (runGit: GitRunner)
     (environment: (string * string)[])
-    (mode: string)
-    (blobId: string)
-    (path: string)
+    (entries: (string * string * string)[])
     =
     async {
-        let indexInfo = $"{mode} {blobId}\t{path}\000"
+        let indexInfo =
+            entries
+            |> Array.map (fun (mode, blobId, path) -> $"{mode} {blobId}\t{path}\000")
+            |> String.concat ""
+
         let! result = runGit [| "update-index"; "-z"; "--index-info" |] (Some indexInfo) environment
 
         match result with
@@ -771,67 +734,50 @@ let private invalidTemporaryIndexEntry path =
 let private listTemporaryIndexEntries
     (runGit: GitRunner)
     (environment: (string * string)[])
-    (path: string)
+    (paths: string[])
     =
     async {
-        let! result =
-            runGit
-                [| "--literal-pathspecs"; "ls-files"; "--stage"; "-z"; "--"; path |]
-                None
-                environment
+        let fixedArguments = [| "--literal-pathspecs"; "ls-files"; "--stage"; "-z"; "--" |]
+        let argumentChunks = GitPathTransport.chunkArguments fixedArguments paths
+        let affectedPath = paths |> Array.tryHead |> Option.defaultValue ""
+        let entries = ResizeArray<TemporaryIndexEntry>()
+        let mutable failure = None
 
-        match result with
-        | Error failure -> return Error failure
-        | Ok output when output.ExitCode <> 0 -> return Error(failedRun "git ls-files --stage" output)
-        | Ok output ->
-            let mutable failure = None
-            let entries = ResizeArray<TemporaryIndexEntry>()
-
-            for value in output.StdOut.Split '\000' |> Array.filter (String.IsNullOrEmpty >> not) do
-                match failure with
-                | Some _ -> ()
-                | None ->
-                    let separatorIndex = value.IndexOf '\t'
-
-                    if separatorIndex <= 0 || separatorIndex = value.Length - 1 then
-                        failure <- Some(invalidTemporaryIndexEntry path)
-                    else
-                        let metadata = value.Substring(0, separatorIndex)
-                        let entryPath = value.Substring(separatorIndex + 1)
-
-                        match metadata.Split(' ', StringSplitOptions.RemoveEmptyEntries) with
-                        | [| mode; blobId; "0" |] ->
-                            entries.Add {
-                                Mode = mode
-                                BlobId = blobId
-                                Path = entryPath
-                            }
-                        | _ -> failure <- Some(invalidTemporaryIndexEntry path)
-
+        for chunk in argumentChunks do
             match failure with
-            | Some currentFailure -> return Error currentFailure
-            | None -> return Ok(entries.ToArray())
-    }
-
-let private temporaryIndexMode
-    (runGit: GitRunner)
-    (environment: (string * string)[])
-    (path: string)
-    =
-    async {
-        match! listTemporaryIndexEntries runGit environment path with
-        | Error failure -> return Error failure
-        | Ok entries ->
-            match entries |> Array.tryFind (fun entry -> entry.Path = path) with
-            | Some entry -> return Ok entry.Mode
+            | Some _ -> ()
             | None ->
-                return
-                    Error(
-                        OperationFailure.create
-                            ProviderError
-                            "temporary_index_entry_missing"
-                            "The selected file was not present in the temporary index."
-                    )
+                let! result = runGit (Array.append fixedArguments chunk) None environment
+
+                match result with
+                | Error currentFailure -> failure <- Some currentFailure
+                | Ok output when output.ExitCode <> 0 ->
+                    failure <- Some(failedRun "git ls-files --stage" output)
+                | Ok output ->
+                    for value in output.StdOut.Split '\000' |> Array.filter (String.IsNullOrEmpty >> not) do
+                        match failure with
+                        | Some _ -> ()
+                        | None ->
+                            let separatorIndex = value.IndexOf '\t'
+
+                            if separatorIndex <= 0 || separatorIndex = value.Length - 1 then
+                                failure <- Some(invalidTemporaryIndexEntry affectedPath)
+                            else
+                                let metadata = value.Substring(0, separatorIndex)
+                                let entryPath = value.Substring(separatorIndex + 1)
+
+                                match metadata.Split(' ', StringSplitOptions.RemoveEmptyEntries) with
+                                | [| mode; blobId; "0" |] ->
+                                    entries.Add {
+                                        Mode = mode
+                                        BlobId = blobId
+                                        Path = entryPath
+                                    }
+                                | _ -> failure <- Some(invalidTemporaryIndexEntry affectedPath)
+
+        match failure with
+        | Some currentFailure -> return Error currentFailure
+        | None -> return entries.ToArray() |> Array.distinctBy _.Path |> Ok
     }
 
 let private validateLfsPlanAgainstTemporaryIndex
@@ -850,34 +796,69 @@ let private validateLfsPlanAgainstTemporaryIndex
         let inlinePaths = plan.InlinePaths |> Set.ofArray
         let mutable newlyOversized = Set.empty
 
-        for path in paths |> Array.map RepositoryPath.value do
-            match failure with
-            | Some _ -> ()
-            | None ->
-                match! listTemporaryIndexEntries runGit environment path with
-                | Error currentFailure -> failure <- Some currentFailure
-                | Ok entries ->
-                    for entry in entries do
-                        match failure with
-                        | Some _ -> ()
-                        | None when
-                            plannedOversized.Contains entry.Path
-                            || plannedPointers.Contains entry.Path
-                            || inlinePaths.Contains entry.Path
-                            ->
-                            ()
-                        | None when entry.Mode.StartsWith("100", StringComparison.Ordinal) ->
-                            let! sizeResult = runGit [| "cat-file"; "-s"; entry.BlobId |] None [||]
+        let! entriesResult =
+            listTemporaryIndexEntries runGit environment (paths |> Array.map RepositoryPath.value)
 
-                            match sizeResult with
-                            | Error currentFailure -> failure <- Some currentFailure
-                            | Ok output when output.ExitCode <> 0 ->
-                                failure <- Some(failedRun "git cat-file -s" output)
-                            | Ok output ->
-                                match Int64.TryParse(output.StdOut.Trim()) with
-                                | true, size when float size >= plan.ThresholdBytes ->
-                                    newlyOversized <- newlyOversized.Add entry.Path
-                                | true, _ -> ()
+        match entriesResult with
+        | Error currentFailure -> failure <- Some currentFailure
+        | Ok entries ->
+            let sizeCheckedEntries =
+                entries
+                |> Array.filter (fun entry ->
+                    not (
+                        plannedOversized.Contains entry.Path
+                        || plannedPointers.Contains entry.Path
+                        || inlinePaths.Contains entry.Path
+                    )
+                    && entry.Mode.StartsWith("100", StringComparison.Ordinal))
+
+            if sizeCheckedEntries.Length > 0 then
+                let input =
+                    sizeCheckedEntries
+                    |> Array.map _.BlobId
+                    |> String.concat "\n"
+                    |> fun blobIds -> blobIds + "\n"
+
+                let! sizeResult =
+                    runGit [| "cat-file"; "--batch-check=%(objectname) %(objectsize)" |] (Some input) [||]
+
+                match sizeResult with
+                | Error currentFailure -> failure <- Some currentFailure
+                | Ok output when output.ExitCode <> 0 ->
+                    failure <- Some(failedRun "git cat-file -s" output)
+                | Ok output ->
+                    let sizeLines =
+                        output.StdOut.Replace("\r\n", "\n").Split('\n', StringSplitOptions.RemoveEmptyEntries)
+
+                    if sizeLines.Length <> sizeCheckedEntries.Length then
+                        failure <-
+                            Some(
+                                OperationFailure.create
+                                    ProviderError
+                                    "staged_blob_size_invalid"
+                                    "Git returned an invalid size for a staged selected file."
+                            )
+                    else
+                        for index in 0 .. sizeCheckedEntries.Length - 1 do
+                            match failure with
+                            | Some _ -> ()
+                            | None ->
+                                let entry = sizeCheckedEntries[index]
+
+                                match sizeLines[index].Split(' ', StringSplitOptions.RemoveEmptyEntries) with
+                                | [| blobId; sizeText |] when blobId = entry.BlobId ->
+                                    match Int64.TryParse sizeText with
+                                    | true, size when float size >= plan.ThresholdBytes ->
+                                        newlyOversized <- newlyOversized.Add entry.Path
+                                    | true, _ -> ()
+                                    | _ ->
+                                        failure <-
+                                            Some(
+                                                OperationFailure.create
+                                                    ProviderError
+                                                    "staged_blob_size_invalid"
+                                                    "Git returned an invalid size for a staged selected file."
+                                            )
                                 | _ ->
                                     failure <-
                                         Some(
@@ -886,7 +867,6 @@ let private validateLfsPlanAgainstTemporaryIndex
                                                 "staged_blob_size_invalid"
                                                 "Git returned an invalid size for a staged selected file."
                                         )
-                        | None -> ()
 
         match failure with
         | Some currentFailure -> return Error currentFailure
@@ -902,6 +882,39 @@ let private validateLfsPlanAgainstTemporaryIndex
                 }
     }
 
+let private hashObjectPathBatch
+    (runGit: GitRunner)
+    (arguments: string[])
+    (paths: string[])
+    (operation: string)
+    =
+    async {
+        if paths.Length = 0 then
+            return Ok [||]
+        else
+            let input = String.concat "\n" paths + "\n"
+            let! result = runGit arguments (Some input) [||]
+
+            match result with
+            | Error failure -> return Error failure
+            | Ok output when output.ExitCode <> 0 -> return Error(failedRun operation output)
+            | Ok output ->
+                let ids =
+                    output.StdOut.Replace("\r\n", "\n").Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                    |> Array.map _.Trim()
+
+                if ids.Length = paths.Length then
+                    return Ok ids
+                else
+                    return
+                        Error(
+                            OperationFailure.create
+                                ProviderError
+                                "git_hash_output_invalid"
+                                "Git returned malformed object ids for selected files."
+                        )
+    }
+
 let private applyLfsPlanToTemporaryIndex
     (runGit: GitRunner)
     (repoPath: string)
@@ -910,58 +923,35 @@ let private applyLfsPlanToTemporaryIndex
     (plan: SelectedLfsPlan)
     =
     async {
+        let affectedPaths = Array.append plan.InlinePaths plan.OversizedPaths |> Array.distinct
         let mutable failure = None
+        let mutable modeByPath: Map<string, string> = Map.empty
 
-        for relativePath in plan.InlinePaths do
-            match failure with
-            | Some _ -> ()
-            | None ->
-                match! temporaryIndexMode runGit environment relativePath with
-                | Error currentFailure -> failure <- Some currentFailure
-                | Ok mode ->
-                    let absolutePath = NodePath.resolve [| repoPath; relativePath |]
+        if affectedPaths.Length > 0 then
+            match! listTemporaryIndexEntries runGit environment affectedPaths with
+            | Error currentFailure -> failure <- Some currentFailure
+            | Ok entries ->
+                modeByPath <- entries |> Array.map (fun entry -> entry.Path, entry.Mode) |> Map.ofArray
 
-                    // Inline keeps git's own conversions for the path (text normalization,
-                    // other clean filters) and only neutralizes Git LFS, so the committed
-                    // blob is what git status compares against afterwards. The process
-                    // filter has to be cleared as well, because it takes precedence over
-                    // clean and smudge.
-                    let! blobResult =
-                        runGit
-                            [|
-                                "-c"
-                                "filter.lfs.process="
-                                "-c"
-                                "filter.lfs.clean=cat"
-                                "-c"
-                                "filter.lfs.smudge=cat"
-                                "-c"
-                                "filter.lfs.required=false"
-                                "hash-object"
-                                "-w"
-                                "--path"
-                                relativePath
-                                "--"
-                                absolutePath
-                            |]
-                            None
-                            [||]
+                for path in affectedPaths do
+                    if not (Map.containsKey path modeByPath) then
+                        failure <-
+                            Some(
+                                OperationFailure.create
+                                    ProviderError
+                                    "temporary_index_entry_missing"
+                                    "The selected file was not present in the temporary index."
+                            )
 
-                    match blobResult with
-                    | Error currentFailure -> failure <- Some currentFailure
-                    | Ok output when output.ExitCode <> 0 ->
-                        failure <- Some(failedRun "git hash-object (inline file)" output)
-                    | Ok output ->
-                        match!
-                            updateTemporaryIndexEntry
-                                runGit
-                                environment
-                                mode
-                                (output.StdOut.Trim())
-                                relativePath
-                        with
-                        | Error currentFailure -> failure <- Some currentFailure
-                        | Ok() -> ()
+        let updates = ResizeArray<string * string * string>()
+        let temporaryFiles = ResizeArray<string>()
+        let cleanupTemporaryFiles () =
+            for path in temporaryFiles do
+                try
+                    if NodeFileSystem.existsSync path then
+                        NodeFileSystem.unlinkSync path
+                with _ ->
+                    ()
 
         let mutable cachedMediaDirectory: Result<string, OperationFailure> option = None
 
@@ -978,41 +968,149 @@ let private applyLfsPlanToTemporaryIndex
                 return result
         }
 
-        for relativePath in plan.OversizedPaths do
-            match failure with
-            | Some _ -> ()
-            | None ->
-                match! prepareLfsPointerBlob runGit repoPath getMediaDirectory commonGitDir relativePath with
+        try
+            if failure.IsNone && plan.InlinePaths.Length > 0 then
+                let inlineHashes = Array.create plan.InlinePaths.Length ""
+                let batchIndices =
+                    plan.InlinePaths
+                    |> Array.mapi (fun index path -> index, path)
+                    |> Array.choose (fun (index, path) ->
+                        if path.Contains '\n' || path.Contains '\r' then None else Some index)
+
+                let batchPaths = batchIndices |> Array.map (fun index -> plan.InlinePaths[index])
+                let inlineHashArguments = [|
+                    "-c"
+                    "filter.lfs.process="
+                    "-c"
+                    "filter.lfs.clean=cat"
+                    "-c"
+                    "filter.lfs.smudge=cat"
+                    "-c"
+                    "filter.lfs.required=false"
+                    "hash-object"
+                    "-w"
+                    "--stdin-paths"
+                |]
+
+                match!
+                    hashObjectPathBatch
+                        runGit
+                        inlineHashArguments
+                        batchPaths
+                        "git hash-object (inline file)"
+                with
                 | Error currentFailure -> failure <- Some currentFailure
-                | Ok pointerBlob ->
-                    match! temporaryIndexMode runGit environment relativePath with
-                    | Error currentFailure -> failure <- Some currentFailure
-                    | Ok mode ->
+                | Ok ids ->
+                    for index in 0 .. batchIndices.Length - 1 do
+                        inlineHashes[batchIndices[index]] <- ids[index]
+
+                for index in 0 .. plan.InlinePaths.Length - 1 do
+                    match failure with
+                    | Some _ -> ()
+                    | None when inlineHashes[index] <> "" -> ()
+                    | None ->
+                        let relativePath = plan.InlinePaths[index]
+                        let absolutePath = NodePath.resolve [| repoPath; relativePath |]
+
+                        let! result =
+                            runGit
+                                [|
+                                    "-c"
+                                    "filter.lfs.process="
+                                    "-c"
+                                    "filter.lfs.clean=cat"
+                                    "-c"
+                                    "filter.lfs.smudge=cat"
+                                    "-c"
+                                    "filter.lfs.required=false"
+                                    "hash-object"
+                                    "-w"
+                                    "--path"
+                                    relativePath
+                                    "--"
+                                    absolutePath
+                                |]
+                                None
+                                [||]
+
+                        match result with
+                        | Error currentFailure -> failure <- Some currentFailure
+                        | Ok output when output.ExitCode <> 0 ->
+                            failure <- Some(failedRun "git hash-object (inline file)" output)
+                        | Ok output -> inlineHashes[index] <- output.StdOut.Trim()
+
+                if failure.IsNone then
+                    for index in 0 .. plan.InlinePaths.Length - 1 do
+                        let path = plan.InlinePaths[index]
+                        let mode = Map.find path modeByPath
+                        updates.Add(mode, inlineHashes[index], path)
+
+            if failure.IsNone
+               && (plan.OversizedPaths.Length > 0 || plan.GeneratedAttributesContent.IsSome) then
+                let operationKey = DateTime.Now.Ticks.ToString()
+                let pointerPaths = ResizeArray<string>()
+
+                for index in 0 .. plan.OversizedPaths.Length - 1 do
+                    match failure with
+                    | Some _ -> ()
+                    | None ->
+                        let relativePath = plan.OversizedPaths[index]
+                        let pointerPath =
+                            NodePath.join [| commonGitDir; $"vcs-lfs-snapshot-{operationKey}-{index}-pointer" |]
+
+                        temporaryFiles.Add pointerPath
+                        pointerPaths.Add pointerPath
+
                         match!
-                            updateTemporaryIndexEntry
-                                runGit
-                                environment
-                                mode
-                                pointerBlob
+                            prepareLfsPointerBlob
+                                repoPath
+                                getMediaDirectory
                                 relativePath
+                                pointerPath
                         with
                         | Error currentFailure -> failure <- Some currentFailure
                         | Ok() -> ()
 
-        match failure, plan.GeneratedAttributesContent with
-        | Some currentFailure, _ -> return Error currentFailure
-        | None, None -> return Ok()
-        | None, Some attributesContent ->
-            match! hashTextBlob runGit attributesContent with
-            | Error currentFailure -> return Error currentFailure
-            | Ok attributesBlob ->
-                return!
-                    updateTemporaryIndexEntry
-                        runGit
-                        environment
-                        "100644"
-                        attributesBlob
-                        ".gitattributes"
+                let attributesPath =
+                    match failure, plan.GeneratedAttributesContent with
+                    | Some _, _ -> None
+                    | None, None -> None
+                    | None, Some attributesContent ->
+                        let path = NodePath.join [| commonGitDir; $"vcs-lfs-snapshot-{operationKey}-attributes" |]
+                        temporaryFiles.Add path
+                        NodeFileSystem.writeFileSync path attributesContent NodeFileSystem.TextEncoding.Utf8
+                        Some path
+
+                if failure.IsNone then
+                    let hashInputPaths =
+                        Array.append
+                            (pointerPaths.ToArray())
+                            (attributesPath |> Option.toArray)
+
+                    match!
+                        hashObjectPathBatch
+                            runGit
+                            [| "hash-object"; "-w"; "--stdin-paths"; "--no-filters" |]
+                            hashInputPaths
+                            "git hash-object (LFS pointer)"
+                    with
+                    | Error currentFailure -> failure <- Some currentFailure
+                    | Ok blobIds ->
+                        for index in 0 .. plan.OversizedPaths.Length - 1 do
+                            let path = plan.OversizedPaths[index]
+                            let mode = Map.find path modeByPath
+                            updates.Add(mode, blobIds[index], path)
+
+                        match attributesPath with
+                        | Some _ -> updates.Add("100644", blobIds[plan.OversizedPaths.Length], ".gitattributes")
+                        | None -> ()
+
+            match failure with
+            | Some currentFailure -> return Error currentFailure
+            | None when updates.Count = 0 -> return Ok()
+            | None -> return! updateTemporaryIndexEntries runGit environment (updates.ToArray())
+        finally
+            cleanupTemporaryFiles ()
     }
 
 /// Creates a revision from exact selected paths without touching the real index

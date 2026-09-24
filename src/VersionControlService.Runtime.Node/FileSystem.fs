@@ -49,6 +49,19 @@ type HashedFile = {
     Stats: Stats
 }
 
+[<AllowNullLiteral>]
+type private NodeError =
+    abstract member message: string
+
+[<AllowNullLiteral>]
+type private ReadStream =
+    abstract member on: eventName: string * listener: (obj -> unit) -> ReadStream
+
+[<AllowNullLiteral>]
+type private CryptoHash =
+    abstract member update: data: obj -> CryptoHash
+    abstract member digest: encoding: string -> string
+
 type Dirent =
     abstract member name: string
     abstract member isDirectory: unit -> bool
@@ -125,6 +138,36 @@ let rmAsync (path: string) (options: RmOptions) : JS.Promise<unit> = jsNative
 
 [<Import("stat", "fs/promises")>]
 let statAsync (path: string) : JS.Promise<Stats> = jsNative
+
+[<Import("createReadStream", "fs")>]
+let private openHashReadStream (path: string) : ReadStream = jsNative
+
+[<Import("createHash", "node:crypto")>]
+let private createHash (algorithm: string) : CryptoHash = jsNative
+
+let hashFileSha256Async (path: string) : Async<HashedFile> =
+    async {
+        let! stats = statAsync path |> Async.AwaitPromise
+
+        return!
+            Async.FromContinuations(fun (resolve, reject, _) ->
+                let hash = createHash "sha256"
+                let stream = openHashReadStream path
+
+                stream.on("data", fun data -> hash.update data |> ignore) |> ignore
+                stream.on("error", fun error -> reject (Exception((unbox<NodeError> error).message)))
+                |> ignore
+
+                stream.on(
+                    "end",
+                    fun _ ->
+                        resolve {
+                            Sha256 = hash.digest "hex"
+                            Stats = stats
+                        }
+                )
+                |> ignore)
+    }
 
 [<Import("lstat", "fs/promises")>]
 let lstatAsync (path: string) : JS.Promise<Stats> = jsNative

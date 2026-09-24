@@ -1807,7 +1807,7 @@ Vitest.describe (
                         RunBytesProcess = None
                         RunProcess =
                             Some(fun request operationContext ->
-                                if request.Arguments = [| "hash-object"; "-w"; "--stdin" |] then
+                                if request.Arguments = [| "hash-object"; "-w"; "--stdin-paths"; "--no-filters" |] then
                                     async {
                                         return
                                             OperationResult.failed(
