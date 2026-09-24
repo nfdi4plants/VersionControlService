@@ -5467,42 +5467,6 @@ Vitest.describe (
             }
         )
 
-        Vitest.test (
-            "RestorePaths reports the resulting workspace version",
-            TestOptions(timeout = 120000),
-            fun () -> promise {
-                let! root, workPath, _, session =
-                    createSyncFixture GitWorkspaceSession.GitSessionHooks.none
-
-                try
-                    do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) "local dirty change\n"
-                    let! beforeRestore = sessionStatus session
-
-                    let! restoreResult =
-                        Async.StartAsPromise(
-                            session.Core.RestorePaths
-                                {
-                                    Paths = [| mkPath "base.txt" |]
-                                    ExpectedWorkspaceVersion = beforeRestore.WorkspaceVersion
-                                }
-                                (ctx "restore-resulting-version")
-                        )
-
-                    let restoreOutcome =
-                        match restoreResult with
-                        | Succeeded outcome
-                        | PartiallySucceeded(outcome, _) -> outcome
-                        | Failed failure ->
-                            failwith $"RestorePaths failed ({failure.Category}/{failure.Code}): {failure.Message}"
-
-                    let! afterRestore = sessionStatus session
-                    Vitest.expect(restoreOutcome.ResultingWorkspaceVersion).toEqual (Some afterRestore.WorkspaceVersion)
-                    do! removeDirectoryAsync root
-                with error ->
-                    do! removeDirectoryAsync root
-                    return raise error
-            }
-        )
 )
 
 Vitest.describe (

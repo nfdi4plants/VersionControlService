@@ -1100,6 +1100,57 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "maintenance prune succeeds after restoring an edited LFS file",
+            TestOptions(timeout = 180000),
+            fun () ->
+                withGitFixture RevisionPolicyStrategy.automatic None (fun fixture -> promise {
+                    let barePath = join [| fixture.Root; "origin.git" |]
+                    let dataPath = join [| fixture.WorkPath; "data.bin" |]
+                    let originalContent = "original LFS content\n"
+
+                    let! _ = runGitOk fixture.Root [| "init"; "--bare"; "-b"; "main"; barePath |]
+                    let! _ = runGitOk fixture.WorkPath [| "remote"; "add"; "origin"; barePath |]
+                    let! _ = runGitOk fixture.WorkPath [| "lfs"; "track"; "data.bin" |]
+                    do! writeUtf8FileAsync dataPath originalContent
+                    let! _ = runGitOk fixture.WorkPath [| "add"; "-A" |]
+                    let! _ = runGitOk fixture.WorkPath [| "commit"; "-m"; "test: push an LFS file" |]
+                    let! _ = runGitOk fixture.WorkPath [| "push"; "-u"; "origin"; "main" |]
+
+                    do! writeUtf8FileAsync dataPath "edited LFS content\n"
+                    let! _ = runGitOk fixture.WorkPath [| "add"; "data.bin" |]
+
+                    let! statusResult =
+                        fixture.Session.Core.GetStatus(context "m6-prune-status")
+                        |> Async.StartAsPromise
+
+                    let status = expectSucceeded "M6 prune status" statusResult
+
+                    let! restoreResult =
+                        fixture.Session.Core.RestorePaths
+                            {
+                                Paths = [| repositoryPath "data.bin" |]
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            (context "m6-prune-restore")
+                        |> Async.StartAsPromise
+
+                    expectSucceeded "M6 prune restore" restoreResult |> ignore
+                    let! restored = readUtf8FileAsync dataPath
+                    Vitest.expect(restored).toBe originalContent
+
+                    let! porcelain = runGitOk fixture.WorkPath [| "status"; "--porcelain" |]
+                    Vitest.expect(porcelain.Trim()).toBe ""
+
+                    let maintenance =
+                        fixture.Session.Maintenance
+                        |> Option.defaultWith (fun () -> failwith "Expected Git maintenance.")
+
+                    let! pruneResult = maintenance.Prune(context "m6-prune") |> Async.StartAsPromise
+                    expectSucceeded "M6 prune after a restored LFS edit" pruneResult |> ignore
+                })
+        )
+
+        Vitest.test (
             "the lakeFS factory accepts a strategy and never calls it",
             fun () ->
                 let mutable called = false

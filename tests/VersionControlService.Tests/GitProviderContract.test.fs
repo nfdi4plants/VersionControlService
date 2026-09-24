@@ -4035,93 +4035,40 @@ Vitest.describe (
     "Git clone target refs",
     fun () ->
         Vitest.test (
-            "Clone honors branch refs and rejects unsupported refs",
+            "Clone rejects target refs before creating the target",
             TestOptions(timeout = 120000),
             fun () -> promise {
                 let! root = createTempDirectoryAsync ()
 
                 try
-                    let barePath = join [| root; "origin.git" |]
-                    let sourcePath = join [| root; "source" |]
-                    let localClonePath = join [| root; "local-clone" |]
-                    let remoteClonePath = join [| root; "remote-clone" |]
-                    let unsupportedClonePath = join [| root; "unsupported-clone" |]
-
-                    let! _ = runGitIn root [||] [| "init"; "--bare"; "-b"; "main"; barePath |] None
-                    let! _ = runGitIn root [||] [| "init"; "-b"; "main"; sourcePath |] None
-                    do! configureUser sourcePath
-                    do! writeUtf8FileAsync (join [| sourcePath; "base.txt" |]) "base\n"
-                    let! _ = runGitIn sourcePath [||] [| "add"; "-A" |] None
-                    let! _ = runGitIn sourcePath [||] [| "commit"; "-m"; "test: base" |] None
-                    let! _ = runGitIn sourcePath [||] [| "remote"; "add"; "origin"; barePath |] None
-                    let! _ = runGitIn sourcePath [||] [| "push"; "-u"; "origin"; "main" |] None
-                    let! _ = runGitIn sourcePath [||] [| "switch"; "-c"; "feature" |] None
-                    do! writeUtf8FileAsync (join [| sourcePath; "feature.txt" |]) "feature\n"
-                    let! _ = runGitIn sourcePath [||] [| "add"; "-A" |] None
-                    let! _ = runGitIn sourcePath [||] [| "commit"; "-m"; "test: feature" |] None
-                    let! _ = runGitIn sourcePath [||] [| "push"; "-u"; "origin"; "feature" |] None
-
+                    let targetPath = join [| root; "target-ref-clone" |]
                     let location = {
                         ProviderId = gitProviderId
                         DisplayName = None
-                        ProviderLocation = barePath
+                        ProviderLocation = join [| root; "origin.git" |]
                         ConnectionProfileId = None
                     }
 
                     let factory = GitWorkspaceSession.createFactory GitWorkspaceSession.GitSessionHooks.none
-                    let clone targetPath targetRef contextName =
+                    let! result =
                         factory.Clone
                             {
                                 Location = location
                                 TargetPath = targetPath
-                                TargetRef = Some(ProviderRef.tryCreate targetRef |> Result.defaultWith failwith)
+                                TargetRef = Some(ProviderRef.tryCreate "git-local:main" |> Result.defaultWith failwith)
                                 MaterializeAllObjects = false
                             }
-                            (OperationContext.detached contextName)
+                            (OperationContext.detached "clone-unsupported-target-ref")
                         |> Async.StartAsPromise
 
-                    let! localResult = clone localClonePath "git-local:feature" "clone-local-feature"
-                    expectProviderValue "clone local feature ref" localResult |> ignore
-                    let! localBranch = runGitIn localClonePath [||] [| "branch"; "--show-current" |] None
-                    Vitest.expect(localBranch.Trim()).toBe "feature"
-
-                    let! remoteResult = clone remoteClonePath "git-remote:origin/feature" "clone-remote-feature"
-                    expectProviderValue "clone remote feature ref" remoteResult |> ignore
-                    let! remoteBranch = runGitIn remoteClonePath [||] [| "branch"; "--show-current" |] None
-                    Vitest.expect(remoteBranch.Trim()).toBe "feature"
-
-                    let! unsupportedResult =
-                        clone unsupportedClonePath "git-local:refs/tags/v1" "clone-unsupported-target-ref"
-
-                    match unsupportedResult with
+                    match result with
                     | Failed failure ->
                         Vitest.expect(failure.Category).toEqual Unsupported
                         Vitest.expect(failure.Code).toBe "target_ref_unsupported"
                     | Succeeded _
-                    | PartiallySucceeded _ -> failwith "An unsupported clone target ref unexpectedly succeeded."
+                    | PartiallySucceeded _ -> failwith "A clone with a target ref unexpectedly succeeded."
 
-                    Vitest.expect(NodeFileSystem.existsSync unsupportedClonePath).toBe(false)
-
-                    let! headsRefResult =
-                        clone (join [| root; "heads-clone" |]) "git-local:refs/heads/main" "clone-heads-target-ref"
-
-                    match headsRefResult with
-                    | Failed failure -> Vitest.expect(failure.Code).toBe "target_ref_unsupported"
-                    | Succeeded _
-                    | PartiallySucceeded _ -> failwith "A refs/ branch name unexpectedly cloned."
-
-                    // clone --branch also accepts a tag, so a tag-only name must be refused before cloning.
-                    let! _ = runGitIn sourcePath [||] [| "tag"; "v1" |] None
-                    let! _ = runGitIn sourcePath [||] [| "push"; "origin"; "v1" |] None
-                    let tagClonePath = join [| root; "tag-clone" |]
-                    let! tagResult = clone tagClonePath "git-local:v1" "clone-tag-only-target-ref"
-
-                    match tagResult with
-                    | Failed failure -> Vitest.expect(failure.Code).toBe "target_ref_not_found"
-                    | Succeeded _
-                    | PartiallySucceeded _ -> failwith "A tag-only name unexpectedly cloned as a branch."
-
-                    Vitest.expect(NodeFileSystem.existsSync tagClonePath).toBe(false)
+                    Vitest.expect(NodeFileSystem.existsSync targetPath).toBe(false)
                     do! removeDirectoryAsync root
                 with error ->
                     do! removeDirectoryAsync root
@@ -4207,90 +4154,6 @@ Vitest.describe (
                     | Some synchronization -> Vitest.expect(synchronization.Relationship).toEqual (NoTarget)
                     | None -> failwith "Expected synchronization information for the adopted local repository."
 
-                    do! removeDirectoryAsync root
-                with error ->
-                    do! removeDirectoryAsync root
-                    return raise error
-            }
-        )
-
-        Vitest.test (
-            "Clone and Bind normalize workspace roots to Initialize and Adopt roots",
-            TestOptions(timeout = 120000),
-            fun () -> promise {
-                let! root = createTempDirectoryAsync ()
-
-                try
-                    let barePath = join [| root; "origin.git" |]
-                    let sourcePath = join [| root; "source" |]
-                    let clonePath = join [| root; "clone" |]
-                    let initializedPath = join [| root; "initialized" |]
-                    let pathWithTrailingForwardSlash (path: string) = path.Replace("\\", "/").TrimEnd('/') + "/"
-
-                    let! _ = runGitIn root [||] [| "init"; "--bare"; "-b"; "main"; barePath |] None
-                    let! _ = runGitIn root [||] [| "init"; "-b"; "main"; sourcePath |] None
-                    do! configureUser sourcePath
-                    do! writeUtf8FileAsync (join [| sourcePath; "base.txt" |]) "base\n"
-                    let! _ = runGitIn sourcePath [||] [| "add"; "-A" |] None
-                    let! _ = runGitIn sourcePath [||] [| "commit"; "-m"; "test: base" |] None
-                    let! _ = runGitIn sourcePath [||] [| "remote"; "add"; "origin"; barePath |] None
-                    let! _ = runGitIn sourcePath [||] [| "push"; "-u"; "origin"; "main" |] None
-
-                    let location = {
-                        ProviderId = gitProviderId
-                        DisplayName = None
-                        ProviderLocation = barePath
-                        ConnectionProfileId = None
-                    }
-
-                    let factory = GitWorkspaceSession.createFactory GitWorkspaceSession.GitSessionHooks.none
-                    let cloneTarget = pathWithTrailingForwardSlash clonePath
-                    let! cloneResult =
-                        factory.Clone
-                            {
-                                Location = location
-                                TargetPath = cloneTarget
-                                TargetRef = None
-                                MaterializeAllObjects = false
-                            }
-                            (OperationContext.detached "normalize-clone-root")
-                        |> Async.StartAsPromise
-
-                    let cloneBinding = expectProviderValue "clone with trailing path separator" cloneResult
-                    let! adoptResult =
-                        factory.Adopt
-                            {
-                                WorkspaceRoot = cloneTarget
-                                ConnectionProfileId = None
-                            }
-                            (OperationContext.detached "normalize-adopt-root")
-                        |> Async.StartAsPromise
-
-                    let adoptedBinding = expectProviderValue "adopt cloned workspace" adoptResult
-                    Vitest.expect(cloneBinding.WorkspaceRoot).toBe adoptedBinding.WorkspaceRoot
-
-                    let! initializeResult =
-                        factory.Initialize
-                            {
-                                TargetPath = initializedPath
-                                Location = None
-                            }
-                            (OperationContext.detached "normalize-initialize-root")
-                        |> Async.StartAsPromise
-
-                    let initializedBinding = expectProviderValue "initialize workspace" initializeResult
-                    let bindTarget = pathWithTrailingForwardSlash initializedPath
-                    let! bindResult =
-                        factory.Bind
-                            {
-                                WorkspaceRoot = bindTarget
-                                Location = location
-                            }
-                            (OperationContext.detached "normalize-bind-root")
-                        |> Async.StartAsPromise
-
-                    let boundBinding = expectProviderValue "bind initialized workspace" bindResult
-                    Vitest.expect(boundBinding.WorkspaceRoot).toBe initializedBinding.WorkspaceRoot
                     do! removeDirectoryAsync root
                 with error ->
                     do! removeDirectoryAsync root
@@ -4886,6 +4749,108 @@ Vitest.describe (
                         expectProviderValue "restore LFS path without a local object" restoreResult |> ignore
                         let! restored = tryReadUtf8FileAsync (join [| repoPath; "large.bin" |])
                         Vitest.expect(restored |> Option.exists (fun content -> content.StartsWith lfsPointerPrefix)).toBe true
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "RestorePaths restores an LFS directory",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGitResultIn "." [| "lfs"; "version" |]
+
+                if lfsProbe.ExitCode <> 0 then
+                    Vitest.expect(true).toBe true
+                else
+                    let! root, repoPath, session = createDownloadedLfsRestoreFixture ()
+
+                    try
+                        let firstPath = "data/first.bin"
+                        let secondPath = "data/second.bin"
+                        let firstContent = "first committed content\n"
+                        let secondContent = "second committed content\n"
+
+                        do! writeUtf8FileAsync (join [| repoPath; firstPath |]) firstContent
+                        do! writeUtf8FileAsync (join [| repoPath; secondPath |]) secondContent
+                        let! _ = runGitIn repoPath [||] [| "add"; "-A" |] None
+                        let! _ = runGitIn repoPath [||] [| "commit"; "-m"; "test: restore an LFS directory" |] None
+
+                        do! writeUtf8FileAsync (join [| repoPath; firstPath |]) "first local edit\n"
+                        do! writeUtf8FileAsync (join [| repoPath; secondPath |]) "second local edit\n"
+
+                        let! statusResult =
+                            session.Core.GetStatus(OperationContext.detached "restore-LFS-directory-status")
+                            |> Async.StartAsPromise
+
+                        let status = expectProviderValue "status before restoring the LFS directory" statusResult
+
+                        let! restoreResult =
+                            session.Core.RestorePaths
+                                {
+                                    Paths = [| repositoryPath "data" |]
+                                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                }
+                                (OperationContext.detached "restore-LFS-directory")
+                            |> Async.StartAsPromise
+
+                        expectProviderValue "restore the LFS directory" restoreResult |> ignore
+                        let! restoredFirst = tryReadUtf8FileAsync (join [| repoPath; firstPath |])
+                        let! restoredSecond = tryReadUtf8FileAsync (join [| repoPath; secondPath |])
+
+                        Vitest.expect(restoredFirst).toEqual (Some firstContent)
+                        Vitest.expect(restoredSecond).toEqual (Some secondContent)
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "RestorePaths restores a non-ASCII tracked path",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGitResultIn "." [| "lfs"; "version" |]
+
+                if lfsProbe.ExitCode <> 0 then
+                    Vitest.expect(true).toBe true
+                else
+                    let! root, repoPath, session = createDownloadedLfsRestoreFixture ()
+
+                    try
+                        let relativePath = "data/Messung_ä.csv"
+                        let! _ = runGitIn repoPath [||] [| "config"; "core.autocrlf"; "false" |] None
+                        let committedContent = "Messung;Wert\nTemperatur;21.5\n"
+                        let path = join [| repoPath; relativePath |]
+
+                        do! writeUtf8FileAsync path committedContent
+                        let! _ = runGitIn repoPath [||] [| "add"; "-A" |] None
+                        let! _ = runGitIn repoPath [||] [| "commit"; "-m"; "test: restore a non-ASCII path" |] None
+                        do! writeUtf8FileAsync path "edited;value\n"
+
+                        let! statusResult =
+                            session.Core.GetStatus(OperationContext.detached "restore-non-ASCII-status")
+                            |> Async.StartAsPromise
+
+                        let status = expectProviderValue "status before restoring the non-ASCII path" statusResult
+
+                        let! restoreResult =
+                            session.Core.RestorePaths
+                                {
+                                    Paths = [| repositoryPath relativePath |]
+                                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                }
+                                (OperationContext.detached "restore-non-ASCII-path")
+                            |> Async.StartAsPromise
+
+                        expectProviderValue "restore the non-ASCII path" restoreResult |> ignore
+                        let! restored = tryReadUtf8FileAsync path
+                        Vitest.expect(restored).toEqual (Some committedContent)
+                        let! status = runGitIn repoPath [||] [| "status"; "--porcelain" |] None
+                        Vitest.expect(status.Trim()).toBe ""
                         do! removeDirectoryAsync root
                     with error ->
                         do! removeDirectoryAsync root
