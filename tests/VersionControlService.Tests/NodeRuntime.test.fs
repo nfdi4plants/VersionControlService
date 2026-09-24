@@ -101,6 +101,27 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "byte-process cancellation after child exit preserves success",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let request = NodeProcess.ProcessRequest.create nodeExecutable [| "-e"; "" |]
+                let source = OperationCancellation.Source()
+                let context = OperationContext.create "runtime-bytes-late-cancel" source.Cancellation ignore
+                let restore = cancelAfterChildExit source.Cancel
+
+                try
+                    let! result = run (NodeProcess.runBytes request context)
+
+                    match result with
+                    | Succeeded outcome -> Vitest.expect(outcome.Value.ExitCode).toBe (0)
+                    | PartiallySucceeded _
+                    | Failed _ -> failwith "Expected late byte-process cancellation to preserve success."
+                finally
+                    restore ()
+            }
+        )
+
+        Vitest.test (
             "forwards stdin data to the child process",
             TestOptions(timeout = 120000),
             fun () -> promise {

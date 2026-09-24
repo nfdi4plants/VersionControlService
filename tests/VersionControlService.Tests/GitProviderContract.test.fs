@@ -4317,6 +4317,63 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "Git Bind strips userinfo from the binding when fetch fails",
+            fun () -> promise {
+                let! root = createTempDirectoryAsync ()
+
+                try
+                    let repoPath = join [| root; "bind-credential-origin" |]
+                    let credentialUrl = "https://user:secret@example.invalid/org/repo.git"
+                    let mutable fetchObserved = false
+
+                    let! _ = runGitIn root [||] [| "init"; "-b"; "main"; repoPath |] None
+
+                    let hooks = {
+                        GitWorkspaceSession.GitSessionHooks.none with
+                            RunProcess =
+                                Some(fun request context ->
+                                    if request.Arguments = [| "fetch"; "origin" |] then
+                                        async {
+                                            fetchObserved <- true
+                                            return
+                                                OperationResult.succeeded(
+                                                    processOutput 128 "" "fatal: injected fetch failure"
+                                                )
+                                        }
+                                    else
+                                        NodeProcess.run request context)
+                    }
+
+                    let factory = GitWorkspaceSession.createFactory hooks
+                    let location = {
+                        ProviderId = gitProviderId
+                        DisplayName = None
+                        ProviderLocation = credentialUrl
+                        ConnectionProfileId = None
+                    }
+
+                    let! bindResult =
+                        Async.StartAsPromise(
+                            factory.Bind
+                                {
+                                    WorkspaceRoot = repoPath
+                                    Location = location
+                                }
+                                (OperationContext.detached "bind-credential-origin")
+                        )
+
+                    let binding = expectProviderValue "bind credential-bearing Git location" bindResult
+                    Vitest.expect(fetchObserved).toBe true
+                    Vitest.expect(binding.Location.ProviderLocation).toBe "https://example.invalid/org/repo.git"
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
             "Git initialization preserves an existing non-Git directory and reports an already initialized repository",
             fun () -> promise {
                 let! root = createTempDirectoryAsync ()

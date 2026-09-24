@@ -6583,6 +6583,30 @@ let createFactoryWithCredentialsIdentityAndPolicy
         }
     Clone =
         fun request context -> async {
+            let targetNotEmptyFailure () =
+                OperationFailure.create
+                    Validation
+                    "target_not_empty"
+                    "The clone target directory is not empty."
+
+            let targetCreatedByOtherFailure () =
+                OperationFailure.create
+                    Validation
+                    "target_not_empty"
+                    "The clone target was created by another program while the clone started. Choose an empty folder."
+
+            let targetLinkFailure () =
+                OperationFailure.create
+                    Validation
+                    "clone_target_is_link"
+                    "The clone target is a link. Choose a folder."
+
+            let targetUnreadableFailure () =
+                OperationFailure.create
+                    ProviderError
+                    "clone_target_unreadable"
+                    "The clone target could not be inspected."
+
             let validatedLocation =
                 match cloneTargetRefArguments request.TargetRef with
                 | Error failure -> Error failure
@@ -6590,9 +6614,28 @@ let createFactoryWithCredentialsIdentityAndPolicy
                     validateFactoryLocation request.Location
                     |> Result.map (fun location -> location, branchArguments)
 
-            match validatedLocation with
-            | Error failure -> return Failed failure
-            | Ok (location, branchArguments) ->
+            let targetSnapshot =
+                match validatedLocation with
+                | Error failure -> Error failure
+                | Ok _ ->
+                    try
+                        match NodeFileSystem.tryLstatSync request.TargetPath with
+                        | None -> Ok(false, false, false)
+                        | Some stats when stats.isSymbolicLink () -> Ok(true, false, true)
+                        | Some stats ->
+                            let empty =
+                                stats.isDirectory ()
+                                && (NodeFileSystem.readdirSync request.TargetPath).Length = 0
+
+                            Ok(true, empty, false)
+                    with _ ->
+                        Error(targetUnreadableFailure ())
+
+            match validatedLocation, targetSnapshot with
+            | Error failure, _ -> return Failed failure
+            | _, Error failure -> return Failed failure
+            | Ok _, Ok (_, _, true) -> return Failed(targetLinkFailure ())
+            | Ok (location, branchArguments), Ok (targetExistedBefore, targetWasEmptyDirectory, false) ->
                 let! effectiveLocation = expandLocationUrl hooks location.ProviderLocation context
 
                 let! authentication =
@@ -6602,45 +6645,36 @@ let createFactoryWithCredentialsIdentityAndPolicy
                         location.ConnectionProfileId
                         "origin"
 
-                // Remember what the target looked like so a killed or failed clone can be
-                // undone without touching anything the caller already had there. When the
-                // target cannot be inspected, nothing is cleaned up later.
-                let targetExistedBefore, targetWasEmptyDirectory =
-                    try
-                        let existed = NodeFileSystem.existsSync request.TargetPath
-
-                        let empty =
-                            existed
-                            && (let stats = NodeFileSystem.lstatSync request.TargetPath
-
-                                stats.isDirectory ()
-                                && not (stats.isSymbolicLink ())
-                                && (NodeFileSystem.readdirSync request.TargetPath).Length = 0)
-
-                        existed, empty
-                    with _ ->
-                        true, false
-
                 let mutable targetCreatedByClone = false
-                // Rollback runs only after git started, so a refusal or a cancel before
-                // the clone never touches what someone else put into the target.
+                let mutable targetCreatedByCloneIdentity: (float * float) option = None
+                // Rollback runs only after the target was set up, so a refusal or a cancel
+                // before the clone never touches what someone else put into the target.
                 let mutable cloneStarted = false
 
                 let removeCloneResidue () =
                     async {
                         try
                             if targetCreatedByClone then
-                                if NodeFileSystem.existsSync request.TargetPath then
-                                    do!
-                                        NodeFileSystem.rmAsync
-                                            request.TargetPath
-                                            (NodeFileSystem.RmOptions(
-                                                recursive = true,
-                                                force = true,
-                                                maxRetries = 5,
-                                                retryDelay = 100
-                                            ))
-                                        |> Async.AwaitPromise
+                                match targetCreatedByCloneIdentity with
+                                | None -> return Some "The clone target identity could not be recorded."
+                                | Some (expectedDevice, expectedInode) ->
+                                    let stats = NodeFileSystem.statSync request.TargetPath
+
+                                    if stats.dev <> expectedDevice || stats.ino <> expectedInode then
+                                        return Some "The clone target changed identity before cleanup."
+                                    else
+                                        do!
+                                            NodeFileSystem.rmAsync
+                                                request.TargetPath
+                                                (NodeFileSystem.RmOptions(
+                                                    recursive = true,
+                                                    force = true,
+                                                    maxRetries = 5,
+                                                    retryDelay = 100
+                                                ))
+                                            |> Async.AwaitPromise
+
+                                        return None
                             elif targetExistedBefore && targetWasEmptyDirectory then
                                 for entry in NodeFileSystem.readdirSync request.TargetPath do
                                     do!
@@ -6654,7 +6688,9 @@ let createFactoryWithCredentialsIdentityAndPolicy
                                             ))
                                         |> Async.AwaitPromise
 
-                            return None
+                                return None
+                            else
+                                return None
                         with error ->
                             return Some error.Message
                     }
@@ -6678,12 +6714,6 @@ let createFactoryWithCredentialsIdentityAndPolicy
                                             )
                                     }
                         }
-
-                let targetNotEmptyFailure () =
-                    OperationFailure.create
-                        Validation
-                        "target_not_empty"
-                        "The clone target directory is not empty."
 
                 let! result =
                     async {
@@ -6713,11 +6743,13 @@ let createFactoryWithCredentialsIdentityAndPolicy
                                             (NodeFileSystem.MkdirOptions(recursive = false))
 
                                         targetCreatedByClone <- true
+                                        let stats = NodeFileSystem.statSync request.TargetPath
+                                        targetCreatedByCloneIdentity <- Some(stats.dev, stats.ino)
 
                                     Ok()
                                 with error ->
                                     if tryGetNodeErrorCode error = Some "EEXIST" then
-                                        Error(targetNotEmptyFailure ())
+                                        Error(targetCreatedByOtherFailure ())
                                     else
                                         Error(
                                             OperationFailure.createRedacted
@@ -6754,7 +6786,7 @@ let createFactoryWithCredentialsIdentityAndPolicy
                     }
 
                 match result with
-                | Error failure when not cloneStarted -> return Failed failure
+                | Error failure when not cloneStarted && not targetCreatedByClone -> return Failed failure
                 | Error failure ->
                     let! cleanupError = removeCloneResidue ()
 

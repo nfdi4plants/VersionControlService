@@ -113,15 +113,17 @@ let private toBase64 (_value: string) : string = jsNative
 [<Emit("encodeURIComponent($0)")>]
 let private encodeUriComponent (_value: string) : string = jsNative
 
-/// Scoped `-c` arguments injecting a Basic credential for exactly the remote's
-/// host. Non-HTTPS remotes (SSH, scp-like, local paths) get no header: git's own
-/// transport auth applies.
+/// Scoped `-c` arguments inject a Basic credential into a header scoped to the
+/// remote's authority (host and non-default port). Non-HTTPS remotes get no
+/// header because Git's own transport auth applies.
 let internal buildScopedAuthArguments (remoteUrl: string) (credential: GitCredential option) : string[] =
+    let trimmedRemoteUrl = remoteUrl.Trim()
+
     match credential with
     | None -> [||]
     | Some resolved ->
-        match GitAuthAdapter.tryExtractAuthorityFromRemoteUrl remoteUrl with
-        | Ok authority when remoteUrl.StartsWith "https://" ->
+        match GitAuthAdapter.tryExtractAuthorityFromRemoteUrl trimmedRemoteUrl with
+        | Ok authority when trimmedRemoteUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase) ->
             let basicValue = toBase64 $"{resolved.Username}:{resolved.Secret}"
 
             [|

@@ -14,7 +14,7 @@ The host owns binding persistence. VersionControlService does not keep an applic
 
 Do not serialize access keys, tokens, passwords, credential-bearing URLs, process arguments, or provider clients into a binding. The host resolves `ConnectionProfileId` through the credential strategy injected into the selected factory.
 
-Providers store binding locations without userinfo (HTTPS drops all of it and SSH keeps the user name with its password removed), and the repository's own remote configuration keeps the location the caller gave.
+HTTP and HTTPS drop all userinfo and SSH keeps the user name with its password removed. The provider keeps the location the caller gave wherever it reaches the repository.
 
 ## Resolution order
 

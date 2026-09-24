@@ -162,13 +162,25 @@ let cloneWorkspace (factory: ProviderFactory) location targetPath (context: Oper
             context
 
     match result with
-    | Succeeded outcome
-    | PartiallySucceeded(outcome, _) -> return Ok outcome.Value
+    | Succeeded outcome -> return Ok outcome.Value
+    | PartiallySucceeded(_, failure) ->
+        let recoveryCode =
+            failure.RecoveryAction
+            |> Option.map (fun action -> action.Code)
+            |> Option.defaultValue "none"
+
+        return
+            Error {
+                failure with
+                    Message = $"The clone finished with a problem ({failure.Code}). Recovery: {recoveryCode}."
+            }
     | Failed failure -> return Error failure
 }
 ```
 
-A clone canceled before it completes rolls back and fails as `Canceled`. A pre-existing empty target stays empty, and a clone that finished before cancellation took effect succeeds. A download failure that is not a cancellation returns `PartiallySucceeded` with `retry_materialization`, so the workspace exists and its large objects are not materialized.
+A clone canceled before it completes rolls back and fails as `Canceled`. A pre-existing empty target is cleaned by removing its entries, so entries another program adds to that folder during the clone are removed too. A clone that finished before cancellation took effect succeeds. A download failure returns `PartiallySucceeded` with `retry_materialization`, so the workspace exists and its large objects are not materialized.
+
+If a failed rollback cannot remove the clone target, `Clone` returns `Failed` with category `Canceled` and `StateChanged = true`. Its recovery code is `remove_clone_target`. Ask the user to clear the target folder before retrying.
 
 `Initialize` takes a directory the provider does not already own, keeps the files already in
 it, and reports them as ordinary workspace changes. `Location` is optional in the contract and
