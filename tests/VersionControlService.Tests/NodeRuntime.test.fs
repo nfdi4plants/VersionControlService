@@ -62,6 +62,59 @@ Vitest.describe (
     "Node runtime process adapter",
     fun () ->
         Vitest.test (
+            "parses progress meter lines",
+            fun () ->
+                let cases: (string * NodeProcess.ProgressMeter option)[] = [|
+                    "Uploading LFS objects:  45% (9/20), 1.2 MB | 1.0 MB/s",
+                    Some {
+                        Label = "Uploading LFS objects"
+                        Percent = 45.0
+                        Count = Some(9, 20)
+                    };
+                    "Downloading LFS objects: 100% (3/3), 3.1 MB | 2 MB/s, done.",
+                    Some {
+                        Label = "Downloading LFS objects"
+                        Percent = 100.0
+                        Count = Some(3, 3)
+                    };
+                    "Writing objects: 100% (3/3), 250 bytes | 250.00 KiB/s, done.",
+                    Some {
+                        Label = "Writing objects"
+                        Percent = 100.0
+                        Count = Some(3, 3)
+                    };
+                    "Receiving objects: 12.5% (1/8)",
+                    Some {
+                        Label = "Receiving objects"
+                        Percent = 12.5
+                        Count = Some(1, 8)
+                    };
+                    "Receiving objects: 7% complete",
+                    Some {
+                        Label = "Receiving objects"
+                        Percent = 7.0
+                        Count = None
+                    };
+                    "Uploading LFS objects: 150% (3/2)",
+                    Some {
+                        Label = "Uploading LFS objects"
+                        Percent = 100.0
+                        Count = Some(3, 2)
+                    };
+                    "remote: Counting objects: 100% (5/5)", None;
+                    "To https://localhost:3443/e2eadmin/arc.git", None;
+                    "   abc1234..def5678  main -> main", None;
+                    "4b825dc642cb6eb9a060e54bf8d69288fbee4904", None;
+                    ".git/MERGE_HEAD", None;
+                    "https://localhost:3443/x/y.git", None;
+                    "", None
+                |]
+
+                for line, expected in cases do
+                    Vitest.expect(NodeProcess.tryParseProgressMeter line).toEqual expected
+        )
+
+        Vitest.test (
             "runs a child process to completion and captures output",
             TestOptions(timeout = 120000),
             fun () -> promise {
@@ -76,6 +129,45 @@ Vitest.describe (
                     Vitest.expect(outcome.Value.StdOut.Contains "hello runtime").toBe (true)
                 | PartiallySucceeded _
                 | Failed _ -> failwith "Expected the process to succeed."
+            }
+        )
+
+        Vitest.test (
+            "reports meter lines and preserves unreported child output",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let stdoutText = "4b825dc642cb6eb9a060e54bf8d69288fbee4904\n"
+                let stderrText =
+                    "Uploading LFS objects:  45% (9/20), 1.2 MB | 1.0 MB/s\r" +
+                    "Uploading LFS objects: 100% (20/20), 2.4 MB | 1.0 MB/s, done.\n"
+
+                let script =
+                    "process.stdout.write('4b825dc642cb6eb9a060e54bf8d69288fbee4904\\n');" +
+                    "process.stderr.write('Uploading LFS objects:  45% (9/20), 1.2 MB | 1.0 MB/s\\r" +
+                    "Uploading LFS objects: 100% (20/20), 2.4 MB | 1.0 MB/s, done.\\n');"
+
+                let request = NodeProcess.ProcessRequest.create nodeExecutable [| "-e"; script |]
+                let reports = ResizeArray<OperationProgress>()
+                let context =
+                    OperationContext.create "runtime-progress-meter" OperationCancellation.none reports.Add
+
+                let! result = run (NodeProcess.run request context)
+
+                match result with
+                | Succeeded outcome ->
+                    Vitest.expect(outcome.Value.ExitCode).toBe 0
+                    Vitest.expect(outcome.Value.StdOut).toBe stdoutText
+                    Vitest.expect(outcome.Value.StdErr).toBe stderrText
+                | PartiallySucceeded _
+                | Failed _ -> failwith "Expected the process to succeed."
+
+                Vitest.expect(reports.Count).toBe 2
+                Vitest.expect(reports[0].DisplayMessage).toEqual (Some "Uploading LFS objects (9/20)")
+                Vitest.expect(reports[0].Completed).toEqual (Some 45.0)
+                Vitest.expect(reports[0].Total).toEqual (Some 100.0)
+                Vitest.expect(reports[1].DisplayMessage).toEqual (Some "Uploading LFS objects (20/20)")
+                Vitest.expect(reports[1].Completed).toEqual (Some 100.0)
+                Vitest.expect(reports[1].Total).toEqual (Some 100.0)
             }
         )
 
@@ -189,7 +281,7 @@ Vitest.describe (
             TestOptions(timeout = 120000),
             fun () -> promise {
                 // A child that ticks forever until killed.
-                let script = "setInterval(()=>console.log('tick'), 25)"
+                let script = "setInterval(()=>console.error('tick: 50%'), 25)"
                 let request = NodeProcess.ProcessRequest.create nodeExecutable [| "-e"; script |]
 
                 let source = OperationCancellation.Source()
@@ -220,11 +312,12 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "observed process output is redacted before progress reporting",
+            "progress headlines contain meter labels only",
             TestOptions(timeout = 120000),
             fun () -> promise {
                 let script =
-                    "console.log('Authorization: Bearer topsecret123'); console.log('fetch https://user:hunter2@host.example/repo.git')"
+                    "console.error('Uploading LFS objects: 50% (1/2), Authorization: Bearer topsecret123');" +
+                    "console.error('Downloading LFS objects: 100% (2/2), fetch https://user:hunter2@host.example/repo.git')"
 
                 let request = NodeProcess.ProcessRequest.create nodeExecutable [| "-e"; script |]
                 let progressMessages = ResizeArray<string>()
@@ -242,7 +335,9 @@ Vitest.describe (
                 | PartiallySucceeded _
                 | Failed _ -> failwith "Expected the redaction process to succeed."
 
-                Vitest.expect(progressMessages.Count >= 2).toBe (true)
+                Vitest.expect(progressMessages.Count).toBe 2
+                Vitest.expect(progressMessages[0]).toBe "Uploading LFS objects (1/2)"
+                Vitest.expect(progressMessages[1]).toBe "Downloading LFS objects (2/2)"
 
                 for message in progressMessages do
                     Vitest.expect(message.Contains "topsecret123").toBe (false)

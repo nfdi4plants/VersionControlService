@@ -10,6 +10,7 @@ open VersionControlService.Bindings.SimpleGit
 open VersionControlService.Git.GitAuthAdapter
 
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
+module NodeProcess = VersionControlService.Runtime.Node.Process
 
 type GitProgressCallback = GitProgressDto -> unit
 
@@ -85,13 +86,24 @@ let internal reportPhase (progressCallback: GitProgressCallback option) methodNa
     |> Option.iter (fun report -> createProgressDto (Some methodName) (Some stage) None None None None |> report)
 
 let internal reportOutputText (progressCallback: GitProgressCallback option) (text: string) =
-    progressCallback
-    |> Option.iter (fun report ->
-        let output = text |> Option.ofObj |> Option.defaultValue String.Empty |> redactToken
+    match NodeProcess.tryParseProgressMeter text with
+    | Some meter ->
+        let output = NodeProcess.formatProgressMeter meter |> Redaction.redact
 
-        if not (String.IsNullOrEmpty output) then
-            createProgressDto None None None None None (Some output) |> report
-    )
+        progressCallback
+        |> Option.iter (fun report ->
+            createProgressDto
+                None
+                None
+                (Some meter.Percent)
+                (Some meter.Percent)
+                (Some 100.0)
+                (Some output)
+            |> report)
+    | None -> ()
+
+let private createOutputObserver (progressCallback: GitProgressCallback option) =
+    NodeProcess.createMeterObserver (reportOutputText progressCallback)
 
 [<Emit("$0 != null && typeof $0.on === 'function'")>]
 let private hasStreamListener (_stream: obj) : bool = jsNative
@@ -107,14 +119,14 @@ let internal withGitOutputProgress (progressCallback: GitProgressCallback option
         attachOutputHandler
             git
             (fun (_command: string) (stdout: obj) (stderr: obj) (_args: string[]) ->
-                let handleChunk chunk =
-                    reportOutputText progressCallback (string chunk)
+                let observeStream (stream: obj) =
+                    if hasStreamListener stream then
+                        let observe, flush = createOutputObserver progressCallback
+                        stream?on ("data", fun (chunk: obj) -> observe (string chunk)) |> ignore
+                        stream?on ("end", fun (_: obj) -> flush ()) |> ignore
 
-                if hasStreamListener stdout then
-                    stdout?on ("data", handleChunk) |> ignore
-
-                if hasStreamListener stderr then
-                    stderr?on ("data", handleChunk) |> ignore
+                observeStream stdout
+                observeStream stderr
             )
 
 // `internal` stays inside the library assembly boundary.

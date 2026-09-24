@@ -17,6 +17,7 @@ open VersionControlService.Git.GitAuthAdapter
 open VersionControlService.Git.GitInternals
 
 module FileSystem = VersionControlService.Runtime.Node.FileSystem
+module NodeProcess = VersionControlService.Runtime.Node.Process
 module GitCredentialStrategy = VersionControlService.Git.GitCredentialStrategy
 
 type GitFailure = {
@@ -763,96 +764,11 @@ let private runSimpleGitPathspecChunks
         | None -> return Ok(String.concat "" outputs)
     }
 
-let private exactTransferBytesPattern =
-    Regex(
-        @"(?<processed>\d+(?:\.\d+)?)\s*/\s*(?<total>\d+(?:\.\d+)?)\s*bytes",
-        RegexOptions.IgnoreCase
-    )
-
-let private scaledTransferBytesPattern =
-    Regex(
-        @"(?<processed>\d+(?:\.\d+)?)\s*(?<processedUnit>KiB|MiB|GiB|KB|MB|GB|B)\s*/\s*(?<total>\d+(?:\.\d+)?)\s*(?<totalUnit>KiB|MiB|GiB|KB|MB|GB|B)",
-        RegexOptions.IgnoreCase
-    )
-
-let private completedTransferBytesPattern =
-    Regex(
-        @"(?<bytes>\d+(?:\.\d+)?)\s*(?<unit>KiB|MiB|GiB|KB|MB|GB|B)\s*\|\s*\d+(?:\.\d+)?\s*(?:KiB|MiB|GiB|KB|MB|GB|B)/s",
-        RegexOptions.IgnoreCase
-    )
-
-let private tryParseInvariantNumber (value: string) =
-    match Double.TryParse value with
-    | true, parsed -> Some parsed
-    | false, _ -> None
-
-let private transferUnitMultiplier (unitName: string) =
-    match unitName.Trim().ToUpperInvariant() with
-    | "KIB"
-    | "KB" -> 1024.0
-    | "MIB"
-    | "MB" -> 1024.0 * 1024.0
-    | "GIB"
-    | "GB" -> 1024.0 * 1024.0 * 1024.0
-    | _ -> 1.0
-
-let private tryParseTransferBytes (text: string) =
-    let lastMatch (pattern: Regex) =
-        let matches = pattern.Matches text
-
-        if matches.Count = 0 then
-            None
-        else
-            Some matches[matches.Count - 1]
-
-    match lastMatch exactTransferBytesPattern with
-    | Some exact ->
-        match
-            tryParseInvariantNumber exact.Groups["processed"].Value,
-            tryParseInvariantNumber exact.Groups["total"].Value
-        with
-        | Some processed, Some total -> Some(processed, total)
-        | _ -> None
-    | None ->
-        match lastMatch scaledTransferBytesPattern with
-        | Some scaled ->
-            match
-                tryParseInvariantNumber scaled.Groups["processed"].Value,
-                tryParseInvariantNumber scaled.Groups["total"].Value
-            with
-            | Some processed, Some total ->
-                Some(
-                    processed * transferUnitMultiplier scaled.Groups["processedUnit"].Value,
-                    total * transferUnitMultiplier scaled.Groups["totalUnit"].Value
-                )
-            | _ -> None
-        | None ->
-            match lastMatch completedTransferBytesPattern with
-            | Some completed ->
-                tryParseInvariantNumber completed.Groups["bytes"].Value
-                |> Option.map (fun bytes ->
-                    let transferred = bytes * transferUnitMultiplier completed.Groups["unit"].Value
-                    transferred, transferred)
-            | None -> None
-
 let private runGitCapturedWithOutput progressCallback request =
-    let pending = System.Text.StringBuilder()
-    let mutable lastReported: (float * float) option = None
-
-    let observeOutput (chunk: string) =
-        GitInternals.reportOutputText progressCallback chunk
-        pending.Append chunk |> ignore
-
-        if pending.Length > 4096 then
-            // Workaround: the fable-library of Fable 5.0.0-alpha.21, which Swate still uses, has no
-            // StringBuilder.Remove, so the bundled app fails to build. Go back to
-            // pending.Remove(0, pending.Length - 4096) once consumers are on a newer Fable.
-            let tail = pending.ToString(pending.Length - 4096, 4096)
-            pending.Clear().Append(tail) |> ignore
-
-        match tryParseTransferBytes (pending.ToString()) with
-        | Some(processed, total) when lastReported <> Some(processed, total) ->
-            lastReported <- Some(processed, total)
+    let reportLine (line: string) =
+        match NodeProcess.tryParseProgressMeter line with
+        | Some meter ->
+            let displayMessage = NodeProcess.formatProgressMeter meter |> Redaction.redact
 
             progressCallback
             |> Option.iter (fun report ->
@@ -860,13 +776,19 @@ let private runGitCapturedWithOutput progressCallback request =
                     (Some "lfs")
                     (Some "upload")
                     None
-                    (Some processed)
-                    (Some total)
-                    None
+                    (Some meter.Percent)
+                    (Some 100.0)
+                    (Some displayMessage)
                 |> report)
-        | _ -> ()
+        | None -> ()
 
-    GitLfsAdapter.runGitCapturedWithOutput observeOutput request
+    let observeOutput, flushOutput = NodeProcess.createMeterObserver reportLine
+
+    promise {
+        let! result = GitLfsAdapter.runGitCapturedWithOutput observeOutput request
+        flushOutput ()
+        return result
+    }
 
 // GitService reads the threshold because stage/commit need the value while deciding whether to enforce LFS automatically.
 let private getConfiguredLfsThresholdMb (arcPath: string) : JS.Promise<GitResult<int>> = promise {

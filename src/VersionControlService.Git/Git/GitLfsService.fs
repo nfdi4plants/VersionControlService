@@ -14,6 +14,7 @@ open VersionControlService.Git.GitAuthAdapter
 
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodePath = VersionControlService.Runtime.Node.Path
+module NodeProcess = VersionControlService.Runtime.Node.Process
 
 /// Default timeout for interactive Git LFS commands launched by the service process.
 [<Literal>]
@@ -1228,59 +1229,25 @@ let private extractSpawnFailureMessage (result: GitSpawnResult) =
 
 let private spawnFailure (result: GitSpawnResult) = exn (extractSpawnFailureMessage result)
 
-let private maintenanceProgressPattern =
-    Regex(@"(?<progress>\d+(?:\.\d+)?)%\s+\((?<processed>\d+(?:\.\d+)?)/(?<total>\d+(?:\.\d+)?)(?:\s+bytes)?\)")
-
-let private tryParseInvariantFloat (value: string) =
-    match Double.TryParse value with
-    | true, parsed -> Some parsed
-    | false, _ -> None
-
 let private createMaintenanceOutputObserver (progressCallback: (GitProgressDto -> unit) option) =
-    let pending = System.Text.StringBuilder()
-
     let reportLine (line: string) =
-        progressCallback
-        |> Option.iter (fun report ->
-            if not (String.IsNullOrWhiteSpace line) then
-                let matched = maintenanceProgressPattern.Match line
+        match NodeProcess.tryParseProgressMeter line with
+        | Some meter ->
+            let displayMessage = NodeProcess.formatProgressMeter meter |> Redaction.redact
 
-                let progress, processed, total =
-                    if matched.Success then
-                        tryParseInvariantFloat matched.Groups["progress"].Value,
-                        tryParseInvariantFloat matched.Groups["processed"].Value,
-                        tryParseInvariantFloat matched.Groups["total"].Value
-                    else
-                        None, None, None
-
+            progressCallback
+            |> Option.iter (fun report ->
                 report {
                     Method = Some "lfs"
                     Stage = Some "maintenance"
-                    Progress = progress
-                    Processed = processed
-                    Total = total
-                    Output = Some(Redaction.redact line)
+                    Progress = Some meter.Percent
+                    Processed = Some meter.Percent
+                    Total = Some 100.0
+                    Output = Some displayMessage
                 })
+        | None -> ()
 
-    let observe (chunk: string) =
-        pending.Append chunk |> ignore
-        let mutable text = pending.ToString()
-        let mutable newline = text.IndexOf '\n'
-
-        while newline >= 0 do
-            reportLine (text.Substring(0, newline).TrimEnd '\r')
-            text <- text.Substring(newline + 1)
-            newline <- text.IndexOf '\n'
-
-        pending.Clear() |> ignore
-        pending.Append text |> ignore
-
-    let flush () =
-        if pending.Length > 0 then
-            reportLine (pending.ToString().TrimEnd '\r')
-            pending.Clear() |> ignore
-
-    observe, flush
+    NodeProcess.createMeterObserver reportLine
 
 /// Runs a maintenance command with authentication and streams its real process progress.
 /// `onStarted` fires only after the child process can observe cancellation.

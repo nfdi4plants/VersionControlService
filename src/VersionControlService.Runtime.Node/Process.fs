@@ -4,6 +4,7 @@
 module VersionControlService.Runtime.Node.Process
 
 open System
+open System.Text.RegularExpressions
 open Fable.Core
 open Fable.Core.JsInterop
 open VersionControlService.Abstractions
@@ -16,7 +17,7 @@ type ProcessRequest = {
     StdinData: string option
     /// Additional environment entries layered over the current process environment.
     Environment: (string * string)[]
-    /// Stable progress phase code attached to observed output lines.
+    /// Stable progress phase code attached to parsed meter events.
     ProgressPhase: string
 }
 
@@ -44,6 +45,82 @@ type ByteProcessOutput = {
     StdOut: obj
     StdErr: string
 }
+
+type ProgressMeter = {
+    Label: string
+    Percent: float
+    Count: (int * int) option
+}
+
+let private progressMeterPattern =
+    Regex(
+        @"^(?<label>[A-Za-z][^:%\r\n]*?):\s+(?<percent>\d{1,3}(?:\.\d+)?)%(?:\s*\((?<done>\d+)/(?<total>\d+)\))?"
+    )
+
+let tryParseProgressMeter (line: string) =
+    let text = (line |> Option.ofObj |> Option.defaultValue String.Empty).Trim()
+    let matched =
+        progressMeterPattern.Match text
+
+    if not matched.Success then
+        None
+    else
+        match
+            Double.TryParse(
+                matched.Groups["percent"].Value,
+                Globalization.NumberStyles.Float,
+                Globalization.CultureInfo.InvariantCulture
+            )
+        with
+        | false, _ -> None
+        | true, percent ->
+            let count =
+                if matched.Groups["done"].Success then
+                    match
+                        Int32.TryParse matched.Groups["done"].Value,
+                        Int32.TryParse matched.Groups["total"].Value
+                    with
+                    | (true, doneCount), (true, totalCount) -> Some(doneCount, totalCount)
+                    | _ -> None
+                else
+                    None
+
+            Some {
+                Label = matched.Groups["label"].Value.Trim()
+                Percent = max 0.0 (min 100.0 percent)
+                Count = count
+            }
+
+let formatProgressMeter (meter: ProgressMeter) =
+    match meter.Count with
+    | Some(completed, total) -> $"{meter.Label} ({completed}/{total})"
+    | None -> meter.Label
+
+let private reportProgressMeter (phaseCode: string) (context: OperationContext) (meter: ProgressMeter) =
+    context.ReportProgress {
+        PhaseCode = phaseCode
+        Item = None
+        Completed = Some meter.Percent
+        Total = Some 100.0
+        DisplayMessage = Some(Redaction.redact (formatProgressMeter meter))
+    }
+
+let createMeterObserver (reportLine: string -> unit) =
+    let pending = System.Text.StringBuilder()
+
+    let observe (text: string) =
+        let lines = (pending.ToString() + text).Split([| '\r'; '\n' |], StringSplitOptions.None)
+        pending.Clear().Append(lines.[lines.Length - 1]) |> ignore
+
+        for index = 0 to lines.Length - 2 do
+            reportLine lines.[index]
+
+    let flush () =
+        if pending.Length > 0 then
+            reportLine (pending.ToString())
+            pending.Clear() |> ignore
+
+    observe, flush
 
 let private childProcessModule: obj = importAll "child_process"
 let private processGlobal: obj = emitJsExpr () "process"
@@ -79,9 +156,9 @@ let isProcessAlive (pid: int) : bool =
     with _ ->
         false
 
-/// Runs a child process under the operation context. Cancellation terminates the
-/// process tree and yields a structured canceled failure with StateChanged = false;
-/// observed output lines are redacted before they reach progress reporting.
+/// Runs a child process under the operation context. On cancellation, it terminates
+/// the process tree and returns a canceled failure with StateChanged = false.
+/// Parsed progress meter lines are redacted before progress reporting.
 let run (request: ProcessRequest) (context: OperationContext) : Async<OperationResult<ProcessOutput>> =
     Async.FromContinuations(fun (resolve, _, _) ->
         if context.Cancellation.IsCancellationRequested() then
@@ -129,25 +206,26 @@ let run (request: ProcessRequest) (context: OperationContext) : Async<OperationR
                 let mutable canceled = false
 
                 let reportLine (line: string) =
-                    if not (String.IsNullOrWhiteSpace line) then
-                        context.ReportProgress {
-                            PhaseCode = request.ProgressPhase
-                            Item = None
-                            Completed = None
-                            Total = None
-                            DisplayMessage = Some(Redaction.redact line)
-                        }
+                    tryParseProgressMeter line
+                    |> Option.iter (reportProgressMeter request.ProgressPhase context)
 
-                let observeStream (stream: obj) (decoder: obj) (buffer: System.Text.StringBuilder) =
+                let observeStderr, flushStderr = createMeterObserver reportLine
+
+                let observeStream
+                    (stream: obj)
+                    (decoder: obj)
+                    (buffer: System.Text.StringBuilder)
+                    (observeProgress: (string -> unit) option)
+                    =
                     if not (isNull stream) then
                         stream?on ("data", fun (data: obj) ->
                             let text = Interop.decodeUtf8Chunk decoder data
                             buffer.Append text |> ignore
-                            text.Split '\n' |> Array.iter reportLine)
+                            observeProgress |> Option.iter (fun observe -> observe text))
                         |> ignore
 
-                observeStream child?stdout stdoutDecoder stdout
-                observeStream child?stderr stderrDecoder stderr
+                observeStream child?stdout stdoutDecoder stdout None
+                observeStream child?stderr stderrDecoder stderr (Some observeStderr)
 
                 child?on ("exit", fun (code: obj) ->
                     exited <- true
@@ -177,15 +255,23 @@ let run (request: ProcessRequest) (context: OperationContext) : Async<OperationR
                                 OperationResult.canceled "The operation was canceled and its process tree terminated."
                             )
                         else
-                            let finishStream (decoder: obj) (buffer: System.Text.StringBuilder) =
+                            let finishStream
+                                (decoder: obj)
+                                (buffer: System.Text.StringBuilder)
+                                =
                                 let tail = Interop.finishUtf8Decoding decoder
 
                                 if not (String.IsNullOrEmpty tail) then
                                     buffer.Append tail |> ignore
-                                    tail.Split '\n' |> Array.iter reportLine
+                                tail
 
-                            finishStream stdoutDecoder stdout
-                            finishStream stderrDecoder stderr
+                            finishStream stdoutDecoder stdout |> ignore
+                            let stderrTail = finishStream stderrDecoder stderr
+
+                            if not (String.IsNullOrEmpty stderrTail) then
+                                observeStderr stderrTail
+
+                            flushStderr ()
 
                             resolve (
                                 OperationResult.succeeded {
@@ -295,16 +381,13 @@ let runBytes
                                 |> Interop.bufferConcat
                                 |> Interop.bufferToUtf8String
 
-                            stderrText.Split '\n'
-                            |> Array.filter (String.IsNullOrWhiteSpace >> not)
-                            |> Array.iter (fun line ->
-                                context.ReportProgress {
-                                    PhaseCode = request.ProgressPhase
-                                    Item = None
-                                    Completed = None
-                                    Total = None
-                                    DisplayMessage = Some(Redaction.redact line)
-                                })
+                            let reportLine (line: string) =
+                                tryParseProgressMeter line
+                                |> Option.iter (reportProgressMeter request.ProgressPhase context)
+
+                            let observeProgress, flushProgress = createMeterObserver reportLine
+                            observeProgress stderrText
+                            flushProgress ()
 
                             resolve (
                                 OperationResult.succeeded {

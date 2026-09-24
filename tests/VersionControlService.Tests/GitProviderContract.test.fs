@@ -2173,15 +2173,13 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "maintenance streams real process progress totals above two GiB",
+            "maintenance streams process meter percentages",
             TestOptions(timeout = 120000),
             fun () -> promise {
                 let harness = createGitHarness ()
                 let! fakeRoot = createTempDirectoryAsync ()
-                let completedBytes = 3.0 * 1024.0 * 1024.0 * 1024.0
-                let totalBytes = 4.0 * 1024.0 * 1024.0 * 1024.0
-                let completedBytesText = string (int64 completedBytes)
-                let totalBytesText = string (int64 totalBytes)
+                let completedCount = "3"
+                let totalCount = "4"
 
                 try
                     let! workspace = harness.CreateWorkspace()
@@ -2200,10 +2198,10 @@ Vitest.describe (
                             writeUtf8FileAsync
                                 (join [| workspace.Binding.WorkspaceRoot; "lfs" |])
                                 ("console.log('deduplicate: 75% ("
-                                 + completedBytesText
+                                 + completedCount
                                  + "/"
-                                 + totalBytesText
-                                 + " bytes)');\n")
+                                 + totalCount
+                                 + ")');\n")
                     else
                         let dispatcher = join [| fakeRoot; "fake-git.js" |]
 
@@ -2213,10 +2211,10 @@ Vitest.describe (
                             writeUtf8FileAsync
                                 dispatcher
                                 ("if (process.argv.includes('rev-parse')) console.log('true');\nelse if (process.argv.includes('dedup')) console.log('deduplicate: 75% ("
-                                 + completedBytesText
+                                 + completedCount
                                  + "/"
-                                 + totalBytesText
-                                 + " bytes)');\n")
+                                 + totalCount
+                                 + ")');\n")
 
                         do!
                             writeUtf8FileAsync
@@ -2251,8 +2249,8 @@ Vitest.describe (
                         |> Seq.find (fun report -> report.Completed.IsSome)
 
                     Vitest.expect(largeReport.PhaseCode).toBe "maintenance-deduplicate"
-                    Vitest.expect(largeReport.Completed).toEqual (Some completedBytes)
-                    Vitest.expect(largeReport.Total).toEqual (Some totalBytes)
+                    Vitest.expect(largeReport.Completed).toEqual (Some 75.0)
+                    Vitest.expect(largeReport.Total).toEqual (Some 100.0)
                     do! harness.Cleanup()
                     do! removeDirectoryAsync fakeRoot
                 with error ->

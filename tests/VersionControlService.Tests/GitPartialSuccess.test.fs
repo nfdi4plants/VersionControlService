@@ -652,7 +652,7 @@ Vitest.describe (
                         let blockedTransfer =
                             NodeProcess.ProcessRequest.create
                                 nodeExecutablePath
-                                [| "-e"; "console.log('lfs-transfer-started'); setInterval(()=>{}, 1000)" |]
+                                [| "-e"; "console.error('lfs-transfer-started: 10% (1/2)'); setInterval(()=>{}, 1000)" |]
 
                         let hooks = {
                             GitWorkspaceSession.GitSessionHooks.none with
@@ -671,7 +671,7 @@ Vitest.describe (
 
                             let context =
                                 OperationContext.create operationId source.Cancellation (fun progress ->
-                                    if progress.DisplayMessage = Some "lfs-transfer-started" then
+                                    if progress.DisplayMessage = Some "lfs-transfer-started (1/2)" then
                                         source.Cancel())
 
                             return!
@@ -746,7 +746,7 @@ Vitest.describe (
                                             let script =
                                                 "const fs=require('node:fs');const path=require('node:path');" +
                                                 "const fd=fs.openSync(path.join(process.argv[1],'clone-residue.txt'),'w');fs.writeSync(fd,'residue');" +
-                                                "console.log('clone-started');setInterval(()=>{},1000)"
+                                                "console.error('clone-started: 10% (1/2)');setInterval(()=>{},1000)"
 
                                             // The child runs inside the target and keeps a file open there, as a
                                             // killed git does on Windows until the rollback removes the target.
@@ -764,7 +764,7 @@ Vitest.describe (
 
                         let context =
                             OperationContext.create "cancel-during-clone" source.Cancellation (fun progress ->
-                                if progress.DisplayMessage = Some "clone-started" then
+                                if progress.DisplayMessage = Some "clone-started (1/2)" then
                                     source.Cancel())
 
                         let factory = GitWorkspaceSession.createFactory hooks
