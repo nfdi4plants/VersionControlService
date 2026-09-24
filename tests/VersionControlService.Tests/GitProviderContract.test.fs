@@ -3748,6 +3748,7 @@ let private createDownloadedLfsRestoreFixture () = promise {
     let! _ = runGitIn sourcePath [||] [| "remote"; "add"; "origin"; barePath |] None
     let! _ = runGitIn sourcePath [||] [| "push"; "-u"; "origin"; "main" |] None
     let! _ = runGitIn root [||] [| "clone"; barePath; repoPath |] None
+    do! configureUser repoPath
     let! _ = runGitIn repoPath [||] [| "lfs"; "install"; "--local" |] None
     let! _ = runGitIn repoPath [||] [| "lfs"; "pull"; "origin" |] None
 
