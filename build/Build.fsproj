@@ -8,11 +8,13 @@
   <ItemGroup>
     <Compile Include="ProjectInfo.fs"/>
     <Compile Include="Util.fs"/>
+    <Compile Include="IO\Changelog.fs"/>
     <Compile Include="IO\PackageIO.fs"/>
     <Compile Include="Tools\Docker.fs"/>
     <Compile Include="Actions\Test.fs"/>
     <Compile Include="Actions\Pack.fs"/>
     <Compile Include="Actions\Verify.fs"/>
+    <Compile Include="Actions\Release.fs"/>
     <Compile Include="Actions\Consumer.fs"/>
     <Compile Include="Actions\LakeFs.fs"/>
     <Compile Include="Build.fs"/>

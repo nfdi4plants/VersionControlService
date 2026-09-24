@@ -14,11 +14,13 @@ let private prepareOutput (output: string) =
     let volumeRoot = Path.GetPathRoot outputPath
     let repositoryPrefix = ProjectPaths.repositoryRoot.TrimEnd(Path.DirectorySeparatorChar) + separator
     let outputPrefix = outputPath.TrimEnd(Path.DirectorySeparatorChar) + separator
+    let releaseOutputPath = Path.Combine(ProjectPaths.repositoryRoot, "nupkgs")
+    let isReleaseOutput = outputPath.Equals(releaseOutputPath, comparison)
 
     if
         outputPath.Equals(volumeRoot, comparison)
         || outputPath.Equals(ProjectPaths.repositoryRoot, comparison)
-        || outputPath.StartsWith(repositoryPrefix, comparison)
+        || (outputPath.StartsWith(repositoryPrefix, comparison) && not isReleaseOutput)
         || ProjectPaths.repositoryRoot.StartsWith(outputPrefix, comparison)
     then
         failwithf "Refusing to clear unsafe package output directory '%s'." outputPath
@@ -47,14 +49,13 @@ let private prepareOutput (output: string) =
 
 /// Packs the five coordinated packages at one version into a local feed. The projects are
 /// already restored by the time a target gets here, which is why packing skips restore.
-let Local (version: string) (output: string) =
+let Local (version: string) (output: string) (releaseNotes: string option) =
     let outputPath = prepareOutput output
 
     for packageId, projectPath in Packages.projects do
         printGreenfn "Packing %s %s" packageId version
 
-        run
-            "dotnet"
+        let args =
             [
                 "pack"
                 projectPath
@@ -65,7 +66,22 @@ let Local (version: string) (output: string) =
                 $"-p:Version={version}"
                 "--no-restore"
             ]
-            ProjectPaths.repositoryRoot
+
+        let args =
+            match releaseNotes with
+            | Some notes ->
+                // MSBuild treats semicolons and commas as property separators. Percent
+                // encoding keeps the full changelog body inside PackageReleaseNotes.
+                let escapedNotes =
+                    notes
+                        .Replace("%", "%25")
+                        .Replace(";", "%3B")
+                        .Replace(",", "%2C")
+
+                args @ [ $"-p:PackageReleaseNotes={escapedNotes}" ]
+            | None -> args
+
+        run "dotnet" args ProjectPaths.repositoryRoot
 
     printGreenfn "Packed local %s graph into %s" project outputPath
     outputPath

@@ -1,7 +1,7 @@
 <Project>
     <PropertyGroup>
         <DisableImplicitFSharpCoreReference>true</DisableImplicitFSharpCoreReference>
-        <Authors>nfdi4plants</Authors>
+        <Authors>Caroline Ott</Authors>
         <RepositoryUrl>https://github.com/nfdi4plants/VersionControlService</RepositoryUrl>
         <RepositoryType>git</RepositoryType>
         <PackageLicenseExpression>MIT</PackageLicenseExpression>

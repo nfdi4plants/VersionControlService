@@ -19,6 +19,17 @@ directory.
 
 The umbrella package is dependency-only and carries the public abstractions, the Node runtime, the Git provider, and the lakeFS provider at one coordinated version. An external provider that does not need the built-in implementations can reference `VersionControlService.Abstractions` alone. Once the packages are published, `dotnet add package VersionControlService --prerelease` replaces the three commands above.
 
+## NuGet release
+
+Add the next version and its release notes to `CHANGELOG.md`, then run the release target:
+
+```console
+NUGET_KEY=<key> dotnet run --project build/Build.fsproj -- release nuget
+```
+
+The target packs into `nupkgs/` and verifies the package graph before it pushes to NuGet.
+Pass `--dry-run` to pack and verify without publishing.
+
 The Git and lakeFS providers run on Fable and Node, and the Git provider needs the git binary. Git LFS is optional and only the large-object services use it. [Consuming the library](docs/consuming.md) lists what to install.
 
 ## Compose providers

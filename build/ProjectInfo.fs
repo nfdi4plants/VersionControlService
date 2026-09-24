@@ -40,7 +40,7 @@ let gitOwner = "nfdi4plants"
 let project = "VersionControlService"
 let projectRepo = $"https://github.com/{gitOwner}/{project}"
 
-let packageAuthors = "nfdi4plants"
+let packageAuthors = "Caroline Ott"
 let packageLicense = "MIT"
 
 /// Source Link writes this prefix into the portable PDBs of the symbol packages.

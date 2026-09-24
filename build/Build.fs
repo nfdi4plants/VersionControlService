@@ -11,6 +11,7 @@ let private usage =
         "  test consumer                               The Fable consumer suite over the abstractions"
         "  test lakefs                                 The live lakeFS matrix against a pinned container"
         "  pack --version=<v> --output=<dir>           Pack the five coordinated packages into a local feed"
+        "  release nuget [--dry-run]                   Pack and verify the latest changelog version, then push to NuGet"
         "  verify packages --feed=<dir> --version=<v>  Check a local feed against the expected package graph"
         "  package-consumer [--version=<v>] [--temp=<dir>]"
         "                                              Pack, verify, compile and bundle the one-reference consumer"
@@ -51,12 +52,19 @@ let main args =
             printRedfn "Usage: build test focused <test-file> <filter>"
             1
     | "test" :: "lakefs" :: _ -> target LakeFs.Live
+    | "release" :: "nuget" :: _ ->
+        target (fun () ->
+            let isDryRun = argv |> List.contains "--dry-run"
+            let key = if isDryRun then None else Some(getEnvironementVariableOrFail "NUGET_KEY")
+
+            Release.nuget key isDryRun
+        )
     | "pack" :: _ ->
         target (fun () ->
             let version = raw |> flagValue "--version"
             let output = raw |> flagValue "--output"
 
-            Pack.Local version output |> ignore
+            Pack.Local version output None |> ignore
         )
     | "verify" :: "packages" :: _ ->
         target (fun () ->
@@ -81,7 +89,7 @@ let main args =
             let cache = Path.Combine(workingRoot, "version-control-service-cache")
             let output = Path.Combine(workingRoot, "version-control-service-consumer-output")
 
-            Pack.Local version feed |> ignore
+            Pack.Local version feed None |> ignore
             Verify.PackageGraph feed version
             Consumer.Compile version feed cache output
             Consumer.BundleWithOldestFable version feed cache output
