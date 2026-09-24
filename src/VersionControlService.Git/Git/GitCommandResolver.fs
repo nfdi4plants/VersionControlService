@@ -1,5 +1,8 @@
 module internal VersionControlService.Git.GitCommandResolver
 
+[<assembly: System.Runtime.CompilerServices.InternalsVisibleTo("VersionControlService.Tests")>]
+do ()
+
 open System
 open System.Collections.Generic
 open Fable.Core

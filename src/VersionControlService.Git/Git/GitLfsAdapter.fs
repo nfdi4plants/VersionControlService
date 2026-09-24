@@ -1,6 +1,7 @@
 module internal VersionControlService.Git.GitLfsAdapter
 
 open System
+open Fable.Core
 open Fable.Core.JsInterop
 open Fable.Core.JS
 open VersionControlService.Git.GitEngineTypes
@@ -22,6 +23,9 @@ let private tryKillProcess (proc: obj) (signal: string) =
         proc?kill (signal) |> unbox<bool>
     with _ ->
         false
+
+[<Emit("process.kill($0, $1)")>]
+let private killProcessGroup (_pid: int) (_signal: string) : bool = jsNative
 
 let private signalProcessTree (proc: obj) (signal: string) =
     let pid: int = proc?pid |> unbox
@@ -51,16 +55,8 @@ let private signalProcessTree (proc: obj) (signal: string) =
             false
     else
         try
-            let signalName = signal.Replace("SIG", "")
-
-            childProcessDynamic?execFileSync (
-                "kill",
-                // A negative process-group ID must follow the option delimiter. Some
-                // kill implementations parse -12345 as -1 and signal unrelated processes.
-                [| $"-{signalName}"; "--"; $"-{pid}" |],
-                createObj [ "stdio" ==> "ignore" ]
-            )
-            |> ignore
+            // Detached POSIX children use their PID as the process-group ID.
+            killProcessGroup (-pid) signal |> ignore
             true
         with _ ->
             tryKillProcess proc signal
