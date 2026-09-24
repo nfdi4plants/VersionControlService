@@ -50,6 +50,7 @@ let createPreview
     {
         ChangedPaths = repositoryPaths changedPaths
         OverlappingPaths = overlapping |> Set.toList |> repositoryPaths
+        PredictedConflictPaths = None
         HasDataLossRisk = not (Set.isEmpty (Set.intersect changed dirtyPaths))
         WouldCreateConflictSession = not (Set.isEmpty overlapping)
     }

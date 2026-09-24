@@ -31,6 +31,9 @@ type UpdatePreview = {
     ChangedPaths: RepositoryPath[]
     /// Target-side changes overlapping local dirty paths.
     OverlappingPaths: RepositoryPath[]
+    /// Paths the update is expected to leave in conflict, when the provider can predict them.
+    /// None means the provider does not predict conflicts.
+    PredictedConflictPaths: RepositoryPath[] option
     HasDataLossRisk: bool
     WouldCreateConflictSession: bool
 }
@@ -261,9 +264,15 @@ module Synchronization =
                                                         Conflict
                                                         SynchronizationCodes.UpdateWouldCreateConflictSession
                                                         "Updating from the target needs conflict resolution." with
+                                                            // Committed conflicts count too, so the consumer can
+                                                            // name every path the merge will stop on.
                                                             AffectedPaths =
-                                                                previewOutcome.Value.OverlappingPaths
+                                                                Array.append
+                                                                    previewOutcome.Value.OverlappingPaths
+                                                                    (previewOutcome.Value.PredictedConflictPaths
+                                                                     |> Option.defaultValue [||])
                                                                 |> Array.map RepositoryPath.value
+                                                                |> Array.distinct
                                                             RevisionEvidence =
                                                                 state0.TargetRevision
                                                                 |> Option.map (fun revision -> [| "observed_target", revision |])

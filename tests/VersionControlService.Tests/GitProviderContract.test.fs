@@ -4032,6 +4032,84 @@ Vitest.describe (
 )
 
 Vitest.describe (
+    "Git clone target refs",
+    fun () ->
+        Vitest.test (
+            "Clone honors branch refs and rejects unsupported refs",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root = createTempDirectoryAsync ()
+
+                try
+                    let barePath = join [| root; "origin.git" |]
+                    let sourcePath = join [| root; "source" |]
+                    let localClonePath = join [| root; "local-clone" |]
+                    let remoteClonePath = join [| root; "remote-clone" |]
+                    let unsupportedClonePath = join [| root; "unsupported-clone" |]
+
+                    let! _ = runGitIn root [||] [| "init"; "--bare"; "-b"; "main"; barePath |] None
+                    let! _ = runGitIn root [||] [| "init"; "-b"; "main"; sourcePath |] None
+                    do! configureUser sourcePath
+                    do! writeUtf8FileAsync (join [| sourcePath; "base.txt" |]) "base\n"
+                    let! _ = runGitIn sourcePath [||] [| "add"; "-A" |] None
+                    let! _ = runGitIn sourcePath [||] [| "commit"; "-m"; "test: base" |] None
+                    let! _ = runGitIn sourcePath [||] [| "remote"; "add"; "origin"; barePath |] None
+                    let! _ = runGitIn sourcePath [||] [| "push"; "-u"; "origin"; "main" |] None
+                    let! _ = runGitIn sourcePath [||] [| "switch"; "-c"; "feature" |] None
+                    do! writeUtf8FileAsync (join [| sourcePath; "feature.txt" |]) "feature\n"
+                    let! _ = runGitIn sourcePath [||] [| "add"; "-A" |] None
+                    let! _ = runGitIn sourcePath [||] [| "commit"; "-m"; "test: feature" |] None
+                    let! _ = runGitIn sourcePath [||] [| "push"; "-u"; "origin"; "feature" |] None
+
+                    let location = {
+                        ProviderId = gitProviderId
+                        DisplayName = None
+                        ProviderLocation = barePath
+                        ConnectionProfileId = None
+                    }
+
+                    let factory = GitWorkspaceSession.createFactory GitWorkspaceSession.GitSessionHooks.none
+                    let clone targetPath targetRef contextName =
+                        factory.Clone
+                            {
+                                Location = location
+                                TargetPath = targetPath
+                                TargetRef = Some(ProviderRef.tryCreate targetRef |> Result.defaultWith failwith)
+                                MaterializeAllObjects = false
+                            }
+                            (OperationContext.detached contextName)
+                        |> Async.StartAsPromise
+
+                    let! localResult = clone localClonePath "git-local:feature" "clone-local-feature"
+                    expectProviderValue "clone local feature ref" localResult |> ignore
+                    let! localBranch = runGitIn localClonePath [||] [| "branch"; "--show-current" |] None
+                    Vitest.expect(localBranch.Trim()).toBe "feature"
+
+                    let! remoteResult = clone remoteClonePath "git-remote:origin/feature" "clone-remote-feature"
+                    expectProviderValue "clone remote feature ref" remoteResult |> ignore
+                    let! remoteBranch = runGitIn remoteClonePath [||] [| "branch"; "--show-current" |] None
+                    Vitest.expect(remoteBranch.Trim()).toBe "feature"
+
+                    let! unsupportedResult =
+                        clone unsupportedClonePath "git-local:refs/tags/v1" "clone-unsupported-target-ref"
+
+                    match unsupportedResult with
+                    | Failed failure ->
+                        Vitest.expect(failure.Category).toEqual Unsupported
+                        Vitest.expect(failure.Code).toBe "target_ref_unsupported"
+                    | Succeeded _
+                    | PartiallySucceeded _ -> failwith "An unsupported clone target ref unexpectedly succeeded."
+
+                    Vitest.expect(NodeFileSystem.existsSync unsupportedClonePath).toBe(false)
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+)
+
+Vitest.describe (
     "Git workspace adoption",
     fun () ->
         Vitest.test (

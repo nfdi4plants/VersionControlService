@@ -211,6 +211,7 @@ module FakeProvider =
                         OperationResult.succeeded {
                             ChangedPaths = [||]
                             OverlappingPaths = [||]
+                            PredictedConflictPaths = None
                             HasDataLossRisk = false
                             WouldCreateConflictSession = false
                         }

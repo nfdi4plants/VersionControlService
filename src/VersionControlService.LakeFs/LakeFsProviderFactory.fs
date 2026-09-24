@@ -171,7 +171,24 @@ let createFactory
         }
     Clone =
         fun request context -> async {
-            let! resolved = resolveLocation credentials request.Location
+            let locationResolution =
+                match LakeFsLocation.tryParse request.Location.ProviderLocation with
+                | Error message ->
+                    async.Return(Error(OperationFailure.create Validation "invalid_location" message))
+                | Ok parsed ->
+                    match request.TargetRef with
+                    | Some reference when ProviderRef.value reference <> $"lakefs:{parsed.TargetRef}" ->
+                        async.Return(
+                            Error(
+                                OperationFailure.create
+                                    Validation
+                                    "target_ref_mismatch"
+                                    "The requested provider ref does not match the ref in the lakeFS location."
+                            )
+                        )
+                    | _ -> resolveLocation credentials request.Location
+
+            let! resolved = locationResolution
 
             match resolved with
             | Error failure -> return Failed failure

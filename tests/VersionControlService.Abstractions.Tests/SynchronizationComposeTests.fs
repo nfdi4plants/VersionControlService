@@ -44,6 +44,7 @@ let private warning code = {
 let private preview risk conflict paths = {
     ChangedPaths = [||]
     OverlappingPaths = paths |> Array.map path
+    PredictedConflictPaths = None
     HasDataLossRisk = risk
     WouldCreateConflictSession = conflict
 }
@@ -283,6 +284,29 @@ let synchronizationComposeTests =
                 Expect.equal (observedFailure.RevisionEvidence |> Array.map fst) [| "observed_target" |] "Observed target evidence."
                 Expect.equal (observedFailure.RecoveryAction |> Option.map _.Code) (Some expectedRecovery) "Decision recovery."
                 assertSequence log [| "active"; "refresh"; "preview" |]
+
+        testCase "a conflict refusal names predicted conflict paths after the overlapping ones"
+        <| fun () ->
+            let log = ResizeArray<string>()
+            let target = revision "target"
+
+            let predictedPreview = {
+                preview false true [| "overlap.txt" |] with
+                    PredictedConflictPaths = Some [| path "committed.txt"; path "overlap.txt" |]
+            }
+
+            let steps, _, _ =
+                recordingSteps
+                    log
+                    (OperationResult.succeeded false)
+                    (OperationResult.succeeded (state TargetAhead (Some target)))
+                    (fun _ -> OperationResult.succeeded predictedPreview)
+                    (fun value -> OperationResult.succeeded value)
+                    (fun value -> OperationResult.succeeded value)
+
+            let observedFailure = expectFailure (run steps (request false false None) None)
+            Expect.equal observedFailure.Code SynchronizationCodes.UpdateWouldCreateConflictSession "Conflict decision."
+            Expect.equal observedFailure.AffectedPaths [| "overlap.txt"; "committed.txt" |] "Both path sets, each once."
 
         testCase "data loss still fails when accepted and does not update"
         <| fun () ->

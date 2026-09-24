@@ -609,7 +609,7 @@ Vitest.describe (
                         // the changed workspace and a retry-materialization action.
                         match cloneResult with
                         | PartiallySucceeded(outcome, failure) ->
-                            Vitest.expect(outcome.Value.WorkspaceRoot).toBe (clonePath)
+                            Vitest.expect(outcome.Value.WorkspaceRoot).toBe (VersionControlService.Runtime.Node.Path.normalizeWorkspaceRoot clonePath)
                             Vitest.expect(failure.StateChanged).toBe (true)
 
                             Vitest

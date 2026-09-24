@@ -791,7 +791,7 @@ let private registrations =
         [||]
 
 Vitest.describe (
-    "lakeFS clone cancellation",
+    "lakeFS clone contract",
     fun () ->
         Vitest.test (
             "a pre-canceled clone leaves a missing target missing",
@@ -828,6 +828,47 @@ Vitest.describe (
                     | Succeeded _
                     | PartiallySucceeded _ ->
                         failwith "A pre-canceled lakeFS clone unexpectedly succeeded."
+
+                    Vitest.expect(RuntimeNodeFileSystem.existsSync targetPath).toBe(false)
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "a mismatching target ref fails before clone creates a workspace",
+            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
+            fun () -> promise {
+                if not (integrationEnabled ()) then
+                    return failwith "lakeFS integration skipped: Docker not available"
+
+                let harness = createLakeFsHarness ()
+
+                try
+                    let! anchor = harness.CreateWorkspace()
+                    let! targetRoot = harness.CreateLocalPath()
+                    let targetPath = RuntimeNodePath.join [| targetRoot; "mismatching-ref-clone" |]
+                    let targetRef = ProviderRef.tryCreate "lakefs:other" |> Result.defaultWith failwith
+
+                    let! result =
+                        harness.Factory.Clone
+                            {
+                                Location = anchor.Binding.Location
+                                TargetPath = targetPath
+                                TargetRef = Some targetRef
+                                MaterializeAllObjects = false
+                            }
+                            (context "clone-target-ref-mismatch")
+                        |> Async.StartAsPromise
+
+                    match result with
+                    | Failed failure ->
+                        Vitest.expect(failure.Category).toEqual FailureCategory.Validation
+                        Vitest.expect(failure.Code).toBe "target_ref_mismatch"
+                    | Succeeded _
+                    | PartiallySucceeded _ -> failwith "A clone with a mismatching target ref unexpectedly succeeded."
 
                     Vitest.expect(RuntimeNodeFileSystem.existsSync targetPath).toBe(false)
                     do! harness.Cleanup()
@@ -3010,6 +3051,7 @@ Vitest.describe (
                     Vitest.expect(changedPaths.Length).toBe 105
                     Vitest.expect(changedPaths).toContain "remote/object-103.txt"
                     Vitest.expect(overlapPaths).toEqual ([| "local/object-104.txt" |])
+                    Vitest.expect(preview.PredictedConflictPaths).toEqual None
                     Vitest.expect(preview.HasDataLossRisk).toBe false
                     Vitest.expect(preview.WouldCreateConflictSession).toBe true
 

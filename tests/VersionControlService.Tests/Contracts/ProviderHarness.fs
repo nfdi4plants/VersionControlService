@@ -830,6 +830,7 @@ module FakeHarness =
                 OperationResult.succeeded {
                     ChangedPaths = changed |> Set.toArray |> Array.map mkPath
                     OverlappingPaths = overlapping |> Set.toArray |> Array.map mkPath
+                    PredictedConflictPaths = None
                     HasDataLossRisk = not (Set.isEmpty (Set.intersect changed localChanged))
                     WouldCreateConflictSession = not (Set.isEmpty overlapping)
                 }

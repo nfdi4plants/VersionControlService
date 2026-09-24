@@ -5383,6 +5383,7 @@ Vitest.describe (
                     let overlapping = preview.OverlappingPaths |> Array.map RepositoryPath.value
 
                     Vitest.expect(overlapping).toEqual ([| "base.txt" |])
+                    Vitest.expect(preview.PredictedConflictPaths).toEqual (Some [||])
                     Vitest.expect(preview.HasDataLossRisk).toBe (true)
                     Vitest.expect(preview.WouldCreateConflictSession).toBe (true)
 
@@ -5408,6 +5409,94 @@ Vitest.describe (
 
                     Vitest.expect(newGit.Compatible).toBe (true)
 
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "diverged preview predicts committed conflicts and omits a clean target change",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, barePath, session =
+                    createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+
+                try
+                    do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) "local committed change\n"
+                    let! beforeRevision = sessionStatus session
+
+                    let! revisionResult =
+                        Async.StartAsPromise(
+                            session.Core.CreateRevision
+                                {
+                                    Message = "save local conflict"
+                                    Paths = [| mkPath "base.txt" |]
+                                    ExpectedWorkspaceVersion = beforeRevision.WorkspaceVersion
+                                }
+                                (ctx "preview-local-conflict")
+                        )
+
+                    expectValue "create local conflicting revision" revisionResult |> ignore
+
+                    do!
+                        advanceTarget root barePath [
+                            "base.txt", "target conflicting change\n"
+                            "target-clean.txt", "clean target change\n"
+                        ]
+
+                    let! previewResult =
+                        Async.StartAsPromise((syncService session).PreviewUpdate(ctx "preview-committed-conflict"))
+
+                    let preview = expectValue "preview committed conflict" previewResult
+                    let overlapping = preview.OverlappingPaths |> Array.map RepositoryPath.value
+                    Vitest.expect(overlapping).toEqual [||]
+
+                    let predictedConflicts =
+                        preview.PredictedConflictPaths
+                        |> Option.defaultWith (fun () -> failwith "Expected Git to predict committed conflict paths.")
+                        |> Array.map RepositoryPath.value
+
+                    Vitest.expect(predictedConflicts).toEqual [| "base.txt" |]
+                    Vitest.expect(preview.WouldCreateConflictSession).toBe (true)
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "RestorePaths reports the resulting workspace version",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, _, session =
+                    createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+
+                try
+                    do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) "local dirty change\n"
+                    let! beforeRestore = sessionStatus session
+
+                    let! restoreResult =
+                        Async.StartAsPromise(
+                            session.Core.RestorePaths
+                                {
+                                    Paths = [| mkPath "base.txt" |]
+                                    ExpectedWorkspaceVersion = beforeRestore.WorkspaceVersion
+                                }
+                                (ctx "restore-resulting-version")
+                        )
+
+                    let restoreOutcome =
+                        match restoreResult with
+                        | Succeeded outcome
+                        | PartiallySucceeded(outcome, _) -> outcome
+                        | Failed failure ->
+                            failwith $"RestorePaths failed ({failure.Category}/{failure.Code}): {failure.Message}"
+
+                    let! afterRestore = sessionStatus session
+                    Vitest.expect(restoreOutcome.ResultingWorkspaceVersion).toEqual (Some afterRestore.WorkspaceVersion)
                     do! removeDirectoryAsync root
                 with error ->
                     do! removeDirectoryAsync root

@@ -813,6 +813,30 @@ let private computeWorkspaceVersion
                         return Ok($"git:{headPart}:{statusPart}:{unmergedContentPart}:{mergePart}")
     }
 
+/// Every write that performed something reports the workspace version a GetStatus right
+/// after it would return. When the version cannot be read, the result stays as it was.
+let private withResultingWorkspaceVersion
+    (state: SessionState)
+    (context: OperationContext)
+    (result: OperationResult<'T>)
+    : Async<OperationResult<'T>> =
+    let updateOutcome outcome =
+        async {
+            let! versionResult = computeWorkspaceVersion state context
+            return { outcome with ResultingWorkspaceVersion = Result.toOption versionResult }
+        }
+
+    async {
+        match result with
+        | Succeeded outcome when outcome.Effect = Performed ->
+            let! updated = updateOutcome outcome
+            return Succeeded updated
+        | PartiallySucceeded(outcome, failure) when outcome.Effect = Performed ->
+            let! updated = updateOutcome outcome
+            return PartiallySucceeded(updated, failure)
+        | _ -> return result
+    }
+
 /// Serializes a mutation and revalidates the expected workspace version under the
 /// lock, so a stale request never reaches provider state.
 let private withValidatedMutation
@@ -909,6 +933,24 @@ let private remoteNames (output: string) =
     output.Replace("\r\n", "\n").Split('\n', StringSplitOptions.RemoveEmptyEntries)
     |> Array.map _.Trim()
     |> Array.filter (String.IsNullOrWhiteSpace >> not)
+
+let private mergeTreeConflictPaths (output: string) =
+    let fields = output.Split([| '\000' |], StringSplitOptions.None)
+
+    if fields.Length < 2 || String.IsNullOrWhiteSpace fields[0] then
+        Error "Git did not return a tree and a NUL-delimited conflict path list."
+    else
+        match fields |> Array.tryFindIndex String.IsNullOrEmpty with
+        | Some separatorIndex when separatorIndex > 0 ->
+            let pathFields =
+                if separatorIndex = 1 then [||] else fields[1 .. separatorIndex - 1]
+
+            let parsedPaths = pathFields |> Array.map RepositoryPath.tryCreate
+
+            match parsedPaths |> Array.tryPick (function Error message -> Some message | Ok _ -> None) with
+            | Some message -> Error message
+            | None -> Ok(parsedPaths |> Array.choose Result.toOption)
+        | _ -> Error "Git did not terminate its NUL-delimited conflict path list."
 
 let private configuredRemoteNames (state: SessionState) (context: OperationContext) =
     async {
@@ -1953,6 +1995,33 @@ let private refNameOfProviderRef (reference: ProviderRef) =
         Choice1Of2(value.Substring "git-local:".Length)
     else
         Choice1Of2 value
+
+let private cloneTargetRefArguments (targetRef: ProviderRef option) =
+    let unsupported () =
+        OperationFailure.create
+            Unsupported
+            "target_ref_unsupported"
+            "Git clone supports local branches and origin remote branches only."
+
+    match targetRef with
+    | None -> Ok [||]
+    | Some reference ->
+        let value = ProviderRef.value reference
+
+        let branchName =
+            if value.StartsWith("git-local:", StringComparison.Ordinal) then
+                Some(value.Substring("git-local:".Length))
+            elif value.StartsWith("git-remote:origin/", StringComparison.Ordinal) then
+                Some(value.Substring("git-remote:origin/".Length))
+            else
+                None
+
+        match branchName with
+        | Some name when
+            not (String.IsNullOrWhiteSpace name)
+            && not (name.StartsWith("refs/tags/", StringComparison.Ordinal)) ->
+            Ok [| "--branch"; name |]
+        | _ -> Error(unsupported ())
 
 let private createRevisionTransaction (state: SessionState) (request: CreateRevisionRequest) (context: OperationContext) =
     async {
@@ -3263,7 +3332,7 @@ let private previewRefreshedState (state: SessionState) (context: OperationConte
                 |> Array.filter (fun path -> dirtyPaths.Contains(RepositoryPath.value path))
 
             // Committed-side conflicts between diverged histories via
-            // `merge-tree --write-tree` (Git 2.38+): exit code 1 = conflicts.
+            // `merge-tree --write-tree` (Git 2.38+).
             let! committedConflicts =
                 match syncState.Relationship, syncState.TargetRevision with
                 | Diverged, Some target ->
@@ -3275,6 +3344,8 @@ let private previewRefreshedState (state: SessionState) (context: OperationConte
                                 [|
                                     "merge-tree"
                                     "--write-tree"
+                                    "--name-only"
+                                    "-z"
                                     "HEAD"
                                     RevisionId.value target
                                 |]
@@ -3282,8 +3353,17 @@ let private previewRefreshedState (state: SessionState) (context: OperationConte
                                 context
 
                         match mergeTree with
-                        | Ok output when output.ExitCode = 0 -> return Ok false
-                        | Ok output when output.ExitCode = 1 -> return Ok true
+                        | Ok output when output.ExitCode = 0 || output.ExitCode = 1 ->
+                            match mergeTreeConflictPaths output.StdOut with
+                            | Ok paths when output.ExitCode = 0 || paths.Length > 0 -> return Ok paths
+                            | Ok _ ->
+                                return
+                                    Error(
+                                        previewIndeterminate
+                                            "committed conflicts"
+                                            "Git reported conflicts without any conflict paths."
+                                    )
+                            | Error detail -> return Error(previewIndeterminate "committed conflicts" detail)
                         | Ok output ->
                             let detail =
                                 if String.IsNullOrWhiteSpace output.StdErr then output.StdOut else output.StdErr
@@ -3292,17 +3372,18 @@ let private previewRefreshedState (state: SessionState) (context: OperationConte
                         | Error failure ->
                             return Error(previewIndeterminate "committed conflicts" failure.Message)
                     }
-                | _ -> async { return Ok false }
+                | _ -> async { return Ok [||] }
 
             match committedConflicts with
             | Error failure -> return Failed failure
-            | Ok hasCommittedConflicts ->
+            | Ok predictedConflictPaths ->
                 return
                     OperationResult.succeeded {
                         ChangedPaths = changed
                         OverlappingPaths = overlapping
+                        PredictedConflictPaths = Some predictedConflictPaths
                         HasDataLossRisk = overlapping.Length > 0
-                        WouldCreateConflictSession = overlapping.Length > 0 || hasCommittedConflicts
+                        WouldCreateConflictSession = overlapping.Length > 0 || predictedConflictPaths.Length > 0
                     }
     }
 
@@ -4773,6 +4854,8 @@ let private cleanupCommittedConflict
 
 let private withSerializedConflictMutation
     (state: SessionState)
+    (context: OperationContext)
+    (includeResultingWorkspaceVersion: bool)
     (body: unit -> Async<OperationResult<'T>>)
     : Async<OperationResult<'T>> =
     async {
@@ -4780,7 +4863,16 @@ let private withSerializedConflictMutation
         do! state.Lock.Acquire()
 
         try
-            return! body ()
+            let! result = body ()
+
+            if includeResultingWorkspaceVersion then
+                return!
+                    withResultingWorkspaceVersion
+                        state
+                        context
+                        result
+            else
+                return result
         finally
             state.Lock.Release()
     }
@@ -4958,7 +5050,7 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
             }
         Resolve =
             fun request context ->
-                withSerializedConflictMutation state (fun () -> async {
+                withSerializedConflictMutation state context false (fun () -> async {
                     let! validation = validateConflictHandle state request.Handle request.ExpectedWorkspaceVersion context
 
                     match validation with
@@ -5256,7 +5348,7 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                 })
         Finalize =
             fun request context ->
-                withSerializedConflictMutation state (fun () -> async {
+                withSerializedConflictMutation state context true (fun () -> async {
                     let! validation = validateConflictHandle state request.Handle request.ExpectedWorkspaceVersion context
 
                     match validation with
@@ -5524,7 +5616,7 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                 })
         Cancel =
             fun request context ->
-                withSerializedConflictMutation state (fun () -> async {
+                withSerializedConflictMutation state context false (fun () -> async {
                     let! validation = validateConflictHandle state request.Handle request.ExpectedWorkspaceVersion context
 
                     match validation with
@@ -5980,20 +6072,49 @@ let createSessionWithCredentialsIdentityAndPolicy
         CreateRef =
             fun request context ->
                 withValidatedMutation state request.ExpectedWorkspaceVersion context (fun () ->
-                    createRef state request context)
+                    async {
+                        let! result = createRef state request context
+
+                        if request.SwitchTo then
+                            return!
+                                withResultingWorkspaceVersion
+                                    state
+                                    context
+                                    result
+                        else
+                            return result
+                    })
         PreflightSwitchRef = fun request context -> preflightSwitchRef state request context
         SwitchRef =
             fun request context ->
                 withValidatedMutation state request.ExpectedWorkspaceVersion context (fun () ->
-                    switchRef state request context)
+                    async {
+                        let! result = switchRef state request context
+
+                        return!
+                            withResultingWorkspaceVersion
+                                state
+                                context
+                                result
+                    })
         CreateRevision =
             fun request context ->
                 withValidatedMutation state request.ExpectedWorkspaceVersion context (fun () ->
-                    createRevision state request context)
+                    async {
+                        let! result = createRevision state request context
+
+                        return!
+                            withResultingWorkspaceVersion state context result
+                    })
         RestorePaths =
             fun request context ->
                 withValidatedMutation state request.ExpectedWorkspaceVersion context (fun () ->
-                    restorePaths state request context)
+                    async {
+                        let! result = restorePaths state request context
+
+                        return!
+                            withResultingWorkspaceVersion state context result
+                    })
         GetDiffSummary = fun context -> getDiffSummary state context
     }
 
@@ -6032,7 +6153,14 @@ let createSessionWithCredentialsIdentityAndPolicy
                                     match guardResult with
                                     | Failed failure -> return Failed failure
                                     | Succeeded active when active.Value -> return Failed(activeConflictFailure ())
-                                    | Succeeded _ -> return! update state request context
+                                    | Succeeded _ ->
+                                        let! result = update state request context
+
+                                        return!
+                                            withResultingWorkspaceVersion
+                                                state
+                                                context
+                                                result
                                     | PartiallySucceeded(_, failure) -> return Failed failure
                                 })
                     Publish =
@@ -6045,30 +6173,45 @@ let createSessionWithCredentialsIdentityAndPolicy
                                     | Failed failure -> return Failed failure
                                     | Succeeded active when active.Value -> return Failed(activeConflictFailure ())
                                     | Succeeded _ ->
-                                        return! publish state request.ExpectedTargetRevision context
+                                        let! result = publish state request.ExpectedTargetRevision context
+
+                                        return!
+                                            withResultingWorkspaceVersion
+                                                state
+                                                context
+                                                result
                                     | PartiallySucceeded(_, failure) -> return Failed failure
                                 })
                     Synchronize =
                         fun request context ->
                             withValidatedMutation state request.ExpectedWorkspaceVersion context (fun () ->
-                                Synchronization.compose
-                                    {
-                                        HasActiveConflictSession = fun context -> activeOperationGuard state context
-                                        Refresh = fun context -> refresh state context
-                                        PreviewUpdate = fun syncState context -> previewFromState state syncState context
-                                        Update = fun syncState context -> updateFromState state syncState context
-                                        Publish =
-                                            fun syncState context ->
-                                                async {
-                                                    let! expected = publicationTargetRevision state syncState context
+                                async {
+                                    let! result =
+                                        Synchronization.compose
+                                            {
+                                                HasActiveConflictSession = fun context -> activeOperationGuard state context
+                                                Refresh = fun context -> refresh state context
+                                                PreviewUpdate = fun syncState context -> previewFromState state syncState context
+                                                Update = fun syncState context -> updateFromState state syncState context
+                                                Publish =
+                                                    fun syncState context ->
+                                                        async {
+                                                            let! expected = publicationTargetRevision state syncState context
 
-                                                    match expected with
-                                                    | Error failure -> return Failed failure
-                                                    | Ok expected -> return! publish state expected context
-                                                }
-                                    }
-                                    request
-                                    context)
+                                                            match expected with
+                                                            | Error failure -> return Failed failure
+                                                            | Ok expected -> return! publish state expected context
+                                                        }
+                                            }
+                                            request
+                                            context
+
+                                    return!
+                                        withResultingWorkspaceVersion
+                                            state
+                                            context
+                                            result
+                                })
                 }
             ConflictResolution = Some(createConflictService state)
             TextDiff = Some(createTextDiff state)
@@ -6440,9 +6583,16 @@ let createFactoryWithCredentialsIdentityAndPolicy
         }
     Clone =
         fun request context -> async {
-            match validateFactoryLocation request.Location with
+            let validatedLocation =
+                match cloneTargetRefArguments request.TargetRef with
+                | Error failure -> Error failure
+                | Ok branchArguments ->
+                    validateFactoryLocation request.Location
+                    |> Result.map (fun location -> location, branchArguments)
+
+            match validatedLocation with
             | Error failure -> return Failed failure
-            | Ok location ->
+            | Ok (location, branchArguments) ->
                 let! effectiveLocation = expandLocationUrl hooks location.ProviderLocation context
 
                 let! authentication =
@@ -6590,6 +6740,7 @@ let createFactoryWithCredentialsIdentityAndPolicy
                                         [|
                                             yield! authentication.ConfigArgs
                                             "clone"
+                                            yield! branchArguments
                                             "--"
                                             location.ProviderLocation
                                             request.TargetPath

@@ -142,6 +142,9 @@ Four factory operations produce a binding, and none of them needs an opened sess
 here, and `Adopt` belongs to the next section. Each one returns the binding for the host to
 persist, after which `Open` works exactly as in the next section.
 
+When `TargetRef` is present, `Clone` checks out that exact provider ref. A provider that cannot
+honor it returns an `Unsupported` failure and never ignores the ref.
+
 `Clone` wants a destination that is missing or empty:
 
 ```fsharp
@@ -380,9 +383,10 @@ arrive redacted, so a host can show them to a user.
 exist locally and a publish can still be retried. `PublicationNotApplicable` means the
 operation has no publication meaning at all, so it is not a claim that anything was published.
 
-`ResultingWorkspaceVersion` is optional and a provider may leave it `None`. The built-in Git
-provider never sets it, and lakeFS does, so do not build a host around it. Two payloads carry
-a workspace version: `Core.GetStatus` and `SwitchRef`, which both return a `WorkspaceStatus`.
+`ResultingWorkspaceVersion` is optional and a provider may leave it `None`. Both built-in
+providers fill it after writes when they can observe the new token, and a consumer can use it
+as the next `ExpectedWorkspaceVersion`. Two payloads carry a workspace version:
+`Core.GetStatus` and `SwitchRef`, which both return a `WorkspaceStatus`.
 The synchronization operations return a `SynchronizationState`, which has revisions and a
 target but no workspace version, so call `Core.GetStatus` after a synchronize to get the token
 for the next mutation. The token is opaque either way, so do not parse it or compare it for
@@ -585,9 +589,9 @@ let saveSelected
                     // outcome.Value. ResultingRevision is optional metadata that a conforming
                     // provider may leave as None, so do not read the revision out of it.
                     //
-                    // The commit moved the workspace version, and ResultingWorkspaceVersion is
-                    // None on Git. None here means the host re-reads the status before the
-                    // next mutation. It does not mean the version is unchanged.
+                    // A provider leaves ResultingWorkspaceVersion as None when it cannot read the
+                    // version after the commit. The host then re-reads the status before the next
+                    // mutation.
                     return
                         Ok {
                             Revision = Some outcome.Value
@@ -669,6 +673,12 @@ workspace content. `PreviewUpdate` reports what an update would change. `Update`
 `Publish` are the two mutations, and `Synchronize` runs a refresh, the update the
 workspace needs, and the publish of its revisions as one operation under the provider's
 lock.
+
+`OverlappingPaths` still names target-side changes on local dirty paths. `PredictedConflictPaths`
+reports committed paths the provider predicts will be in conflict. Git fills it from `merge-tree`,
+and lakeFS returns `None`. An empty `Some` array means Git predicts no conflicts.
+When `Synchronize` refuses with `update_would_create_conflict_session`, its `AffectedPaths`
+list the overlapping paths and then the predicted conflict paths, each once.
 
 Prefer `Synchronize` for a button that means "bring me up to date". It refuses when it cannot
 decide safely, and the refusal says what the host has to ask the user. Keep
