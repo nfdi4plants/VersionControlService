@@ -7,10 +7,12 @@ The host owns binding persistence. VersionControlService does not keep an applic
 `WorkspaceBinding` contains:
 
 - the schema version and provider ID
-- the normalized workspace root
+- `WorkspaceRoot`, stored as absolute, in the file system's own case when the folder exists, with forward slashes on Windows and no trailing separator
 - an optional opaque provider state reference
 - a nonsecret repository location
 - an optional connection profile ID
+
+`ProviderResolver.normalizePath` is the comparison form hosts use for lookups. It is not the stored form.
 
 Do not serialize access keys, tokens, passwords, credential-bearing URLs, process arguments, or provider clients into a binding. The host resolves `ConnectionProfileId` through the credential strategy injected into the selected factory.
 

@@ -839,23 +839,39 @@ Vitest.describe (
 
         Vitest.test (
             "a mismatching target ref fails before clone creates a workspace",
-            TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
+            TestOptions(timeout = 120000),
             fun () -> promise {
-                if not (integrationEnabled ()) then
-                    return failwith "lakeFS integration skipped: Docker not available"
-
-                let harness = createLakeFsHarness ()
+                let! root = createTempDirectoryAsync ()
+                let targetPath = RuntimeNodePath.join [| root; "mismatching-ref-clone" |]
+                let stateRoot = RuntimeNodePath.join [| root; "provider-state" |]
 
                 try
-                    let! anchor = harness.CreateWorkspace()
-                    let! targetRoot = harness.CreateLocalPath()
-                    let targetPath = RuntimeNodePath.join [| targetRoot; "mismatching-ref-clone" |]
+                    let options: LakeFsProviderOptions.LakeFsProviderOptions = {
+                        StateRoot = stateRoot
+                        PathCaseSensitivity = CaseInsensitive
+                    }
+
+                    let credentials =
+                        LakeFsCredentials.fixedConnection {
+                            Endpoint = "http://127.0.0.1:1"
+                            AccessKeyId = "unused"
+                            SecretAccessKey = "unused"
+                        }
+
+                    let location: RepositoryLocation = {
+                        ProviderId = ProviderId.tryCreate "lakefs" |> Result.defaultWith failwith
+                        DisplayName = Some "repo"
+                        ProviderLocation = "lakefs://repo/main"
+                        ConnectionProfileId = None
+                    }
+
+                    let factory = LakeFsWorkspaceSession.createFactory options credentials
                     let targetRef = ProviderRef.tryCreate "lakefs:other" |> Result.defaultWith failwith
 
                     let! result =
-                        harness.Factory.Clone
+                        factory.Clone
                             {
-                                Location = anchor.Binding.Location
+                                Location = location
                                 TargetPath = targetPath
                                 TargetRef = Some targetRef
                                 MaterializeAllObjects = false
@@ -871,9 +887,9 @@ Vitest.describe (
                     | PartiallySucceeded _ -> failwith "A clone with a mismatching target ref unexpectedly succeeded."
 
                     Vitest.expect(RuntimeNodeFileSystem.existsSync targetPath).toBe(false)
-                    do! harness.Cleanup()
+                    do! removeDirectoryAsync root
                 with error ->
-                    do! harness.Cleanup()
+                    do! removeDirectoryAsync root
                     return raise error
             }
         )

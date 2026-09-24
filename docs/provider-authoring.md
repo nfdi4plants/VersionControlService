@@ -12,8 +12,10 @@ Hosts that spawn git beside the library can use `GitExecution.resolvedEnvironmen
 - `VerifyLocation` checks explicit access intents against a repository location.
 - `Initialize` creates provider state in place and preserves existing user files.
 - `Clone` requires a missing or empty destination.
-- A provider checks out a supplied `CloneRequest.TargetRef` exactly and returns an `Unsupported`
-  failure when it cannot honor that ref.
+- A provider returns an `Unsupported` failure for a ref it cannot check out, and a `Validation`
+  failure (`target_ref_mismatch`) for a ref that contradicts the location. It never ignores the
+  ref. Use `target_ref_unsupported` for the unsupported case and `target_ref_not_found` when a
+  supported ref is absent.
 - A clone canceled before it completes rolls back and returns `Canceled`, and a pre-existing empty target stays empty. A clone that finished before the cancellation took effect succeeds. A download failure that is not a cancellation returns `PartiallySucceeded` with `retry_materialization`.
 - A failed clone rollback returns `Failed` with category `Canceled` and `StateChanged = true`, with recovery code `remove_clone_target`.
 - `Adopt` derives a binding from an existing provider-owned workspace without cloning. Return an `Unsupported` failure if the provider cannot do that safely.

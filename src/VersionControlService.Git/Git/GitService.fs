@@ -1868,14 +1868,15 @@ let private hasHeadCommit (git: ISimpleGit) = promise {
     return Result.isOk headResult
 }
 
-let private headPathsForPathspecs (git: ISimpleGit) (pathSpecs: string[]) = promise {
+let private headPathsForPathspecsWithGit (git: ISimpleGit) (pathSpecs: string[]) = promise {
     let! headPathsResult =
         runSimpleGit
-            (fun currentGit -> currentGit.raw (withGitPathspecs [| "ls-tree"; "-r"; "--name-only"; "HEAD" |] pathSpecs))
+            (fun currentGit ->
+                currentGit.raw (withGitPathspecs [| "ls-tree"; "-r"; "-z"; "--name-only"; "HEAD" |] pathSpecs))
             git
 
     match headPathsResult with
-    | Ok output -> return splitGitOutputLines output
+    | Ok output -> return output.Split('\000', StringSplitOptions.RemoveEmptyEntries)
     | Error failure -> return abortGitPromise failure.Message
 }
 
@@ -1898,6 +1899,26 @@ let private discardPathspecsWithOriginals (arcPath: string) (status: StatusResul
         )
 
     Array.append safePathSpecs originalPaths |> Array.distinct
+
+/// Lists tracked HEAD paths selected by validated pathspecs without changing the worktree.
+let headPathsForPathspecs (arcPath: string) (pathSpecs: string[]) : JS.Promise<GitResult<string[]>> = promise {
+    match validatePathspecs pathSpecs with
+    | Error validationError -> return errorResult validationError
+    | Ok safePathSpecs ->
+        return!
+            withLocalGit
+                arcPath
+                (fun git -> promise {
+                    let! status = git.status ()
+                    let discardPathSpecs = discardPathspecsWithOriginals arcPath status safePathSpecs
+                    let! hasHead = hasHeadCommit git
+
+                    if hasHead then
+                        return! headPathsForPathspecsWithGit git discardPathSpecs
+                    else
+                        return [||]
+                })
+}
 
 let private canceledLfsResult<'T> () : GitResult<'T> =
     Error(createFailure GitFailureKind.Canceled "Git LFS operation canceled.")
@@ -2304,7 +2325,7 @@ let discardPaths (arcPath: string) (pathSpecs: string[]) : JS.Promise<GitResult<
                         match resetResult with
                         | Error failure -> return abortGitPromise failure.Message
                         | Ok _ ->
-                            let! headPaths = headPathsForPathspecs git discardPathSpecs
+                            let! headPaths = headPathsForPathspecsWithGit git discardPathSpecs
                             restoredHeadPaths <- headPaths
 
                             if headPaths.Length > 0 then

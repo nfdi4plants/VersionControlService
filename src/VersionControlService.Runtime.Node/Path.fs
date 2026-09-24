@@ -11,12 +11,26 @@ let resolve ([<ParamSeq>] paths: string[]) : string = jsNative
 [<Import("sep", "path")>]
 let private separator: string = jsNative
 
-/// The stored form of a workspace root: absolute, without a trailing separator, and with
-/// forward slashes on Windows, which is the form git reports for a repository root.
+type private RealpathSync =
+    abstract member ``native``: path: string -> string
+
+[<Import("realpathSync", "fs")>]
+let private realpathSync: RealpathSync = jsNative
+
+[<Import("existsSync", "fs")>]
+let private existsSync (path: string) : bool = jsNative
+
+let private isFilesystemRoot (path: string) =
+    path = "/" || (path.Length = 3 && path.[1] = ':' && path.[2] = '/')
+
+/// Returns the stored form of a workspace root. Existing paths use the file system's case.
+/// Windows paths use forward slashes. A drive root and `/` keep their trailing slash.
 let normalizeWorkspaceRoot (path: string) =
     let resolved = resolve [| path |]
+    let canonical = if existsSync resolved then realpathSync.``native`` resolved else resolved
+    let normalized = if separator = "\\" then canonical.Replace('\\', '/') else canonical
 
-    if separator = "\\" then resolved.Replace('\\', '/') else resolved
+    if isFilesystemRoot normalized then normalized else normalized.TrimEnd('/')
 
 [<Import("relative", "path")>]
 let relative (fromPath: string) (toPath: string) : string = jsNative

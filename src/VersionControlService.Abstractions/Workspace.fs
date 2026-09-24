@@ -59,8 +59,9 @@ type InitializeRequest = {
 type CloneRequest = {
     Location: RepositoryLocation
     TargetPath: string
-    /// Optional exact provider ref to check out after cloning. A provider that cannot honor it
-    /// returns an Unsupported failure. It never ignores the ref.
+    /// Optional exact provider ref to check out after cloning. A provider returns an Unsupported
+    /// failure for a ref it cannot check out, and a Validation failure (`target_ref_mismatch`) for
+    /// a ref that contradicts the location. It never ignores the ref.
     TargetRef: ProviderRef option
     /// Whether large/lazily-materialized objects are hydrated during clone.
     MaterializeAllObjects: bool

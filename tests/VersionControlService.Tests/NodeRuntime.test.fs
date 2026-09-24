@@ -24,8 +24,14 @@ let private bufferFromBytes (_bytes: int[]) : obj = jsNative
 [<Emit("Buffer.alloc($0, $1)")>]
 let private filledBuffer (_length: int) (_value: int) : obj = jsNative
 
+[<Emit("process.platform === 'win32'")>]
+let private isWindowsProcess () : bool = jsNative
+
 [<Emit("$0.toString('base64')")>]
 let private bufferBase64 (_buffer: obj) : string = jsNative
+
+[<Emit("(() => { const fs = require('node:fs'); const moduleApi = require('node:module'); const original = fs.existsSync; fs.existsSync = () => false; moduleApi.syncBuiltinESMExports(); return () => { fs.existsSync = original; moduleApi.syncBuiltinESMExports(); }; })()")>]
+let private hidePathsFromExistsSync () : unit -> unit = jsNative
 
 [<Emit("""
 (() => {
@@ -265,6 +271,49 @@ Vitest.describe (
                     Vitest.expect(failure.Code).toBe ("spawn_failed")
                 | Succeeded _
                 | PartiallySucceeded _ -> failwith "Expected a structured spawn failure."
+            }
+        )
+)
+
+Vitest.describe (
+    "Node workspace path normalization",
+    fun () ->
+        Vitest.test (
+            "uses the file system case and normalizes root separators",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! createdRoot = createTempDirectoryAsync ()
+                let! root = fsPromisesDynamic?realpath (createdRoot) |> unbox<JS.Promise<string>>
+
+                try
+                    let workspaceRoot = NodePath.join [| root; "StoredCase" |]
+                    let! _ = fsPromisesDynamic?mkdir (workspaceRoot) |> unbox<JS.Promise<obj>>
+
+                    let suppliedRoot =
+                        if isWindowsProcess () then
+                            workspaceRoot.ToLowerInvariant()
+                        else
+                            workspaceRoot
+
+                    let suppliedWithSeparator = suppliedRoot + (if isWindowsProcess () then "\\" else "/")
+                    let expectedRoot = workspaceRoot.Replace('\\', '/')
+                    Vitest.expect(NodePath.normalizeWorkspaceRoot suppliedWithSeparator).toBe expectedRoot
+
+                    if isWindowsProcess () then
+                        let restoreExistsSync = hidePathsFromExistsSync ()
+
+                        try
+                            Vitest.expect(NodePath.normalizeWorkspaceRoot "C:\\").toBe "C:/"
+                            Vitest.expect(NodePath.normalizeWorkspaceRoot "\\\\server\\share").toBe "//server/share"
+                        finally
+                            restoreExistsSync ()
+                    else
+                        Vitest.expect(NodePath.normalizeWorkspaceRoot "/").toBe "/"
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
             }
         )
 )

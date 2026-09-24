@@ -4101,6 +4101,27 @@ Vitest.describe (
                     | PartiallySucceeded _ -> failwith "An unsupported clone target ref unexpectedly succeeded."
 
                     Vitest.expect(NodeFileSystem.existsSync unsupportedClonePath).toBe(false)
+
+                    let! headsRefResult =
+                        clone (join [| root; "heads-clone" |]) "git-local:refs/heads/main" "clone-heads-target-ref"
+
+                    match headsRefResult with
+                    | Failed failure -> Vitest.expect(failure.Code).toBe "target_ref_unsupported"
+                    | Succeeded _
+                    | PartiallySucceeded _ -> failwith "A refs/ branch name unexpectedly cloned."
+
+                    // clone --branch also accepts a tag, so a tag-only name must be refused before cloning.
+                    let! _ = runGitIn sourcePath [||] [| "tag"; "v1" |] None
+                    let! _ = runGitIn sourcePath [||] [| "push"; "origin"; "v1" |] None
+                    let tagClonePath = join [| root; "tag-clone" |]
+                    let! tagResult = clone tagClonePath "git-local:v1" "clone-tag-only-target-ref"
+
+                    match tagResult with
+                    | Failed failure -> Vitest.expect(failure.Code).toBe "target_ref_not_found"
+                    | Succeeded _
+                    | PartiallySucceeded _ -> failwith "A tag-only name unexpectedly cloned as a branch."
+
+                    Vitest.expect(NodeFileSystem.existsSync tagClonePath).toBe(false)
                     do! removeDirectoryAsync root
                 with error ->
                     do! removeDirectoryAsync root

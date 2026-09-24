@@ -142,8 +142,11 @@ Four factory operations produce a binding, and none of them needs an opened sess
 here, and `Adopt` belongs to the next section. Each one returns the binding for the host to
 persist, after which `Open` works exactly as in the next section.
 
-When `TargetRef` is present, `Clone` checks out that exact provider ref. A provider that cannot
-honor it returns an `Unsupported` failure and never ignores the ref.
+When `TargetRef` is present, `Clone` checks out that exact provider ref. A provider returns an
+`Unsupported` failure for a ref it cannot check out, and a `Validation` failure
+(`target_ref_mismatch`) for a ref that contradicts the location. It never ignores the ref.
+For Git, `git-remote:origin/<name>` checks out a local branch named `<name>` that tracks
+`origin/<name>`.
 
 `Clone` wants a destination that is missing or empty:
 
@@ -395,14 +398,12 @@ arrive redacted, so a host can show them to a user.
 exist locally and a publish can still be retried. `PublicationNotApplicable` means the
 operation has no publication meaning at all, so it is not a claim that anything was published.
 
-`ResultingWorkspaceVersion` is optional and a provider may leave it `None`. Both built-in
-providers fill it after writes when they can observe the new token, and a consumer can use it
-as the next `ExpectedWorkspaceVersion`. Two payloads carry a workspace version:
-`Core.GetStatus` and `SwitchRef`, which both return a `WorkspaceStatus`.
-The synchronization operations return a `SynchronizationState`, which has revisions and a
-target but no workspace version, so call `Core.GetStatus` after a synchronize to get the token
-for the next mutation. The token is opaque either way, so do not parse it or compare it for
-ordering.
+`ResultingWorkspaceVersion` is optional and a provider may leave it `None`. Git fills
+`ResultingWorkspaceVersion` after a performed `CreateRevision`, `RestorePaths`, `SwitchRef`,
+`CreateRef` with `SwitchTo`, `Update`, `Publish`, `Synchronize` and conflict `Resolve`, `Finalize`
+and `Cancel`. lakeFS fills it after its writes. A consumer uses the outcome's version when it is
+`Some` and calls `Core.GetStatus` when it is `None`. The token is opaque, so do not parse it or
+compare it for ordering.
 
 ## Optional services
 
