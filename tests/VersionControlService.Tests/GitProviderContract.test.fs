@@ -11,6 +11,8 @@ open Vitest
 
 module GitWorkspaceSession = VersionControlService.Git.GitWorkspaceSession
 module GitCredentialStrategy = VersionControlService.Git.GitCredentialStrategy
+module GitEngineTypes = VersionControlService.Git.GitEngineTypes
+module GitService = VersionControlService.Git.GitService
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodeProcess = VersionControlService.Runtime.Node.Process
 
@@ -573,6 +575,92 @@ let private expectProviderFailure (operationName: string) (result: OperationResu
     | Failed failure -> failure
     | Succeeded _
     | PartiallySucceeded _ -> failwith $"Expected {operationName} to fail."
+
+let private expectGitBranches (repositoryPath: string) = promise {
+    let! result = GitService.getBranches repositoryPath
+
+    match result with
+    | Ok branches -> return branches
+    | Error failure -> return failwith $"Listing Git branches failed: {failure.Message}"
+}
+
+Vitest.describe (
+    "Git branch refs and LFS failure classification",
+    fun () ->
+        Vitest.test (
+            "classifies Git LFS filter failures by startup evidence",
+            fun () ->
+                let accessDenied =
+                    GitService.classifyFailureKind
+                        "fatal: x.txt: clean filter 'lfs' failed\nAccess is denied"
+
+                let missingFilterProcess =
+                    GitService.classifyFailureKind
+                        "git-lfs filter-process: git-lfs: command not found\nexternal filter 'git-lfs filter-process' failed"
+
+                let missingGitLfsCommand = GitService.classifyFailureKind "git: 'lfs' is not a git command"
+
+                Vitest.expect(accessDenied).toEqual (GitEngineTypes.GitFailureKind.Unknown)
+                Vitest.expect(missingFilterProcess).toEqual (GitEngineTypes.GitFailureKind.LfsInstallRequired)
+                Vitest.expect(missingGitLfsCommand).toEqual (GitEngineTypes.GitFailureKind.LfsInstallRequired)
+        )
+
+        Vitest.test (
+            "preserves current and tracking flags across branch states",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let harness = createGitHarness ()
+
+                try
+                    let! workspace = harness.CreateWorkspace()
+
+                    let! trackedBranches = expectGitBranches workspace.Binding.WorkspaceRoot
+                    let trackedLocal = trackedBranches |> Array.find (fun branch -> branch.RefName = "main")
+                    let trackedRemote = trackedBranches |> Array.find (fun branch -> branch.RefName = "origin/main")
+
+                    Vitest.expect(trackedLocal.IsCurrent).toBe true
+                    Vitest.expect(trackedLocal.IsTracking).toBe true
+                    Vitest.expect(trackedRemote.IsCurrent).toBe false
+                    Vitest.expect(trackedRemote.IsTracking).toBe true
+
+                    let! _ =
+                        runGitIn
+                            workspace.Binding.WorkspaceRoot
+                            [||]
+                            [| "branch"; "--unset-upstream" |]
+                            None
+
+                    let! untrackedBranches = expectGitBranches workspace.Binding.WorkspaceRoot
+                    let untrackedLocal = untrackedBranches |> Array.find (fun branch -> branch.RefName = "main")
+                    let untrackedRemote = untrackedBranches |> Array.find (fun branch -> branch.RefName = "origin/main")
+
+                    Vitest.expect(untrackedLocal.IsCurrent).toBe true
+                    Vitest.expect(untrackedLocal.IsTracking).toBe false
+                    Vitest.expect(untrackedRemote.IsCurrent).toBe false
+                    Vitest.expect(untrackedRemote.IsTracking).toBe false
+
+                    let! _ =
+                        runGitIn
+                            workspace.Binding.WorkspaceRoot
+                            [||]
+                            [| "checkout"; "--detach" |]
+                            None
+
+                    let! detachedBranches = expectGitBranches workspace.Binding.WorkspaceRoot
+                    let detachedLocal = detachedBranches |> Array.find (fun branch -> branch.RefName = "main")
+                    let detachedRemote = detachedBranches |> Array.find (fun branch -> branch.RefName = "origin/main")
+
+                    Vitest.expect(detachedLocal.IsCurrent).toBe false
+                    Vitest.expect(detachedLocal.IsTracking).toBe false
+                    Vitest.expect(detachedRemote.IsCurrent).toBe false
+                    Vitest.expect(detachedRemote.IsTracking).toBe false
+                    do! harness.Cleanup()
+                with error ->
+                    do! harness.Cleanup()
+                    return raise error
+            }
+        )
+)
 
 Vitest.describe (
     "Git / consumer workflow profile",

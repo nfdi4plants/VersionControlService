@@ -62,11 +62,26 @@ let private lfsInstallRequiredTokens = [|
     "git lfs is required for files larger than"
     "git lfs is required for this operation"
     "git: 'lfs' is not a git command"
-    "git-lfs filter-process"
     "this repository is configured for git lfs but 'git-lfs' was not found"
+|]
+
+let private lfsFilterFailureTokens = [|
+    "git-lfs filter-process"
     "external filter 'git-lfs filter-process' failed"
     "smudge filter lfs failed"
     "clean filter 'lfs' failed"
+|]
+
+let private lfsExecutableMissingTokens = [|
+    "command not found"
+    "is not recognized as an internal or external command"
+    "no such file or directory"
+    "cannot find the file"
+    "git-lfs: not found"
+    "git-lfs not found"
+    "git-lfs was not found"
+    "'git-lfs' was not found"
+    "git-lfs' was not found"
 |]
 
 /// Classifies git/simple-git/LFS error text into the shared failure taxonomy.
@@ -80,7 +95,17 @@ let classifyFailureKind (message: string) =
     let containsAny (terms: string[]) =
         terms |> Array.exists normalizedMessage.Contains
 
-    if containsAny lfsInstallRequiredTokens then
+    let gitLfsExecutableCouldNotStart =
+        normalizedMessage.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
+        |> Array.exists (fun line ->
+            line.Contains("git-lfs")
+            && (lfsExecutableMissingTokens |> Array.exists line.Contains)
+        )
+
+    if
+        containsAny lfsInstallRequiredTokens
+        || (containsAny lfsFilterFailureTokens && gitLfsExecutableCouldNotStart)
+    then
         GitFailureKind.LfsInstallRequired
     elif
         containsAny [|
@@ -1301,15 +1326,41 @@ let getBranches (arcPath: string) : JS.Promise<GitResult<GitBranchRefDto[]>> =
     withLocalGit
         arcPath
         (fun git -> promise {
-            let! status = git.status ()
-            let statusDto = toStatusDto arcPath status
             let! localBranchSummary = git.branchLocal ()
+            let! localBranchUpstreamText =
+                git.raw [| "for-each-ref"; "--format=%(refname:short)%09%(upstream:short)"; "refs/heads" |]
             let! remoteBranchText = git.raw [| "branch"; "-r"; "--no-color" |]
+
+            let currentBranch =
+                if localBranchSummary.detached then
+                    None
+                else
+                    normalizeOptionalGitRef (Option.ofObj localBranchSummary.current)
+
+            let localBranchUpstreams =
+                localBranchUpstreamText.Replace("\r\n", "\n").Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                |> Array.choose (fun branchLine ->
+                    let separatorIndex = branchLine.IndexOf('\t')
+
+                    if separatorIndex < 0 then
+                        None
+                    else
+                        let branchName = branchLine.Substring(0, separatorIndex)
+                        let upstream = normalizeOptionalGitRef (Some(branchLine.Substring(separatorIndex + 1)))
+                        Some(branchName, upstream)
+                )
+                |> Map.ofArray
+
+            let currentTracking =
+                currentBranch
+                |> Option.bind (fun branchName ->
+                    Map.tryFind branchName localBranchUpstreams |> Option.flatten
+                )
 
             let localRefs =
                 valueOrEmptyArray localBranchSummary.all
                 |> Array.map (fun branchName ->
-                    let isCurrent = statusDto.Current = Some branchName
+                    let isCurrent = currentBranch = Some branchName
 
                     {
                         RefName = branchName
@@ -1317,7 +1368,7 @@ let getBranches (arcPath: string) : JS.Promise<GitResult<GitBranchRefDto[]>> =
                         Kind = GitBranchRefKind.Local
                         IsCurrent = isCurrent
                         // Mark the active local branch when it already tracks an upstream so callers can represent the switched branch itself.
-                        IsTracking = isCurrent && statusDto.Tracking.IsSome
+                        IsTracking = isCurrent && currentTracking.IsSome
                     }
                 )
 
@@ -1332,7 +1383,7 @@ let getBranches (arcPath: string) : JS.Promise<GitResult<GitBranchRefDto[]>> =
                     DisplayLabel = branchName
                     Kind = GitBranchRefKind.Remote
                     IsCurrent = false
-                    IsTracking = statusDto.Tracking = Some branchName
+                    IsTracking = currentTracking = Some branchName
                 })
 
             return
