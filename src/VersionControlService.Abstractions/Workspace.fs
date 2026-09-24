@@ -15,7 +15,8 @@ type ProbeResult =
 type WorkspaceBinding = {
     SchemaVersion: int
     ProviderId: ProviderId
-    /// Normalized local workspace root.
+    /// The local workspace root as the provider received it (for Adopt, the root the provider reports).
+    /// Hosts compare roots with `ProviderResolver.normalizePath`.
     WorkspaceRoot: string
     /// Opaque provider state reference (e.g. a provider-owned workspace branch or index location).
     ProviderStateRef: string option
@@ -60,8 +61,8 @@ type CloneRequest = {
     Location: RepositoryLocation
     TargetPath: string
     /// Optional exact provider ref to check out after cloning. A provider returns an Unsupported
-    /// failure for a ref it cannot check out, and a Validation failure (`target_ref_mismatch`) for
-    /// a ref that contradicts the location. It never ignores the ref.
+    /// failure for a ref it cannot check out. lakeFS returns a Validation failure (`target_ref_mismatch`)
+    /// for a ref that contradicts the location. It never ignores the ref.
     TargetRef: ProviderRef option
     /// Whether large/lazily-materialized objects are hydrated during clone.
     MaterializeAllObjects: bool
@@ -85,7 +86,8 @@ type BindRequest = {
 /// Identity of one opened workspace session.
 type WorkspaceDescriptor = {
     ProviderId: ProviderId
-    /// Normalized local workspace root.
+    /// The local workspace root as the provider received it (for Adopt, the root the provider reports).
+    /// Hosts compare roots with `ProviderResolver.normalizePath`.
     WorkspaceRoot: string
     Location: RepositoryLocation option
 }

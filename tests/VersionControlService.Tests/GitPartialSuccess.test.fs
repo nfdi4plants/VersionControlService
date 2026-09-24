@@ -612,7 +612,7 @@ Vitest.describe (
                         // the changed workspace and a retry-materialization action.
                         match cloneResult with
                         | PartiallySucceeded(outcome, failure) ->
-                            Vitest.expect(outcome.Value.WorkspaceRoot).toBe (VersionControlService.Runtime.Node.Path.normalizeWorkspaceRoot clonePath)
+                            Vitest.expect(outcome.Value.WorkspaceRoot).toBe (clonePath)
                             Vitest.expect(failure.StateChanged).toBe (true)
 
                             Vitest
@@ -745,13 +745,17 @@ Vitest.describe (
 
                                             let script =
                                                 "const fs=require('node:fs');const path=require('node:path');" +
-                                                "fs.writeFileSync(path.join(process.argv[1],'clone-residue.txt'),'residue');" +
+                                                "const fd=fs.openSync(path.join(process.argv[1],'clone-residue.txt'),'w');fs.writeSync(fd,'residue');" +
                                                 "console.log('clone-started');setInterval(()=>{},1000)"
 
-                                            let blockedClone =
+                                            // The child runs inside the target and keeps a file open there, as a
+                                            // killed git does on Windows until the rollback removes the target.
+                                            let blockedClone = {
                                                 NodeProcess.ProcessRequest.create
                                                     nodeExecutablePath
-                                                    [| "-e"; script; targetPath |]
+                                                    [| "-e"; script; targetPath |] with
+                                                    WorkingDirectory = Some targetPath
+                                            }
 
                                             NodeProcess.run blockedClone context
                                         else
@@ -924,9 +928,7 @@ Vitest.describe (
 
                         match result with
                         | Succeeded outcome ->
-                            Vitest.expect(outcome.Value.WorkspaceRoot).toBe (
-                                VersionControlService.Runtime.Node.Path.normalizeWorkspaceRoot targetPath
-                            )
+                            Vitest.expect(outcome.Value.WorkspaceRoot).toBe (targetPath)
                         | Failed failure ->
                             failwith $"Expected clone success after late cancellation ({failure.Code})."
                         | PartiallySucceeded _ -> failwith "Expected clone success after late cancellation."
@@ -934,89 +936,6 @@ Vitest.describe (
                         Vitest.expect(lfsPullSeen).toBe (true)
                         let! targetExists = pathExistsAsync targetPath
                         Vitest.expect(targetExists).toBe (true)
-                        do! removeDirectoryAsync root
-                    with error ->
-                        do! removeDirectoryAsync root
-                        return raise error
-            }
-        )
-
-        Vitest.test (
-            "canceled clone keeps a replacement target when its identity changed",
-            TestOptions(timeout = 120000),
-            fun () -> promise {
-                let! lfsProbe = runGit "." [| "lfs"; "version" |]
-
-                match lfsProbe with
-                | Error _ -> Vitest.expect(true).toBe (true)
-                | Ok _ ->
-                    let! root, barePath = createLfsCloneFixture ()
-
-                    try
-                        let source = OperationCancellation.Source()
-
-                        let hooks = {
-                            GitWorkspaceSession.GitSessionHooks.none with
-                                RunProcess =
-                                    Some(fun request context ->
-                                        if isGitCloneRequest request then
-                                            async {
-                                                let targetPath = request.Arguments |> Array.last
-                                                let displacedPath = targetPath + ".vcs-replacement-old"
-                                                do! renameAsync targetPath displacedPath |> Async.AwaitPromise
-                                                NodeFileSystem.mkdirSync targetPath (NodeFileSystem.MkdirOptions(recursive = false))
-                                                do! removeDirectoryAsync displacedPath |> Async.AwaitPromise
-
-                                                let blockedClone =
-                                                    NodeProcess.ProcessRequest.create
-                                                        nodeExecutablePath
-                                                        [| "-e"; "console.log('replacement-clone-started');setInterval(()=>{},1000)" |]
-
-                                                return! NodeProcess.run blockedClone context
-                                            }
-                                        else
-                                            NodeProcess.run request context)
-                        }
-
-                        let context =
-                            OperationContext.create "identity-mismatch-clone" source.Cancellation (fun progress ->
-                                if progress.DisplayMessage = Some "replacement-clone-started" then
-                                    source.Cancel())
-
-                        let factory = GitWorkspaceSession.createFactory hooks
-                        let targetPath = join [| root; "identity-mismatch-clone" |]
-
-                        let! result =
-                            Async.StartAsPromise(
-                                factory.Clone
-                                    {
-                                        Location = {
-                                            ProviderId = gitProviderId
-                                            DisplayName = None
-                                            ProviderLocation = barePath
-                                            ConnectionProfileId = None
-                                        }
-                                        TargetPath = targetPath
-                                        TargetRef = None
-                                        MaterializeAllObjects = true
-                                    }
-                                    context
-                            )
-
-                        match result with
-                        | Failed failure ->
-                            Vitest.expect(failure.Category).toEqual (Canceled)
-                            Vitest.expect(failure.Code).toBe ("operation_canceled")
-                            Vitest.expect(failure.StateChanged).toBe (true)
-                            Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (
-                                Some "remove_clone_target"
-                            )
-                        | Succeeded _
-                        | PartiallySucceeded _ -> failwith "Expected the clone to be canceled."
-
-                        let! replacementExists = pathExistsAsync targetPath
-                        Vitest.expect(replacementExists).toBe (true)
-                        Vitest.expect(NodeFileSystem.readdirSync targetPath).toHaveLength (0)
                         do! removeDirectoryAsync root
                     with error ->
                         do! removeDirectoryAsync root

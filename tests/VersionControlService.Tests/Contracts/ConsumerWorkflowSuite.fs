@@ -38,10 +38,9 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                             (ctx "consumer-save")
                     )
 
-                let saved = expectPerformed "selected save" saveResult
+                expectPerformed "selected save" saveResult |> ignore
 
                 let! afterSave = getStatus workspace
-                Vitest.expect(saved.ResultingWorkspaceVersion).toEqual (Some afterSave.WorkspaceVersion)
                 Vitest.expect(changePaths afterSave).toEqual ([| "scratch.txt" |])
 
                 let! publishResult =

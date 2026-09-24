@@ -813,30 +813,6 @@ let private computeWorkspaceVersion
                         return Ok($"git:{headPart}:{statusPart}:{unmergedContentPart}:{mergePart}")
     }
 
-/// Every write that performed something reports the workspace version a GetStatus right
-/// after it would return. When the version cannot be read, the result stays as it was.
-let private withResultingWorkspaceVersion
-    (state: SessionState)
-    (context: OperationContext)
-    (result: OperationResult<'T>)
-    : Async<OperationResult<'T>> =
-    let updateOutcome outcome =
-        async {
-            let! versionResult = computeWorkspaceVersion state context
-            return { outcome with ResultingWorkspaceVersion = Result.toOption versionResult }
-        }
-
-    async {
-        match result with
-        | Succeeded outcome when outcome.Effect = Performed ->
-            let! updated = updateOutcome outcome
-            return Succeeded updated
-        | PartiallySucceeded(outcome, failure) when outcome.Effect = Performed ->
-            let! updated = updateOutcome outcome
-            return PartiallySucceeded(updated, failure)
-        | _ -> return result
-    }
-
 /// Serializes a mutation and revalidates the expected workspace version under the
 /// lock, so a stale request never reaches provider state.
 let private withValidatedMutation
@@ -1996,33 +1972,6 @@ let private refNameOfProviderRef (reference: ProviderRef) =
     else
         Choice1Of2 value
 
-let private cloneTargetRefArguments (targetRef: ProviderRef option) =
-    let unsupported () =
-        OperationFailure.create
-            Unsupported
-            "target_ref_unsupported"
-            "Git clone supports local branches and origin remote branches only."
-
-    match targetRef with
-    | None -> Ok None
-    | Some reference ->
-        let value = ProviderRef.value reference
-
-        let branchName =
-            if value.StartsWith("git-local:", StringComparison.Ordinal) then
-                Some(value.Substring("git-local:".Length))
-            elif value.StartsWith("git-remote:origin/", StringComparison.Ordinal) then
-                Some(value.Substring("git-remote:origin/".Length))
-            else
-                None
-
-        match branchName with
-        | Some name when
-            not (String.IsNullOrWhiteSpace name)
-            && not (name.StartsWith("refs/", StringComparison.Ordinal)) ->
-            Ok(Some name)
-        | _ -> Error(unsupported ())
-
 let private createRevisionTransaction (state: SessionState) (request: CreateRevisionRequest) (context: OperationContext) =
     async {
         if request.Paths.Length = 0 then
@@ -2160,7 +2109,6 @@ let private materializeLocalLfsObject
 let private materializeRestoredLocalLfsObjects
     (state: SessionState)
     (restoredPaths: string[])
-    (previousPointerPaths: Set<string>)
     (context: OperationContext)
     : Async<(string * string * bool)[]> =
     async {
@@ -2168,18 +2116,17 @@ let private materializeRestoredLocalLfsObjects
         let failures = ResizeArray<string * string * bool>()
 
         for pathValue in restoredPaths do
-            if not (previousPointerPaths.Contains pathValue) then
-                let! pointerResult = GitLfsObjects.readWorktreePointer state.RepoPath pathValue
+            let! pointerResult = GitLfsObjects.readWorktreePointer state.RepoPath pathValue
 
-                match pointerResult with
-                | Error failure ->
-                    failures.Add(
-                        pathValue,
-                        failure.Message,
-                        failure.Category = Canceled || context.Cancellation.IsCancellationRequested()
-                    )
-                | Ok None -> ()
-                | Ok(Some pointer) -> candidates.Add(pathValue, pointer)
+            match pointerResult with
+            | Error failure ->
+                failures.Add(
+                    pathValue,
+                    failure.Message,
+                    failure.Category = Canceled || context.Cancellation.IsCancellationRequested()
+                )
+            | Ok None -> ()
+            | Ok(Some pointer) -> candidates.Add(pathValue, pointer)
 
         if candidates.Count > 0 then
             let! mediaDirectoryResult =
@@ -2300,65 +2247,43 @@ let private restorePaths (state: SessionState) (request: RestoreRequest) (contex
                                 AffectedPaths = unmergedRequestedPaths
                         }
                 else
-                    let! headPathsResult = awaitGit (GitService.headPathsForPathspecs state.RepoPath requestedPaths)
+                    let! result = awaitGit (GitService.discardPaths state.RepoPath requestedPaths)
 
-                    match headPathsResult with
+                    match result with
                     | Error failure -> return Failed failure
-                    | Ok headPaths ->
-                        let previousPointerPaths = ResizeArray<string>()
-                        let mutable pointerReadFailure: (string * OperationFailure) option = None
+                    | Ok restoredPaths ->
+                        let! materializationFailures =
+                            materializeRestoredLocalLfsObjects
+                                state
+                                restoredPaths
+                                context
 
-                        for pathValue in headPaths do
-                            if pointerReadFailure.IsNone then
-                                let! pointerResult = GitLfsObjects.readWorktreePointer state.RepoPath pathValue
+                        if materializationFailures.Length = 0 then
+                            return OperationResult.succeeded ()
+                        else
+                            let canceled = materializationFailures |> Array.exists (fun (_, _, value) -> value)
+                            let affectedPaths = materializationFailures |> Array.map (fun (path, _, _) -> path)
+                            let _, firstDetail, _ = materializationFailures[0]
 
-                                match pointerResult with
-                                | Error failure -> pointerReadFailure <- Some(pathValue, failure)
-                                | Ok None -> ()
-                                | Ok(Some _) -> previousPointerPaths.Add pathValue
+                            let failure =
+                                OperationFailure.createRedacted
+                                    (if canceled then Canceled else ProviderError)
+                                    (if canceled then "operation_canceled" else "object_materialization_failed")
+                                    (if canceled then
+                                         $"Materializing restored paths was canceled: {firstDetail}"
+                                     else
+                                         $"Materializing restored paths failed: {firstDetail}")
+                                |> fun failure -> {
+                                    failure with
+                                        StateChanged = true
+                                        AffectedPaths = affectedPaths
+                                }
 
-                        match pointerReadFailure with
-                        | Some(pathValue, failure) ->
-                            return Failed { failure with AffectedPaths = [| pathValue |] }
-                        | None ->
-                            let! result = awaitGit (GitService.discardPaths state.RepoPath requestedPaths)
-
-                            match result with
-                            | Error failure -> return Failed failure
-                            | Ok restoredPaths ->
-                                let! materializationFailures =
-                                    materializeRestoredLocalLfsObjects
-                                        state
-                                        restoredPaths
-                                        (previousPointerPaths |> Set.ofSeq)
-                                        context
-
-                                if materializationFailures.Length = 0 then
-                                    return OperationResult.succeeded ()
-                                else
-                                    let canceled = materializationFailures |> Array.exists (fun (_, _, value) -> value)
-                                    let affectedPaths = materializationFailures |> Array.map (fun (path, _, _) -> path)
-                                    let _, firstDetail, _ = materializationFailures[0]
-
-                                    let failure =
-                                        OperationFailure.createRedacted
-                                            (if canceled then Canceled else ProviderError)
-                                            (if canceled then "operation_canceled" else "object_materialization_failed")
-                                            (if canceled then
-                                                 $"Materializing restored paths was canceled: {firstDetail}"
-                                             else
-                                                 $"Materializing restored paths failed: {firstDetail}")
-                                        |> fun failure -> {
-                                            failure with
-                                                StateChanged = true
-                                                AffectedPaths = affectedPaths
-                                        }
-
-                                    return
-                                        OperationResult.partiallySucceeded
-                                            (OperationOutcome.performed ())
-                                            failure
-                                            (localMaterializationRecovery ())
+                            return
+                                OperationResult.partiallySucceeded
+                                    (OperationOutcome.performed ())
+                                    failure
+                                    (localMaterializationRecovery ())
     }
 
 let private listRefs (state: SessionState) (context: OperationContext) =
@@ -4951,8 +4876,6 @@ let private cleanupCommittedConflict
 
 let private withSerializedConflictMutation
     (state: SessionState)
-    (context: OperationContext)
-    (includeResultingWorkspaceVersion: bool)
     (body: unit -> Async<OperationResult<'T>>)
     : Async<OperationResult<'T>> =
     async {
@@ -4960,16 +4883,7 @@ let private withSerializedConflictMutation
         do! state.Lock.Acquire()
 
         try
-            let! result = body ()
-
-            if includeResultingWorkspaceVersion then
-                return!
-                    withResultingWorkspaceVersion
-                        state
-                        context
-                        result
-            else
-                return result
+            return! body ()
         finally
             state.Lock.Release()
     }
@@ -5147,7 +5061,7 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
             }
         Resolve =
             fun request context ->
-                withSerializedConflictMutation state context true (fun () -> async {
+                withSerializedConflictMutation state (fun () -> async {
                     let! validation = validateConflictHandle state request.Handle request.ExpectedWorkspaceVersion context
 
                     match validation with
@@ -5445,7 +5359,7 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                 })
         Finalize =
             fun request context ->
-                withSerializedConflictMutation state context true (fun () -> async {
+                withSerializedConflictMutation state (fun () -> async {
                     let! validation = validateConflictHandle state request.Handle request.ExpectedWorkspaceVersion context
 
                     match validation with
@@ -5713,7 +5627,7 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                 })
         Cancel =
             fun request context ->
-                withSerializedConflictMutation state context true (fun () -> async {
+                withSerializedConflictMutation state (fun () -> async {
                     let! validation = validateConflictHandle state request.Handle request.ExpectedWorkspaceVersion context
 
                     match validation with
@@ -6169,49 +6083,20 @@ let createSessionWithCredentialsIdentityAndPolicy
         CreateRef =
             fun request context ->
                 withValidatedMutation state request.ExpectedWorkspaceVersion context (fun () ->
-                    async {
-                        let! result = createRef state request context
-
-                        if request.SwitchTo then
-                            return!
-                                withResultingWorkspaceVersion
-                                    state
-                                    context
-                                    result
-                        else
-                            return result
-                    })
+                    createRef state request context)
         PreflightSwitchRef = fun request context -> preflightSwitchRef state request context
         SwitchRef =
             fun request context ->
                 withValidatedMutation state request.ExpectedWorkspaceVersion context (fun () ->
-                    async {
-                        let! result = switchRef state request context
-
-                        return!
-                            withResultingWorkspaceVersion
-                                state
-                                context
-                                result
-                    })
+                    switchRef state request context)
         CreateRevision =
             fun request context ->
                 withValidatedMutation state request.ExpectedWorkspaceVersion context (fun () ->
-                    async {
-                        let! result = createRevision state request context
-
-                        return!
-                            withResultingWorkspaceVersion state context result
-                    })
+                    createRevision state request context)
         RestorePaths =
             fun request context ->
                 withValidatedMutation state request.ExpectedWorkspaceVersion context (fun () ->
-                    async {
-                        let! result = restorePaths state request context
-
-                        return!
-                            withResultingWorkspaceVersion state context result
-                    })
+                    restorePaths state request context)
         GetDiffSummary = fun context -> getDiffSummary state context
     }
 
@@ -6250,14 +6135,7 @@ let createSessionWithCredentialsIdentityAndPolicy
                                     match guardResult with
                                     | Failed failure -> return Failed failure
                                     | Succeeded active when active.Value -> return Failed(activeConflictFailure ())
-                                    | Succeeded _ ->
-                                        let! result = update state request context
-
-                                        return!
-                                            withResultingWorkspaceVersion
-                                                state
-                                                context
-                                                result
+                                    | Succeeded _ -> return! update state request context
                                     | PartiallySucceeded(_, failure) -> return Failed failure
                                 })
                     Publish =
@@ -6269,21 +6147,14 @@ let createSessionWithCredentialsIdentityAndPolicy
                                     match guardResult with
                                     | Failed failure -> return Failed failure
                                     | Succeeded active when active.Value -> return Failed(activeConflictFailure ())
-                                    | Succeeded _ ->
-                                        let! result = publish state request.ExpectedTargetRevision context
-
-                                        return!
-                                            withResultingWorkspaceVersion
-                                                state
-                                                context
-                                                result
+                                    | Succeeded _ -> return! publish state request.ExpectedTargetRevision context
                                     | PartiallySucceeded(_, failure) -> return Failed failure
                                 })
                     Synchronize =
                         fun request context ->
                             withValidatedMutation state request.ExpectedWorkspaceVersion context (fun () ->
                                 async {
-                                    let! result =
+                                    return!
                                         Synchronization.compose
                                             {
                                                 HasActiveConflictSession = fun context -> activeOperationGuard state context
@@ -6302,12 +6173,6 @@ let createSessionWithCredentialsIdentityAndPolicy
                                             }
                                             request
                                             context
-
-                                    return!
-                                        withResultingWorkspaceVersion
-                                            state
-                                            context
-                                            result
                                 })
                 }
             ConflictResolution = Some(createConflictService state)
@@ -6380,7 +6245,7 @@ let private probe (workspacePath: string) : Async<ProbeResult> =
 let private bindingFor (workspaceRoot: string) (location: RepositoryLocation) : WorkspaceBinding = {
     SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
     ProviderId = gitProviderId
-    WorkspaceRoot = NodePath.normalizeWorkspaceRoot workspaceRoot
+    WorkspaceRoot = workspaceRoot
     ProviderStateRef = None
     Location = {
         location with
@@ -6686,53 +6551,37 @@ let createFactoryWithCredentialsIdentityAndPolicy
                     "target_not_empty"
                     "The clone target directory is not empty."
 
-            let targetCreatedByOtherFailure () =
-                OperationFailure.create
-                    Validation
-                    "target_not_empty"
-                    "The clone target was created by another program while the clone started. Choose an empty folder."
-
-            let targetLinkFailure () =
-                OperationFailure.create
-                    Validation
-                    "clone_target_is_link"
-                    "The clone target is a link. Choose a folder."
-
-            let targetUnreadableFailure () =
-                OperationFailure.create
-                    ProviderError
-                    "clone_target_unreadable"
-                    "The clone target could not be inspected."
-
             let validatedLocation =
-                match cloneTargetRefArguments request.TargetRef with
-                | Error failure -> Error failure
-                | Ok branchName ->
-                    validateFactoryLocation request.Location
-                    |> Result.map (fun location -> location, branchName)
+                match request.TargetRef with
+                | Some _ ->
+                    Error(
+                        OperationFailure.create
+                            Unsupported
+                            "target_ref_unsupported"
+                            "Git clone does not support choosing a ref."
+                    )
+                | None -> validateFactoryLocation request.Location
 
+            // Remember what the target looked like so a killed or failed clone can be
+            // undone without touching anything the caller already had there. A target
+            // that cannot be inspected counts as not empty.
             let targetSnapshot =
-                match validatedLocation with
-                | Error failure -> Error failure
-                | Ok _ ->
-                    try
-                        match NodeFileSystem.tryLstatSync request.TargetPath with
-                        | None -> Ok(false, false, false)
-                        | Some stats when stats.isSymbolicLink () -> Ok(true, false, true)
-                        | Some stats ->
-                            let empty =
-                                stats.isDirectory ()
-                                && (NodeFileSystem.readdirSync request.TargetPath).Length = 0
+                try
+                    match NodeFileSystem.tryLstatSync request.TargetPath with
+                    | None -> false, false
+                    | Some stats ->
+                        let empty =
+                            stats.isDirectory ()
+                            && not (stats.isSymbolicLink ())
+                            && (NodeFileSystem.readdirSync request.TargetPath).Length = 0
 
-                            Ok(true, empty, false)
-                    with _ ->
-                        Error(targetUnreadableFailure ())
+                        true, empty
+                with _ ->
+                    true, false
 
             match validatedLocation, targetSnapshot with
             | Error failure, _ -> return Failed failure
-            | _, Error failure -> return Failed failure
-            | Ok _, Ok (_, _, true) -> return Failed(targetLinkFailure ())
-            | Ok (location, branchName), Ok (targetExistedBefore, targetWasEmptyDirectory, false) ->
+            | Ok location, (targetExistedBefore, targetWasEmptyDirectory) ->
                 let! effectiveLocation = expandLocationUrl hooks location.ProviderLocation context
 
                 let! authentication =
@@ -6742,100 +6591,27 @@ let createFactoryWithCredentialsIdentityAndPolicy
                         location.ConnectionProfileId
                         "origin"
 
-                let! targetRefCheck =
-                    if
-                        context.Cancellation.IsCancellationRequested()
-                        || (targetExistedBefore && not targetWasEmptyDirectory)
-                    then
-                        async.Return(Ok())
-                    else
-                        match branchName with
-                        | None -> async.Return(Ok())
-                        | Some name ->
-                            async {
-                                let expectedReference = $"refs/heads/{name}"
-                                let! checkResult =
-                                    runGitEnv
-                                        hooks
-                                        "."
-                                        [|
-                                            yield! authentication.ConfigArgs
-                                            "ls-remote"
-                                            "--heads"
-                                            "--"
-                                            effectiveLocation
-                                            expectedReference
-                                        |]
-                                        None
-                                        [| "GIT_TERMINAL_PROMPT", "0" |]
-                                        context
-
-                                match checkResult with
-                                | Error failure -> return Error failure
-                                | Ok output when output.ExitCode <> 0 ->
-                                    let detail =
-                                        if String.IsNullOrWhiteSpace output.StdErr then
-                                            output.StdOut
-                                        else
-                                            output.StdErr
-
-                                    let kind = GitService.classifyFailureKind detail
-
-                                    return
-                                        Error(
-                                            OperationFailure.createRedacted
-                                                (categoryOfKind kind)
-                                                (codeOfKind kind)
-                                                $"Checking clone target branch '{name}' failed: {detail}"
-                                        )
-                                | Ok output ->
-                                    let found =
-                                        output.StdOut.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
-                                        |> Array.exists (fun line ->
-                                            line.EndsWith($"\t{expectedReference}", StringComparison.Ordinal))
-
-                                    if found then
-                                        return Ok()
-                                    else
-                                        return
-                                            Error(
-                                                OperationFailure.create
-                                                    NotFound
-                                                    "target_ref_not_found"
-                                                    $"Clone target branch '{name}' does not exist."
-                                            )
-                            }
-
                 let mutable targetCreatedByClone = false
-                let mutable targetCreatedByCloneIdentity: (float * float) option = None
                 // Rollback runs only after the target was set up, so a refusal or a cancel
                 // before the clone never touches what someone else put into the target.
                 let mutable cloneStarted = false
 
-                let removeCloneResidue () =
+                let removeCloneResidue () : Async<string option> =
                     async {
                         try
                             if targetCreatedByClone then
-                                match targetCreatedByCloneIdentity with
-                                | None -> return Some "The clone target identity could not be recorded."
-                                | Some (expectedDevice, expectedInode) ->
-                                    let stats = NodeFileSystem.statSync request.TargetPath
+                                do!
+                                    NodeFileSystem.rmAsync
+                                        request.TargetPath
+                                        (NodeFileSystem.RmOptions(
+                                            recursive = true,
+                                            force = true,
+                                            maxRetries = 5,
+                                            retryDelay = 100
+                                        ))
+                                    |> Async.AwaitPromise
 
-                                    if stats.dev <> expectedDevice || stats.ino <> expectedInode then
-                                        return Some "The clone target changed identity before cleanup."
-                                    else
-                                        do!
-                                            NodeFileSystem.rmAsync
-                                                request.TargetPath
-                                                (NodeFileSystem.RmOptions(
-                                                    recursive = true,
-                                                    force = true,
-                                                    maxRetries = 5,
-                                                    retryDelay = 100
-                                                ))
-                                            |> Async.AwaitPromise
-
-                                        return None
+                                return None
                             elif targetExistedBefore && targetWasEmptyDirectory then
                                 for entry in NodeFileSystem.readdirSync request.TargetPath do
                                     do!
@@ -6856,8 +6632,7 @@ let createFactoryWithCredentialsIdentityAndPolicy
                             return Some error.Message
                     }
 
-                // When the residue could not be removed the failure says so, with the
-                // path the caller has to clear, so StateChanged stays truthful.
+                // When cleanup fails, name the target the caller has to clear.
                 let withResidue (failure: OperationFailure) (cleanupError: string option) =
                     match cleanupError with
                     | None -> failure
@@ -6889,72 +6664,62 @@ let createFactoryWithCredentialsIdentityAndPolicy
                         elif targetExistedBefore && not targetWasEmptyDirectory then
                             return Error(targetNotEmptyFailure ())
                         else
-                            match targetRefCheck with
+                            let targetSetup =
+                                try
+                                    if not targetExistedBefore then
+                                        let parentPath = NodePath.dirname request.TargetPath
+
+                                        if not (NodeFileSystem.existsSync parentPath) then
+                                            NodeFileSystem.mkdirSync
+                                                parentPath
+                                                (NodeFileSystem.MkdirOptions(recursive = true))
+
+                                        NodeFileSystem.mkdirSync
+                                            request.TargetPath
+                                            (NodeFileSystem.MkdirOptions(recursive = false))
+
+                                        targetCreatedByClone <- true
+
+                                    Ok()
+                                with error ->
+                                    if tryGetNodeErrorCode error = Some "EEXIST" then
+                                        Error(targetNotEmptyFailure ())
+                                    else
+                                        Error(
+                                            OperationFailure.createRedacted
+                                                ProviderError
+                                                "clone_failed"
+                                                $"Could not create the clone target directory: {error.Message}"
+                                        )
+
+                            match targetSetup with
                             | Error failure -> return Error failure
                             | Ok () ->
-                                let targetSetup =
-                                    try
-                                        if not targetExistedBefore then
-                                            let parentPath = NodePath.dirname request.TargetPath
+                                cloneStarted <- true
 
-                                            if not (NodeFileSystem.existsSync parentPath) then
-                                                NodeFileSystem.mkdirSync
-                                                    parentPath
-                                                    (NodeFileSystem.MkdirOptions(recursive = true))
-
-                                            NodeFileSystem.mkdirSync
-                                                request.TargetPath
-                                                (NodeFileSystem.MkdirOptions(recursive = false))
-
-                                            targetCreatedByClone <- true
-                                            let stats = NodeFileSystem.statSync request.TargetPath
-                                            targetCreatedByCloneIdentity <- Some(stats.dev, stats.ino)
-
-                                        Ok()
-                                    with error ->
-                                        if tryGetNodeErrorCode error = Some "EEXIST" then
-                                            Error(targetCreatedByOtherFailure ())
-                                        else
-                                            Error(
-                                                OperationFailure.createRedacted
-                                                    ProviderError
-                                                    "clone_failed"
-                                                    $"Could not create the clone target directory: {error.Message}"
-                                            )
-
-                                match targetSetup with
-                                | Error failure -> return Error failure
-                                | Ok () ->
-                                    cloneStarted <- true
-
-                                    // Git keeps large objects as pointers until hydration so a download
-                                    // failure can be reported as partial success.
-                                    return!
-                                        runGitEnv
-                                            hooks
-                                            "."
-                                            [|
-                                                yield! authentication.ConfigArgs
-                                                "clone"
-                                                match branchName with
-                                                | Some name ->
-                                                    "--branch"
-                                                    name
-                                                | None -> ()
-                                                "--"
-                                                location.ProviderLocation
-                                                request.TargetPath
-                                            |]
-                                            None
-                                            [|
-                                                "GIT_TERMINAL_PROMPT", "0"
-                                                "GIT_LFS_SKIP_SMUDGE", "1"
-                                            |]
-                                            context
+                                // Git keeps large objects as pointers until hydration so a download
+                                // failure can be reported as partial success.
+                                return!
+                                    runGitEnv
+                                        hooks
+                                        "."
+                                        [|
+                                            yield! authentication.ConfigArgs
+                                            "clone"
+                                            "--"
+                                            location.ProviderLocation
+                                            request.TargetPath
+                                        |]
+                                        None
+                                        [|
+                                            "GIT_TERMINAL_PROMPT", "0"
+                                            "GIT_LFS_SKIP_SMUDGE", "1"
+                                        |]
+                                        context
                     }
 
                 match result with
-                | Error failure when not cloneStarted && not targetCreatedByClone -> return Failed failure
+                | Error failure when not cloneStarted -> return Failed failure
                 | Error failure ->
                     let! cleanupError = removeCloneResidue ()
 

@@ -7,7 +7,7 @@ The host owns binding persistence. VersionControlService does not keep an applic
 `WorkspaceBinding` contains:
 
 - the schema version and provider ID
-- `WorkspaceRoot`, stored as absolute, in the file system's own case when the folder exists, with forward slashes on Windows and no trailing separator
+- `WorkspaceRoot`, the path the provider received. For `Adopt`, this is the root Git reports.
 - an optional opaque provider state reference
 - a nonsecret repository location
 - an optional connection profile ID

@@ -142,11 +142,9 @@ Four factory operations produce a binding, and none of them needs an opened sess
 here, and `Adopt` belongs to the next section. Each one returns the binding for the host to
 persist, after which `Open` works exactly as in the next section.
 
-When `TargetRef` is present, `Clone` checks out that exact provider ref. A provider returns an
-`Unsupported` failure for a ref it cannot check out, and a `Validation` failure
-(`target_ref_mismatch`) for a ref that contradicts the location. It never ignores the ref.
-For Git, `git-remote:origin/<name>` checks out a local branch named `<name>` that tracks
-`origin/<name>`.
+`TargetRef` asks the provider to check out an exact ref. A provider returns an `Unsupported` failure
+for a ref it cannot check out (the Git provider refuses every `TargetRef`), and a `Validation`
+failure (`target_ref_mismatch`) for a ref that contradicts the location. It never ignores the ref.
 
 `Clone` wants a destination that is missing or empty:
 
@@ -181,9 +179,9 @@ let cloneWorkspace (factory: ProviderFactory) location targetPath (context: Oper
 }
 ```
 
-A clone canceled before it completes rolls back and fails as `Canceled`. A pre-existing empty target is cleaned by removing its entries, so entries another program adds to that folder during the clone are removed too. A clone that finished before cancellation took effect succeeds. A download failure returns `PartiallySucceeded` with `retry_materialization`, so the workspace exists and its large objects are not materialized.
+A clone canceled before it completes rolls back and fails as `Canceled`. A pre-existing empty target is cleaned by removing its entries, so entries another program adds to that folder during the clone are removed too. A clone that finished before cancellation took effect succeeds. A download failure that is not a cancellation returns `PartiallySucceeded` with `retry_materialization`, so the workspace exists and its large objects are not materialized.
 
-If a failed rollback cannot remove the clone target, `Clone` returns `Failed` with category `Canceled` and `StateChanged = true`. Its recovery code is `remove_clone_target`. Ask the user to clear the target folder before retrying.
+A clone whose rollback cannot remove the target returns `Failed` with `StateChanged = true` and the recovery code `remove_clone_target`, with category `Canceled` when the user canceled. Ask the user to clear the target folder before retrying.
 
 `Initialize` takes a directory the provider does not already own, keeps the files already in
 it, and reports them as ordinary workspace changes. `Location` is optional in the contract and
@@ -398,12 +396,13 @@ arrive redacted, so a host can show them to a user.
 exist locally and a publish can still be retried. `PublicationNotApplicable` means the
 operation has no publication meaning at all, so it is not a claim that anything was published.
 
-`ResultingWorkspaceVersion` is optional and a provider may leave it `None`. Git fills
-`ResultingWorkspaceVersion` after a performed `CreateRevision`, `RestorePaths`, `SwitchRef`,
-`CreateRef` with `SwitchTo`, `Update`, `Publish`, `Synchronize` and conflict `Resolve`, `Finalize`
-and `Cancel`. lakeFS fills it after its writes. A consumer uses the outcome's version when it is
-`Some` and calls `Core.GetStatus` when it is `None`. The token is opaque, so do not parse it or
-compare it for ordering.
+`ResultingWorkspaceVersion` is optional and a provider may leave it `None`. The built-in Git
+provider never sets it, and lakeFS does, so do not build a host around it. Two payloads carry
+a workspace version: `Core.GetStatus` and `SwitchRef`, which both return a `WorkspaceStatus`.
+The synchronization operations return a `SynchronizationState`, which has revisions and a
+target but no workspace version, so call `Core.GetStatus` after a synchronize to get the token
+for the next mutation. The token is opaque either way, so do not parse it or compare it for
+ordering.
 
 ## Optional services
 
@@ -602,9 +601,9 @@ let saveSelected
                     // outcome.Value. ResultingRevision is optional metadata that a conforming
                     // provider may leave as None, so do not read the revision out of it.
                     //
-                    // A provider leaves ResultingWorkspaceVersion as None when it cannot read the
-                    // version after the commit. The host then re-reads the status before the next
-                    // mutation.
+                    // The commit moved the workspace version, and ResultingWorkspaceVersion is
+                    // None on Git. None here means the host re-reads the status before the
+                    // next mutation. It does not mean the version is unchanged.
                     return
                         Ok {
                             Revision = Some outcome.Value
