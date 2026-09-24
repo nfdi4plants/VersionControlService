@@ -922,16 +922,22 @@ on Fable. The Git and lakeFS providers are different: they go through
 Node. Referencing the package compiles, and executing a built-in provider needs the rest
 of that toolchain.
 
-A Fable host also needs the npm side and a Fable compile step. The Node runtime loads Node
-modules with `require`, which Node does not define inside an ES module, so bundle the Fable
-output as CommonJS before running it:
+A Fable host also needs the npm side and a Fable compile step. Fable emits JavaScript modules
+that Node can run directly. If Fable does not write a package file, add
+`output/package.json` with `{"type":"module"}` so Node treats the output as ES modules:
 
 ```console
 npm install simple-git
-npm install --save-dev rollup
 dotnet new tool-manifest
 dotnet tool install fable --version 5.5.0
 dotnet tool run fable YourApp.fsproj --outDir output
+node output/<your-entry-file>.js
+```
+
+Bundling remains an option when a host needs a single file:
+
+```console
+npm install --save-dev rollup
 npx rollup output/<your-entry-file>.js --file output/app.cjs --format cjs
 node output/app.cjs
 ```

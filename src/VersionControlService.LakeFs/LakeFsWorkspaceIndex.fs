@@ -13,6 +13,14 @@ module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodeInterop = VersionControlService.Runtime.Node.Interop
 module NodePath = VersionControlService.Runtime.Node.Path
 
+let private fileSystemDynamic: obj = importAll "node:fs"
+
+[<Import("createHash", "node:crypto")>]
+let private createHash (_algorithm: string) : obj = jsNative
+
+[<Import("randomBytes", "node:crypto")>]
+let private randomBytes (_size: int) : obj = jsNative
+
 [<Literal>]
 let CurrentSchemaVersion = 1
 
@@ -54,14 +62,22 @@ let private jsonStringify (_value: obj) : string = jsNative
 [<Emit("JSON.parse($0)")>]
 let private jsonParse (_text: string) : obj = jsNative
 
-[<Emit("(() => { const fs = require('node:fs'); const crypto = require('node:crypto'); const fd = fs.openSync($0, 'r'); const chunk = Buffer.allocUnsafe(1024 * 1024); const hash = crypto.createHash('sha256'); try { for (;;) { const read = fs.readSync(fd, chunk, 0, chunk.length, null); if (read === 0) break; hash.update(chunk.subarray(0, read)); } return hash.digest('hex'); } finally { fs.closeSync(fd); } })()")>]
-let hashFile (_path: string) : string = jsNative
+[<Emit("(() => { const fd = $0.openSync($1, 'r'); const chunk = Buffer.allocUnsafe(1024 * 1024); const hash = $2('sha256'); try { for (;;) { const read = $0.readSync(fd, chunk, 0, chunk.length, null); if (read === 0) break; hash.update(chunk.subarray(0, read)); } return hash.digest('hex'); } finally { $0.closeSync(fd); } })()")>]
+let private hashFileFromModules (_fileSystem: obj) (_path: string) (_createHash: string -> obj) : string = jsNative
 
-[<Emit("require('node:crypto').createHash('sha256').update($0, 'utf8').digest('hex')")>]
-let hashMetadata (_content: string) : string = jsNative
+let hashFile (path: string) : string =
+    hashFileFromModules fileSystemDynamic path createHash
 
-[<Emit("require('crypto').randomBytes(16).toString('hex')")>]
-let private randomToken () : string = jsNative
+[<Emit("$0('sha256').update($1, 'utf8').digest('hex')")>]
+let private hashMetadataFromCreateHash (_createHash: string -> obj) (_content: string) : string = jsNative
+
+let hashMetadata (content: string) : string =
+    hashMetadataFromCreateHash createHash content
+
+[<Emit("$0(16).toString('hex')")>]
+let private randomTokenFromRandomBytes (_randomBytes: int -> obj) : string = jsNative
+
+let private randomToken () : string = randomTokenFromRandomBytes randomBytes
 
 let createOwnershipToken () = randomToken ()
 

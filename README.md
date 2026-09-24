@@ -124,19 +124,18 @@ Each mutation carries the `WorkspaceVersion` of the status the caller last read.
 
 ### Run it
 
-Fable compiles the program to JavaScript and Node runs it. Start the workflow with `Async.StartImmediate`, as the entry point above does, or with `Async.StartAsPromise` from Fable.Core when the caller wants a promise. The Node runtime loads Node modules with `require`, which Node does not define inside an ES module, so bundle the Fable output as CommonJS before you run it:
+Fable compiles the program to JavaScript modules that Node can run directly. Start the workflow with `Async.StartImmediate`, as the entry point above does, or with `Async.StartAsPromise` from Fable.Core when the caller wants a promise. If Fable does not write a package file, add `output/package.json` containing `{"type":"module"}` so Node treats the output as ES modules:
 
 ```console
 npm install simple-git
-npm install --save-dev rollup
 dotnet new tool-manifest
 dotnet tool install fable --version 5.5.0
 dotnet tool run fable QuickStart.fsproj --outDir output
-npx rollup output/Program.js --file output/app.cjs --format cjs
-node output/app.cjs
+node output/Program.js
 ```
 
 Fable names each output file after its source file, so `Program.fs` becomes `output/Program.js`.
+Bundling remains an option for a host that needs one file. Install Rollup with `npm install --save-dev rollup`, then run `npx rollup output/Program.js --file output/app.cjs --format cjs` and `node output/app.cjs`.
 
 ### Git terms and their names in the abstraction
 

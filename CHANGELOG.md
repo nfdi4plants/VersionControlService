@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -   `Fixed` for any bug fixes.
 -   `Security` in case of vulnerabilities.
 
+## [Unreleased]
+
+### Fixed
+
+-   The Node runtime and lakeFS provider import Node modules as ES modules, so compiled output runs with plain `node` without a CommonJS bundle.
+
 ## 0.1.0 - 2026-09-24
 
 ### Added

@@ -11,6 +11,9 @@ module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodeInterop = VersionControlService.Runtime.Node.Interop
 module NodePath = VersionControlService.Runtime.Node.Path
 
+[<Import("rmSync", "node:fs")>]
+let private rmSync (_path: string) (_options: NodeFileSystem.RmOptions) : unit = jsNative
+
 type ResolvedState = {
     StateId: string
     StateDirectory: string
@@ -85,8 +88,8 @@ let private jsonStringify (_value: obj) : string = jsNative
 [<Emit("JSON.parse($0)")>]
 let private jsonParse (_text: string) : obj = jsNative
 
-[<Emit("require('node:fs').rmSync($0, { recursive: true, force: true })")>]
-let private removeTreeSync (_path: string) : unit = jsNative
+let private removeTreeSync (path: string) : unit =
+    rmSync path (NodeFileSystem.RmOptions(recursive = true, force = true))
 
 let private pathComparison = function
     | CaseSensitive -> StringComparison.Ordinal

@@ -5,6 +5,15 @@ open Fable.Core.JsInterop
 
 let childProcessDynamic: obj = importAll "node:child_process"
 
+[<Import("randomUUID", "node:crypto")>]
+let randomUuid () : string = jsNative
+
+[<Import("createHash", "node:crypto")>]
+let private createHash (_algorithm: string) : obj = jsNative
+
+[<Import("StringDecoder", "node:string_decoder")>]
+let private stringDecoder: obj = jsNative
+
 [<Emit("process.platform")>]
 let processPlatform () : string = jsNative
 
@@ -29,9 +38,6 @@ let createError (_message: string) : obj = jsNative
 [<Emit("$0?.message ?? String($0)")>]
 let errorMessage (_error: obj) : string = jsNative
 
-[<Emit("require('node:crypto').randomUUID()")>]
-let randomUuid () : string = jsNative
-
 [<Emit("$0.then($1, $2)")>]
 let observePromise (_promise: JS.Promise<'T>) (_onSucceeded: 'T -> unit) (_onFailed: obj -> unit) : unit = jsNative
 
@@ -44,8 +50,7 @@ let bufferIsValidUtf8 (buffer: obj) : bool = jsNative
 [<Emit("$0.indexOf(0) >= 0")>]
 let bufferContainsNul (buffer: obj) : bool = jsNative
 
-[<Emit("require('node:crypto').createHash('sha256')")>]
-let createSha256Hash () : obj = jsNative
+let createSha256Hash () : obj = createHash "sha256"
 
 [<Emit("$0.update($1)")>]
 let updateHash (hash: obj) (buffer: obj) : unit = jsNative
@@ -53,14 +58,22 @@ let updateHash (hash: obj) (buffer: obj) : unit = jsNative
 [<Emit("$0.digest('hex')")>]
 let digestHashHex (hash: obj) : string = jsNative
 
-[<Emit("require('node:crypto').createHash('sha256').update($0, 'utf8').digest('hex')")>]
-let sha256Utf8 (content: string) : string = jsNative
+[<Emit("$0.update($1, 'utf8').digest('hex')")>]
+let private hashUtf8 (hash: obj) (_content: string) : string = jsNative
 
-[<Emit("require('node:crypto').createHash('sha256').update($0).digest('hex')")>]
-let sha256Buffer (buffer: obj) : string = jsNative
+let sha256Utf8 (content: string) : string =
+    hashUtf8 (createHash "sha256") content
 
-[<Emit("new (require('node:string_decoder').StringDecoder)('utf8')")>]
-let createUtf8StringDecoder () : obj = jsNative
+[<Emit("$0.update($1).digest('hex')")>]
+let private hashBuffer (hash: obj) (_buffer: obj) : string = jsNative
+
+let sha256Buffer (buffer: obj) : string =
+    hashBuffer (createHash "sha256") buffer
+
+[<Emit("new $0('utf8')")>]
+let private createStringDecoder (_stringDecoder: obj) : obj = jsNative
+
+let createUtf8StringDecoder () : obj = createStringDecoder stringDecoder
 
 [<Emit("$0.write($1)")>]
 let decodeUtf8Chunk (decoder: obj) (buffer: obj) : string = jsNative

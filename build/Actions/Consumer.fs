@@ -5,8 +5,8 @@ open System
 open System.IO
 open ProjectInfo
 
-/// Restores the one-reference consumer against a local feed and compiles it with Fable,
-/// which is what proves the umbrella package alone carries the whole graph to a consumer.
+/// Restores and compiles the one-reference consumer, then runs its ES module output.
+/// The Git workspace operation checks that the umbrella package works without a bundle.
 let Compile (version: string) (feed: string) (cache: string) (output: string) =
     run
         "dotnet"
@@ -43,6 +43,32 @@ let Compile (version: string) (feed: string) (cache: string) (output: string) =
         ]
         ProjectPaths.repositoryRoot
 
+    let entry = Path.Combine(output, "Program.js")
+
+    if not (File.Exists entry) then
+        failwithf "Fable output folder %s does not contain Program.js" output
+
+    let packageJson = Path.Combine(output, "package.json")
+
+    if not (File.Exists packageJson) then
+        File.WriteAllText(packageJson, "{ \"type\": \"module\" }")
+
+    let nodeModules = Path.Combine(output, "node_modules")
+
+    if not (Directory.Exists nodeModules) then
+        // Node's ES module resolver does not use NODE_PATH, so expose repository packages beside the output.
+        // Windows allows a symbolic link only with a privilege most users lack, and a junction needs none.
+        let target = Path.Combine(ProjectPaths.repositoryRoot, "node_modules")
+
+        if OperatingSystem.IsWindows() then
+            run "cmd" [ "/c"; "mklink"; "/J"; nodeModules; target ] ProjectPaths.repositoryRoot
+        else
+            Directory.CreateSymbolicLink(nodeModules, target) |> ignore
+
+    Environment.SetEnvironmentVariable("NODE_PATH", Path.Combine(ProjectPaths.repositoryRoot, "node_modules"))
+    run "node" [ entry ] ProjectPaths.repositoryRoot
+
+    printGreenfn "Ran the Fable 5.5.0 consumer as an ES module"
     printGreenfn "Compiled the one-reference consumer against %s %s" project version
 
 /// Compiles the consumer with the oldest Fable a consumer uses, bundles it to CommonJS and loads it,
