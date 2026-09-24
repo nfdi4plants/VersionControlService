@@ -903,29 +903,16 @@ phase code.
 
 ## Building against the packages
 
-The packages are not on nuget.org yet. Until they are, produce them locally and restore
-from that feed:
+The packages are on nuget.org:
 
 ```console
-dotnet restore VersionControlService.slnx
-dotnet run --project build/Build.fsproj -- pack --version=0.0.1-local --output=<feed-dir>
-dotnet nuget add source <feed-dir> --name vcs-local
-dotnet add package VersionControlService --version 0.0.1-local
+dotnet add package VersionControlService
 ```
 
-Run this from the repository root, because `pack` resolves the repository root from the
-current directory. The restore on the first line is not optional: `pack` packs the five
-projects with `--no-restore`, and running the build project does not restore them, so a fresh
-clone fails without it.
-
-`pack` empties the output directory first, so it refuses a path inside the repository, a
-volume root, or anything reached through a junction. Pick a directory outside the clone.
-
-`pack` builds five coordinated packages, and the umbrella depends on the other four at
-that exact version. Referencing the umbrella is enough. A host that only defines or
-consumes contracts references `VersionControlService.Abstractions` alone and needs
-nothing else. Once the packages are published, `dotnet add package VersionControlService
---prerelease` replaces the three commands above.
+The umbrella package depends on the other four at that exact version, so referencing it is
+enough. A host that only defines or consumes contracts references
+`VersionControlService.Abstractions` alone and needs nothing else. To build the packages
+from a clone instead, follow "Pack a local feed" in the README.
 
 ### What the built-in providers need at runtime
 
@@ -935,14 +922,18 @@ on Fable. The Git and lakeFS providers are different: they go through
 Node. Referencing the package compiles, and executing a built-in provider needs the rest
 of that toolchain.
 
-A Fable host also needs the npm side and a Fable compile step:
+A Fable host also needs the npm side and a Fable compile step. The Node runtime loads Node
+modules with `require`, which Node does not define inside an ES module, so bundle the Fable
+output as CommonJS before running it:
 
 ```console
 npm install simple-git
+npm install --save-dev rollup
 dotnet new tool-manifest
 dotnet tool install fable --version 5.5.0
 dotnet tool run fable YourApp.fsproj --outDir output
-node output/<your-entry-file>.js
+npx rollup output/<your-entry-file>.js --file output/app.cjs --format cjs
+node output/app.cjs
 ```
 
 Fable is a dotnet tool, so a consumer needs its own manifest. Pin the version, because this

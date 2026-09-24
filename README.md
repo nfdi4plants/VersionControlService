@@ -4,33 +4,180 @@ VersionControlService defines portable version-control workspace contracts for F
 
 ## Install
 
-The packages are not on nuget.org yet. Build the five coordinated packages into a local feed and restore from there:
+The packages are on nuget.org:
 
 ```console
-dotnet restore VersionControlService.slnx
-dotnet run --project build/Build.fsproj -- pack --version=0.0.1-local --output=<feed-dir>
-dotnet nuget add source <feed-dir> --name vcs-local
-dotnet add package VersionControlService --version 0.0.1-local
+dotnet add package VersionControlService
 ```
 
-Run the pack from the repository root. It packs with `--no-restore`, so the restore above is
-what makes it work on a fresh clone, and it resolves the repository root from the current
-directory.
+The umbrella package is dependency-only and carries the public abstractions, the Node runtime, the Git provider, and the lakeFS provider at one coordinated version. An external provider that does not need the built-in implementations can reference `VersionControlService.Abstractions` alone.
 
-The umbrella package is dependency-only and carries the public abstractions, the Node runtime, the Git provider, and the lakeFS provider at one coordinated version. An external provider that does not need the built-in implementations can reference `VersionControlService.Abstractions` alone. Once the packages are published, `dotnet add package VersionControlService --prerelease` replaces the three commands above.
+The Git and lakeFS providers run on Fable and Node. They need the `simple-git` npm package, and the Git provider needs git 2.38 or newer on the path. Git LFS is optional and only the large-object services use it. lakeFS needs no local tool. [Consuming the library](docs/consuming.md) lists what to install.
 
-## NuGet release
+## Quick start
 
-Add the next version and its release notes to `CHANGELOG.md`, then run the release target:
+This example clones a Git repository, commits the changed files, pulls and pushes. Git calls those steps clone, commit, pull and push. The abstraction calls them `Clone`, `CreateRevision`, `Update` and `Publish`.
+
+Every operation takes an `OperationContext` and returns `Async<OperationResult<'T>>`. The `valueOf` helper below unwraps a result and throws on anything other than `Succeeded`, which is enough for a first run. A real host reads the failure category and recovery action, as [reading a result](docs/consuming.md#reading-a-result) shows. Save the example as `Program.fs` in a console project named `QuickStart.fsproj` that references the package.
+
+```fsharp
+module QuickStart
+
+open VersionControlService.Abstractions
+
+module Git = VersionControlService.Git.GitWorkspaceSession
+
+/// Returns the payload and throws on a failure or a partial success.
+let valueOf (result: OperationResult<'T>) : 'T =
+    match result with
+    | Succeeded outcome -> outcome.Value
+    | PartiallySucceeded(_, failure)
+    | Failed failure -> failwith $"{failure.Code}: {failure.Message}"
+
+let factory = Git.createFactory Git.GitSessionHooks.none
+
+let location: RepositoryLocation = {
+    ProviderId = ProviderId.tryCreate WellKnownProviderIds.Git |> Result.defaultWith invalidOp
+    DisplayName = None
+    ProviderLocation = "https://github.com/example/study-archive.git"
+    ConnectionProfileId = None
+}
+
+let quickStart (targetPath: string) =
+    async {
+        let context = OperationContext.detached "quick-start"
+
+        // Clone into a missing or empty directory. The binding is what a host stores
+        // and passes to Open the next time.
+        let! cloned =
+            factory.Clone
+                {
+                    Location = location
+                    TargetPath = targetPath
+                    TargetRef = None
+                    MaterializeAllObjects = false
+                }
+                context
+
+        let! opened = factory.Open (valueOf cloned) context
+        let session = valueOf opened
+
+        let readVersion () =
+            async {
+                let! status = session.Core.GetStatus context
+                return (valueOf status).WorkspaceVersion
+            }
+
+        // Edit files under targetPath, then read the status.
+        let! status = session.Core.GetStatus context
+        let status = valueOf status
+
+        // Commit exactly the changed paths. The version guards against a workspace
+        // that changed since the status was read.
+        if status.Changes.Length > 0 then
+            let! revision =
+                session.Core.CreateRevision
+                    {
+                        Message = "Update results"
+                        Paths = status.Changes |> Array.map (fun change -> change.Path)
+                        ExpectedWorkspaceVersion = status.WorkspaceVersion
+                    }
+                    context
+
+            printfn "Created revision %s" (RevisionId.value (valueOf revision))
+
+        match session.Synchronization with
+        | Some sync ->
+            // Pull. Every mutation moves the version, so read it again each time.
+            let! version = readVersion ()
+            let! updated = sync.Update { ExpectedWorkspaceVersion = version } context
+            printfn "After update: %A" (valueOf updated).Relationship
+
+            // Push.
+            let! version = readVersion ()
+
+            let! published =
+                sync.Publish
+                    {
+                        ExpectedWorkspaceVersion = version
+                        ExpectedTargetRevision = None
+                    }
+                    context
+
+            printfn "After publish: %A" (valueOf published).Relationship
+        | None -> printfn "This provider has no synchronization service."
+
+        do! session.Close()
+    }
+
+[<EntryPoint>]
+let main _ =
+    quickStart "study-archive" |> Async.StartImmediate
+    0
+```
+
+Each mutation carries the `WorkspaceVersion` of the status the caller last read. A workspace that changed in between rejects the call with a `Concurrency` failure. The Git provider does not return the new version after a mutation, so the example reads the status again before each one. `Synchronization` is optional on a session, which is why the example matches on it.
+
+`Synchronization.Synchronize` runs the pull and the push as one operation. It refuses when the pull would overwrite local changes or open a conflict session, and [synchronizing](docs/consuming.md#synchronizing) shows the refusals a host handles.
+
+`Git.createFactory` uses anonymous credentials. Public HTTPS remotes and local paths work with them, and SSH works through the user's SSH agent. `CreateRevision` takes the author from the repository's `user.name` and `user.email` and fails with `identity_missing` when git has none. `Git.createFactoryWithCredentials` takes a credential strategy for tokens, and `Git.createFactoryWithCredentialsAndIdentity` also takes an identity strategy. [Credentials](docs/consuming.md#credentials) describes both.
+
+### Run it
+
+Fable compiles the program to JavaScript and Node runs it. Start the workflow with `Async.StartImmediate`, as the entry point above does, or with `Async.StartAsPromise` from Fable.Core when the caller wants a promise. The Node runtime loads Node modules with `require`, which Node does not define inside an ES module, so bundle the Fable output as CommonJS before you run it:
 
 ```console
-NUGET_KEY=<key> dotnet run --project build/Build.fsproj -- release nuget
+npm install simple-git
+npm install --save-dev rollup
+dotnet new tool-manifest
+dotnet tool install fable --version 5.5.0
+dotnet tool run fable QuickStart.fsproj --outDir output
+npx rollup output/Program.js --file output/app.cjs --format cjs
+node output/app.cjs
 ```
 
-The target packs into `nupkgs/` and verifies the package graph before it pushes to NuGet.
-Pass `--dry-run` to pack and verify without publishing.
+Fable names each output file after its source file, so `Program.fs` becomes `output/Program.js`.
 
-The Git and lakeFS providers run on Fable and Node, and the Git provider needs the git binary. Git LFS is optional and only the large-object services use it. [Consuming the library](docs/consuming.md) lists what to install.
+### Git terms and their names in the abstraction
+
+| Git | VersionControlService |
+|---|---|
+| `git clone` | `ProviderFactory.Clone` |
+| `git init` | `ProviderFactory.Initialize` |
+| `git remote add origin` | `ProviderFactory.Bind` |
+| `git status` | `Core.GetStatus` |
+| `git add` and `git commit` | `Core.CreateRevision` |
+| `git branch` | `Core.ListRefs` and `Core.CreateRef` |
+| `git checkout <branch>` | `Core.PreflightSwitchRef`, then `Core.SwitchRef` |
+| `git restore` | `Core.RestorePaths` |
+| `git diff --stat` | `Core.GetDiffSummary` |
+| `git fetch` | `Synchronization.Refresh` |
+| `git pull` | `Synchronization.Update` |
+| `git push` | `Synchronization.Publish` |
+| `git pull`, then `git push` | `Synchronization.Synchronize` |
+
+### lakeFS
+
+A lakeFS session answers the same calls. Only the factory and the location change. `LakeFsWorkspaceSession.createFactory` takes a `LakeFsProviderOptions` record and a credential strategy. `StateRoot` is a directory outside every workspace where the provider keeps its state, and `PathCaseSensitivity` matches the host's filesystem.
+
+```fsharp
+module LakeFs = VersionControlService.LakeFs.LakeFsWorkspaceSession
+module LakeFsCredentials = VersionControlService.LakeFs.LakeFsCredentials
+
+let lakeFsFactory =
+    LakeFs.createFactory
+        {
+            StateRoot = "/var/lib/my-app/lakefs-state"
+            PathCaseSensitivity = CaseSensitive
+        }
+        (LakeFsCredentials.fixedConnection {
+            Endpoint = "http://localhost:8000"
+            AccessKeyId = accessKeyId
+            SecretAccessKey = secretAccessKey
+        })
+```
+
+The host supplies `accessKeyId` and `secretAccessKey`. The location then uses `WellKnownProviderIds.LakeFs` and a `ProviderLocation` such as `lakefs://study-archive/main`.
 
 ## Compose providers
 
@@ -104,3 +251,27 @@ The ordinary suite skips live lakeFS tests. Run the pinned Docker matrix explici
 CI runs that row on Linux as `./build.sh test lakefs`.
 
 Run `.\build.cmd` without a target to list every target, including the focused test run and the package graph checks.
+
+## Pack a local feed
+
+Contributors who want to try unreleased changes in a host can pack the five coordinated packages into a local feed. Run this from the repository root:
+
+```console
+dotnet restore VersionControlService.slnx
+dotnet run --project build/Build.fsproj -- pack --version=0.0.1-local --output=<feed-dir>
+dotnet nuget add source <feed-dir> --name vcs-local
+dotnet add package VersionControlService --version 0.0.1-local
+```
+
+`pack` packs with `--no-restore`, so a fresh clone needs the restore first. It empties the output directory, so pick a directory outside the clone.
+
+## NuGet release
+
+Add the next version and its release notes to `CHANGELOG.md`, then run the release target:
+
+```console
+NUGET_KEY=<key> dotnet run --project build/Build.fsproj -- release nuget
+```
+
+The target packs into `nupkgs/` and verifies the package graph before it pushes to NuGet.
+Pass `--dry-run` to pack and verify without publishing.
