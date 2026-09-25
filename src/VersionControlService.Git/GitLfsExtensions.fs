@@ -215,6 +215,7 @@ let private wrapUnitWithPreflight
 
 let createObjectMaterialization
     (repoPath: string)
+    (runGit: string[] -> OperationContext -> Async<Result<NodeProcess.ProcessOutput, OperationFailure>>)
     (credentials: GitCredentialStrategy.GitCredentialStrategy)
     (connectionProfileId: string option)
     (preflight: OperationContext -> Async<Result<unit, OperationFailure>>)
@@ -315,12 +316,48 @@ let createObjectMaterialization
                         DisplayMessage = None
                     })
                 (fun () ->
-                    GitService.freeLocalLfsCopy
-                        repoPath
-                        (RepositoryPath.value path)
-                        credentials
-                        connectionProfileId
-                        context)
+                    promise {
+                        let! result =
+                            GitService.freeLocalLfsCopy
+                                repoPath
+                                (RepositoryPath.value path)
+                                credentials
+                                connectionProfileId
+                                context
+
+                        match result with
+                        | Ok true ->
+                            let detachedContext = { context with Cancellation = OperationCancellation.none }
+
+                            try
+                                let! pointerResult =
+                                    GitLfsObjects.readWorktreePointer repoPath (RepositoryPath.value path)
+                                    |> Async.StartAsPromise
+
+                                match pointerResult with
+                                | Ok(Some pointer) ->
+                                    let! mediaDirectoryResult =
+                                        GitLfsObjects.resolveLocalMediaDirectory
+                                            (fun arguments -> runGit arguments detachedContext)
+                                            repoPath
+                                        |> Async.StartAsPromise
+
+                                    match mediaDirectoryResult with
+                                    | Ok mediaDirectory ->
+                                        // The server check confirmed the remote can supply this object again, so the local cache copy can go.
+                                        let objectPath = GitLfsObjects.objectPath mediaDirectory pointer.Oid
+
+                                        if NodeFileSystem.existsSync objectPath then
+                                            NodeFileSystem.unlinkSync objectPath
+                                    | Error _ -> ()
+                                | Error _
+                                | Ok None -> ()
+                            with _ -> ()
+
+                            return Ok()
+                        | Ok false -> return Ok()
+                        | Error failure -> return Error failure
+                    })
 }
 
 let createStoragePolicy

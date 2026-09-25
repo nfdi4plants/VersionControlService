@@ -6366,6 +6366,7 @@ let createSessionWithCredentialsIdentityAndPolicy
                 Some(
                     GitLfsExtensions.createObjectMaterialization
                         state.RepoPath
+                        (fun arguments context -> runGit state.Hooks state.RepoPath arguments None context)
                         state.Credentials
                         state.ConnectionProfileId
                         (preflightIndexLock state)

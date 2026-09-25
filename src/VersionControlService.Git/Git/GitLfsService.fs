@@ -181,6 +181,40 @@ let private requireGitLfsForLiteralPolicy (repoPath: string) : JS.Promise<Result
             Error "Git LFS literal path tracking failed."
 }
 
+let tryGetLfsEndpoint (repoPath: string) : JS.Promise<string option> = promise {
+    let! result =
+        runGitCaptured {
+            WorkingDirectory = Some repoPath
+            Arguments = [| "lfs"; "env" |]
+            Environment = None
+            StandardInput = None
+            CancelCheck = None
+            TimeoutMs = Some DefaultTimeoutMs
+        }
+
+    if result.ExitCode <> 0 || result.TimedOut then
+        return None
+    else
+        return
+            result.StdoutText.Split '\n'
+            |> Array.tryPick (fun line ->
+                let trimmed = line.TrimEnd '\r'
+                let prefix = "Endpoint="
+
+                if trimmed.StartsWith(prefix, StringComparison.Ordinal) then
+                    let value = trimmed.Substring(prefix.Length)
+                    let separator = value.IndexOf(' ')
+                    Some(if separator < 0 then value else value.Substring(0, separator))
+                else
+                    None)
+}
+
+let usesBatchApi (endpoint: string option) : bool =
+    endpoint
+    |> Option.exists (fun value ->
+        value.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+        || value.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+
 let private literalAttributePattern (relativePath: string) =
     let globPattern = System.Text.StringBuilder("/")
 
@@ -959,14 +993,14 @@ let storagePruneArgs = [|
 
 let storageDedupArgs = [| "lfs"; "dedup" |]
 
-let buildFetchRefetchArgs (relativePath: string) = [|
-    "lfs"
-    "fetch"
-    "--refetch"
-    $"--include={relativePath}"
-    "origin"
-    "HEAD"
-|]
+let buildFetchRefetchArgs (dryRun: bool) (relativePath: string) =
+    let dryRunArguments = if dryRun then [| "--dry-run" |] else [||]
+
+    Array.concat [|
+        [| "lfs"; "fetch"; "--refetch" |]
+        dryRunArguments
+        [| $"--include={relativePath}"; "origin"; "HEAD" |]
+    |]
 
 let private buildSmudgePointerArgs (relativePath: string) = [|
     "-c"
@@ -1310,6 +1344,7 @@ let fetchRefetchForPath
     (repoPath: string)
     (commandAuth: GitCommandAuthentication)
     (relativePath: string)
+    (dryRun: bool)
     (cancelCheck: (unit -> bool) option)
     (onStarted: unit -> unit)
     : JS.Promise<Result<unit, exn>> =
@@ -1322,7 +1357,7 @@ let fetchRefetchForPath
                     Arguments =
                         GitCredentialStrategy.buildLfsTransferArguments
                             commandAuth.ConfigArgs
-                            (buildFetchRefetchArgs relativePath)
+                            (buildFetchRefetchArgs dryRun relativePath)
                     Environment = Some commandAuth.Environment
                     StandardInput = None
                     CancelCheck = cancelCheck

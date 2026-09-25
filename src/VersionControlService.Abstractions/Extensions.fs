@@ -28,6 +28,7 @@ type ObjectState = {
 type ObjectMaterializationService = {
     ListObjects: OperationContext -> Async<OperationResult<ObjectState[]>>
     Materialize: RepositoryPath -> OperationContext -> Async<OperationResult<unit>>
+    /// Dematerialize replaces a materialized file with the provider's reference and removes the provider-local object copy. A provider does this only after confirming that its remote can supply the object again.
     Dematerialize: RepositoryPath -> OperationContext -> Async<OperationResult<unit>>
 }
 

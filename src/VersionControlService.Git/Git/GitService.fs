@@ -566,6 +566,9 @@ let private removeTemporaryLfsBackup backupPath =
     if existsSync backupPath then
         unlinkSync backupPath
 
+let private canceledLfsResult<'T> () : GitResult<'T> =
+    Error(createFailure GitFailureKind.Canceled "Git LFS operation canceled.")
+
 let private isPathCleanInStatus (status: StatusResult) (relativePath: string) =
     valueOrEmptyArray status.files
     |> Array.exists (fun fileStatus ->
@@ -575,29 +578,55 @@ let private isPathCleanInStatus (status: StatusResult) (relativePath: string) =
     )
     |> not
 
-let private ensureBackupMatchesLfsOid (backupPath: string) (listing: GitLfsLsFileInfo) = promise {
-    let! pointerTextResult =
-        runGitCaptured {
-            WorkingDirectory = None
-            Arguments = [| "lfs"; "pointer"; "--file"; backupPath |]
-            Environment = None
-            StandardInput = None
-            CancelCheck = None
-            TimeoutMs = Some 30000
-        }
+let private ensureBackupMatchesLfsOid
+    (backupPath: string)
+    (listing: GitLfsLsFileInfo)
+    (context: OperationContext)
+    : JS.Promise<GitResult<unit>> =
+    promise {
+        let! pointerTextResult =
+            runGitCaptured {
+                WorkingDirectory = None
+                Arguments = [| "lfs"; "pointer"; "--file"; backupPath |]
+                Environment = None
+                StandardInput = None
+                CancelCheck = Some context.Cancellation.IsCancellationRequested
+                TimeoutMs = None
+            }
 
-    let generatedPointer =
-        $"{pointerTextResult.StdoutText}\n{pointerTextResult.StderrText}"
+        let generatedPointer =
+            $"{pointerTextResult.StdoutText}\n{pointerTextResult.StderrText}"
 
-    return
-        if
-            pointerTextResult.ExitCode = 0
-            && generatedPointer.Contains($"oid sha256:{listing.oid}")
-        then
-            Ok()
-        else
-            Error(exn "The temporary LFS backup did not match the expected object. The original file was restored.")
-}
+        let processDiagnostic =
+            [|
+                pointerTextResult.StderrText |> Option.ofObj |> Option.defaultValue String.Empty |> _.Trim()
+                pointerTextResult.StdoutText |> Option.ofObj |> Option.defaultValue String.Empty |> _.Trim()
+            |]
+            |> Array.filter (String.IsNullOrWhiteSpace >> not)
+            |> String.concat "\n"
+
+        return
+            if context.Cancellation.IsCancellationRequested() then
+                canceledLfsResult ()
+            elif pointerTextResult.ExitCode <> 0 || pointerTextResult.TimedOut then
+                let failureMessage =
+                    if String.IsNullOrWhiteSpace processDiagnostic then
+                        if pointerTextResult.TimedOut then
+                            "Git LFS pointer verification timed out."
+                        else
+                            $"Git LFS pointer verification failed with exit code {pointerTextResult.ExitCode}."
+                    else
+                        processDiagnostic
+
+                errorResult (exn $"Could not verify the temporary LFS backup: {failureMessage}")
+            elif
+                pointerTextResult.ExitCode = 0
+                && generatedPointer.Contains($"oid sha256:{listing.oid}")
+            then
+                Ok()
+            else
+                errorResult (exn "The temporary LFS backup did not match the expected object. The original file was restored.")
+    }
 
 let private isMergeInProgress (arcPath: string) =
     let mergeHeadPath = resolve [| arcPath; ".git"; "MERGE_HEAD" |]
@@ -1944,9 +1973,6 @@ let private discardPathspecsWithOriginals (arcPath: string) (status: StatusResul
 
     Array.append safePathSpecs originalPaths |> Array.distinct
 
-let private canceledLfsResult<'T> () : GitResult<'T> =
-    Error(createFailure GitFailureKind.Canceled "Git LFS operation canceled.")
-
 let private requireLfsListingForPath
     (arcPath: string)
     (safePath: string)
@@ -2131,7 +2157,7 @@ let freeLocalLfsCopy
     (credentials: GitCredentialStrategy.GitCredentialStrategy)
     (connectionProfileId: string option)
     (context: OperationContext)
-    : JS.Promise<GitResult<unit>> = promise {
+    : JS.Promise<GitResult<bool>> = promise {
     let! lfsFileResult =
         getCleanLfsFileForAction
             arcPath
@@ -2157,7 +2183,7 @@ let freeLocalLfsCopy
             DisplayMessage = Some "Git LFS file is already dematerialized"
         }
 
-        return Ok()
+        return Ok false
     | Ok(safePath, _, _), Ok false ->
         return errorResult (createMissingLfsAttributesFailure safePath "freeing the local LFS copy")
     | Ok(safePath, absolutePath, listing), Ok true ->
@@ -2175,11 +2201,16 @@ let freeLocalLfsCopy
             match! createOriginLfsRemoteSession arcPath credentials connectionProfileId None with
             | Error failure -> return Error failure
             | Ok session ->
+                let! endpoint = GitLfsService.tryGetLfsEndpoint arcPath
+
                 match!
                     GitLfsService.fetchRefetchForPath
                         arcPath
                         session.CommandAuth
                         safePath
+                        // For HTTP endpoints, the dry run asks the LFS server for this exact object without downloading it.
+                        // It proves nothing for local remotes, so those keep the full refetch.
+                        (GitLfsService.usesBatchApi endpoint)
                         (Some context.Cancellation.IsCancellationRequested)
                         (fun () ->
                             context.ReportProgress {
@@ -2191,7 +2222,11 @@ let freeLocalLfsCopy
                             })
                 with
                 | Error _ when context.Cancellation.IsCancellationRequested() -> return canceledLfsResult ()
-                | Error error -> return errorResult error
+                | Error error ->
+                    return
+                        errorResult (
+                            exn $"Could not confirm that the Git LFS server has '{safePath}': {error.Message}"
+                        )
                 | Ok() when context.Cancellation.IsCancellationRequested() -> return canceledLfsResult ()
                 | Ok() ->
                     let git = session.Git
@@ -2204,11 +2239,14 @@ let freeLocalLfsCopy
                             restoreTemporaryLfsBackup backupPath absolutePath
                             return canceledLfsResult ()
                         else
-                            match! ensureBackupMatchesLfsOid backupPath listing with
+                            match! ensureBackupMatchesLfsOid backupPath listing context with
                             | Error validationError ->
                                 restoreTemporaryLfsBackup backupPath absolutePath
 
-                                return errorResult validationError
+                                return Error validationError
+                            | Ok() when context.Cancellation.IsCancellationRequested() ->
+                                restoreTemporaryLfsBackup backupPath absolutePath
+                                return canceledLfsResult ()
                             | Ok() ->
                                 let pointerGit = applyLfsSkipSmudge git
 
@@ -2254,7 +2292,7 @@ let freeLocalLfsCopy
                                             DisplayMessage = Some "Git LFS file dematerialized"
                                         }
 
-                                        return Ok()
+                                        return Ok true
                     with ex ->
                         restoreTemporaryLfsBackup backupPath absolutePath
 
