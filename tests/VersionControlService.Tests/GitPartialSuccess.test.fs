@@ -1255,6 +1255,30 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "a canceled status read returns a canceled result",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, _, _, session = createPublishFixture GitWorkspaceSession.GitSessionHooks.none
+
+                try
+                    let source = OperationCancellation.Source()
+                    source.Cancel()
+                    let context = OperationContext.create "canceled-status" source.Cancellation ignore
+                    let! result = session.Core.GetStatus context |> Async.StartAsPromise
+
+                    match result with
+                    | Failed failure -> Vitest.expect(failure.Category).toEqual Canceled
+                    | Succeeded _
+                    | PartiallySucceeded _ -> failwith "A canceled status read must not succeed."
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
             "dematerialization preserves unpushed objects with special paths or fetch excludes",
             TestOptions(timeout = 120000),
             fun () -> promise {

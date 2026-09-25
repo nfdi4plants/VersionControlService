@@ -1344,13 +1344,21 @@ let private withCancellableLocalGit
         let abortSignal = NodeCancellation.toAbortSignal cancellation
         let options = createUntimedOptions arcPath None (Some abortSignal)
         let git = createGit options
-        let canceledResult: GitResult<'T> = Error(createFailure GitFailureKind.Canceled "Git LFS operation canceled.")
+        let canceledResult: GitResult<'T> = Error(createFailure GitFailureKind.Canceled "The Git command was canceled.")
         let mapCancellation result =
             match result with
             | Error _ when cancellation.IsCancellationRequested() -> canceledResult
             | _ -> result
 
-        let! repoCheckResult = ensureRepo git
+        // An abort during the repository probe rejects the promise, so it is caught here and mapped like
+        // any other failure.
+        let! repoCheckResult =
+            promise {
+                try
+                    return! ensureRepo git
+                with error ->
+                    return Error error
+            }
 
         match repoCheckResult with
         | Error repoError -> return mapCancellation (errorResult repoError)
