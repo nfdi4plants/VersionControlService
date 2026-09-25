@@ -6149,7 +6149,8 @@ let private createTextDiff (state: SessionState) : TextDiffService =
                     return OperationResult.canceled "The Git text diff was canceled."
                 else
                     let pathValue = RepositoryPath.value path
-                    let! gitDiffResult = awaitGit (GitService.getWordDiff state.RepoPath [| pathValue |])
+                    let! gitDiffResult =
+                        awaitGit (GitService.getWordDiff state.RepoPath [| pathValue |] context.Cancellation)
 
                     match context.Cancellation.IsCancellationRequested(), gitDiffResult with
                     | true, _ -> return OperationResult.canceled "The Git text diff was canceled."

@@ -174,6 +174,22 @@ let internal createOptions
             ``unsafe`` = unsafeOptions
         )
 
+let internal createUntimedOptions
+    (baseDir: string)
+    (progressCallback: GitProgressCallback option)
+    (abortSignal: obj option)
+    =
+    // Optional constructor arguments become plain keys of the options object. The generated
+    // property setters would write to a different key that simple-git never reads.
+    SimpleGitOptions(
+        baseDir = baseDir,
+        binary = U3.Case1 "git",
+        maxConcurrentProcesses = 1,
+        ``unsafe`` = unsafeOptions,
+        ?progress = (progressCallback |> Option.map (fun progress -> progressFromSimpleGit >> progress)),
+        ?abort = (abortSignal |> Option.map unbox<IAbortSignal>)
+    )
+
 /// Creates a simple-git instance with non-interactive prompt suppression applied.
 let internal createGit (options: SimpleGitOptions) : ISimpleGit =
     SimpleGit.create options |> applyNonInteractiveEnv

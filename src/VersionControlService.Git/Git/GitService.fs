@@ -18,6 +18,7 @@ open VersionControlService.Git.GitInternals
 
 module FileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodeProcess = VersionControlService.Runtime.Node.Process
+module NodeCancellation = VersionControlService.Runtime.Node.Cancellation
 module GitCredentialStrategy = VersionControlService.Git.GitCredentialStrategy
 
 type GitFailure = {
@@ -1292,6 +1293,46 @@ let private withLocalGitAndProgress
 let private withLocalGit (arcPath: string) (operation: ISimpleGit -> JS.Promise<'T>) : JS.Promise<GitResult<'T>> =
     withLocalGitAndProgress arcPath None operation
 
+let private withUntimedLocalGit
+    (arcPath: string)
+    (progressCallback: GitProgressCallback option)
+    (operation: ISimpleGit -> JS.Promise<'T>)
+    : JS.Promise<GitResult<'T>> =
+    promise {
+        let options = createUntimedOptions arcPath progressCallback None
+        let git = createGit options |> withGitOutputProgress progressCallback
+
+        let! repoCheckResult = ensureRepo git
+
+        match repoCheckResult with
+        | Error repoError -> return errorResult repoError
+        | Ok() -> return! runSimpleGit operation git
+    }
+
+let private withCancellableLocalGit
+    (arcPath: string)
+    (cancellation: OperationCancellation)
+    (operation: ISimpleGit -> JS.Promise<'T>)
+    : JS.Promise<GitResult<'T>> =
+    promise {
+        let abortSignal = NodeCancellation.toAbortSignal cancellation
+        let options = createUntimedOptions arcPath None (Some abortSignal)
+        let git = createGit options
+        let canceledResult: GitResult<'T> = Error(createFailure GitFailureKind.Canceled "Git LFS operation canceled.")
+        let mapCancellation result =
+            match result with
+            | Error _ when cancellation.IsCancellationRequested() -> canceledResult
+            | _ -> result
+
+        let! repoCheckResult = ensureRepo git
+
+        match repoCheckResult with
+        | Error repoError -> return mapCancellation (errorResult repoError)
+        | Ok() ->
+            let! operationResult = runSimpleGit operation git
+            return mapCancellation operationResult
+    }
+
 let private requireCleanWorkingTreeForLfsStorageAction (actionLabel: string) (git: ISimpleGit) = promise {
     let! status = git.status ()
 
@@ -1453,27 +1494,33 @@ let getDiff (arcPath: string) (pathSpecs: string[]) : JS.Promise<GitResult<strin
 }
 
 /// Returns porcelain word-diff text for validated pathspecs.
-let getWordDiff (arcPath: string) (pathSpecs: string[]) : JS.Promise<GitResult<string>> = promise {
-    match validateLiteralDiffPathspecs pathSpecs with
-    | Error validationError -> return errorResult validationError
-    | Ok literalPaths ->
-        return!
-            withLocalGit
-                arcPath
-                (fun git -> promise {
-                    let pathspecs = literalPaths |> Array.map GitPathTransport.literalPathspec
+let getWordDiff
+    (arcPath: string)
+    (pathSpecs: string[])
+    (cancellation: OperationCancellation)
+    : JS.Promise<GitResult<string>> =
+    promise {
+        match validateLiteralDiffPathspecs pathSpecs with
+        | Error validationError -> return errorResult validationError
+        | Ok literalPaths ->
+            return!
+                withCancellableLocalGit
+                    arcPath
+                    cancellation
+                    (fun git -> promise {
+                        let pathspecs = literalPaths |> Array.map GitPathTransport.literalPathspec
 
-                    let! result =
-                        runSimpleGitPathspecChunks
-                            [| "diff"; "--word-diff=porcelain"; "-U0" |]
-                            pathspecs
-                            git
+                        let! result =
+                            runSimpleGitPathspecChunks
+                                [| "diff"; "--word-diff=porcelain"; "-U0" |]
+                                pathspecs
+                                git
 
-                    match result with
-                    | Ok output -> return output
-                    | Error failure -> return abortGitPromise failure.Message
-                })
-}
+                        match result with
+                        | Ok output -> return output
+                        | Error failure -> return abortGitPromise failure.Message
+                    })
+    }
 
 /// Loads previous/current text plus word-diff metadata for diff views.
 /// Binary or explicitly unsupported files return the unsupported-content sentinel.
@@ -1732,7 +1779,7 @@ let pruneLfsCacheWithProgressAndCancellation
     : JS.Promise<GitResult<string>> =
     promise {
         let! localValidationResult =
-            withLocalGitAndProgress
+            withUntimedLocalGit
                 arcPath
                 progressCallback
                 (fun git -> promise {
@@ -1790,7 +1837,7 @@ let dedupLfsStorageWithProgressAndCancellation
     (cancelCheck: unit -> bool)
     (onStarted: unit -> unit)
     : JS.Promise<GitResult<string>> =
-    withLocalGitAndProgress
+    withUntimedLocalGit
         arcPath
         progressCallback
         (fun git -> promise {
@@ -1925,8 +1972,9 @@ let private getCleanLfsListingForPath
     if context.Cancellation.IsCancellationRequested() then
         promise { return canceledLfsResult () }
     else
-        withLocalGit
+        withCancellableLocalGit
             arcPath
+            context.Cancellation
             (fun git -> promise {
                 let! status = git.status ()
 
@@ -2001,7 +2049,6 @@ let private requireDownloadedLfsFile
     absolutePath
     (expectedListing: GitLfsLsFileInfo)
     (context: OperationContext)
-    (git: ISimpleGit)
     =
     promise {
         let! finalListing = requireLfsListingForPath arcPath safePath context
@@ -2018,7 +2065,8 @@ let private requireDownloadedLfsFile
             if actualSize <> expectedSize then
                 return! failLfsCheckout arcPath safePath
             else
-                let! finalStatus = git.status ()
+                let untimedStatusGit = createUntimedOptions arcPath None None |> createGit
+                let! finalStatus = untimedStatusGit.status ()
 
                 if context.Cancellation.IsCancellationRequested() then
                     return abortGitPromise "Git LFS operation canceled."
@@ -2071,14 +2119,13 @@ let private downloadMissingLfsFile
                 | Ok _ ->
                     return!
                         runSimpleGit
-                            (fun currentGit ->
+                            (fun _currentGit ->
                                 requireDownloadedLfsFile
                                     arcPath
                                     safePath
                                     absolutePath
                                     listing
-                                    context
-                                    currentGit)
+                                    context)
                             session.Git
 }
 
@@ -2183,7 +2230,9 @@ let freeLocalLfsCopy
                                     restoreTemporaryLfsBackup backupPath absolutePath
                                     return canceledLfsResult ()
                                 | Ok _ ->
-                                    let! finalStatusResult = runSimpleGit (fun currentGit -> currentGit.status ()) git
+                                    let untimedStatusGit = createUntimedOptions arcPath None None |> createGit
+                                    let! finalStatusResult =
+                                        runSimpleGit (fun currentGit -> currentGit.status ()) untimedStatusGit
 
                                     match finalStatusResult with
                                     | Error failure ->
@@ -2285,8 +2334,9 @@ let discardPaths (arcPath: string) (pathSpecs: string[]) : JS.Promise<GitResult<
     | Error validationError -> return errorResult validationError
     | Ok safePathSpecs ->
         return!
-            withLocalGit
+            withUntimedLocalGit
                 arcPath
+                None
                 (fun git -> promise {
                     let! status = git.status ()
                     let discardPathSpecs = discardPathspecsWithOriginals arcPath status safePathSpecs
