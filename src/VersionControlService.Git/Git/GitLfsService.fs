@@ -979,7 +979,52 @@ let private buildSmudgePointerArgs (relativePath: string) = [|
     relativePath
 |]
 
+let private extractSpawnFailureMessage (result: GitSpawnResult) =
+    let stderrText =
+        result.StderrText
+        |> Option.ofObj
+        |> Option.defaultValue String.Empty
+        |> _.Trim()
+
+    let stdoutText =
+        result.StdoutText
+        |> Option.ofObj
+        |> Option.defaultValue String.Empty
+        |> _.Trim()
+
+    if result.TimedOut then
+        if not (String.IsNullOrWhiteSpace stderrText) then
+            stderrText
+        else
+            "Git command timed out."
+    elif not (String.IsNullOrWhiteSpace stderrText) then
+        stderrText
+    elif not (String.IsNullOrWhiteSpace stdoutText) then
+        stdoutText
+    else
+        "Git command failed."
+
 let buildCheckoutArgs (relativePath: string) = [| "lfs"; "checkout"; "--"; relativePath |]
+
+// Checkout has no timeout or cancellation because git-lfs holds the index lock while it refreshes the index.
+// Stopping it midway leaves a stale lock and a checked-out file.
+let checkoutPath (repoPath: string) (relativePath: string) : JS.Promise<Result<unit, exn>> = promise {
+    let! result =
+        runGitCaptured {
+            WorkingDirectory = Some repoPath
+            Arguments = buildCheckoutArgs relativePath
+            Environment = None
+            StandardInput = None
+            CancelCheck = None
+            TimeoutMs = None
+        }
+
+    return
+        if result.ExitCode = 0 && not result.TimedOut then
+            Ok()
+        else
+            Error(exn (extractSpawnFailureMessage result))
+}
 
 let private resolvePushRefSpec
     (runStatus: ISimpleGit -> JS.Promise<Result<StatusResult, 'Failure>>)
@@ -1203,31 +1248,6 @@ let private tryReadBatchPointerOids (stdoutBuffer: obj) =
         None
     else
         Some(pointerOids.ToArray() |> Array.distinct)
-
-let private extractSpawnFailureMessage (result: GitSpawnResult) =
-    let stderrText =
-        result.StderrText
-        |> Option.ofObj
-        |> Option.defaultValue String.Empty
-        |> _.Trim()
-
-    let stdoutText =
-        result.StdoutText
-        |> Option.ofObj
-        |> Option.defaultValue String.Empty
-        |> _.Trim()
-
-    if result.TimedOut then
-        if not (String.IsNullOrWhiteSpace stderrText) then
-            stderrText
-        else
-            "Git command timed out."
-    elif not (String.IsNullOrWhiteSpace stderrText) then
-        stderrText
-    elif not (String.IsNullOrWhiteSpace stdoutText) then
-        stdoutText
-    else
-        "Git command failed."
 
 let private spawnFailure (result: GitSpawnResult) = exn (extractSpawnFailureMessage result)
 

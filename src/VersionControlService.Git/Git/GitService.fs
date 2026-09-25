@@ -1947,9 +1947,6 @@ let private discardPathspecsWithOriginals (arcPath: string) (status: StatusResul
 let private canceledLfsResult<'T> () : GitResult<'T> =
     Error(createFailure GitFailureKind.Canceled "Git LFS operation canceled.")
 
-let private runLfsRaw (args: string[]) git =
-    runSimpleGit (fun currentGit -> currentGit.raw args) git
-
 let private requireLfsListingForPath
     (arcPath: string)
     (safePath: string)
@@ -2111,12 +2108,11 @@ let private downloadMissingLfsFile
             | Error error -> return errorResult error
             | Ok() when context.Cancellation.IsCancellationRequested() -> return canceledLfsResult ()
             | Ok() ->
-                let! checkoutResult = runLfsRaw (GitLfsService.buildCheckoutArgs safePath) session.Git
+                let! checkoutResult = GitLfsService.checkoutPath arcPath safePath
 
                 match checkoutResult with
-                | Error failure -> return Error failure
-                | Ok _ when context.Cancellation.IsCancellationRequested() -> return canceledLfsResult ()
-                | Ok _ ->
+                | Error error -> return errorResult error
+                | Ok() ->
                     return!
                         runSimpleGit
                             (fun _currentGit ->
@@ -2125,7 +2121,7 @@ let private downloadMissingLfsFile
                                     safePath
                                     absolutePath
                                     listing
-                                    context)
+                                    { context with Cancellation = OperationCancellation.none })
                             session.Git
 }
 
