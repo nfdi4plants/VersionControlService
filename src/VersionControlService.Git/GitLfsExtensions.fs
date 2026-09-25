@@ -350,15 +350,25 @@ let createObjectMaterialization
                                         // Other clones can share a custom lfs.storage, so its objects stay. Prune refuses such storage too.
                                         | Ok output when not (String.IsNullOrWhiteSpace(output.StdOut.Trim())) -> ()
                                         | _ ->
+                                            // git-lfs needs the local object to push an unpushed commit that adds it.
+                                            // The search covers HEAD too, so a commit on a detached HEAD keeps the object.
                                             let! unpushedResult =
                                                 runGit
-                                                    [| "rev-list"; "--count"; "--branches"; "--not"; "--remotes=origin" |]
+                                                    [|
+                                                        "log"
+                                                        "HEAD"
+                                                        "--branches"
+                                                        "--not"
+                                                        "--remotes=origin"
+                                                        "--format=%H"
+                                                        "-1"
+                                                        ("-Soid sha256:" + pointer.Oid)
+                                                    |]
                                                     detachedContext
                                                 |> Async.StartAsPromise
 
                                             match unpushedResult with
-                                            | Ok output when output.ExitCode = 0 && output.StdOut.Trim() = "0" ->
-                                                // git-lfs needs the local object to push a commit that references it.
+                                            | Ok output when output.ExitCode = 0 && String.IsNullOrWhiteSpace output.StdOut ->
                                                 let objectPath = GitLfsObjects.objectPath mediaDirectory pointer.Oid
 
                                                 if NodeFileSystem.existsSync objectPath then

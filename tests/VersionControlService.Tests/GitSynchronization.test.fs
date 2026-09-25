@@ -63,6 +63,39 @@ let private bufferFromBytes (_bytes: int[]) : obj = jsNative
 [<Emit("$0.equals($1)")>]
 let private buffersEqual (_left: obj) (_right: obj) : bool = jsNative
 
+// Records every git spawn, including the ones simple-git makes outside GitSessionHooks.RunProcess.
+[<Emit("""
+(() => {
+    const childProcess = require('node:child_process');
+    const moduleApi = require('node:module');
+    const originalSpawn = childProcess.spawn;
+    childProcess.spawn = function(command, args, options) {
+        if (String(command).toLowerCase() === 'git') $0.push(Array.from(args || []));
+        return originalSpawn.call(childProcess, command, args, options);
+    };
+    moduleApi.syncBuiltinESMExports();
+    return () => {
+        childProcess.spawn = originalSpawn;
+        moduleApi.syncBuiltinESMExports();
+    };
+})()
+""")>]
+let private observeGitSpawnArguments (_observed: ResizeArray<string[]>) : unit -> unit = jsNative
+
+/// The git subcommand of a spawn, skipping global options such as `-c key=value`.
+let private gitSubcommand (arguments: string[]) =
+    let rec find index =
+        if index >= arguments.Length then
+            None
+        else
+            let argument = arguments[index]
+
+            if argument = "-c" || argument = "-C" then find (index + 2)
+            elif argument.StartsWith "-" then find (index + 1)
+            else Some argument
+
+    find 0
+
 let private sha256Hex (bytes: int[]) =
     let hash: obj = cryptoDynamic?createHash "sha256"
     hash?update (bufferFromBytes bytes) |> ignore
@@ -790,9 +823,23 @@ let private verifyPorcelainV2Status
     promise {
         statusCommands.Clear()
         capturedStatus.Value <- None
+        let spawnedCommands = ResizeArray<string[]>()
+        let stopObserving = observeGitSpawnArguments spawnedCommands
 
-        let! workspaceStatus = sessionStatus session
+        let! workspaceStatus =
+            promise {
+                try
+                    return! sessionStatus session
+                finally
+                    stopObserving ()
+            }
+
         Vitest.expect(statusCommands.Count).toBe 1
+
+        let spawnedStatusCommands =
+            spawnedCommands |> Seq.filter (fun arguments -> gitSubcommand arguments = Some "status") |> Seq.length
+
+        Vitest.expect(spawnedStatusCommands).toBe 1
 
         let statusStdOut =
             capturedStatus.Value
@@ -805,7 +852,7 @@ let private verifyPorcelainV2Status
             simpleGitResult
             |> Result.defaultWith (fun failure -> failwith $"simple-git status failed: {failure.Message}")
 
-        // simple-git reports a missing upstream as null; both null and undefined are None in F#.
+        // simple-git reports a missing upstream as null. Both null and undefined are None in F#.
         Vitest.expect(parsed).toEqual { simpleGitStatus with Tracking = simpleGitStatus.Tracking |> Option.bind Some }
 
         statusCommands.Clear()

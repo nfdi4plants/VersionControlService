@@ -18,10 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
--   `Dematerialize` in the Git provider also removes the object from the local Git LFS cache, so freeing a file frees its disk space. It first checks that the remote has that exact object, and it keeps the object when the repository uses a custom `lfs.storage` or has commits that are not pushed to `origin`. `Materialize` downloads it again.
+-   `Dematerialize` in the Git provider also removes the object from the local Git LFS cache, so freeing a file frees its disk space. It first checks that the remote has that exact object, and it keeps the object when the repository uses a custom `lfs.storage` or has unpushed commits that add the object. `Materialize` downloads it again.
 -   For an HTTP(S) Git LFS server, `Dematerialize` checks the object with a dry run and downloads nothing. A local remote still copies the object once, because only a real fetch checks it.
 -   `GetStatus` runs `git status` once. It used to run it a second time for the workspace version.
--   `Materialize` downloads a file's object with one `git lfs fetch` for that path and then checks the file out.
+-   `Materialize` downloads a file's object with one `git lfs fetch` for that path and then checks the file out. Files whose names differ from the requested one only at special characters can be downloaded along with it.
 
 ### Fixed
 
@@ -31,7 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -   `Materialize` runs `git lfs checkout` to completion. For a large file it used to hit a time limit and report a failure, while on Windows git-lfs kept running and held `.git/index.lock`.
 -   `Materialize`, `Dematerialize` and picking a large-object conflict candidate work for file names with brackets, commas or other glob characters. git-lfs read such a name as a pattern that matched no file.
 -   `Materialize` and `Dematerialize` report success when they finished, also when a cancel request arrived during their last step.
--   `Materialize` and `Dematerialize` pass the account credential to git-lfs, so they work on private repositories. The server used to answer 401.
+-   `Materialize`, `Dematerialize` and cleaning the Git LFS cache pass the account credential to git-lfs, so they work on private repositories. The server used to answer 401.
 
 ## 0.1.0 - 2026-09-24
 

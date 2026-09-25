@@ -1442,7 +1442,8 @@ let fetchRefetchForPath
                 Error(exn failureMessage)
     }
 
-/// Fetches the LFS object selected by the path pattern into the local cache.
+/// Fetches into the local cache the objects of HEAD whose paths match the path pattern.
+/// The pattern can also match a few files whose names differ from the requested one only at special characters.
 let downloadObjectFromListing
     (repoPath: string)
     (commandAuth: GitCommandAuthentication)

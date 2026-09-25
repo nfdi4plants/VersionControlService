@@ -813,6 +813,7 @@ let private computeWorkspaceVersionFromStatus
                 return Ok($"git:{headPart}:{statusPart}:{unmergedContentPart}:{mergePart}")
     }
 
+/// Runs the status command and derives the token as described on `computeWorkspaceVersionFromStatus`.
 let private computeWorkspaceVersion
     (state: SessionState)
     (context: OperationContext)

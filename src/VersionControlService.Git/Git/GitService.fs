@@ -2296,6 +2296,11 @@ let private downloadMissingLfsFile
                         })
             with
             | Error _ when context.Cancellation.IsCancellationRequested() -> return canceledLfsResult ()
+            | Error error when GitLfsService.isMissingOnRemote error.Message ->
+                return
+                    errorResult (
+                        exn $"The remote does not have the content of '{safePath}'. Upload it from the computer that saved it."
+                    )
             | Error error -> return errorResult error
             | Ok() when context.Cancellation.IsCancellationRequested() -> return canceledLfsResult ()
             | Ok() ->
