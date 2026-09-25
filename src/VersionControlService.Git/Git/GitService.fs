@@ -1226,7 +1226,8 @@ let private createAuthenticatedGitSession
                         try
                             let operationOptions = createOptions arcPath syncTimeout progressCallback
                             let commandAuth =
-                                GitCredentialStrategy.buildScopedHeaderAuthentication
+                                GitCredentialStrategy.buildScopedCommandAuthentication
+                                    remoteName
                                     allowedRemoteUrl
                                     (Some resolved)
 
@@ -2222,10 +2223,7 @@ let freeLocalLfsCopy
                 let confirmationFailure (error: exn) =
                     let message = error.Message
 
-                    if
-                        message.IndexOf("does not exist on the server", StringComparison.OrdinalIgnoreCase) >= 0
-                        || message.IndexOf("remote missing object", StringComparison.OrdinalIgnoreCase) >= 0
-                    then
+                    if GitLfsService.isMissingOnRemote message then
                         exn $"The remote does not have '{safePath}' yet. Push it before freeing its local copy."
                     else
                         exn $"Could not confirm that the remote has '{safePath}': {message}"

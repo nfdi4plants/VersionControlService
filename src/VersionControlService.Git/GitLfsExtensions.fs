@@ -350,10 +350,20 @@ let createObjectMaterialization
                                         // Other clones can share a custom lfs.storage, so its objects stay. Prune refuses such storage too.
                                         | Ok output when not (String.IsNullOrWhiteSpace(output.StdOut.Trim())) -> ()
                                         | _ ->
-                                            let objectPath = GitLfsObjects.objectPath mediaDirectory pointer.Oid
+                                            let! unpushedResult =
+                                                runGit
+                                                    [| "rev-list"; "--count"; "--branches"; "--not"; "--remotes=origin" |]
+                                                    detachedContext
+                                                |> Async.StartAsPromise
 
-                                            if NodeFileSystem.existsSync objectPath then
-                                                NodeFileSystem.unlinkSync objectPath
+                                            match unpushedResult with
+                                            | Ok output when output.ExitCode = 0 && output.StdOut.Trim() = "0" ->
+                                                // git-lfs needs the local object to push a commit that references it.
+                                                let objectPath = GitLfsObjects.objectPath mediaDirectory pointer.Oid
+
+                                                if NodeFileSystem.existsSync objectPath then
+                                                    NodeFileSystem.unlinkSync objectPath
+                                            | _ -> ()
                                     | Error _ -> ()
                                 | Error _
                                 | Ok None -> ()

@@ -111,6 +111,12 @@ let extractFailureMessage (result: GitLfsResult) =
     else
         "Git LFS command failed."
 
+let isMissingOnRemote (output: string) =
+    not (String.IsNullOrWhiteSpace output)
+    && (output.IndexOf("does not exist on the server", StringComparison.OrdinalIgnoreCase) >= 0
+        || output.IndexOf("remote missing object", StringComparison.OrdinalIgnoreCase) >= 0
+        || Regex.IsMatch(output, @"\[[0-9a-f]{64}\][^\r\n]*\[404\]"))
+
 let private redactDiagnosticText (text: string) =
     if String.IsNullOrWhiteSpace text then
         text

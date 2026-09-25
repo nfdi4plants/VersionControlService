@@ -86,6 +86,24 @@ let private testHost = "git.local.test"
 let private testHttpsUrl = $"https://{testHost}/origin.git"
 let private testSecret = "secret-token-123"
 
+[<Emit("""
+(() => {
+    const childProcess = require('node:child_process');
+    const moduleApi = require('node:module');
+    const originalSpawn = childProcess.spawn;
+    childProcess.spawn = function(command, args, options) {
+        if (String(command).toLowerCase() === 'git') $0.push(Array.from(args || []));
+        return originalSpawn.call(childProcess, command, args, options);
+    };
+    moduleApi.syncBuiltinESMExports();
+    return () => {
+        childProcess.spawn = originalSpawn;
+        moduleApi.syncBuiltinESMExports();
+    };
+})()
+""")>]
+let private observeGitSpawnArguments (_observed: ResizeArray<string[]>) : unit -> unit = jsNative
+
 Vitest.describe (
     "Git LFS transfer authentication",
     fun () ->
@@ -178,6 +196,130 @@ Vitest.describe (
                     "--"
                     "materialized.bin"
                 |]
+        )
+
+        Vitest.test (
+            "materialize and dematerialize transfer commands use the credential LFS URL without extraHeader",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGitIn "." [| "lfs"; "version" |]
+
+                if String.IsNullOrWhiteSpace lfsProbe then
+                    failwith "Expected Git LFS to be available."
+                else
+                    let! root = createTempDirectoryAsync ()
+                    let workPath = join [| root; "work" |]
+                    let remoteUrl = "https://127.0.0.1:1/origin.git"
+                    let relativePath = "materialized.bin"
+                    let observedCommands = ResizeArray<string[]>()
+                    let mutable stopObserving: unit -> unit = ignore
+
+                    try
+                        let! _ = runGitIn root [| "init"; "-b"; "main"; workPath |]
+                        let! _ = runGitIn workPath [| "config"; "user.name"; "VCS Cred Tests" |]
+                        let! _ = runGitIn workPath [| "config"; "user.email"; "cred@example.org" |]
+                        let! _ = runGitIn workPath [| "config"; "core.autocrlf"; "false" |]
+                        let! _ = runGitIn workPath [| "lfs"; "install"; "--local" |]
+                        let! _ = runGitIn workPath [| "lfs"; "track"; relativePath |]
+                        do! writeUtf8FileAsync (join [| workPath; relativePath |]) "cached LFS content\n"
+                        let! _ = runGitIn workPath [| "add"; "-A" |]
+                        let! _ = runGitIn workPath [| "commit"; "-m"; "test: cached materialization" |]
+                        let! _ = runGitIn workPath [| "remote"; "add"; "origin"; remoteUrl |]
+                        let! pointer = runGitIn workPath [| "show"; $"HEAD:{relativePath}" |]
+                        do! writeUtf8FileAsync (join [| workPath; relativePath |]) pointer
+                        // A pointer written by hand counts as modified while its object is cached. A checkout
+                        // without the smudge filter leaves the same pointer with a matching index entry.
+                        let! _ =
+                            runGitIn workPath [|
+                                "-c"
+                                "filter.lfs.smudge="
+                                "-c"
+                                "filter.lfs.process="
+                                "-c"
+                                "filter.lfs.required=false"
+                                "checkout"
+                                "HEAD"
+                                "--"
+                                relativePath
+                            |]
+
+                        let strategy: GitCredentialStrategy.GitCredentialStrategy = {
+                            ResolveCredential =
+                                fun _host _profileId ->
+                                    async {
+                                        return
+                                            Some {
+                                                Username = "oauth2"
+                                                Secret = testSecret
+                                            }
+                                    }
+                        }
+
+                        let binding: WorkspaceBinding = {
+                            SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
+                            ProviderId = gitProviderId
+                            WorkspaceRoot = workPath
+                            ProviderStateRef = None
+                            Location = {
+                                ProviderId = gitProviderId
+                                DisplayName = None
+                                ProviderLocation = remoteUrl
+                                ConnectionProfileId = Some "token-profile"
+                            }
+                            ConnectionProfileId = Some "token-profile"
+                        }
+
+                        let session =
+                            GitWorkspaceSession.createSessionWithCredentials
+                                GitWorkspaceSession.GitSessionHooks.none
+                                strategy
+                                binding
+
+                        let materialization =
+                            session.ObjectMaterialization
+                            |> Option.defaultWith (fun () -> failwith "Expected Git object materialization.")
+
+                        stopObserving <- observeGitSpawnArguments observedCommands
+
+                        let! materializeResult =
+                            materialization.Materialize
+                                (RepositoryPath.tryCreate relativePath |> Result.defaultWith failwith)
+                                (ctx "credential-materialize-transfer")
+                            |> Async.StartAsPromise
+
+                        expectValue "credential materialization" materializeResult |> ignore
+
+                        let! _ =
+                            materialization.Dematerialize
+                                (RepositoryPath.tryCreate relativePath |> Result.defaultWith failwith)
+                                (ctx "credential-dematerialize-transfer")
+                            |> Async.StartAsPromise
+
+                        stopObserving ()
+                        stopObserving <- ignore
+
+                        let expectedLfsUrl =
+                            $"lfs.url=https://oauth2:{testSecret}@127.0.0.1:1/origin.git/info/lfs"
+
+                        let findTransfer verb =
+                            observedCommands
+                            |> Seq.tryFind (fun arguments ->
+                                arguments |> Array.contains "lfs"
+                                && arguments |> Array.contains verb)
+                            |> Option.defaultWith (fun () -> failwith $"Expected a git-lfs {verb} transfer command.")
+
+                        for arguments in [| findTransfer "smudge"; findTransfer "fetch" |] do
+                            Vitest.expect(arguments |> Array.contains expectedLfsUrl).toBe true
+                            Vitest
+                                .expect(arguments |> Array.exists (fun argument -> argument.Contains "extraHeader"))
+                                .toBe false
+
+                        do! removeDirectoryAsync root
+                    with error ->
+                        stopObserving ()
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
         )
 )
 

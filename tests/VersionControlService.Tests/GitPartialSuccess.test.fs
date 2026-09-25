@@ -1051,6 +1051,33 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "identifies missing remote LFS objects without matching batch-level failures",
+            fun () ->
+                Vitest
+                    .expect(
+                        GitLfsService.isMissingOnRemote
+                            "[0df793b089013a17591d42168a475f445bc1994d20f1105a85fe72c8b42a1aac] Not Found: [404] Not Found"
+                    )
+                    .toBe true
+
+                Vitest
+                    .expect(
+                        GitLfsService.isMissingOnRemote
+                            "Object does not exist on the server or you don't have permissions to access it"
+                    )
+                    .toBe true
+
+                Vitest.expect(GitLfsService.isMissingOnRemote "remote missing object").toBe true
+
+                Vitest
+                    .expect(
+                        GitLfsService.isMissingOnRemote
+                            "batch response: Repository or object not found: https://example.org/info/lfs/objects/batch"
+                    )
+                    .toBe false
+        )
+
+        Vitest.test (
             "Git LFS endpoint parsing prefers origin and trims auth annotations",
             fun () -> promise {
                 Vitest.expect(
@@ -1247,6 +1274,65 @@ Vitest.describe (
 
                         let! localObjectExistsAfter = pathExistsAsync localObjectPath
                         Vitest.expect(localObjectExistsAfter).toBe true
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "dematerialization keeps an unpushed duplicate's local LFS object for push",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let! root, workPath, _, session =
+                        createPublishFixture GitWorkspaceSession.GitSessionHooks.none
+
+                    try
+                        let content = "shared LFS content\n"
+                        let! _ = runGitOk workPath [| "lfs"; "track"; "*.bin" |]
+                        do! writeUtf8FileAsync (join [| workPath; "a.bin" |]) content
+                        let! _ = runGitOk workPath [| "add"; "-A" |]
+                        let! _ = runGitOk workPath [| "commit"; "-m"; "test: publish a.bin" |]
+                        let! _ = runGitOk workPath [| "push"; "origin"; "main" |]
+
+                        do! writeUtf8FileAsync (join [| workPath; "b.bin" |]) content
+                        let! _ = runGitOk workPath [| "add"; "-A" |]
+                        let! _ = runGitOk workPath [| "commit"; "-m"; "test: unpushed b.bin copy" |]
+
+                        let! localObjectPath = lfsObjectPathForHeadFile workPath "b.bin"
+                        let! localObjectExistsBefore = pathExistsAsync localObjectPath
+                        Vitest.expect(localObjectExistsBefore).toBe true
+
+                        let materialization =
+                            session.ObjectMaterialization
+                            |> Option.defaultWith (fun () -> failwith "Expected Git object materialization.")
+
+                        let! dematerializeResult =
+                            materialization.Dematerialize (repositoryPath "b.bin") (ctx "unpushed-duplicate-dematerialize")
+                            |> Async.StartAsPromise
+
+                        match dematerializeResult with
+                        | Succeeded _ -> ()
+                        | PartiallySucceeded(_, failure)
+                        | Failed failure ->
+                            failwith $"Dematerialization failed before the push ({failure.Code}): {failure.Message}"
+
+                        let! pointerContent = tryReadUtf8FileAsync (join [| workPath; "b.bin" |])
+
+                        match pointerContent with
+                        | Some pointer -> Vitest.expect(pointer.Contains "oid sha256:").toBe true
+                        | None -> failwith "Dematerialization removed b.bin from the worktree."
+
+                        let! localObjectExistsAfter = pathExistsAsync localObjectPath
+                        Vitest.expect(localObjectExistsAfter).toBe true
+
+                        let! _ = runGitOk workPath [| "push"; "origin"; "main" |]
                         do! removeDirectoryAsync root
                     with error ->
                         do! removeDirectoryAsync root
