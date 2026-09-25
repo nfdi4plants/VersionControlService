@@ -652,6 +652,166 @@ let private toStatusDto (arcPath: string) (status: StatusResult) : GitStatusDto 
         Files = fileStatuses
     }
 
+let private splitPorcelainV2BranchHeaders (statusStdOut: string) =
+    let branchValues = Collections.Generic.Dictionary<string, string>()
+    let mutable offset = 0
+    let mutable readingBranchHeaders = true
+
+    while readingBranchHeaders && offset < statusStdOut.Length do
+        let lineEnd = statusStdOut.IndexOfAny([| '\000'; '\n' |], offset)
+
+        if lineEnd < 0 then
+            readingBranchHeaders <- false
+        else
+            let header = statusStdOut.Substring(offset, lineEnd - offset).TrimEnd('\r')
+
+            if header.StartsWith("# branch.", StringComparison.Ordinal) then
+                let separator = header.IndexOf(' ', 2)
+
+                if separator > 2 then
+                    branchValues[header.Substring(2, separator - 2)] <- header.Substring(separator + 1)
+
+                offset <- lineEnd + 1
+            else
+                readingBranchHeaders <- false
+
+    branchValues, statusStdOut.Substring(offset)
+
+let stripPorcelainV2BranchHeaders (statusStdOut: string) =
+    splitPorcelainV2BranchHeaders statusStdOut |> snd
+
+let parsePorcelainV2StatusDto (arcPath: string) (statusStdOut: string) : GitStatusDto =
+    let branchValues, statusBody = splitPorcelainV2BranchHeaders statusStdOut
+
+    let current =
+        match branchValues.TryGetValue "branch.head" with
+        | true, "(detached)" -> Some "HEAD"
+        | true, branch -> Some branch
+        | false, _ -> None
+
+    let tracking =
+        branchValues.TryGetValue "branch.upstream"
+        |> function
+            | true, upstream when not (String.IsNullOrWhiteSpace upstream) -> Some upstream
+            | _ -> None
+
+    let ahead, behind =
+        match tracking, branchValues.TryGetValue "branch.ab" with
+        | Some _, (true, counts) ->
+            let values = counts.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+
+            let parseCount prefix =
+                values
+                |> Array.tryFind (fun value -> value.StartsWith(prefix, StringComparison.Ordinal))
+                |> Option.bind (fun value ->
+                    match Int32.TryParse(value.Substring(prefix.Length)) with
+                    | true, count -> Some count
+                    | false, _ -> None)
+                |> Option.defaultValue 0
+
+            parseCount "+", parseCount "-"
+        | _ -> 0, 0
+
+    let statusRecords = statusBody.Split('\000')
+    let files = ResizeArray<GitFileStatusDto>()
+    let conflicted = ResizeArray<string>()
+
+    let splitFieldsBeforePath fieldCount (record: string) =
+        let fields = ResizeArray<string>()
+        let mutable fieldStart = 0
+        let mutable index = 0
+
+        while fields.Count < fieldCount && index < record.Length do
+            if record[index] = ' ' then
+                fields.Add(record.Substring(fieldStart, index - fieldStart))
+                fieldStart <- index + 1
+
+            index <- index + 1
+
+        if fields.Count = fieldCount then
+            fields.Add(record.Substring(fieldStart))
+
+        fields.ToArray()
+
+    let statusCode value = if value = '.' then " " else string value
+
+    let mutable recordIndex = 0
+
+    while recordIndex < statusRecords.Length do
+        // With -z, paths are verbatim, so a record is never trimmed (names can start or end with spaces).
+        let record = statusRecords[recordIndex]
+
+        if record.StartsWith("1 ", StringComparison.Ordinal) then
+            let fields = splitFieldsBeforePath 8 record
+
+            if fields.Length = 9 then
+                files.Add {
+                    Path = fields[8]
+                    Index = statusCode (fields[1][0])
+                    WorkingDir = statusCode (fields[1][1])
+                    OriginalPath = None
+                }
+        elif record.StartsWith("2 ", StringComparison.Ordinal) then
+            let fields = splitFieldsBeforePath 9 record
+
+            if fields.Length = 10 then
+                let originalPath =
+                    if recordIndex + 1 < statusRecords.Length then
+                        let sourcePath = statusRecords[recordIndex + 1]
+
+                        // simple-git exposes the source path for rename codes only.
+                        if fields[1][0] = 'R' || fields[1][1] = 'R' then
+                            Some sourcePath
+                        else
+                            None
+                    else
+                        None
+
+                files.Add {
+                    Path = fields[9]
+                    Index = statusCode (fields[1][0])
+                    WorkingDir = statusCode (fields[1][1])
+                    OriginalPath = originalPath
+                }
+
+                recordIndex <- recordIndex + 1
+        elif record.StartsWith("u ", StringComparison.Ordinal) then
+            let fields = splitFieldsBeforePath 10 record
+
+            if fields.Length = 11 then
+                let path = fields[10]
+                conflicted.Add path
+                files.Add {
+                    Path = path
+                    Index = statusCode (fields[1][0])
+                    WorkingDir = statusCode (fields[1][1])
+                    OriginalPath = None
+                }
+        elif record.StartsWith("? ", StringComparison.Ordinal) then
+            files.Add {
+                Path = record.Substring(2)
+                Index = "?"
+                WorkingDir = "?"
+                OriginalPath = None
+            }
+        elif record.StartsWith("! ", StringComparison.Ordinal) then
+            ()
+
+        recordIndex <- recordIndex + 1
+
+    let conflictedPaths = conflicted.ToArray()
+
+    {
+        Current = current
+        Tracking = tracking
+        Ahead = ahead
+        Behind = behind
+        IsClean = files.Count = 0
+        Conflicted = conflictedPaths
+        IsMergeInProgress = conflictedPaths.Length > 0 || isMergeInProgress arcPath
+        Files = files.ToArray()
+    }
+
 let private ensureCurrentlyConflictedPath (status: GitStatusDto) (requestedPath: string) =
     if
         status.Conflicted
@@ -2125,7 +2285,6 @@ let private downloadMissingLfsFile
                     arcPath
                     session.CommandAuth
                     safePath
-                    listing
                     (Some context.Cancellation.IsCancellationRequested)
                     (fun () ->
                         context.ReportProgress {
@@ -2140,21 +2299,33 @@ let private downloadMissingLfsFile
             | Error error -> return errorResult error
             | Ok() when context.Cancellation.IsCancellationRequested() -> return canceledLfsResult ()
             | Ok() ->
-                let! checkoutResult = GitLfsService.checkoutPath arcPath safePath
+                // The listing reader signals failure by throwing, so it runs inside runSimpleGit,
+                // which turns that into a GitResult.
+                let! fetchedListingResult =
+                    runSimpleGit (fun _currentGit -> requireLfsListingForPath arcPath safePath context) session.Git
 
-                match checkoutResult with
-                | Error error -> return errorResult error
-                | Ok() ->
-                    return!
-                        runSimpleGit
-                            (fun _currentGit ->
-                                requireDownloadedLfsFile
-                                    arcPath
-                                    safePath
-                                    absolutePath
-                                    listing
-                                    { context with Cancellation = OperationCancellation.none })
-                            session.Git
+                match fetchedListingResult with
+                | Error _ when context.Cancellation.IsCancellationRequested() -> return canceledLfsResult ()
+                | Error failure -> return Error failure
+                | Ok _ when context.Cancellation.IsCancellationRequested() -> return canceledLfsResult ()
+                | Ok fetchedListing when not fetchedListing.downloaded ->
+                    return errorResult (exn $"Git LFS did not download '{safePath}'.")
+                | Ok _ ->
+                    let! checkoutResult = GitLfsService.checkoutPath arcPath safePath
+
+                    match checkoutResult with
+                    | Error error -> return errorResult error
+                    | Ok() ->
+                        return!
+                            runSimpleGit
+                                (fun _currentGit ->
+                                    requireDownloadedLfsFile
+                                        arcPath
+                                        safePath
+                                        absolutePath
+                                        listing
+                                        { context with Cancellation = OperationCancellation.none })
+                                session.Git
 }
 
 let freeLocalLfsCopy

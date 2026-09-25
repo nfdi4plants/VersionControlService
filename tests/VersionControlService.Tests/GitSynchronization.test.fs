@@ -8,6 +8,7 @@ open VersionControlService.Tests.NodePath
 open Vitest
 
 module GitWorkspaceSession = VersionControlService.Git.GitWorkspaceSession
+module GitService = VersionControlService.Git.GitService
 module GitCredentialStrategy = VersionControlService.Git.GitCredentialStrategy
 module NodeProcess = VersionControlService.Runtime.Node.Process
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
@@ -775,6 +776,178 @@ Vitest.describe (
                 with error ->
                     do! removeDirectoryAsync root
                     return raise error
+            }
+        )
+)
+
+let private verifyPorcelainV2Status
+    (session: WorkspaceSession)
+    (repoPath: string)
+    (statusCommands: ResizeArray<string[]>)
+    (capturedStatus: string option ref)
+    (name: string)
+    =
+    promise {
+        statusCommands.Clear()
+        capturedStatus.Value <- None
+
+        let! workspaceStatus = sessionStatus session
+        Vitest.expect(statusCommands.Count).toBe 1
+
+        let statusStdOut =
+            capturedStatus.Value
+            |> Option.defaultWith (fun () -> failwith "GetStatus did not capture porcelain v2 output.")
+
+        let parsed = GitService.parsePorcelainV2StatusDto repoPath statusStdOut
+        let! simpleGitResult = GitService.getStatus repoPath OperationCancellation.none
+
+        let simpleGitStatus =
+            simpleGitResult
+            |> Result.defaultWith (fun failure -> failwith $"simple-git status failed: {failure.Message}")
+
+        // simple-git reports a missing upstream as null; both null and undefined are None in F#.
+        Vitest.expect(parsed).toEqual { simpleGitStatus with Tracking = simpleGitStatus.Tracking |> Option.bind Some }
+
+        statusCommands.Clear()
+
+        let! invalidRefResult =
+            session.Core.CreateRef
+                {
+                    Name = "invalid..branch"
+                    BaseRef = None
+                    SwitchTo = false
+                    ExpectedWorkspaceVersion = workspaceStatus.WorkspaceVersion
+                }
+                (ctx $"{name}-version-check")
+            |> Async.StartAsPromise
+
+        let versionCheckFailure = expectProviderFailure "workspace version comparison" invalidRefResult
+        Vitest.expect(versionCheckFailure.Code).toBe "invalid_ref_name"
+
+        return parsed
+    }
+
+Vitest.describe (
+    "Git porcelain v2 status",
+    fun () ->
+        Vitest.test (
+            "matches simple-git status and uses one status read for each workspace version",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let statusCommands = ResizeArray<string[]>()
+                let capturedStatus = ref None
+
+                let hooks = {
+                    GitWorkspaceSession.GitSessionHooks.none with
+                        RunProcess =
+                            Some(fun request processContext ->
+                                async {
+                                    let! result = NodeProcess.run request processContext
+
+                                    if request.Arguments.Length > 0 && request.Arguments[0] = "status" then
+                                        statusCommands.Add request.Arguments
+
+                                        if request.Arguments |> Array.contains "--branch" then
+                                            match result with
+                                            | Succeeded outcome -> capturedStatus.Value <- Some outcome.Value.StdOut
+                                            | PartiallySucceeded _
+                                            | Failed _ -> capturedStatus.Value <- None
+
+                                    return result
+                                })
+                }
+
+                let! root, workPath, barePath, session = createSyncFixture hooks
+
+                try
+                    let! clean = verifyPorcelainV2Status session workPath statusCommands capturedStatus "clean"
+                    Vitest.expect(clean.IsClean).toBe true
+
+                    do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) "modified content\n"
+                    let! modified = verifyPorcelainV2Status session workPath statusCommands capturedStatus "modified"
+                    Vitest.expect(modified.Files[0].WorkingDir).toBe "M"
+
+                    let! _ = runGitIn workPath [| "add"; "base.txt" |]
+                    let! staged = verifyPorcelainV2Status session workPath statusCommands capturedStatus "staged"
+                    Vitest.expect(staged.Files[0].Index).toBe "M"
+                    Vitest.expect(staged.Files[0].WorkingDir).toBe " "
+
+                    do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) "staged and modified content\n"
+                    let! stagedAndModified =
+                        verifyPorcelainV2Status session workPath statusCommands capturedStatus "staged-and-modified"
+
+                    Vitest.expect(stagedAndModified.Files[0].Index).toBe "M"
+                    Vitest.expect(stagedAndModified.Files[0].WorkingDir).toBe "M"
+
+                    let! _ = runGitIn workPath [| "reset"; "--hard"; "HEAD" |]
+                    let! _ = runGitIn workPath [| "mv"; "base.txt"; "renamed.txt" |]
+                    let! renamed = verifyPorcelainV2Status session workPath statusCommands capturedStatus "renamed"
+                    Vitest.expect(renamed.Files[0].Path).toBe "renamed.txt"
+                    Vitest.expect(renamed.Files[0].OriginalPath).toEqual (Some "base.txt")
+
+                    let! _ = runGitIn workPath [| "reset"; "--hard"; "HEAD" |]
+                    let! _ = runGitIn workPath [| "rm"; "base.txt" |]
+                    let! deleted = verifyPorcelainV2Status session workPath statusCommands capturedStatus "deleted"
+                    Vitest.expect(deleted.Files[0].Index).toBe "D"
+
+                    let! _ = runGitIn workPath [| "reset"; "--hard"; "HEAD" |]
+                    do! writeUtf8FileAsync (join [| workPath; "untracked.txt" |]) "untracked\n"
+                    let! untracked = verifyPorcelainV2Status session workPath statusCommands capturedStatus "untracked"
+                    Vitest.expect(untracked.Files[0].Index).toBe "?"
+                    Vitest.expect(untracked.Files[0].WorkingDir).toBe "?"
+
+                    let! _ = runGitIn workPath [| "reset"; "--hard"; "HEAD" |]
+                    let! _ = runGitIn workPath [| "clean"; "-fd" |]
+                    let! _ = runGitIn workPath [| "checkout"; "-b"; "conflict-side" |]
+                    do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) "side change\n"
+                    let! _ = runGitIn workPath [| "add"; "base.txt" |]
+                    let! _ = runGitIn workPath [| "commit"; "-m"; "side change" |]
+                    let! _ = runGitIn workPath [| "checkout"; "main" |]
+                    do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) "main change\n"
+                    let! _ = runGitIn workPath [| "add"; "base.txt" |]
+                    let! _ = runGitIn workPath [| "commit"; "-m"; "main change" |]
+                    let! merge = runGitResultIn workPath [| "merge"; "conflict-side" |]
+
+                    if merge.ExitCode = 0 then
+                        failwith "Expected the merge fixture to stop with a conflict."
+
+                    let! conflicted = verifyPorcelainV2Status session workPath statusCommands capturedStatus "conflicted"
+                    Vitest.expect(conflicted.Conflicted).toEqual [| "base.txt" |]
+                    Vitest.expect(conflicted.IsMergeInProgress).toBe true
+
+                    let! _ = runGitIn workPath [| "merge"; "--abort" |]
+                    let! _ = runGitIn workPath [| "checkout"; "--detach"; "HEAD" |]
+                    let! detached = verifyPorcelainV2Status session workPath statusCommands capturedStatus "detached"
+                    Vitest.expect(detached.Current).toEqual (Some "HEAD")
+
+                    let! _ = runGitIn workPath [| "checkout"; "-b"; "no-upstream" |]
+                    let! noUpstream =
+                        verifyPorcelainV2Status session workPath statusCommands capturedStatus "no-upstream"
+
+                    Vitest.expect(noUpstream.Tracking).toEqual None
+                    Vitest.expect(noUpstream.Ahead).toBe 0
+                    Vitest.expect(noUpstream.Behind).toBe 0
+
+                    let! _ = runGitIn workPath [| "checkout"; "main" |]
+                    do! advanceTarget root barePath [ "remote.txt", "remote advance\n" ]
+                    let! _ = runGitIn workPath [| "fetch"; "origin" |]
+                    let! diverged = verifyPorcelainV2Status session workPath statusCommands capturedStatus "ahead-behind"
+                    Vitest.expect(diverged.Ahead).toBe 1
+                    Vitest.expect(diverged.Behind).toBe 1
+
+                    let unbornPath = join [| root; "unborn" |]
+                    let! _ = runGitIn root [| "init"; "-b"; "unborn"; unbornPath |]
+                    let unbornSession = GitWorkspaceSession.createSession hooks (syncBinding unbornPath unbornPath)
+                    let! unborn =
+                        verifyPorcelainV2Status unbornSession unbornPath statusCommands capturedStatus "unborn"
+
+                    Vitest.expect(unborn.Current).toEqual (Some "unborn")
+                    Vitest.expect(unborn.IsClean).toBe true
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+
+                do! removeDirectoryAsync root
             }
         )
 )

@@ -747,15 +747,7 @@ let private computeUnmergedContentPart (state: SessionState) (context: Operation
             return! collect 0 []
     }
 
-/// Stable opaque workspace-version token derived from HEAD, an identity over
-/// index/worktree state, and the active merge/conflict state. Pure reads over an
-/// unchanged workspace return the same token; the token guards in-process,
-/// per-session races only — external processes can invalidate it at any time,
-/// which is why mutations revalidate it under the session lock.
-let private computeWorkspaceVersion
-    (state: SessionState)
-    (context: OperationContext)
-    : Async<Result<string, OperationFailure>> =
+let private readWorkspaceHeadPart (state: SessionState) (context: OperationContext) =
     async {
         let! headOutput =
             runGit state.Hooks state.RepoPath [| "rev-parse"; "--verify"; "--quiet"; "HEAD" |] None context
@@ -763,8 +755,74 @@ let private computeWorkspaceVersion
         match headOutput with
         | Error failure -> return Error failure
         | Ok headResult ->
-            let headPart =
-                if headResult.ExitCode = 0 then headResult.StdOut.Trim() else "unborn"
+            return Ok(if headResult.ExitCode = 0 then headResult.StdOut.Trim() else "unborn")
+    }
+
+let private workspaceStatusReadFailure stderr =
+    OperationFailure.createRedacted
+        ProviderError
+        "git_failure"
+        $"Reading workspace status evidence failed: {stderr}"
+
+/// Stable opaque workspace-version token derived from HEAD, an identity over
+/// index/worktree state, and the active merge/conflict state. Pure reads over an
+/// unchanged workspace return the same token. The token guards in-process,
+/// per-session races only. External processes can invalidate it at any time,
+/// which is why mutations revalidate it under the session lock.
+let private computeWorkspaceVersionFromStatus
+    (state: SessionState)
+    (headPart: string)
+    (statusStdOut: string)
+    (context: OperationContext)
+    : Async<Result<string, OperationFailure>> =
+    async {
+        let statusPart = statusStdOut |> GitService.stripPorcelainV2BranchHeaders |> NodeInterop.sha256Utf8
+        let! unmergedContentResult = computeUnmergedContentPart state context
+
+        match unmergedContentResult with
+        | Error failure -> return Error failure
+        | Ok unmergedContentPart ->
+            let! mergeHeadOutput =
+                runGit
+                    state.Hooks
+                    state.RepoPath
+                    [| "rev-parse"; "--git-path"; "MERGE_HEAD" |]
+                    None
+                    context
+
+            match mergeHeadOutput with
+            | Error failure -> return Error failure
+            | Ok mergeHeadResult ->
+                let mergePart =
+                    if mergeHeadResult.ExitCode = 0 then
+                        let mergeHeadPath = mergeHeadResult.StdOut.Trim()
+
+                        let resolvedPath =
+                            if
+                                mergeHeadPath.StartsWith "/"
+                                || (mergeHeadPath.Length >= 2 && mergeHeadPath[1] = ':')
+                            then
+                                mergeHeadPath
+                            else
+                                NodePath.join [| state.RepoPath; mergeHeadPath |]
+
+                        if NodeFileSystem.existsSync resolvedPath then "merge" else "none"
+                    else
+                        "none"
+
+                return Ok($"git:{headPart}:{statusPart}:{unmergedContentPart}:{mergePart}")
+    }
+
+let private computeWorkspaceVersion
+    (state: SessionState)
+    (context: OperationContext)
+    : Async<Result<string, OperationFailure>> =
+    async {
+        let! headPartResult = readWorkspaceHeadPart state context
+
+        match headPartResult with
+        | Error failure -> return Error failure
+        | Ok headPart ->
 
             let! statusOutput =
                 runGit
@@ -777,49 +835,8 @@ let private computeWorkspaceVersion
             match statusOutput with
             | Error failure -> return Error failure
             | Ok statusResult when statusResult.ExitCode <> 0 ->
-                return
-                    Error(
-                        OperationFailure.createRedacted
-                            ProviderError
-                            "git_failure"
-                            $"Reading workspace status evidence failed: {statusResult.StdErr}"
-                    )
-            | Ok statusResult ->
-                let statusPart = NodeInterop.sha256Utf8 statusResult.StdOut
-                let! unmergedContentResult = computeUnmergedContentPart state context
-
-                match unmergedContentResult with
-                | Error failure -> return Error failure
-                | Ok unmergedContentPart ->
-                    let! mergeHeadOutput =
-                        runGit
-                            state.Hooks
-                            state.RepoPath
-                            [| "rev-parse"; "--git-path"; "MERGE_HEAD" |]
-                            None
-                            context
-
-                    match mergeHeadOutput with
-                    | Error failure -> return Error failure
-                    | Ok mergeHeadResult ->
-                        let mergePart =
-                            if mergeHeadResult.ExitCode = 0 then
-                                let mergeHeadPath = mergeHeadResult.StdOut.Trim()
-
-                                let resolvedPath =
-                                    if
-                                        mergeHeadPath.StartsWith "/"
-                                        || (mergeHeadPath.Length >= 2 && mergeHeadPath[1] = ':')
-                                    then
-                                        mergeHeadPath
-                                    else
-                                        NodePath.join [| state.RepoPath; mergeHeadPath |]
-
-                                if NodeFileSystem.existsSync resolvedPath then "merge" else "none"
-                            else
-                                "none"
-
-                        return Ok($"git:{headPart}:{statusPart}:{unmergedContentPart}:{mergePart}")
+                return Error(workspaceStatusReadFailure statusResult.StdErr)
+            | Ok statusResult -> return! computeWorkspaceVersionFromStatus state headPart statusResult.StdOut context
     }
 
 /// Serializes a mutation and revalidates the expected workspace version under the
@@ -1316,20 +1333,18 @@ let private resolveRevisionIdentity
                 | Ok None -> return Error(identityMissingFailure ())
     }
 
-let private toWorkspaceStatus (state: SessionState) (status: GitStatusDto) (context: OperationContext) =
+let private toWorkspaceStatus
+    (state: SessionState)
+    (status: GitStatusDto)
+    (version: string)
+    (context: OperationContext)
+    =
     async {
         let conflictedSet = Set.ofArray status.Conflicted
 
         let changes =
             status.Files
             |> Array.choose (fun file -> toFileChange (conflictedSet.Contains file.Path) file)
-
-        let! versionResult = computeWorkspaceVersion state context
-
-        let versionFailure, version =
-            match versionResult with
-            | Error failure -> Some failure, String.Empty
-            | Ok value -> None, value
 
         // Synchronization revisions: HEAD and the configured upstream, if any.
         let! headRevision =
@@ -1367,10 +1382,9 @@ let private toWorkspaceStatus (state: SessionState) (status: GitStatusDto) (cont
             | _ when status.Ahead > 0 -> LocalAhead
             | _ -> UnknownRelationship
 
-        match versionFailure, upstreamFailure with
-        | Some failure, _ -> return Error failure
-        | None, Some failure -> return Error failure
-        | None, None ->
+        match upstreamFailure with
+        | Some failure -> return Error failure
+        | None ->
             return
                 Ok {
                     CurrentRef =
@@ -1921,50 +1935,69 @@ let private getMergeConflictSummary (state: SessionState) (context: OperationCon
 
 let private getWorkspaceStatus (state: SessionState) (context: OperationContext) =
     async {
-        let! statusResult = awaitGit (GitService.getStatus state.RepoPath context.Cancellation)
+        let! headPartResult = readWorkspaceHeadPart state context
 
-        match statusResult with
+        match headPartResult with
         | Error failure -> return Failed failure
-        | Ok status ->
-            let! workspaceStatusResult = toWorkspaceStatus state status context
+        | Ok headPart ->
+            let! statusOutput =
+                runGit
+                    state.Hooks
+                    state.RepoPath
+                    [| "status"; "--porcelain=v2"; "-z"; "--untracked-files=all"; "--branch" |]
+                    None
+                    context
 
-            match workspaceStatusResult with
+            match statusOutput with
             | Error failure -> return Failed failure
-            | Ok workspaceStatus ->
-                let! conflictSummaryResult = getMergeConflictSummary state context
+            | Ok output when output.ExitCode <> 0 -> return Failed(workspaceStatusReadFailure output.StdErr)
+            | Ok output ->
+                let status = GitService.parsePorcelainV2StatusDto state.RepoPath output.StdOut
+                let! versionResult = computeWorkspaceVersionFromStatus state headPart output.StdOut context
 
-                match conflictSummaryResult with
+                match versionResult with
                 | Error failure -> return Failed failure
-                | Ok conflictSummary ->
-                    // Submodule-internal changes are never workspace changes: entries at or
-                    // under a gitlink root are filtered from the reported change list.
-                    let selectedRevisionRunner: GitSelectedRevision.GitRunner =
-                        fun arguments stdinData environment ->
-                            runGitEnv state.Hooks state.RepoPath arguments stdinData environment context
+                | Ok version ->
+                    let! workspaceStatusResult = toWorkspaceStatus state status version context
 
-                    let! gitlinkRootsResult = GitSelectedRevision.listGitlinkRoots selectedRevisionRunner
+                    match workspaceStatusResult with
+                    | Error failure -> return Failed failure
+                    | Ok workspaceStatus ->
+                        let! conflictSummaryResult = getMergeConflictSummary state context
 
-                    let gitlinkRoots =
-                        match gitlinkRootsResult with
-                        | Ok roots -> roots
-                        | Error _ -> [||]
+                        match conflictSummaryResult with
+                        | Error failure -> return Failed failure
+                        | Ok conflictSummary ->
+                            // Submodule-internal changes are never workspace changes: entries at or
+                            // under a gitlink root are filtered from the reported change list.
+                            let selectedRevisionRunner: GitSelectedRevision.GitRunner =
+                                fun arguments stdinData environment ->
+                                    runGitEnv state.Hooks state.RepoPath arguments stdinData environment context
 
-                    let filteredChanges =
-                        workspaceStatus.Changes
-                        |> Array.filter (fun change ->
-                            let pathValue = RepositoryPath.value change.Path
+                            let! gitlinkRootsResult = GitSelectedRevision.listGitlinkRoots selectedRevisionRunner
 
-                            not (
-                                gitlinkRoots
-                                |> Array.exists (fun root -> pathValue = root || pathValue.StartsWith(root + "/"))
-                            ))
+                            let gitlinkRoots =
+                                match gitlinkRootsResult with
+                                | Ok roots -> roots
+                                | Error _ -> [||]
 
-                    return
-                        OperationResult.succeeded {
-                            workspaceStatus with
-                                Changes = filteredChanges
-                                ActiveConflictSession = conflictSummary
-                        }
+                            let filteredChanges =
+                                workspaceStatus.Changes
+                                |> Array.filter (fun change ->
+                                    let pathValue = RepositoryPath.value change.Path
+
+                                    not (
+                                        gitlinkRoots
+                                        |> Array.exists (fun root ->
+                                            pathValue = root || pathValue.StartsWith(root + "/"))
+                                    ))
+
+                            return
+                                OperationResult.succeeded {
+                                    workspaceStatus with
+                                        Changes = filteredChanges
+                                        ActiveConflictSession = conflictSummary
+                                }
     }
 
 // ---------------------------------------------------------------------------

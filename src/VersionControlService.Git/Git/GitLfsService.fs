@@ -1024,7 +1024,7 @@ let storagePruneArgs = [|
 let storageDedupArgs = [| "lfs"; "dedup" |]
 
 /// git-lfs has no working escape for these characters.
-/// Replacing each with `?` matches one character, and the leading slash anchors the pattern at the repository root.
+/// The root-anchored pattern can also match a few files whose names differ only at special characters.
 let lfsPathPattern (path: string) : string =
     let pattern =
         path
@@ -1063,15 +1063,14 @@ let dryRunCoversObject (output: string) (oid: string) : bool =
     output.Split '\n'
     |> Array.exists (fun line -> line.Trim().StartsWith(prefix, StringComparison.Ordinal))
 
-let private buildSmudgePointerArgs (relativePath: string) = [|
+let private buildDownloadObjectArgs (relativePath: string) = [|
     "-c"
-    "lfs.fetchinclude="
-    "-c"
-    "lfs.fetchexclude="
+    "lfs.fetchrecentalways=false"
     "lfs"
-    "smudge"
-    "--"
-    relativePath
+    "fetch"
+    $"--include={lfsPathPattern relativePath}"
+    "origin"
+    "HEAD"
 |]
 
 let private extractSpawnFailureMessage (result: GitSpawnResult) =
@@ -1443,18 +1442,11 @@ let fetchRefetchForPath
                 Error(exn failureMessage)
     }
 
-let private buildPointerInput (listing: GitLfsLsFileInfo) =
-    let sizeText = listing.size |> int64 |> string
-
-    $"version {listing.version}\noid {listing.``oid_type``}:{listing.oid}\nsize {sizeText}\n"
-
-/// Downloads the exact LFS object described by `listing` without path include filtering.
-/// `git lfs smudge` reads the pointer OID from stdin and stores the object locally; stdout is discarded.
+/// Fetches the LFS object selected by the path pattern into the local cache.
 let downloadObjectFromListing
     (repoPath: string)
     (commandAuth: GitCommandAuthentication)
     (relativePath: string)
-    (listing: GitLfsLsFileInfo)
     (cancelCheck: (unit -> bool) option)
     (onStarted: unit -> unit)
     : JS.Promise<Result<unit, exn>> =
@@ -1465,9 +1457,9 @@ let downloadObjectFromListing
                 Arguments =
                     GitCredentialStrategy.buildLfsTransferArguments
                         commandAuth.ConfigArgs
-                        (buildSmudgePointerArgs relativePath)
-                Environment = Some commandAuth.Environment
-                StandardInput = Some(buildPointerInput listing)
+                        (buildDownloadObjectArgs relativePath)
+                Environment = Some(withFetchExcludeCleared commandAuth.Environment)
+                StandardInput = None
                 CancelCheck = cancelCheck
                 TimeoutMs = None
             }

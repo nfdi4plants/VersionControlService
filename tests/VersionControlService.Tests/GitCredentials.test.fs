@@ -301,14 +301,19 @@ Vitest.describe (
                         let expectedLfsUrl =
                             $"lfs.url=https://oauth2:{testSecret}@127.0.0.1:1/origin.git/info/lfs"
 
-                        let findTransfer verb =
+                        let fetchTransfers =
                             observedCommands
-                            |> Seq.tryFind (fun arguments ->
+                            |> Seq.filter (fun arguments ->
                                 arguments |> Array.contains "lfs"
-                                && arguments |> Array.contains verb)
-                            |> Option.defaultWith (fun () -> failwith $"Expected a git-lfs {verb} transfer command.")
+                                && arguments |> Array.contains "fetch")
+                            |> Seq.toArray
 
-                        for arguments in [| findTransfer "smudge"; findTransfer "fetch" |] do
+                        Vitest.expect(fetchTransfers.Length >= 2).toBe true
+
+                        let materializeTransfer = fetchTransfers[0]
+                        let dematerializeTransfer = fetchTransfers[fetchTransfers.Length - 1]
+
+                        for arguments in [| materializeTransfer; dematerializeTransfer |] do
                             Vitest.expect(arguments |> Array.contains expectedLfsUrl).toBe true
                             Vitest
                                 .expect(arguments |> Array.exists (fun argument -> argument.Contains "extraHeader"))
