@@ -181,6 +181,24 @@ let private requireGitLfsForLiteralPolicy (repoPath: string) : JS.Promise<Result
             Error "Git LFS literal path tracking failed."
 }
 
+let parseLfsEndpoint (envOutput: string) : string option =
+    let tryParseEndpoint (prefix: string) =
+        envOutput.Split '\n'
+        |> Array.tryPick (fun line ->
+            let trimmed = line.Trim()
+
+            if trimmed.StartsWith(prefix, StringComparison.Ordinal) then
+                let value = trimmed.Substring(prefix.Length)
+                let separator = value.IndexOf(' ')
+                let endpoint = if separator < 0 then value else value.Substring(0, separator)
+                if String.IsNullOrWhiteSpace endpoint then None else Some endpoint
+            else
+                None)
+
+    match tryParseEndpoint "Endpoint (origin)=" with
+    | Some endpoint -> Some endpoint
+    | None -> tryParseEndpoint "Endpoint="
+
 let tryGetLfsEndpoint (repoPath: string) : JS.Promise<string option> = promise {
     let! result =
         runGitCaptured {
@@ -195,18 +213,24 @@ let tryGetLfsEndpoint (repoPath: string) : JS.Promise<string option> = promise {
     if result.ExitCode <> 0 || result.TimedOut then
         return None
     else
-        return
-            result.StdoutText.Split '\n'
-            |> Array.tryPick (fun line ->
-                let trimmed = line.TrimEnd '\r'
-                let prefix = "Endpoint="
+        return parseLfsEndpoint result.StdoutText
+}
 
-                if trimmed.StartsWith(prefix, StringComparison.Ordinal) then
-                    let value = trimmed.Substring(prefix.Length)
-                    let separator = value.IndexOf(' ')
-                    Some(if separator < 0 then value else value.Substring(0, separator))
-                else
-                    None)
+let tryHasStandaloneTransferAgent (repoPath: string) : JS.Promise<bool> = promise {
+    try
+        let! result =
+            runGitCaptured {
+                WorkingDirectory = Some repoPath
+                Arguments = [| "config"; "--get-regexp"; "standalonetransferagent$" |]
+                Environment = None
+                StandardInput = None
+                CancelCheck = None
+                TimeoutMs = Some 5000
+            }
+
+        return result.ExitCode = 0 && not result.TimedOut && not (String.IsNullOrWhiteSpace result.StdoutText)
+    with _ ->
+        return false
 }
 
 let usesBatchApi (endpoint: string option) : bool =
@@ -993,14 +1017,45 @@ let storagePruneArgs = [|
 
 let storageDedupArgs = [| "lfs"; "dedup" |]
 
+/// git-lfs has no working escape for these characters.
+/// Replacing each with `?` matches one character, and the leading slash anchors the pattern at the repository root.
+let lfsPathPattern (path: string) : string =
+    let pattern =
+        path
+        |> String.map (fun character ->
+            match character with
+            | '*' | '?' | '[' | ']' | '{' | '}' | ',' -> '?'
+            | _ -> character)
+
+    "/" + pattern
+
 let buildFetchRefetchArgs (dryRun: bool) (relativePath: string) =
     let dryRunArguments = if dryRun then [| "--dry-run" |] else [||]
 
     Array.concat [|
         [| "lfs"; "fetch"; "--refetch" |]
         dryRunArguments
-        [| $"--include={relativePath}"; "origin"; "HEAD" |]
+        [| $"--include={lfsPathPattern relativePath}"; "origin"; "HEAD" |]
     |]
+
+/// A configured lfs.fetchexclude wins over --include, so the fetch clears it. The override goes
+/// through git's GIT_CONFIG_COUNT variables (git 2.31 or newer), which git-lfs reads as config.
+let withFetchExcludeCleared (environment: obj) : obj =
+    JS.Constructors.Object.assign (
+        JsInterop.createObj [],
+        environment,
+        JsInterop.createObj [
+            "GIT_CONFIG_COUNT", box "1"
+            "GIT_CONFIG_KEY_0", box "lfs.fetchexclude"
+            "GIT_CONFIG_VALUE_0", box ""
+        ]
+    )
+
+let dryRunCoversObject (output: string) (oid: string) : bool =
+    let prefix = $"fetch {oid} "
+
+    output.Split '\n'
+    |> Array.exists (fun line -> line.Trim().StartsWith(prefix, StringComparison.Ordinal))
 
 let private buildSmudgePointerArgs (relativePath: string) = [|
     "-c"
@@ -1038,7 +1093,7 @@ let private extractSpawnFailureMessage (result: GitSpawnResult) =
     else
         "Git command failed."
 
-let buildCheckoutArgs (relativePath: string) = [| "lfs"; "checkout"; "--"; relativePath |]
+let buildCheckoutArgs (relativePath: string) = [| "lfs"; "checkout"; "--"; lfsPathPattern relativePath |]
 
 // Checkout has no timeout or cancellation because git-lfs holds the index lock while it refreshes the index.
 // Stopping it midway leaves a stale lock and a checked-out file.
@@ -1347,10 +1402,10 @@ let fetchRefetchForPath
     (dryRun: bool)
     (cancelCheck: (unit -> bool) option)
     (onStarted: unit -> unit)
-    : JS.Promise<Result<unit, exn>> =
+    : JS.Promise<Result<string, exn>> =
     promise {
         let! result =
-            runGitDiscardingStdoutWithStarted
+            runGitCapturedWithStarted
                 onStarted
                 {
                     WorkingDirectory = Some repoPath
@@ -1358,7 +1413,7 @@ let fetchRefetchForPath
                         GitCredentialStrategy.buildLfsTransferArguments
                             commandAuth.ConfigArgs
                             (buildFetchRefetchArgs dryRun relativePath)
-                    Environment = Some commandAuth.Environment
+                    Environment = Some(withFetchExcludeCleared commandAuth.Environment)
                     StandardInput = None
                     CancelCheck = cancelCheck
                     TimeoutMs = None
@@ -1366,9 +1421,20 @@ let fetchRefetchForPath
 
         return
             if result.ExitCode = 0 && not result.TimedOut then
-                Ok()
+                Ok(result.StdoutText + "\n" + result.StderrText)
             else
-                Error(exn (extractSpawnFailureMessage result))
+                let outputMessage =
+                    [| result.StdoutText.Trim(); result.StderrText.Trim() |]
+                    |> Array.filter (String.IsNullOrWhiteSpace >> not)
+                    |> String.concat "\n"
+
+                let failureMessage =
+                    if String.IsNullOrWhiteSpace outputMessage then
+                        extractSpawnFailureMessage result
+                    else
+                        outputMessage
+
+                Error(exn failureMessage)
     }
 
 let private buildPointerInput (listing: GitLfsLsFileInfo) =

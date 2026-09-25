@@ -244,16 +244,6 @@ let tryReadLocalObject (mediaDirectory: string) (oid: string) (sizeBytes: float)
     with _ ->
         None
 
-/// Escapes the glob characters git-lfs would otherwise expand in a path argument.
-let internal escapeLfsPathspec (path: string) =
-    path
-    |> Seq.map (fun character ->
-        if character = '*' || character = '?' || character = '[' || character = ']' || character = '{' || character = '}' then
-            "\\" + string character
-        else
-            string character)
-    |> String.concat ""
-
 /// Root-anchored `git lfs checkout` pattern for one repository path. git-lfs reads its
 /// arguments as gitignore-style patterns, so an unanchored name also matches in subfolders.
-let internal lfsCheckoutPattern (path: string) = "/" + escapeLfsPathspec path
+let internal lfsCheckoutPattern (path: string) = GitLfsService.lfsPathPattern path

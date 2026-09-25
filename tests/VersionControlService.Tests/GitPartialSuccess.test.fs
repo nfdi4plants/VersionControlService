@@ -1021,6 +1021,52 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "Git LFS path patterns escape unsupported characters by replacing them",
+            fun () -> promise {
+                Vitest.expect(GitLfsService.lfsPathPattern "data.bin").toBe "/data.bin"
+                Vitest.expect(GitLfsService.lfsPathPattern "sub/data.bin").toBe "/sub/data.bin"
+                Vitest.expect(GitLfsService.lfsPathPattern "br[1].bin").toBe "/br?1?.bin"
+                Vitest.expect(GitLfsService.lfsPathPattern "a,b.bin").toBe "/a?b.bin"
+                Vitest.expect(GitLfsService.lfsPathPattern "x*{y}?.bin").toBe "/x??y??.bin"
+
+                Vitest.expect(GitLfsService.buildCheckoutArgs "br[1].bin").toEqual [|
+                    "lfs"
+                    "checkout"
+                    "--"
+                    "/br?1?.bin"
+                |]
+            }
+        )
+
+        Vitest.test (
+            "Git LFS dry-run output identifies the requested object",
+            fun () -> promise {
+                let oid = "0123456789abcdef"
+                let matchingOutput = $"other output\n  fetch {oid} => sub/data.bin \nmore output"
+
+                Vitest.expect(GitLfsService.dryRunCoversObject matchingOutput oid).toBe true
+                Vitest.expect(GitLfsService.dryRunCoversObject ($"fetch 1111111111111111 => data.bin") oid).toBe false
+                Vitest.expect(GitLfsService.dryRunCoversObject "no fetch lines" oid).toBe false
+            }
+        )
+
+        Vitest.test (
+            "Git LFS endpoint parsing prefers origin and trims auth annotations",
+            fun () -> promise {
+                Vitest.expect(
+                    GitLfsService.parseLfsEndpoint "Endpoint=https://lfs.example.org/info/lfs (auth=none)"
+                )
+                    .toEqual (Some "https://lfs.example.org/info/lfs")
+
+                let multipleEndpoints =
+                    "Endpoint=https://other.example.org/info/lfs (auth=none)\nEndpoint (origin)=https://origin.example.org/info/lfs (auth=basic)"
+
+                Vitest.expect(GitLfsService.parseLfsEndpoint multipleEndpoints)
+                    .toEqual (Some "https://origin.example.org/info/lfs")
+            }
+        )
+
+        Vitest.test (
             "HTTP LFS endpoints use the batch dry-run fetch arguments",
             fun () -> promise {
                 Vitest.expect(GitLfsService.usesBatchApi(Some "https://lfs.example.org/info/lfs")).toBe true
@@ -1033,7 +1079,7 @@ Vitest.describe (
                     "fetch"
                     "--refetch"
                     "--dry-run"
-                    "--include=guarded.bin"
+                    "--include=/guarded.bin"
                     "origin"
                     "HEAD"
                 |]
@@ -1042,10 +1088,18 @@ Vitest.describe (
                     "lfs"
                     "fetch"
                     "--refetch"
-                    "--include=guarded.bin"
+                    "--include=/guarded.bin"
                     "origin"
                     "HEAD"
                 |]
+
+                let environment =
+                    GitLfsService.withFetchExcludeCleared (createObj [ "KEEP_ME", box "yes" ])
+
+                Vitest.expect(environment?KEEP_ME).toEqual "yes"
+                Vitest.expect(environment?GIT_CONFIG_COUNT).toEqual "1"
+                Vitest.expect(environment?GIT_CONFIG_KEY_0).toEqual "lfs.fetchexclude"
+                Vitest.expect(environment?GIT_CONFIG_VALUE_0).toEqual ""
             }
         )
 
@@ -1193,6 +1247,149 @@ Vitest.describe (
 
                         let! localObjectExistsAfter = pathExistsAsync localObjectPath
                         Vitest.expect(localObjectExistsAfter).toBe true
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "dematerialization preserves unpushed objects with special paths or fetch excludes",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let! root, workPath, _, session =
+                        createPublishFixture GitWorkspaceSession.GitSessionHooks.none
+
+                    try
+                        let paths = [| "a,b.bin"; "br[1].bin"; "plain.bin" |]
+                        let content = "object exists only in the local LFS cache\n"
+                        let! _ = runGitOk workPath [| "lfs"; "track"; "*.bin" |]
+
+                        for relativePath in paths do
+                            do! writeUtf8FileAsync (join [| workPath; relativePath |]) content
+
+                        let! _ = runGitOk workPath [| "add"; "-A" |]
+                        let! _ = runGitOk workPath [| "commit"; "-m"; "test: unpushed special LFS paths" |]
+
+                        let materialization =
+                            session.ObjectMaterialization
+                            |> Option.defaultWith (fun () -> failwith "Expected the object-materialization service.")
+
+                        for relativePath in [| "a,b.bin"; "br[1].bin" |] do
+                            let objectPath = join [| workPath; relativePath |]
+                            let! localObjectPath = lfsObjectPathForHeadFile workPath relativePath
+                            let! localObjectExistsBefore = pathExistsAsync localObjectPath
+                            Vitest.expect(localObjectExistsBefore).toBe true
+
+                            let! dematerializeResult =
+                                materialization.Dematerialize
+                                    (repositoryPath relativePath)
+                                    (ctx $"unpushed-{relativePath}")
+                                |> Async.StartAsPromise
+
+                            match dematerializeResult with
+                            | Failed _ -> ()
+                            | Succeeded _
+                            | PartiallySucceeded _ ->
+                                failwith $"Dematerialization must fail for unpushed '{relativePath}'."
+
+                            let! afterDematerialize = tryReadUtf8FileAsync objectPath
+                            Vitest.expect(afterDematerialize).toEqual (Some content)
+
+                            let! localObjectExistsAfter = pathExistsAsync localObjectPath
+                            Vitest.expect(localObjectExistsAfter).toBe true
+
+                        let! _ = runGitOk workPath [| "config"; "lfs.fetchexclude"; "*.bin" |]
+                        let objectPath = join [| workPath; "plain.bin" |]
+                        let! localObjectPath = lfsObjectPathForHeadFile workPath "plain.bin"
+                        let! localObjectExistsBefore = pathExistsAsync localObjectPath
+                        Vitest.expect(localObjectExistsBefore).toBe true
+
+                        let! dematerializeResult =
+                            materialization.Dematerialize
+                                (repositoryPath "plain.bin")
+                                (ctx "unpushed-excluded-plain")
+                            |> Async.StartAsPromise
+
+                        match dematerializeResult with
+                        | Failed _ -> ()
+                        | Succeeded _
+                        | PartiallySucceeded _ ->
+                            failwith "Dematerialization must fail for an unpushed plain.bin excluded by config."
+
+                        let! afterDematerialize = tryReadUtf8FileAsync objectPath
+                        Vitest.expect(afterDematerialize).toEqual (Some content)
+
+                        let! localObjectExistsAfter = pathExistsAsync localObjectPath
+                        Vitest.expect(localObjectExistsAfter).toBe true
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "dematerialization and materialization handle a pushed bracket path",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let! root, workPath, _, session =
+                        createPublishFixture GitWorkspaceSession.GitSessionHooks.none
+
+                    try
+                        let relativePath = "br[1].bin"
+                        let content = "pushed bracket-path content\n"
+                        let objectPath = join [| workPath; relativePath |]
+                        let! _ = runGitOk workPath [| "lfs"; "track"; "*.bin" |]
+                        do! writeUtf8FileAsync objectPath content
+                        let! _ = runGitOk workPath [| "add"; "-A" |]
+                        let! _ = runGitOk workPath [| "commit"; "-m"; "test: pushed bracket LFS path" |]
+                        let! _ = runGitOk workPath [| "push"; "origin"; "main" |]
+
+                        let! localObjectPath = lfsObjectPathForHeadFile workPath relativePath
+                        let! localObjectExistsBefore = pathExistsAsync localObjectPath
+                        Vitest.expect(localObjectExistsBefore).toBe true
+
+                        let materialization =
+                            session.ObjectMaterialization
+                            |> Option.defaultWith (fun () -> failwith "Expected the object-materialization service.")
+
+                        let! dematerializeResult =
+                            materialization.Dematerialize (repositoryPath relativePath) (ctx "pushed-bracket-dematerialize")
+                            |> Async.StartAsPromise
+
+                        match dematerializeResult with
+                        | Succeeded _ -> ()
+                        | PartiallySucceeded(_, failure)
+                        | Failed failure ->
+                            failwith $"Dematerialization failed for the pushed bracket path ({failure.Code})."
+
+                        let! localObjectExistsAfter = pathExistsAsync localObjectPath
+                        Vitest.expect(localObjectExistsAfter).toBe false
+
+                        let! materializeResult =
+                            materialization.Materialize (repositoryPath relativePath) (ctx "pushed-bracket-materialize")
+                            |> Async.StartAsPromise
+
+                        match materializeResult with
+                        | Succeeded _ -> ()
+                        | PartiallySucceeded(_, failure)
+                        | Failed failure ->
+                            failwith $"Materialization failed for the pushed bracket path ({failure.Code})."
+
+                        let! restoredContent = tryReadUtf8FileAsync objectPath
+                        Vitest.expect(restoredContent).toEqual (Some content)
                         do! removeDirectoryAsync root
                     with error ->
                         do! removeDirectoryAsync root

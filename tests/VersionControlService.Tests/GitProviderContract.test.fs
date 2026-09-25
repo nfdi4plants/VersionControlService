@@ -2685,6 +2685,13 @@ const net = require('node:net');
 const command = process.argv[2] || '';
 const markerPath = process.env.VCS_TEST_LFS_MARKER;
 const port = Number(process.env.VCS_TEST_LFS_LOCK_PORT);
+// Like git-lfs, a dry-run fetch names each object it covers on stderr.
+const writeDryRunLine = () => {
+    if (command === 'fetch' && process.argv.includes('--dry-run')) {
+        const match = fs.readFileSync(process.env.VCS_TEST_LFS_POINTER, 'utf8').match(/oid sha256:([0-9a-f]+)/);
+        if (match) process.stderr.write('fetch ' + match[1] + ' => materialized.bin\n');
+    }
+};
 if (command === 'ls-files') {
     process.stdout.write(fs.readFileSync(process.env.VCS_TEST_LFS_LISTING, 'utf8'));
 } else if (command === 'pointer') {
@@ -2707,7 +2714,10 @@ if (command === 'ls-files') {
                 throw error;
             }
         });
-        probe.listen(port, '127.0.0.1', () => probe.close(() => process.exit(0)));
+        probe.listen(port, '127.0.0.1', () => probe.close(() => {
+            writeDryRunLine();
+            process.exit(0);
+        }));
     }
 } else {
     process.exit(0);

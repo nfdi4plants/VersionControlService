@@ -1921,7 +1921,7 @@ let private getMergeConflictSummary (state: SessionState) (context: OperationCon
 
 let private getWorkspaceStatus (state: SessionState) (context: OperationContext) =
     async {
-        let! statusResult = awaitGit (GitService.getStatus state.RepoPath)
+        let! statusResult = awaitGit (GitService.getStatus state.RepoPath context.Cancellation)
 
         match statusResult with
         | Error failure -> return Failed failure
@@ -2408,7 +2408,7 @@ let private preflightSwitchRef (state: SessionState) (request: SwitchRefRequest)
                     |> Array.filter (fun entry -> entry <> "")
                     |> Set.ofArray
 
-                let! statusResult = awaitGit (GitService.getStatus state.RepoPath)
+                let! statusResult = awaitGit (GitService.getStatus state.RepoPath context.Cancellation)
 
                 match statusResult with
                 | Error failure -> return Failed failure
@@ -3356,7 +3356,7 @@ let private previewRefreshedState (state: SessionState) (context: OperationConte
     async {
         let changed = syncState.RemoteChangedPaths |> Option.defaultValue [||]
 
-        let! statusResult = awaitGit (GitService.getStatus state.RepoPath)
+        let! statusResult = awaitGit (GitService.getStatus state.RepoPath context.Cancellation)
 
         match statusResult with
         | Error failure -> return Failed failure
@@ -6150,7 +6150,7 @@ let private createTextDiff (state: SessionState) : TextDiffService =
                 else
                     let pathValue = RepositoryPath.value path
                     let! gitDiffResult =
-                        awaitGit (GitService.getWordDiff state.RepoPath [| pathValue |] context.Cancellation)
+                        awaitGit (GitService.getWordDiff state.RepoPath [| pathValue |])
 
                     match context.Cancellation.IsCancellationRequested(), gitDiffResult with
                     | true, _ -> return OperationResult.canceled "The Git text diff was canceled."

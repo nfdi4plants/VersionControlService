@@ -61,8 +61,6 @@ let private wrapUnit
                 let! result = Async.AwaitPromise(operation ())
 
                 match result with
-                | Ok() when context.Cancellation.IsCancellationRequested() ->
-                    return OperationResult.canceled "Git LFS operation canceled."
                 | Ok() -> return OperationResult.succeeded ()
                 | Error failure -> return toOperationResult failure
     }
@@ -344,11 +342,18 @@ let createObjectMaterialization
 
                                     match mediaDirectoryResult with
                                     | Ok mediaDirectory ->
-                                        // The server check confirmed the remote can supply this object again, so the local cache copy can go.
-                                        let objectPath = GitLfsObjects.objectPath mediaDirectory pointer.Oid
+                                        let! storageResult =
+                                            runGit [| "config"; "--get"; "lfs.storage" |] detachedContext
+                                            |> Async.StartAsPromise
 
-                                        if NodeFileSystem.existsSync objectPath then
-                                            NodeFileSystem.unlinkSync objectPath
+                                        match storageResult with
+                                        // Other clones can share a custom lfs.storage, so its objects stay. Prune refuses such storage too.
+                                        | Ok output when not (String.IsNullOrWhiteSpace(output.StdOut.Trim())) -> ()
+                                        | _ ->
+                                            let objectPath = GitLfsObjects.objectPath mediaDirectory pointer.Oid
+
+                                            if NodeFileSystem.existsSync objectPath then
+                                                NodeFileSystem.unlinkSync objectPath
                                     | Error _ -> ()
                                 | Error _
                                 | Ok None -> ()

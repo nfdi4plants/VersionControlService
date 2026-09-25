@@ -608,17 +608,14 @@ let private ensureBackupMatchesLfsOid
         return
             if context.Cancellation.IsCancellationRequested() then
                 canceledLfsResult ()
-            elif pointerTextResult.ExitCode <> 0 || pointerTextResult.TimedOut then
+            elif pointerTextResult.ExitCode <> 0 then
                 let failureMessage =
                     if String.IsNullOrWhiteSpace processDiagnostic then
-                        if pointerTextResult.TimedOut then
-                            "Git LFS pointer verification timed out."
-                        else
-                            $"Git LFS pointer verification failed with exit code {pointerTextResult.ExitCode}."
+                        $"Git LFS pointer verification failed with exit code {pointerTextResult.ExitCode}"
                     else
-                        processDiagnostic
+                        processDiagnostic.TrimEnd('.')
 
-                errorResult (exn $"Could not verify the temporary LFS backup: {failureMessage}")
+                errorResult (exn $"Could not verify the temporary LFS backup: {failureMessage}. The original file was restored.")
             elif
                 pointerTextResult.ExitCode = 0
                 && generatedPointer.Contains($"oid sha256:{listing.oid}")
@@ -1383,9 +1380,10 @@ let private rejectCustomLfsStorageForPrune (git: ISimpleGit) = promise {
 }
 
 /// Reads status for the active repository, including conflict metadata used by merge UI.
-let getStatus (arcPath: string) : JS.Promise<GitResult<GitStatusDto>> =
-    withLocalGit
+let getStatus (arcPath: string) (cancellation: OperationCancellation) : JS.Promise<GitResult<GitStatusDto>> =
+    withCancellableLocalGit
         arcPath
+        cancellation
         (fun git -> promise {
             let! status = git.status ()
             return toStatusDto arcPath status
@@ -1526,16 +1524,15 @@ let getDiff (arcPath: string) (pathSpecs: string[]) : JS.Promise<GitResult<strin
 let getWordDiff
     (arcPath: string)
     (pathSpecs: string[])
-    (cancellation: OperationCancellation)
     : JS.Promise<GitResult<string>> =
     promise {
         match validateLiteralDiffPathspecs pathSpecs with
         | Error validationError -> return errorResult validationError
         | Ok literalPaths ->
             return!
-                withCancellableLocalGit
+                withUntimedLocalGit
                     arcPath
-                    cancellation
+                    None
                     (fun git -> promise {
                         let pathspecs = literalPaths |> Array.map GitPathTransport.literalPathspec
 
@@ -2202,33 +2199,68 @@ let freeLocalLfsCopy
             | Error failure -> return Error failure
             | Ok session ->
                 let! endpoint = GitLfsService.tryGetLfsEndpoint arcPath
+                let! standaloneAgent = GitLfsService.tryHasStandaloneTransferAgent arcPath
+                let usesServer = GitLfsService.usesBatchApi endpoint && not standaloneAgent
 
-                match!
-                    GitLfsService.fetchRefetchForPath
-                        arcPath
-                        session.CommandAuth
-                        safePath
-                        // For HTTP endpoints, the dry run asks the LFS server for this exact object without downloading it.
-                        // It proves nothing for local remotes, so those keep the full refetch.
-                        (GitLfsService.usesBatchApi endpoint)
-                        (Some context.Cancellation.IsCancellationRequested)
-                        (fun () ->
-                            context.ReportProgress {
-                                PhaseCode = "lfs-dematerialize-transfer"
-                                Item = Some safePath
-                                Completed = Some 0.0
-                                Total = Some listing.size
-                                DisplayMessage = None
-                            })
-                with
+                let onTransferStarted () =
+                    context.ReportProgress {
+                        PhaseCode = "lfs-dematerialize-transfer"
+                        Item = Some safePath
+                        Completed = Some 0.0
+                        Total = Some listing.size
+                        DisplayMessage = None
+                    }
+
+                let confirmationFailure (error: exn) =
+                    let message = error.Message
+
+                    if
+                        message.IndexOf("does not exist on the server", StringComparison.OrdinalIgnoreCase) >= 0
+                        || message.IndexOf("remote missing object", StringComparison.OrdinalIgnoreCase) >= 0
+                    then
+                        exn $"The remote does not have '{safePath}' yet. Push it before freeing its local copy."
+                    else
+                        exn $"Could not confirm that the remote has '{safePath}': {message}"
+
+                let noCoverageMessage =
+                    $"Could not check whether the remote has '{safePath}', so its local copy stays."
+
+                // The dry run must list this OID, then non-batch endpoints must complete a refetch.
+                let! confirmationResult =
+                    promise {
+                        let! dryRunResult =
+                            GitLfsService.fetchRefetchForPath
+                                arcPath
+                                session.CommandAuth
+                                safePath
+                                true
+                                (Some context.Cancellation.IsCancellationRequested)
+                                onTransferStarted
+
+                        match dryRunResult with
+                        | Error error -> return Error error
+                        | Ok output when not (GitLfsService.dryRunCoversObject output listing.oid) ->
+                            return Ok None
+                        | Ok _ when usesServer -> return Ok(Some String.Empty)
+                        | Ok _ ->
+                            let! refetchResult =
+                                GitLfsService.fetchRefetchForPath
+                                    arcPath
+                                    session.CommandAuth
+                                    safePath
+                                    false
+                                    (Some context.Cancellation.IsCancellationRequested)
+                                    onTransferStarted
+
+                            return Result.map Some refetchResult
+                    }
+
+                match confirmationResult with
                 | Error _ when context.Cancellation.IsCancellationRequested() -> return canceledLfsResult ()
-                | Error error ->
-                    return
-                        errorResult (
-                            exn $"Could not confirm that the Git LFS server has '{safePath}': {error.Message}"
-                        )
-                | Ok() when context.Cancellation.IsCancellationRequested() -> return canceledLfsResult ()
-                | Ok() ->
+                | Error error -> return errorResult (confirmationFailure error)
+                | Ok _ when context.Cancellation.IsCancellationRequested() -> return canceledLfsResult ()
+                | Ok None -> return errorResult (exn noCoverageMessage)
+                | Ok _ ->
                     let git = session.Git
                     let backupPath = createTemporaryLfsBackupPath absolutePath
 
@@ -2242,7 +2274,6 @@ let freeLocalLfsCopy
                             match! ensureBackupMatchesLfsOid backupPath listing context with
                             | Error validationError ->
                                 restoreTemporaryLfsBackup backupPath absolutePath
-
                                 return Error validationError
                             | Ok() when context.Cancellation.IsCancellationRequested() ->
                                 restoreTemporaryLfsBackup backupPath absolutePath
@@ -2258,7 +2289,6 @@ let freeLocalLfsCopy
                                 match checkoutResult with
                                 | Error failure ->
                                     restoreTemporaryLfsBackup backupPath absolutePath
-
                                     return Error failure
                                 | Ok _ when context.Cancellation.IsCancellationRequested() ->
                                     restoreTemporaryLfsBackup backupPath absolutePath
@@ -2271,7 +2301,6 @@ let freeLocalLfsCopy
                                     match finalStatusResult with
                                     | Error failure ->
                                         restoreTemporaryLfsBackup backupPath absolutePath
-
                                         return Error failure
                                     | Ok finalStatus when not (isPathCleanInStatus finalStatus safePath) ->
                                         restoreTemporaryLfsBackup backupPath absolutePath
@@ -2295,7 +2324,6 @@ let freeLocalLfsCopy
                                         return Ok true
                     with ex ->
                         restoreTemporaryLfsBackup backupPath absolutePath
-
                         return errorResult ex
 }
 
