@@ -2378,8 +2378,9 @@ let private downloadMissingLfsFile
         | Error failure -> return Error failure
         | Ok session ->
             // A fetch of the path pattern also downloads files whose names differ only at special
-            // characters, and the checkout after it replaces their pointers. When the listing has
-            // such a file, the download takes only this object so that file keeps its state.
+            // characters. When the listing has such a file, the download takes only this object, so
+            // it adds no object for that file. The checkout below still runs with the pattern, so it
+            // replaces that file's pointer when the file's own object is already in the local cache.
             let! fullListingResult = GitLfsService.readLsFilesByRelativePath arcPath context
 
             match fullListingResult with

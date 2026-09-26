@@ -1036,8 +1036,8 @@ let lfsPathPattern (path: string) : string =
 
     "/" + pattern
 
-/// Tells whether a pattern from lfsPathPattern matches a repository path. `?` matches one
-/// character other than `/`, every other character matches itself, and the leading `/` anchors
+/// Tells whether a pattern from lfsPathPattern matches a repository path. A `?` matches one
+/// character other than `/`, and every other character matches itself. The leading `/` anchors
 /// the pattern at the root. The comparison ignores case, and a pattern that matches a directory
 /// also matches the files below it. Both err toward reporting a match, which only costs the
 /// caller the slower exact-object download.

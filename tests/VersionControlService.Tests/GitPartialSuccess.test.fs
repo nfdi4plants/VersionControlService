@@ -82,6 +82,51 @@ let private injectNextFileHandleSyncFailureAfterAttributesEdit
     : JS.Promise<unit -> unit> =
     jsNative
 
+
+[<Emit("""
+(() => {
+    const childProcess = require('node:child_process');
+    const moduleApi = require('node:module');
+    const originalSpawn = childProcess.spawn;
+    childProcess.spawn = function(command, args, options) {
+        if (String(command).toLowerCase() === 'git') $0.push(Array.from(args || []));
+        return originalSpawn.call(childProcess, command, args, options);
+    };
+    moduleApi.syncBuiltinESMExports();
+    return () => {
+        childProcess.spawn = originalSpawn;
+        moduleApi.syncBuiltinESMExports();
+    };
+})()
+""")>]
+let private observeGitSpawnArguments (_observed: ResizeArray<string[]>) : unit -> unit = jsNative
+
+// The listener goes on the child before the caller adds its own close handler, so the append
+// finishes before the caller sees the hash result.
+[<Emit("""
+(() => {
+    const fs = require('node:fs');
+    const childProcess = require('node:child_process');
+    const moduleApi = require('node:module');
+    const originalSpawn = childProcess.spawn;
+    let fired = false;
+    childProcess.spawn = function(command, args, options) {
+        const child = originalSpawn.call(childProcess, command, args, options);
+        const list = Array.from(args || []);
+        if (!fired && String(command).toLowerCase() === 'git' && list.includes('pointer') && list.includes('--file')) {
+            fired = true;
+            child.once('close', () => fs.appendFileSync($0, $1, 'utf8'));
+        }
+        return child;
+    };
+    moduleApi.syncBuiltinESMExports();
+    return () => {
+        childProcess.spawn = originalSpawn;
+        moduleApi.syncBuiltinESMExports();
+    };
+})()
+""")>]
+let private appendAfterLfsPointerCommand (_filePath: string) (_appendedText: string) : unit -> unit = jsNative
 let private tryReadUtf8FileAsync (path: string) : JS.Promise<string option> = promise {
     try
         let! content = fsPromisesDynamic?readFile (path, "utf8") |> unbox<JS.Promise<string>>
@@ -1886,6 +1931,309 @@ Vitest.describe (
                             )
                             .toBe true
 
+                        do! removeDirectoryAsync root
+                    with error ->
+                        releaseHold.Value ()
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "dematerialization hashes the file at its working-tree path",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let! root, workPath, _, session =
+                        createPublishFixture GitWorkspaceSession.GitSessionHooks.none
+
+                    let observedCommands = ResizeArray<string[]>()
+                    let stopObserving: (unit -> unit) ref = ref ignore
+
+                    try
+                        let relativePath = "hashed.bin"
+                        let objectPath = join [| workPath; relativePath |]
+                        let! _ = runGitOk workPath [| "lfs"; "track"; "*.bin" |]
+                        do! writeUtf8FileAsync objectPath "hashed where it lies\n"
+                        let! _ = runGitOk workPath [| "add"; "-A" |]
+                        let! _ = runGitOk workPath [| "commit"; "-m"; "test: LFS file to hash" |]
+                        let! _ = runGitOk workPath [| "push"; "origin"; "main" |]
+
+                        let materialization =
+                            session.ObjectMaterialization
+                            |> Option.defaultWith (fun () -> failwith "Expected the object-materialization service.")
+
+                        stopObserving.Value <- observeGitSpawnArguments observedCommands
+
+                        let! dematerializeResult =
+                            materialization.Dematerialize (repositoryPath relativePath) (ctx "hash-in-place-dematerialize")
+                            |> Async.StartAsPromise
+
+                        stopObserving.Value ()
+                        stopObserving.Value <- ignore
+
+                        match dematerializeResult with
+                        | Succeeded _ -> ()
+                        | PartiallySucceeded(_, failure)
+                        | Failed failure ->
+                            failwith $"Dematerialization failed ({failure.Code}): {failure.Message}"
+
+                        let pointerTargets =
+                            observedCommands
+                            |> Seq.filter (fun arguments ->
+                                arguments |> Array.contains "lfs" && arguments |> Array.contains "pointer")
+                            |> Seq.map (fun arguments ->
+                                let fileIndex = arguments |> Array.findIndex (fun argument -> argument = "--file")
+                                join [| arguments[fileIndex + 1] |])
+                            |> Seq.toArray
+
+                        Vitest.expect(pointerTargets.Length > 0).toBe true
+                        Vitest.expect(pointerTargets |> Array.forall (fun target -> target = objectPath)).toBe true
+                        do! removeDirectoryAsync root
+                    with error ->
+                        stopObserving.Value ()
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "a successful dematerialization leaves no backup in the working tree or the backup directory",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let! root, workPath, _, session =
+                        createPublishFixture GitWorkspaceSession.GitSessionHooks.none
+
+                    try
+                        let relativePath = "backed-up.bin"
+                        let! _ = runGitOk workPath [| "lfs"; "track"; "*.bin" |]
+                        do! writeUtf8FileAsync (join [| workPath; relativePath |]) "freed without a leftover backup\n"
+                        let! _ = runGitOk workPath [| "add"; "-A" |]
+                        let! _ = runGitOk workPath [| "commit"; "-m"; "test: LFS file with a backup" |]
+                        let! _ = runGitOk workPath [| "push"; "origin"; "main" |]
+
+                        let materialization =
+                            session.ObjectMaterialization
+                            |> Option.defaultWith (fun () -> failwith "Expected the object-materialization service.")
+
+                        let! dematerializeResult =
+                            materialization.Dematerialize (repositoryPath relativePath) (ctx "backup-dematerialize")
+                            |> Async.StartAsPromise
+
+                        match dematerializeResult with
+                        | Succeeded _ -> ()
+                        | PartiallySucceeded(_, failure)
+                        | Failed failure ->
+                            failwith $"Dematerialization failed ({failure.Code}): {failure.Message}"
+
+                        let! statusOutput = runGitOk workPath [| "status"; "--porcelain"; "--untracked-files=all" |]
+                        Vitest.expect(statusOutput.Contains "vcs-lfs-backup").toBe false
+
+                        let! backupGitPath = runGitOk workPath [| "rev-parse"; "--git-path"; "vcs-lfs-backup" |]
+                        let backupDirectory = join [| workPath; backupGitPath.Trim() |]
+                        let! backupDirectoryExists = pathExistsAsync backupDirectory
+                        Vitest.expect(backupDirectoryExists).toBe true
+
+                        let! backupEntries =
+                            fsPromisesDynamic?readdir (backupDirectory) |> unbox<JS.Promise<string[]>>
+
+                        Vitest.expect(backupEntries).toEqual ([||]: string[])
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "dematerialization keeps a file that changes between its hash and its move",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let! root, workPath, _, session =
+                        createPublishFixture GitWorkspaceSession.GitSessionHooks.none
+
+                    let stopAppending: (unit -> unit) ref = ref ignore
+
+                    try
+                        let relativePath = "written-during-free.bin"
+                        let objectPath = join [| workPath; relativePath |]
+                        let content = "content before the free\n"
+                        let appendedText = "written while the free ran\n"
+                        let! _ = runGitOk workPath [| "lfs"; "track"; "*.bin" |]
+                        do! writeUtf8FileAsync objectPath content
+                        let! _ = runGitOk workPath [| "add"; "-A" |]
+                        let! _ = runGitOk workPath [| "commit"; "-m"; "test: LFS file written during a free" |]
+                        let! _ = runGitOk workPath [| "push"; "origin"; "main" |]
+
+                        let materialization =
+                            session.ObjectMaterialization
+                            |> Option.defaultWith (fun () -> failwith "Expected the object-materialization service.")
+
+                        stopAppending.Value <- appendAfterLfsPointerCommand objectPath appendedText
+
+                        let! dematerializeResult =
+                            materialization.Dematerialize (repositoryPath relativePath) (ctx "changed-during-dematerialize")
+                            |> Async.StartAsPromise
+
+                        stopAppending.Value ()
+                        stopAppending.Value <- ignore
+
+                        match dematerializeResult with
+                        | Failed failure -> Vitest.expect(failure.Message.Contains $"'{relativePath}'").toBe true
+                        | Succeeded _
+                        | PartiallySucceeded _ -> failwith "Expected the dematerialization to fail after the file changed."
+
+                        let! contentAfter = tryReadUtf8FileAsync objectPath
+                        Vitest.expect(contentAfter).toEqual (Some(content + appendedText))
+
+                        let! backupGitPath = runGitOk workPath [| "rev-parse"; "--git-path"; "vcs-lfs-backup" |]
+
+                        let! backupEntries =
+                            fsPromisesDynamic?readdir (join [| workPath; backupGitPath.Trim() |])
+                            |> unbox<JS.Promise<string[]>>
+
+                        Vitest.expect(backupEntries).toEqual ([||]: string[])
+                        do! removeDirectoryAsync root
+                    with error ->
+                        stopAppending.Value ()
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "a workspace mutation waits until a running materialization finishes",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let holdArmed = ref false
+                    let holding = ref false
+                    let mutationStarted = ref false
+                    let releaseHold = ref ignore
+                    let commandsDuringHold = ResizeArray<string[]>()
+
+                    let recordCommand (arguments: string[]) =
+                        if holding.Value && mutationStarted.Value then
+                            commandsDuringHold.Add arguments
+
+                    // Materialize spawns its download commands itself. The index.lock lookup of its preflight
+                    // is the one command inside the locked body that goes through these hooks.
+                    let hooks: GitWorkspaceSession.GitSessionHooks = {
+                        RunBytesProcess =
+                            Some(fun request operationContext ->
+                                recordCommand request.Arguments
+                                NodeProcess.runBytes request operationContext)
+                        RunProcess =
+                            Some(fun request operationContext -> async {
+                                recordCommand request.Arguments
+
+                                if
+                                    holdArmed.Value
+                                    && request.Arguments = [| "rev-parse"; "--git-path"; "index.lock" |]
+                                then
+                                    holdArmed.Value <- false
+
+                                    do!
+                                        Promise.create (fun resolve _ ->
+                                            releaseHold.Value <- (fun () -> resolve ())
+                                            holding.Value <- true)
+                                        |> Async.AwaitPromise
+
+                                    holding.Value <- false
+
+                                return! NodeProcess.run request operationContext
+                            })
+                        Barrier = None
+                    }
+
+                    let! root, workPath, _, session = createPublishFixture hooks
+
+                    try
+                        let relativePath = "held-download.bin"
+                        let content = "held while downloading\n"
+                        let! _ = runGitOk workPath [| "lfs"; "track"; "*.bin" |]
+                        do! writeUtf8FileAsync (join [| workPath; relativePath |]) content
+                        let! _ = runGitOk workPath [| "add"; "-A" |]
+                        let! _ = runGitOk workPath [| "commit"; "-m"; "test: LFS file to download" |]
+                        let! _ = runGitOk workPath [| "push"; "origin"; "main" |]
+
+                        let materialization =
+                            session.ObjectMaterialization
+                            |> Option.defaultWith (fun () -> failwith "Expected the object-materialization service.")
+
+                        let! dematerializeResult =
+                            materialization.Dematerialize (repositoryPath relativePath) (ctx "free-before-held-download")
+                            |> Async.StartAsPromise
+
+                        match dematerializeResult with
+                        | Succeeded _ -> ()
+                        | PartiallySucceeded(_, failure)
+                        | Failed failure -> failwith $"The free before the download failed ({failure.Code})."
+
+                        do! writeUtf8FileAsync (join [| workPath; "note.txt" |]) "saved after the download\n"
+                        holdArmed.Value <- true
+
+                        let materializationRun =
+                            materialization.Materialize (repositoryPath relativePath) (ctx "held-materialize")
+                            |> Async.StartAsPromise
+
+                        let waitedMs = ref 0
+
+                        while not holding.Value && waitedMs.Value < 60000 do
+                            do! Promise.sleep 20
+                            waitedMs.Value <- waitedMs.Value + 20
+
+                        Vitest.expect(holding.Value).toBe true
+                        let! status = sessionStatus session
+                        mutationStarted.Value <- true
+
+                        let revision =
+                            session.Core.CreateRevision
+                                {
+                                    Message = "test: save during a download"
+                                    Paths = [| repositoryPath "note.txt" |]
+                                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                }
+                                (ctx "save-during-download")
+                            |> Async.StartAsPromise
+
+                        do! Promise.sleep 500
+                        Vitest.expect(commandsDuringHold.Count).toBe 0
+                        releaseHold.Value ()
+
+                        let! materializeResult = materializationRun
+                        let! revisionResult = revision
+
+                        match materializeResult with
+                        | Succeeded _ -> ()
+                        | PartiallySucceeded(_, failure)
+                        | Failed failure -> failwith $"The held materialization failed ({failure.Code}): {failure.Message}"
+
+                        match revisionResult with
+                        | Succeeded _ -> ()
+                        | PartiallySucceeded(_, failure)
+                        | Failed failure -> failwith $"The save after the download failed ({failure.Code}): {failure.Message}"
+
+                        let! downloadedContent = tryReadUtf8FileAsync (join [| workPath; relativePath |])
+                        Vitest.expect(downloadedContent).toEqual (Some content)
                         do! removeDirectoryAsync root
                     with error ->
                         releaseHold.Value ()
