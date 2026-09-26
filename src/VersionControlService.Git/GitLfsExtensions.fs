@@ -217,6 +217,7 @@ let createObjectMaterialization
     (credentials: GitCredentialStrategy.GitCredentialStrategy)
     (connectionProfileId: string option)
     (preflight: OperationContext -> Async<Result<unit, OperationFailure>>)
+    (serialize: (unit -> Async<OperationResult<unit>>) -> Async<OperationResult<unit>>)
     : ObjectMaterializationService = {
     ListObjects =
         fun context -> async {
@@ -282,107 +283,109 @@ let createObjectMaterialization
         }
     Materialize =
         fun path context ->
-            wrapUnitWithPreflight
-                preflight
-                context
-                (fun () ->
-                    context.ReportProgress {
-                        PhaseCode = "lfs-materialize"
-                        Item = Some(RepositoryPath.value path)
-                        Completed = None
-                        Total = None
-                        DisplayMessage = None
-                    })
-                (fun () ->
-                    GitService.downloadLfsFile
-                        repoPath
-                        (RepositoryPath.value path)
-                        credentials
-                        connectionProfileId
-                        context)
+            serialize (fun () ->
+                wrapUnitWithPreflight
+                    preflight
+                    context
+                    (fun () ->
+                        context.ReportProgress {
+                            PhaseCode = "lfs-materialize"
+                            Item = Some(RepositoryPath.value path)
+                            Completed = None
+                            Total = None
+                            DisplayMessage = None
+                        })
+                    (fun () ->
+                        GitService.downloadLfsFile
+                            repoPath
+                            (RepositoryPath.value path)
+                            credentials
+                            connectionProfileId
+                            context))
     Dematerialize =
         fun path context ->
-            wrapUnitWithPreflight
-                preflight
-                context
-                (fun () ->
-                    context.ReportProgress {
-                        PhaseCode = "lfs-dematerialize"
-                        Item = Some(RepositoryPath.value path)
-                        Completed = None
-                        Total = None
-                        DisplayMessage = None
-                    })
-                (fun () ->
-                    promise {
-                        let! result =
-                            GitService.freeLocalLfsCopy
-                                repoPath
-                                (RepositoryPath.value path)
-                                credentials
-                                connectionProfileId
-                                context
+            serialize (fun () ->
+                wrapUnitWithPreflight
+                    preflight
+                    context
+                    (fun () ->
+                        context.ReportProgress {
+                            PhaseCode = "lfs-dematerialize"
+                            Item = Some(RepositoryPath.value path)
+                            Completed = None
+                            Total = None
+                            DisplayMessage = None
+                        })
+                    (fun () ->
+                        promise {
+                            let! result =
+                                GitService.freeLocalLfsCopy
+                                    repoPath
+                                    (RepositoryPath.value path)
+                                    credentials
+                                    connectionProfileId
+                                    context
 
-                        match result with
-                        | Ok true ->
-                            let detachedContext = { context with Cancellation = OperationCancellation.none }
+                            match result with
+                            | Ok true ->
+                                let detachedContext = { context with Cancellation = OperationCancellation.none }
 
-                            try
-                                let! pointerResult =
-                                    GitLfsObjects.readWorktreePointer repoPath (RepositoryPath.value path)
-                                    |> Async.StartAsPromise
-
-                                match pointerResult with
-                                | Ok(Some pointer) ->
-                                    let! mediaDirectoryResult =
-                                        GitLfsObjects.resolveLocalMediaDirectory
-                                            (fun arguments -> runGit arguments detachedContext)
-                                            repoPath
+                                try
+                                    let! pointerResult =
+                                        GitLfsObjects.readWorktreePointer repoPath (RepositoryPath.value path)
                                         |> Async.StartAsPromise
 
-                                    match mediaDirectoryResult with
-                                    | Ok mediaDirectory ->
-                                        let! storageResult =
-                                            runGit [| "config"; "--get"; "lfs.storage" |] detachedContext
+                                    match pointerResult with
+                                    | Ok(Some pointer) ->
+                                        let! mediaDirectoryResult =
+                                            GitLfsObjects.resolveLocalMediaDirectory
+                                                (fun arguments -> runGit arguments detachedContext)
+                                                repoPath
                                             |> Async.StartAsPromise
 
-                                        match storageResult with
-                                        // Other clones can share a custom lfs.storage, so its objects stay. Prune refuses such storage too.
-                                        | Ok output when not (String.IsNullOrWhiteSpace(output.StdOut.Trim())) -> ()
-                                        | _ ->
-                                            // git-lfs needs the local object to push an unpushed commit that adds it.
-                                            // The search covers HEAD too, so a commit on a detached HEAD keeps the object.
-                                            let! unpushedResult =
-                                                runGit
-                                                    [|
-                                                        "log"
-                                                        "HEAD"
-                                                        "--branches"
-                                                        "--not"
-                                                        "--remotes=origin"
-                                                        "--format=%H"
-                                                        "-1"
-                                                        ("-Soid sha256:" + pointer.Oid)
-                                                    |]
-                                                    detachedContext
+                                        match mediaDirectoryResult with
+                                        | Ok mediaDirectory ->
+                                            let! storageResult =
+                                                runGit [| "config"; "--get"; "lfs.storage" |] detachedContext
                                                 |> Async.StartAsPromise
 
-                                            match unpushedResult with
-                                            | Ok output when output.ExitCode = 0 && String.IsNullOrWhiteSpace output.StdOut ->
-                                                let objectPath = GitLfsObjects.objectPath mediaDirectory pointer.Oid
+                                            match storageResult with
+                                            // Other clones can share a custom lfs.storage, so its objects stay. Prune refuses such storage too.
+                                            | Ok output when not (String.IsNullOrWhiteSpace(output.StdOut.Trim())) -> ()
+                                            | _ ->
+                                                // git-lfs needs the local object to push an unpushed commit that adds it.
+                                                // The search covers HEAD too, so a commit on a detached HEAD keeps the object.
+                                                let! unpushedResult =
+                                                    runGit
+                                                        [|
+                                                            "log"
+                                                            "HEAD"
+                                                            "--branches"
+                                                            "--not"
+                                                            "--remotes=origin"
+                                                            "--format=%H"
+                                                            "-1"
+                                                            ("-Soid sha256:" + pointer.Oid)
+                                                        |]
+                                                        detachedContext
+                                                    |> Async.StartAsPromise
 
-                                                if NodeFileSystem.existsSync objectPath then
-                                                    NodeFileSystem.unlinkSync objectPath
-                                            | _ -> ()
-                                    | Error _ -> ()
-                                | Error _
-                                | Ok None -> ()
-                            with _ -> ()
+                                                match unpushedResult with
+                                                | Ok output when output.ExitCode = 0 && String.IsNullOrWhiteSpace output.StdOut ->
+                                                    let objectPath = GitLfsObjects.objectPath mediaDirectory pointer.Oid
 
-                            return Ok()
-                        | Ok false -> return Ok()
-                        | Error failure -> return Error failure
-                    })
+                                                    if NodeFileSystem.existsSync objectPath then
+                                                        NodeFileSystem.unlinkSync objectPath
+                                                | _ -> ()
+                                        | Error _ -> ()
+                                    | Error _
+                                    | Ok None -> ()
+                                with _ -> ()
+
+                                return Ok()
+                            | Ok false -> return Ok()
+                            | Error failure -> return Error failure
+                        }))
 }
 
 let createStoragePolicy

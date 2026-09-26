@@ -555,6 +555,50 @@ let private tryResolveArcRelativePath (arcPath: string) (requestedPath: string) 
 let private createTemporaryLfsBackupPath (absolutePath: string) =
     absolutePath + ".vcs-lfs-backup-" + Guid.NewGuid().ToString("N")
 
+/// Resolves the backup directory inside the Git directory and creates it when missing.
+/// A backup there stays out of the working tree, so git status does not list it. The directory
+/// is separate from Git LFS's lfs/tmp. git-lfs commands delete files in lfs/tmp whose modification
+/// time is over an hour old, and a renamed file keeps its old modification time.
+let private resolveLfsBackupDirectory (arcPath: string) : JS.Promise<GitResult<string>> = promise {
+    let! result =
+        runGitCaptured {
+            WorkingDirectory = Some arcPath
+            Arguments = [| "rev-parse"; "--git-path"; "vcs-lfs-backup" |]
+            Environment = None
+            StandardInput = None
+            CancelCheck = None
+            TimeoutMs = Some GitLfsService.DefaultTimeoutMs
+        }
+
+    let gitPath = result.StdoutText |> Option.ofObj |> Option.defaultValue String.Empty |> _.Trim()
+
+    if result.ExitCode <> 0 || result.TimedOut || String.IsNullOrWhiteSpace gitPath then
+        let diagnostic = result.StderrText |> Option.ofObj |> Option.defaultValue String.Empty |> _.Trim()
+        return errorResult (exn $"Could not find the backup directory in the Git directory: {diagnostic}")
+    else
+        try
+            // git prints the path relative to its working directory, which is the repository root here.
+            let directory = resolve [| arcPath; gitPath |]
+            mkdirSync directory (MkdirOptions(recursive = true))
+            return Ok directory
+        with error ->
+            return errorResult error
+}
+
+/// Moves the file into the backup directory. When that directory is on another volume,
+/// a rename cannot cross it, so the backup goes next to the file.
+let private moveToLfsBackup (absolutePath: string) (backupDirectory: string) : string =
+    let backupPath =
+        join [| backupDirectory; "vcs-lfs-backup-" + Guid.NewGuid().ToString("N") |]
+
+    try
+        renameSync absolutePath backupPath
+        backupPath
+    with error when tryGetNodeErrorCode error = Some "EXDEV" ->
+        let siblingPath = createTemporaryLfsBackupPath absolutePath
+        renameSync absolutePath siblingPath
+        siblingPath
+
 let private restoreTemporaryLfsBackup backupPath absolutePath =
     if existsSync backupPath then
         if existsSync absolutePath then
@@ -578,8 +622,8 @@ let private isPathCleanInStatus (status: StatusResult) (relativePath: string) =
     )
     |> not
 
-let private ensureBackupMatchesLfsOid
-    (backupPath: string)
+let private ensureFileMatchesLfsOid
+    (filePath: string)
     (listing: GitLfsLsFileInfo)
     (context: OperationContext)
     : JS.Promise<GitResult<unit>> =
@@ -587,7 +631,7 @@ let private ensureBackupMatchesLfsOid
         let! pointerTextResult =
             runGitCaptured {
                 WorkingDirectory = None
-                Arguments = [| "lfs"; "pointer"; "--file"; backupPath |]
+                Arguments = [| "lfs"; "pointer"; "--file"; filePath |]
                 Environment = None
                 StandardInput = None
                 CancelCheck = Some context.Cancellation.IsCancellationRequested
@@ -615,14 +659,67 @@ let private ensureBackupMatchesLfsOid
                     else
                         processDiagnostic.TrimEnd('.')
 
-                errorResult (exn $"Could not verify the temporary LFS backup: {failureMessage}. The original file was restored.")
+                errorResult (exn $"Could not verify the file against its Git LFS object: {failureMessage}. The file stays in place.")
             elif
                 pointerTextResult.ExitCode = 0
                 && generatedPointer.Contains($"oid sha256:{listing.oid}")
             then
                 Ok()
             else
-                errorResult (exn "The temporary LFS backup did not match the expected object. The original file was restored.")
+                errorResult (exn "The file does not match its Git LFS object. The file stays in place.")
+    }
+
+/// Hashes the file where it is, then moves it into a backup. The hash of a large file takes a while,
+/// and the file stays in the working tree during that time. The size and modification time recorded
+/// before the hash reveal a write that happened while it ran.
+let private moveVerifiedFileToLfsBackup
+    (arcPath: string)
+    (safePath: string)
+    (absolutePath: string)
+    (listing: GitLfsLsFileInfo)
+    (context: OperationContext)
+    : JS.Promise<GitResult<string>> =
+    promise {
+        let! verifiedResult =
+            promise {
+                try
+                    let statsBeforeHash = statSync absolutePath
+                    let! verification = ensureFileMatchesLfsOid absolutePath listing context
+                    return verification |> Result.map (fun () -> statsBeforeHash)
+                with error ->
+                    return errorResult error
+            }
+
+        match verifiedResult with
+        | Error failure -> return Error failure
+        | Ok _ when context.Cancellation.IsCancellationRequested() -> return canceledLfsResult ()
+        | Ok statsBeforeHash ->
+            match! resolveLfsBackupDirectory arcPath with
+            | Error failure -> return Error failure
+            | Ok backupDirectory ->
+                let movedResult =
+                    try
+                        Ok(moveToLfsBackup absolutePath backupDirectory)
+                    with error ->
+                        errorResult error
+
+                match movedResult with
+                | Error failure -> return Error failure
+                | Ok backupPath ->
+                    try
+                        let backupStats = statSync backupPath
+
+                        if
+                            backupStats.size <> statsBeforeHash.size
+                            || backupStats.mtimeMs <> statsBeforeHash.mtimeMs
+                        then
+                            restoreTemporaryLfsBackup backupPath absolutePath
+                            return errorResult (exn $"'{safePath}' changed while it was being freed. Try again.")
+                        else
+                            return Ok backupPath
+                    with error ->
+                        restoreTemporaryLfsBackup backupPath absolutePath
+                        return errorResult error
     }
 
 let private isMergeInProgress (arcPath: string) =
@@ -2280,57 +2377,71 @@ let private downloadMissingLfsFile
         match! createOriginLfsRemoteSession arcPath credentials connectionProfileId None with
         | Error failure -> return Error failure
         | Ok session ->
-            match!
-                GitLfsService.downloadObjectFromListing
-                    arcPath
-                    session.CommandAuth
-                    safePath
-                    (Some context.Cancellation.IsCancellationRequested)
-                    (fun () ->
-                        context.ReportProgress {
-                            PhaseCode = "lfs-materialize-transfer"
-                            Item = Some safePath
-                            Completed = None
-                            Total = None
-                            DisplayMessage = None
-                        })
-            with
+            // A fetch of the path pattern also downloads files whose names differ only at special
+            // characters, and the checkout after it replaces their pointers. When the listing has
+            // such a file, the download takes only this object so that file keeps its state.
+            let! fullListingResult = GitLfsService.readLsFilesByRelativePath arcPath context
+
+            match fullListingResult with
             | Error _ when context.Cancellation.IsCancellationRequested() -> return canceledLfsResult ()
-            | Error error when GitLfsService.isMissingOnRemote error.Message ->
-                return
-                    errorResult (
-                        exn $"The remote does not have the content of '{safePath}'. Upload it from the computer that saved it."
-                    )
-            | Error error -> return errorResult error
-            | Ok() when context.Cancellation.IsCancellationRequested() -> return canceledLfsResult ()
-            | Ok() ->
-                // The listing reader signals failure by throwing, so it runs inside runSimpleGit,
-                // which turns that into a GitResult.
-                let! fetchedListingResult =
-                    runSimpleGit (fun _currentGit -> requireLfsListingForPath arcPath safePath context) session.Git
+            | Error message -> return errorResult (exn $"Could not read Git LFS file metadata: {message}")
+            | Ok _ when context.Cancellation.IsCancellationRequested() -> return canceledLfsResult ()
+            | Ok fullListing ->
+                let exactObjectOnly = GitLfsService.pathPatternMatchesOtherListedPath fullListing safePath
 
-                match fetchedListingResult with
+                match!
+                    GitLfsService.downloadObjectFromListing
+                        arcPath
+                        session.CommandAuth
+                        safePath
+                        listing
+                        exactObjectOnly
+                        (Some context.Cancellation.IsCancellationRequested)
+                        (fun () ->
+                            context.ReportProgress {
+                                PhaseCode = "lfs-materialize-transfer"
+                                Item = Some safePath
+                                Completed = None
+                                Total = None
+                                DisplayMessage = None
+                            })
+                with
                 | Error _ when context.Cancellation.IsCancellationRequested() -> return canceledLfsResult ()
-                | Error failure -> return Error failure
-                | Ok _ when context.Cancellation.IsCancellationRequested() -> return canceledLfsResult ()
-                | Ok fetchedListing when not fetchedListing.downloaded ->
-                    return errorResult (exn $"Git LFS did not download '{safePath}'.")
-                | Ok _ ->
-                    let! checkoutResult = GitLfsService.checkoutPath arcPath safePath
+                | Error error when GitLfsService.isMissingOnRemote error.Message ->
+                    return
+                        errorResult (
+                            exn $"The remote does not have the content of '{safePath}'. Upload it from the computer that saved it."
+                        )
+                | Error error -> return errorResult error
+                | Ok() when context.Cancellation.IsCancellationRequested() -> return canceledLfsResult ()
+                | Ok() ->
+                    // The listing reader signals failure by throwing, so it runs inside runSimpleGit,
+                    // which turns that into a GitResult.
+                    let! fetchedListingResult =
+                        runSimpleGit (fun _currentGit -> requireLfsListingForPath arcPath safePath context) session.Git
 
-                    match checkoutResult with
-                    | Error error -> return errorResult error
-                    | Ok() ->
-                        return!
-                            runSimpleGit
-                                (fun _currentGit ->
-                                    requireDownloadedLfsFile
-                                        arcPath
-                                        safePath
-                                        absolutePath
-                                        listing
-                                        { context with Cancellation = OperationCancellation.none })
-                                session.Git
+                    match fetchedListingResult with
+                    | Error _ when context.Cancellation.IsCancellationRequested() -> return canceledLfsResult ()
+                    | Error failure -> return Error failure
+                    | Ok _ when context.Cancellation.IsCancellationRequested() -> return canceledLfsResult ()
+                    | Ok fetchedListing when not fetchedListing.downloaded ->
+                        return errorResult (exn $"Git LFS did not download '{safePath}'.")
+                    | Ok _ ->
+                        let! checkoutResult = GitLfsService.checkoutPath arcPath safePath
+
+                        match checkoutResult with
+                        | Error error -> return errorResult error
+                        | Ok() ->
+                            return!
+                                runSimpleGit
+                                    (fun _currentGit ->
+                                        requireDownloadedLfsFile
+                                            arcPath
+                                            safePath
+                                            absolutePath
+                                            listing
+                                            { context with Cancellation = OperationCancellation.none })
+                                    session.Git
 }
 
 let freeLocalLfsCopy
@@ -2444,23 +2555,16 @@ let freeLocalLfsCopy
                 | Ok None -> return errorResult (exn noCoverageMessage)
                 | Ok _ ->
                     let git = session.Git
-                    let backupPath = createTemporaryLfsBackupPath absolutePath
+                    let! backupResult = moveVerifiedFileToLfsBackup arcPath safePath absolutePath listing context
 
-                    try
-                        renameSync absolutePath backupPath
-
-                        if context.Cancellation.IsCancellationRequested() then
-                            restoreTemporaryLfsBackup backupPath absolutePath
-                            return canceledLfsResult ()
-                        else
-                            match! ensureBackupMatchesLfsOid backupPath listing context with
-                            | Error validationError ->
-                                restoreTemporaryLfsBackup backupPath absolutePath
-                                return Error validationError
-                            | Ok() when context.Cancellation.IsCancellationRequested() ->
+                    match backupResult with
+                    | Error failure -> return Error failure
+                    | Ok backupPath ->
+                        try
+                            if context.Cancellation.IsCancellationRequested() then
                                 restoreTemporaryLfsBackup backupPath absolutePath
                                 return canceledLfsResult ()
-                            | Ok() ->
+                            else
                                 let pointerGit = applyLfsSkipSmudge git
 
                                 let! checkoutResult =
@@ -2504,9 +2608,9 @@ let freeLocalLfsCopy
                                         }
 
                                         return Ok true
-                    with ex ->
-                        restoreTemporaryLfsBackup backupPath absolutePath
-                        return errorResult ex
+                        with ex ->
+                            restoreTemporaryLfsBackup backupPath absolutePath
+                            return errorResult ex
 }
 
 let downloadLfsFile

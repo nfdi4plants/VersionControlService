@@ -1025,6 +1025,7 @@ let storageDedupArgs = [| "lfs"; "dedup" |]
 
 /// git-lfs has no working escape for these characters.
 /// The root-anchored pattern can also match a few files whose names differ only at special characters.
+/// A download checks for such files with pathPatternMatchesOtherListedPath.
 let lfsPathPattern (path: string) : string =
     let pattern =
         path
@@ -1034,6 +1035,46 @@ let lfsPathPattern (path: string) : string =
             | _ -> character)
 
     "/" + pattern
+
+/// Tells whether a pattern from lfsPathPattern matches a repository path. `?` matches one
+/// character other than `/`, every other character matches itself, and the leading `/` anchors
+/// the pattern at the root. The comparison ignores case, and a pattern that matches a directory
+/// also matches the files below it. Both err toward reporting a match, which only costs the
+/// caller the slower exact-object download.
+let lfsPathPatternMatches (pattern: string) (path: string) : bool =
+    let body =
+        (if pattern.StartsWith("/", StringComparison.Ordinal) then pattern.Substring 1 else pattern)
+            .ToLowerInvariant()
+
+    let candidate = (PathHelpers.normalizeSeparators path).ToLowerInvariant()
+
+    let rec matchesFrom index =
+        if index = body.Length then
+            true
+        else
+            let character = candidate.[index]
+
+            let characterMatches =
+                if body.[index] = '?' then character <> '/' else character = body.[index]
+
+            characterMatches && matchesFrom (index + 1)
+
+    candidate.Length >= body.Length
+    && matchesFrom 0
+    && (candidate.Length = body.Length || candidate.[body.Length] = '/')
+
+/// Tells whether the path pattern of `relativePath` also matches another path in the LFS listing.
+let pathPatternMatchesOtherListedPath
+    (filesByRelativePath: Dictionary<string, GitLfsLsFileInfo>)
+    (relativePath: string)
+    : bool =
+    let pattern = lfsPathPattern relativePath
+    let normalizedPath = PathHelpers.normalizeSeparators relativePath
+
+    filesByRelativePath.Keys
+    |> Seq.exists (fun listedPath ->
+        not (String.Equals(listedPath, normalizedPath, StringComparison.Ordinal))
+        && lfsPathPatternMatches pattern listedPath)
 
 let buildFetchRefetchArgs (dryRun: bool) (relativePath: string) =
     let dryRunArguments = if dryRun then [| "--dry-run" |] else [||]
@@ -1062,6 +1103,22 @@ let dryRunCoversObject (output: string) (oid: string) : bool =
 
     output.Split '\n'
     |> Array.exists (fun line -> line.Trim().StartsWith(prefix, StringComparison.Ordinal))
+
+let private buildSmudgePointerArgs (relativePath: string) = [|
+    "-c"
+    "lfs.fetchinclude="
+    "-c"
+    "lfs.fetchexclude="
+    "lfs"
+    "smudge"
+    "--"
+    relativePath
+|]
+
+let private buildPointerInput (listing: GitLfsLsFileInfo) =
+    let sizeText = listing.size |> int64 |> string
+
+    $"version {listing.version}\noid {listing.``oid_type``}:{listing.oid}\nsize {sizeText}\n"
 
 let private buildDownloadObjectArgs (relativePath: string) = [|
     "-c"
@@ -1442,25 +1499,32 @@ let fetchRefetchForPath
                 Error(exn failureMessage)
     }
 
-/// Fetches into the local cache the objects of HEAD whose paths match the path pattern.
-/// The pattern can also match a few files whose names differ from the requested one only at special characters.
+/// Downloads the object of `listing` into the local cache.
+/// By default one fetch of the path pattern downloads it. The pattern can also match files whose
+/// names differ from the requested one only at special characters. For those, `exactObjectOnly`
+/// switches to `git lfs smudge`, which downloads only the object named in the pointer on stdin.
 let downloadObjectFromListing
     (repoPath: string)
     (commandAuth: GitCommandAuthentication)
     (relativePath: string)
+    (listing: GitLfsLsFileInfo)
+    (exactObjectOnly: bool)
     (cancelCheck: (unit -> bool) option)
     (onStarted: unit -> unit)
     : JS.Promise<Result<unit, exn>> =
     promise {
+        let arguments, standardInput =
+            if exactObjectOnly then
+                buildSmudgePointerArgs relativePath, Some(buildPointerInput listing)
+            else
+                buildDownloadObjectArgs relativePath, None
+
         let! result =
             runGitDiscardingStdoutWithStarted onStarted {
                 WorkingDirectory = Some repoPath
-                Arguments =
-                    GitCredentialStrategy.buildLfsTransferArguments
-                        commandAuth.ConfigArgs
-                        (buildDownloadObjectArgs relativePath)
+                Arguments = GitCredentialStrategy.buildLfsTransferArguments commandAuth.ConfigArgs arguments
                 Environment = Some(withFetchExcludeCleared commandAuth.Environment)
-                StandardInput = None
+                StandardInput = standardInput
                 CancelCheck = cancelCheck
                 TimeoutMs = None
             }

@@ -144,7 +144,19 @@ let internal buildScopedCommandAuthentication
     let lfsArguments =
         match credential with
         | Some resolved when remoteUrl.StartsWith("https://", System.StringComparison.OrdinalIgnoreCase) ->
-            let remoteWithoutScheme = remoteUrl.Substring("https://".Length)
+            let remoteWithoutScheme =
+                let withoutScheme = remoteUrl.Substring("https://".Length)
+                let authorityEnd = withoutScheme.IndexOf '/'
+
+                let authority =
+                    if authorityEnd < 0 then withoutScheme else withoutScheme.Substring(0, authorityEnd)
+
+                // The resolved credential replaces a user name (and password) the remote URL carries,
+                // because a second userinfo in front of the host breaks the URL.
+                let userInfoEnd = authority.LastIndexOf '@'
+
+                if userInfoEnd < 0 then withoutScheme else withoutScheme.Substring(userInfoEnd + 1)
+
             let username = encodeUriComponent resolved.Username
             let secret = encodeUriComponent resolved.Secret
             let authenticatedRemote = $"https://{username}:{secret}@{remoteWithoutScheme}"

@@ -1681,6 +1681,220 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "Git LFS path pattern matching finds files that differ only at special characters",
+            fun () -> promise {
+                Vitest.expect(GitLfsService.lfsPathPatternMatches "/runs/x?y.bin" "runs/x_y.bin").toBe true
+                Vitest.expect(GitLfsService.lfsPathPatternMatches "/runs/x?y.bin" "runs/x,y.bin").toBe true
+                Vitest.expect(GitLfsService.lfsPathPatternMatches "/runs/x?y.bin" "runs/x/y.bin").toBe false
+                Vitest.expect(GitLfsService.lfsPathPatternMatches "/runs/x?y.bin" "other/runs/x_y.bin").toBe false
+                Vitest.expect(GitLfsService.lfsPathPatternMatches "/runs/x?y.bin" "runs/x_y.bin.old").toBe false
+                Vitest.expect(GitLfsService.lfsPathPatternMatches "/sample?1?.bin" "sample_1_.bin").toBe true
+            }
+        )
+
+        Vitest.test (
+            "materialization downloads only the requested file when another file matches its path pattern",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let! root, workPath, _, session =
+                        createPublishFixture GitWorkspaceSession.GitSessionHooks.none
+
+                    try
+                        let requestedPath = "runs/x,y.bin"
+                        let siblingPath = "runs/x_y.bin"
+                        let requestedContent = "requested object\n"
+                        let siblingContent = "sibling object\n"
+                        let! _ = runGitOk workPath [| "lfs"; "track"; "*.bin" |]
+                        NodeFileSystem.mkdirSync (join [| workPath; "runs" |]) (NodeFileSystem.MkdirOptions(recursive = true))
+                        do! writeUtf8FileAsync (join [| workPath; requestedPath |]) requestedContent
+                        do! writeUtf8FileAsync (join [| workPath; siblingPath |]) siblingContent
+                        let! _ = runGitOk workPath [| "add"; "-A" |]
+                        let! _ = runGitOk workPath [| "commit"; "-m"; "test: LFS files with a shared path pattern" |]
+                        let! _ = runGitOk workPath [| "push"; "origin"; "main" |]
+                        let! siblingObjectPath = lfsObjectPathForHeadFile workPath siblingPath
+
+                        let materialization =
+                            session.ObjectMaterialization
+                            |> Option.defaultWith (fun () -> failwith "Expected the object-materialization service.")
+
+                        for relativePath in [| requestedPath; siblingPath |] do
+                            let! dematerializeResult =
+                                materialization.Dematerialize (repositoryPath relativePath) (ctx $"free-{relativePath}")
+                                |> Async.StartAsPromise
+
+                            match dematerializeResult with
+                            | Succeeded _ -> ()
+                            | PartiallySucceeded(_, failure)
+                            | Failed failure ->
+                                failwith $"Dematerialization failed for '{relativePath}' ({failure.Code})."
+
+                        // The remote check of a free on a local remote refetches every object the pattern
+                        // matches. Removing the requested object makes the download fetch it from the remote.
+                        let! requestedObjectPath = lfsObjectPathForHeadFile workPath requestedPath
+
+                        if NodeFileSystem.existsSync requestedObjectPath then
+                            NodeFileSystem.unlinkSync requestedObjectPath
+
+                        let! siblingObjectExistsBefore = pathExistsAsync siblingObjectPath
+                        Vitest.expect(siblingObjectExistsBefore).toBe false
+
+                        let! materializeResult =
+                            materialization.Materialize (repositoryPath requestedPath) (ctx "download-requested")
+                            |> Async.StartAsPromise
+
+                        match materializeResult with
+                        | Succeeded _ -> ()
+                        | PartiallySucceeded(_, failure)
+                        | Failed failure -> failwith $"Materialization failed for '{requestedPath}' ({failure.Code})."
+
+                        let! requestedAfter = tryReadUtf8FileAsync (join [| workPath; requestedPath |])
+                        Vitest.expect(requestedAfter).toEqual (Some requestedContent)
+
+                        let! siblingAfter = tryReadUtf8FileAsync (join [| workPath; siblingPath |])
+
+                        Vitest
+                            .expect(
+                                siblingAfter
+                                |> Option.exists (fun text -> text.StartsWith("version https://git-lfs", StringComparison.Ordinal))
+                            )
+                            .toBe true
+
+                        let! siblingObjectExists = pathExistsAsync siblingObjectPath
+                        Vitest.expect(siblingObjectExists).toBe false
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "a workspace mutation waits until a running dematerialization finishes",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let holdArmed = ref false
+                    let holding = ref false
+                    let mutationStarted = ref false
+                    let releaseHold = ref ignore
+                    let commandsDuringHold = ResizeArray<string[]>()
+
+                    let recordCommand (arguments: string[]) =
+                        if holding.Value && mutationStarted.Value then
+                            commandsDuringHold.Add arguments
+
+                    // Dematerialize reads lfs.storage after the file became a pointer, still inside its body.
+                    let hooks: GitWorkspaceSession.GitSessionHooks = {
+                        RunBytesProcess =
+                            Some(fun request operationContext ->
+                                recordCommand request.Arguments
+                                NodeProcess.runBytes request operationContext)
+                        RunProcess =
+                            Some(fun request operationContext -> async {
+                                recordCommand request.Arguments
+
+                                if holdArmed.Value && request.Arguments = [| "config"; "--get"; "lfs.storage" |] then
+                                    holdArmed.Value <- false
+
+                                    do!
+                                        Promise.create (fun resolve _ ->
+                                            releaseHold.Value <- (fun () -> resolve ())
+                                            holding.Value <- true)
+                                        |> Async.AwaitPromise
+
+                                    holding.Value <- false
+
+                                return! NodeProcess.run request operationContext
+                            })
+                        Barrier = None
+                    }
+
+                    let! root, workPath, _, session = createPublishFixture hooks
+
+                    try
+                        let relativePath = "held.bin"
+                        let content = "held while freeing\n"
+                        let! _ = runGitOk workPath [| "lfs"; "track"; "*.bin" |]
+                        do! writeUtf8FileAsync (join [| workPath; relativePath |]) content
+                        let! _ = runGitOk workPath [| "add"; "-A" |]
+                        let! _ = runGitOk workPath [| "commit"; "-m"; "test: LFS file to free" |]
+                        let! _ = runGitOk workPath [| "push"; "origin"; "main" |]
+                        do! writeUtf8FileAsync (join [| workPath; "note.txt" |]) "saved after the free\n"
+
+                        let materialization =
+                            session.ObjectMaterialization
+                            |> Option.defaultWith (fun () -> failwith "Expected the object-materialization service.")
+
+                        holdArmed.Value <- true
+
+                        let dematerialization =
+                            materialization.Dematerialize (repositoryPath relativePath) (ctx "held-dematerialize")
+                            |> Async.StartAsPromise
+
+                        let waitedMs = ref 0
+
+                        while not holding.Value && waitedMs.Value < 60000 do
+                            do! Promise.sleep 20
+                            waitedMs.Value <- waitedMs.Value + 20
+
+                        Vitest.expect(holding.Value).toBe true
+                        let! status = sessionStatus session
+                        mutationStarted.Value <- true
+
+                        let revision =
+                            session.Core.CreateRevision
+                                {
+                                    Message = "test: save during a free"
+                                    Paths = [| repositoryPath "note.txt" |]
+                                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                }
+                                (ctx "save-during-free")
+                            |> Async.StartAsPromise
+
+                        do! Promise.sleep 500
+                        Vitest.expect(commandsDuringHold.Count).toBe 0
+                        releaseHold.Value ()
+
+                        let! dematerializeResult = dematerialization
+                        let! revisionResult = revision
+
+                        match dematerializeResult with
+                        | Succeeded _ -> ()
+                        | PartiallySucceeded(_, failure)
+                        | Failed failure -> failwith $"The held dematerialization failed ({failure.Code})."
+
+                        match revisionResult with
+                        | Succeeded _ -> ()
+                        | PartiallySucceeded(_, failure)
+                        | Failed failure -> failwith $"The save after the free failed ({failure.Code}): {failure.Message}"
+
+                        let! freedContent = tryReadUtf8FileAsync (join [| workPath; relativePath |])
+
+                        Vitest
+                            .expect(
+                                freedContent
+                                |> Option.exists (fun text -> text.StartsWith("version https://git-lfs", StringComparison.Ordinal))
+                            )
+                            .toBe true
+
+                        do! removeDirectoryAsync root
+                    with error ->
+                        releaseHold.Value ()
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
             "selected revision LFS reconciliation rejects unrelated dirty attributes before ref movement",
             TestOptions(timeout = 120000),
             fun () -> promise {
