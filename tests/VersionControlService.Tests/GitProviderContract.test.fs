@@ -2657,7 +2657,11 @@ Vitest.describe (
                         ()
 
                     do! writeUtf8FileAsync (join [| workspace.Binding.WorkspaceRoot; "status" |]) ""
-                    do! writeUtf8FileAsync (join [| workspace.Binding.WorkspaceRoot; "checkout" |]) ""
+                    // Like `git checkout HEAD -- <path>` with smudge skipped, write the committed pointer.
+                    do!
+                        writeUtf8FileAsync
+                            (join [| workspace.Binding.WorkspaceRoot; "checkout" |])
+                            "const fs = require('node:fs');\nconst target = process.argv[process.argv.length - 1].replace(/^:\\([^)]*\\)/, '');\nfs.writeFileSync(target, fs.readFileSync(process.env.VCS_TEST_LFS_POINTER, 'utf8'));\n"
                     do! writeUtf8FileAsync (join [| workspace.Binding.WorkspaceRoot; "rev-parse" |]) "console.log('true');\n"
 
                     do!
@@ -2675,6 +2679,12 @@ Vitest.describe (
                         writeUtf8FileAsync
                             (join [| workspace.Binding.WorkspaceRoot; "check-attr" |])
                             "process.stdout.write('materialized.bin\\0filter\\0lfs\\0');\n"
+
+                    // Free reads the committed pointer with `git cat-file blob HEAD:<path>`.
+                    do!
+                        writeUtf8FileAsync
+                            (join [| workspace.Binding.WorkspaceRoot; "cat-file" |])
+                            "process.stdout.write(require('node:fs').readFileSync(process.env.VCS_TEST_LFS_POINTER, 'utf8'));\n"
 
                     do!
                         writeUtf8FileAsync
