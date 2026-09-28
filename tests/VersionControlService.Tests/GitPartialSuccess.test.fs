@@ -8,6 +8,7 @@ open VersionControlService.Tests.NodePath
 open Vitest
 
 module GitWorkspaceSession = VersionControlService.Git.GitWorkspaceSession
+module GitService = VersionControlService.Git.GitService
 module GitExecution = VersionControlService.Git.GitExecution
 module GitLfsService = VersionControlService.Git.GitLfsService
 module NodeProcess = VersionControlService.Runtime.Node.Process
@@ -281,6 +282,22 @@ let private createPublishFixture hooks = promise {
     }
 
     return root, workPath, barePath, GitWorkspaceSession.createSession hooks binding
+}
+
+let private createPathspecFixture () = promise {
+    let! root = createTempDirectoryAsync ()
+    let workPath = join [| root; "work" |]
+    let! _ = runGitOk root [| "init"; "-b"; "main"; workPath |]
+    let! _ = runGitOk workPath [| "config"; "user.name"; "VCS Partial Tests" |]
+    let! _ = runGitOk workPath [| "config"; "user.email"; "partial@example.org" |]
+    let! _ = runGitOk workPath [| "config"; "core.autocrlf"; "false" |]
+    return root, workPath
+}
+
+let private commitPathspecFixtureFiles (workPath: string) (message: string) = promise {
+    let! _ = runGitOk workPath [| "add"; "-A" |]
+    let! _ = runGitOk workPath [| "commit"; "-m"; message |]
+    return ()
 }
 
 let private isLfsPullRequest (request: NodeProcess.ProcessRequest) =
@@ -1722,6 +1739,233 @@ Vitest.describe (
                     with error ->
                         do! removeDirectoryAsync root
                         return raise error
+            }
+        )
+
+        Vitest.test (
+            "dematerialization of a bracket path keeps edits to a similarly named tracked file",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let! root, workPath, _, session =
+                        createPublishFixture GitWorkspaceSession.GitSessionHooks.none
+
+                    try
+                        let requestedPath = "runs/sample[1].csv"
+                        let siblingPath = "runs/sample1.csv"
+                        let requestedContent = "LFS sample content\n"
+                        let siblingContent = "ordinary sample content\n"
+                        NodeFileSystem.mkdirSync (join [| workPath; "runs" |]) (NodeFileSystem.MkdirOptions(recursive = true))
+                        let! _ = runGitOk workPath [| "lfs"; "track"; "--filename"; requestedPath |]
+                        do! writeUtf8FileAsync (join [| workPath; requestedPath |]) requestedContent
+                        do! writeUtf8FileAsync (join [| workPath; siblingPath |]) siblingContent
+                        let! _ = runGitOk workPath [| "add"; "-A" |]
+                        let! _ = runGitOk workPath [| "commit"; "-m"; "test: add bracket LFS path" |]
+                        let! _ = runGitOk workPath [| "push"; "origin"; "main" |]
+                        let siblingEdit = "ordinary sample edit\n"
+                        do! writeUtf8FileAsync (join [| workPath; siblingPath |]) siblingEdit
+
+                        let materialization =
+                            session.ObjectMaterialization
+                            |> Option.defaultWith (fun () -> failwith "Expected the object-materialization service.")
+
+                        let! dematerializeResult =
+                            materialization.Dematerialize
+                                (repositoryPath requestedPath)
+                                (ctx "free-bracket-path-keeps-sibling-edit")
+                            |> Async.StartAsPromise
+
+                        match dematerializeResult with
+                        | Succeeded _ -> ()
+                        | PartiallySucceeded(_, failure)
+                        | Failed failure ->
+                            failwith $"Dematerialization failed for the bracket path ({failure.Code})."
+
+                        let! siblingAfter = tryReadUtf8FileAsync (join [| workPath; siblingPath |])
+                        Vitest.expect(siblingAfter).toEqual (Some siblingEdit)
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "discard restores a bracket path and keeps a similarly named tracked edit",
+            fun () -> promise {
+                let! root, workPath = createPathspecFixture ()
+
+                try
+                    let requestedPath = "runs/sample[1].csv"
+                    let siblingPath = "runs/sample1.csv"
+                    let requestedContent = "bracket base\n"
+                    let siblingContent = "sibling base\n"
+                    NodeFileSystem.mkdirSync (join [| workPath; "runs" |]) (NodeFileSystem.MkdirOptions(recursive = true))
+                    do! writeUtf8FileAsync (join [| workPath; requestedPath |]) requestedContent
+                    do! writeUtf8FileAsync (join [| workPath; siblingPath |]) siblingContent
+                    do! commitPathspecFixtureFiles workPath "init: bracket discard paths"
+                    let siblingEdit = "sibling edit\n"
+                    do! writeUtf8FileAsync (join [| workPath; requestedPath |]) "bracket edit\n"
+                    do! writeUtf8FileAsync (join [| workPath; siblingPath |]) siblingEdit
+
+                    let! discardResult =
+                        GitService.discardPaths workPath [| requestedPath |]
+
+                    match discardResult with
+                    | Ok _ -> ()
+                    | Error failure -> failwith $"Discard failed: {failure.Message}"
+
+                    let! requestedAfter = tryReadUtf8FileAsync (join [| workPath; requestedPath |])
+                    let! siblingAfter = tryReadUtf8FileAsync (join [| workPath; siblingPath |])
+                    Vitest.expect(requestedAfter).toEqual (Some requestedContent)
+                    Vitest.expect(siblingAfter).toEqual (Some siblingEdit)
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "discard of a directory path restores files below it",
+            fun () -> promise {
+                let! root, workPath = createPathspecFixture ()
+
+                try
+                    let nestedPath = "runs/sub/deep/file.txt"
+                    let siblingPath = "runs-extra/file.txt"
+                    let nestedContent = "nested base\n"
+                    NodeFileSystem.mkdirSync (join [| workPath; "runs/sub/deep" |]) (NodeFileSystem.MkdirOptions(recursive = true))
+                    NodeFileSystem.mkdirSync (join [| workPath; "runs-extra" |]) (NodeFileSystem.MkdirOptions(recursive = true))
+                    do! writeUtf8FileAsync (join [| workPath; nestedPath |]) nestedContent
+                    do! writeUtf8FileAsync (join [| workPath; siblingPath |]) "outside base\n"
+                    do! commitPathspecFixtureFiles workPath "init: directory discard path"
+                    let siblingEdit = "outside edit\n"
+                    do! writeUtf8FileAsync (join [| workPath; nestedPath |]) "nested edit\n"
+                    do! writeUtf8FileAsync (join [| workPath; siblingPath |]) siblingEdit
+
+                    let! discardResult = GitService.discardPaths workPath [| "runs" |]
+
+                    match discardResult with
+                    | Ok _ -> ()
+                    | Error failure -> failwith $"Directory discard failed: {failure.Message}"
+
+                    let! nestedAfter = tryReadUtf8FileAsync (join [| workPath; nestedPath |])
+                    let! siblingAfter = tryReadUtf8FileAsync (join [| workPath; siblingPath |])
+                    Vitest.expect(nestedAfter).toEqual (Some nestedContent)
+                    Vitest.expect(siblingAfter).toEqual (Some siblingEdit)
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "discard follows a rename original with brackets and keeps a similar edit",
+            fun () -> promise {
+                let! root, workPath = createPathspecFixture ()
+
+                try
+                    let originalPath = "data/a[1].csv"
+                    let selectedPath = "data/b.csv"
+                    let siblingPath = "data/a1.csv"
+                    let originalContent = "original bracket file\n"
+                    NodeFileSystem.mkdirSync (join [| workPath; "data" |]) (NodeFileSystem.MkdirOptions(recursive = true))
+                    do! writeUtf8FileAsync (join [| workPath; originalPath |]) originalContent
+                    do! writeUtf8FileAsync (join [| workPath; siblingPath |]) "sibling base\n"
+                    do! commitPathspecFixtureFiles workPath "init: rename original path"
+                    let! _ = runGitOk workPath [| "mv"; originalPath; selectedPath |]
+                    let siblingEdit = "sibling edit\n"
+                    do! writeUtf8FileAsync (join [| workPath; siblingPath |]) siblingEdit
+
+                    let! discardResult = GitService.discardPaths workPath [| selectedPath |]
+
+                    match discardResult with
+                    | Ok _ -> ()
+                    | Error failure -> failwith $"Rename discard failed: {failure.Message}"
+
+                    let! originalAfter = tryReadUtf8FileAsync (join [| workPath; originalPath |])
+                    let! selectedStillExists = pathExistsAsync (join [| workPath; selectedPath |])
+                    let! siblingAfter = tryReadUtf8FileAsync (join [| workPath; siblingPath |])
+                    Vitest.expect(originalAfter).toEqual (Some originalContent)
+                    Vitest.expect(selectedStillExists).toBe false
+                    Vitest.expect(siblingAfter).toEqual (Some siblingEdit)
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "discard in an unborn repository unstages only the selected bracket path",
+            fun () -> promise {
+                let! root, workPath = createPathspecFixture ()
+
+                try
+                    do! writeUtf8FileAsync (join [| workPath; "new[1].txt" |]) "selected new file\n"
+                    do! writeUtf8FileAsync (join [| workPath; "new1.txt" |]) "sibling new file\n"
+                    let! _ = runGitOk workPath [| "add"; "-A" |]
+
+                    let! discardResult =
+                        GitService.discardPaths workPath [| "new[1].txt" |]
+
+                    match discardResult with
+                    | Ok _ -> ()
+                    | Error failure -> failwith $"Unborn repository discard failed: {failure.Message}"
+
+                    let! stagedPaths = runGitOk workPath [| "diff"; "--cached"; "--name-only" |]
+                    let! siblingExists = pathExistsAsync (join [| workPath; "new1.txt" |])
+                    Vitest.expect(stagedPaths.Trim()).toBe "new1.txt"
+                    Vitest.expect(siblingExists).toBe true
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "stage and unstage of a bracket path leave a similarly named file alone",
+            fun () -> promise {
+                let! root, workPath = createPathspecFixture ()
+
+                try
+                    let selectedPath = "x[1].txt"
+                    let siblingPath = "x1.txt"
+                    do! writeUtf8FileAsync (join [| workPath; selectedPath |]) "selected base\n"
+                    do! writeUtf8FileAsync (join [| workPath; siblingPath |]) "sibling base\n"
+                    do! commitPathspecFixtureFiles workPath "init: stage bracket path"
+                    do! writeUtf8FileAsync (join [| workPath; selectedPath |]) "selected edit\n"
+                    do! writeUtf8FileAsync (join [| workPath; siblingPath |]) "sibling edit\n"
+
+                    let! stageResult = GitService.stagePaths workPath [| selectedPath |]
+
+                    match stageResult with
+                    | Ok() -> ()
+                    | Error failure -> failwith $"Stage failed: {failure.Message}"
+
+                    let! stagedAfterSelection = runGitOk workPath [| "diff"; "--cached"; "--name-only" |]
+                    Vitest.expect(stagedAfterSelection.Trim()).toBe selectedPath
+                    let! _ = runGitOk workPath [| "add"; "--"; siblingPath |]
+
+                    let! unstageResult = GitService.unstagePaths workPath [| selectedPath |]
+
+                    match unstageResult with
+                    | Ok() -> ()
+                    | Error failure -> failwith $"Unstage failed: {failure.Message}"
+
+                    let! stagedAfterUnstage = runGitOk workPath [| "diff"; "--cached"; "--name-only" |]
+                    Vitest.expect(stagedAfterUnstage.Trim()).toBe siblingPath
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
             }
         )
 

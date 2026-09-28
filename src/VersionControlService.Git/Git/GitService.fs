@@ -340,6 +340,13 @@ let validatePathspecs (pathSpecs: string[]) =
             )
             (Ok [||])
 
+// The callers already validated these paths with ensureValidPathspec. RepositoryPath would reject
+// a directory with a trailing slash, which git accepts, so the prefix is added directly.
+let private literalPathspecFromString (path: string) = ":(literal)" + path
+
+let private literalPathspecsFromStrings (paths: string[]) =
+    paths |> Array.map literalPathspecFromString
+
 let private validateLiteralDiffPathspecs (pathSpecs: string[]) =
     if isNull pathSpecs || pathSpecs.Length = 0 then
         Error(exn "At least one pathspec is required.")
@@ -1304,7 +1311,11 @@ let private enforceStageTimeLfsTrackingForPaths
                         else
                             let pathsToRestage = [| ".gitattributes"; yield! oversizedPaths |] |> Array.distinct
 
-                            let! restageResult = runSimpleGitPathspecChunks [| "add" |] pathsToRestage git
+                            let! restageResult =
+                                runSimpleGitPathspecChunks
+                                    [| "add" |]
+                                    (literalPathspecsFromStrings pathsToRestage)
+                                    git
 
                             match restageResult with
                             | Ok _ -> return Ok()
@@ -1315,7 +1326,10 @@ let private enforceStageTimeLfsTrackingForPaths
 
 let private tryGetIndexedBlobId (git: ISimpleGit) (relativePath: string) : JS.Promise<GitResult<string option>> = promise {
     let! lsFilesResult =
-        runSimpleGit (fun currentGit -> currentGit.raw [| "ls-files"; "--stage"; "--"; relativePath |]) git
+        runSimpleGit
+            (fun currentGit ->
+                currentGit.raw [| "ls-files"; "--stage"; "--"; literalPathspecFromString relativePath |])
+            git
 
     return
         lsFilesResult
@@ -1869,6 +1883,7 @@ let getDiffViewData (arcPath: string) (requestedPath: string) : JS.Promise<GitRe
                                         yield originalPath
                                     | _ -> ()
                                 |]
+                                let literalDiffPaths = literalPathspecsFromStrings diffPaths
 
                                 let! wordDiffResult =
                                     runSimpleGit
@@ -1880,7 +1895,7 @@ let getDiffViewData (arcPath: string) (requestedPath: string) : JS.Promise<GitRe
                                                 "--find-renames"
                                                 "HEAD"
                                                 "--"
-                                                yield! diffPaths
+                                                yield! literalDiffPaths
                                             |]
                                         )
                                         git
@@ -2169,7 +2184,8 @@ let stagePaths (arcPath: string) (pathSpecs: string[]) : JS.Promise<GitResult<un
             withLocalGit
                 arcPath
                 (fun git -> promise {
-                    let! stageResult = runSimpleGitPathspecChunks [| "add" |] safePathSpecs git
+                    let! stageResult =
+                        runSimpleGitPathspecChunks [| "add" |] (literalPathspecsFromStrings safePathSpecs) git
 
                     match stageResult with
                     | Error failure -> return abortGitPromise failure.Message
@@ -2191,7 +2207,11 @@ let unstagePaths (arcPath: string) (pathSpecs: string[]) : JS.Promise<GitResult<
             withLocalGit
                 arcPath
                 (fun git -> promise {
-                    let! resetResult = runSimpleGitPathspecChunks [| "reset"; "--mixed" |] safePathSpecs git
+                    let! resetResult =
+                        runSimpleGitPathspecChunks
+                            [| "reset"; "--mixed" |]
+                            (literalPathspecsFromStrings safePathSpecs)
+                            git
 
                     match resetResult with
                     | Ok _ -> return ()
@@ -2206,7 +2226,10 @@ let private hasHeadCommit (git: ISimpleGit) = promise {
 
 let private headPathsForPathspecsWithGit (git: ISimpleGit) (pathSpecs: string[]) = promise {
     let! headPathsResult =
-        runSimpleGitPathspecChunks [| "ls-tree"; "-r"; "-z"; "--name-only"; "HEAD" |] pathSpecs git
+        runSimpleGitPathspecChunks
+            [| "ls-tree"; "-r"; "-z"; "--name-only"; "HEAD" |]
+            (literalPathspecsFromStrings pathSpecs)
+            git
 
     match headPathsResult with
     | Ok output ->
@@ -2570,7 +2593,13 @@ let freeLocalLfsCopy
 
                                 let! checkoutResult =
                                     runSimpleGit
-                                        (fun currentGit -> currentGit.raw [| "checkout"; "HEAD"; "--"; safePath |])
+                                        (fun currentGit ->
+                                            currentGit.raw [|
+                                                "checkout"
+                                                "HEAD"
+                                                "--"
+                                                literalPathspecFromString safePath
+                                            |])
                                         pointerGit
 
                                 match checkoutResult with
@@ -2694,7 +2723,10 @@ let discardPaths (arcPath: string) (pathSpecs: string[]) : JS.Promise<GitResult<
 
                     if hasHead then
                         let! resetResult =
-                            runSimpleGitPathspecChunks [| "reset" |] discardPathSpecs git
+                            runSimpleGitPathspecChunks
+                                [| "reset" |]
+                                (literalPathspecsFromStrings discardPathSpecs)
+                                git
 
                         match resetResult with
                         | Error failure -> return abortGitPromise failure.Message
@@ -2706,7 +2738,10 @@ let discardPaths (arcPath: string) (pathSpecs: string[]) : JS.Promise<GitResult<
                                 let restoreGit = applyLfsSkipSmudge git
 
                                 let! restoreResult =
-                                    runSimpleGitPathspecChunks [| "restore"; "--worktree" |] headPaths restoreGit
+                                    runSimpleGitPathspecChunks
+                                        [| "restore"; "--worktree" |]
+                                        (literalPathspecsFromStrings headPaths)
+                                        restoreGit
 
                                 match restoreResult with
                                 | Error failure -> return abortGitPromise failure.Message
@@ -2715,7 +2750,7 @@ let discardPaths (arcPath: string) (pathSpecs: string[]) : JS.Promise<GitResult<
                         let! rmCachedResult =
                             runSimpleGitPathspecChunks
                                 [| "rm"; "--cached"; "-r"; "--ignore-unmatch" |]
-                                discardPathSpecs
+                                (literalPathspecsFromStrings discardPathSpecs)
                                 git
 
                         match rmCachedResult with
@@ -2723,7 +2758,10 @@ let discardPaths (arcPath: string) (pathSpecs: string[]) : JS.Promise<GitResult<
                         | Ok _ -> ()
 
                     let! cleanResult =
-                        runSimpleGitPathspecChunks [| "clean"; "-fd" |] discardPathSpecs git
+                        runSimpleGitPathspecChunks
+                            [| "clean"; "-fd" |]
+                            (literalPathspecsFromStrings discardPathSpecs)
+                            git
 
                     match cleanResult with
                     | Error failure -> return abortGitPromise failure.Message
@@ -2813,7 +2851,14 @@ let confirmMergeResolution
                                                 $"Failed to write resolved content for '{safeRequestedPath}': {error.Message}"
 
                                     let! addResult =
-                                        runSimpleGit (fun currentGit -> currentGit.add [| safeRequestedPath |]) git
+                                        runSimpleGit
+                                            (fun currentGit ->
+                                                currentGit.raw [|
+                                                    "add"
+                                                    "--"
+                                                    literalPathspecFromString safeRequestedPath
+                                                |])
+                                            git
 
                                     match addResult with
                                     | Error failure ->
