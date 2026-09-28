@@ -340,8 +340,8 @@ let validatePathspecs (pathSpecs: string[]) =
             )
             (Ok [||])
 
-// The callers already validated these paths with ensureValidPathspec. RepositoryPath would reject
-// a directory with a trailing slash, which git accepts, so the prefix is added directly.
+// Paths here are either validated with ensureValidPathspec or come from git output. RepositoryPath
+// rejects a trailing slash that git accepts, so this function adds the prefix itself.
 let private literalPathspecFromString (path: string) = ":(literal)" + path
 
 let private literalPathspecsFromStrings (paths: string[]) =
@@ -657,7 +657,7 @@ let private restoreTemporaryLfsBackup
 let private lfsBackupRetainedFailure safePath backupPath =
     createFailure
         GitFailureKind.LfsBackupRetained
-        $"Free did not complete because '{safePath}' changed. The current file was left untouched. The backup is retained at '{backupPath}'."
+        $"Freeing the local LFS copy of '{safePath}' stopped because the file changed. Its earlier content is kept at '{backupPath}'."
 
 let private removeTemporaryLfsBackup backupPath =
     if existsSync backupPath then
@@ -2728,6 +2728,9 @@ let freeLocalLfsCopy
                                         let untimedStatusGit = createUntimedOptions arcPath None None |> createGit
                                         let! finalStatusResult =
                                             runSimpleGit (fun currentGit -> currentGit.status ()) untimedStatusGit
+
+                                        freeLocalLfsCopyTestHook
+                                        |> Option.iter (fun hook -> hook "after-final-status" absolutePath)
 
                                         match finalStatusResult with
                                         | Error failure ->

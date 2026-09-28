@@ -234,7 +234,7 @@ let private pathExistsAsync (path: string) : JS.Promise<bool> = promise {
 }
 
 let private retainedBackupPath (message: string) =
-    let marker = "The backup is retained at '"
+    let marker = "Its earlier content is kept at '"
     let markerStart = message.IndexOf(marker, StringComparison.Ordinal)
 
     if markerStart < 0 then
@@ -2503,6 +2503,68 @@ Vitest.describe (
                             materialization.Dematerialize
                                 (repositoryPath relativePath)
                                 (ctx "save-after-pointer-checkout")
+                            |> Async.StartAsPromise
+
+                        GitService.freeLocalLfsCopyTestHook <- None
+
+                        match dematerializeResult with
+                        | Failed failure ->
+                            Vitest.expect(failure.Code).toEqual "lfs_backup_retained"
+                            Vitest.expect(failure.StateChanged).toBe true
+
+                            let backupPath = retainedBackupPath failure.Message
+                            let! backupExists = pathExistsAsync backupPath
+                            Vitest.expect(backupExists).toBe true
+                        | Succeeded _
+                        | PartiallySucceeded _ ->
+                            failwith "Expected a retained-backup failure after the save."
+
+                        let! contentAfter = tryReadUtf8FileAsync objectPath
+                        Vitest.expect(contentAfter).toEqual (Some savedContent)
+                        do! removeDirectoryAsync root
+                    with error ->
+                        GitService.freeLocalLfsCopyTestHook <- None
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "dematerialization retains a save written after the final status check",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let! root, workPath, _, session =
+                        createPublishFixture GitWorkspaceSession.GitSessionHooks.none
+
+                    try
+                        let relativePath = "saved-after-final-status.bin"
+                        let objectPath = join [| workPath; relativePath |]
+                        let savedContent = "saved after the final status check\n"
+                        let! _ = runGitOk workPath [| "lfs"; "track"; "*.bin" |]
+                        do! writeUtf8FileAsync objectPath "content before the free\n"
+                        let! _ = runGitOk workPath [| "add"; "-A" |]
+                        let! _ = runGitOk workPath [| "commit"; "-m"; "test: LFS file to free" |]
+                        let! _ = runGitOk workPath [| "push"; "origin"; "main" |]
+
+                        let materialization =
+                            session.ObjectMaterialization
+                            |> Option.defaultWith (fun () -> failwith "Expected the object-materialization service.")
+
+                        // The status ran before this write and saw a clean path, so the free reaches the success branch.
+                        GitService.freeLocalLfsCopyTestHook <-
+                            Some(fun stage path ->
+                                if stage = "after-final-status" then
+                                    NodeFileSystem.writeFileSync path savedContent NodeFileSystem.TextEncoding.Utf8)
+
+                        let! dematerializeResult =
+                            materialization.Dematerialize
+                                (repositoryPath relativePath)
+                                (ctx "save-after-final-status")
                             |> Async.StartAsPromise
 
                         GitService.freeLocalLfsCopyTestHook <- None
