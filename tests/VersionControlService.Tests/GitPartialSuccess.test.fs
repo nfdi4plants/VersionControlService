@@ -233,6 +233,21 @@ let private pathExistsAsync (path: string) : JS.Promise<bool> = promise {
         return false
 }
 
+let private retainedBackupPath (message: string) =
+    let marker = "The backup is retained at '"
+    let markerStart = message.IndexOf(marker, StringComparison.Ordinal)
+
+    if markerStart < 0 then
+        failwith $"The retained backup path was missing from the failure message: {message}"
+
+    let pathStart = markerStart + marker.Length
+    let pathEnd = message.IndexOf('\'', pathStart)
+
+    if pathEnd < 0 then
+        failwith $"The retained backup path was incomplete in the failure message: {message}"
+
+    message.Substring(pathStart, pathEnd - pathStart)
+
 [<Emit("require('node:crypto').createHash('sha256').update($0, 'utf8').digest('hex')")>]
 let private sha256Utf8 (_value: string) : string = jsNative
 
@@ -2354,6 +2369,145 @@ Vitest.describe (
                         do! removeDirectoryAsync root
                     with error ->
                         stopAppending.Value ()
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "dematerialization retains a save written after the pointer checkout",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let! root, workPath, _, session =
+                        createPublishFixture GitWorkspaceSession.GitSessionHooks.none
+
+                    try
+                        let relativePath = "saved-after-checkout.bin"
+                        let objectPath = join [| workPath; relativePath |]
+                        let savedContent = "saved after the pointer checkout\n"
+                        let! _ = runGitOk workPath [| "lfs"; "track"; "*.bin" |]
+                        do! writeUtf8FileAsync objectPath "content before the free\n"
+                        let! _ = runGitOk workPath [| "add"; "-A" |]
+                        let! _ = runGitOk workPath [| "commit"; "-m"; "test: LFS file to free" |]
+                        let! _ = runGitOk workPath [| "push"; "origin"; "main" |]
+
+                        let materialization =
+                            session.ObjectMaterialization
+                            |> Option.defaultWith (fun () -> failwith "Expected the object-materialization service.")
+
+                        GitService.freeLocalLfsCopyTestHook <-
+                            Some(fun stage path ->
+                                if stage = "after-pointer-checkout" then
+                                    NodeFileSystem.writeFileSync path savedContent NodeFileSystem.TextEncoding.Utf8)
+
+                        let! dematerializeResult =
+                            materialization.Dematerialize
+                                (repositoryPath relativePath)
+                                (ctx "save-after-pointer-checkout")
+                            |> Async.StartAsPromise
+
+                        GitService.freeLocalLfsCopyTestHook <- None
+
+                        match dematerializeResult with
+                        | Failed failure ->
+                            Vitest.expect(failure.Code).toEqual "lfs_backup_retained"
+                            Vitest.expect(failure.StateChanged).toBe true
+
+                            let backupPath = retainedBackupPath failure.Message
+                            let! backupExists = pathExistsAsync backupPath
+                            Vitest.expect(backupExists).toBe true
+                        | Succeeded _
+                        | PartiallySucceeded _ ->
+                            failwith "Expected a retained-backup failure after the save."
+
+                        let! contentAfter = tryReadUtf8FileAsync objectPath
+                        Vitest.expect(contentAfter).toEqual (Some savedContent)
+                        do! removeDirectoryAsync root
+                    with error ->
+                        GitService.freeLocalLfsCopyTestHook <- None
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "dematerialization leaves a recreated path untouched before pointer checkout",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let! root, workPath, _, session =
+                        createPublishFixture GitWorkspaceSession.GitSessionHooks.none
+
+                    let observedCommands = ResizeArray<string[]>()
+                    let stopObserving: (unit -> unit) ref = ref ignore
+
+                    try
+                        let relativePath = "recreated-before-checkout.bin"
+                        let objectPath = join [| workPath; relativePath |]
+                        let savedContent = "recreated after the backup move\n"
+                        let! _ = runGitOk workPath [| "lfs"; "track"; "*.bin" |]
+                        do! writeUtf8FileAsync objectPath "content before the free\n"
+                        let! _ = runGitOk workPath [| "add"; "-A" |]
+                        let! _ = runGitOk workPath [| "commit"; "-m"; "test: LFS file to free" |]
+                        let! _ = runGitOk workPath [| "push"; "origin"; "main" |]
+
+                        let materialization =
+                            session.ObjectMaterialization
+                            |> Option.defaultWith (fun () -> failwith "Expected the object-materialization service.")
+
+                        GitService.freeLocalLfsCopyTestHook <-
+                            Some(fun stage path ->
+                                if stage = "after-backup-move" then
+                                    NodeFileSystem.writeFileSync path savedContent NodeFileSystem.TextEncoding.Utf8)
+
+                        stopObserving.Value <- observeGitSpawnArguments observedCommands
+
+                        let! dematerializeResult =
+                            materialization.Dematerialize
+                                (repositoryPath relativePath)
+                                (ctx "recreated-before-pointer-checkout")
+                            |> Async.StartAsPromise
+
+                        stopObserving.Value ()
+                        stopObserving.Value <- ignore
+                        GitService.freeLocalLfsCopyTestHook <- None
+
+                        match dematerializeResult with
+                        | Failed failure ->
+                            Vitest.expect(failure.Code).toEqual "lfs_backup_retained"
+                            Vitest.expect(failure.StateChanged).toBe true
+
+                            let backupPath = retainedBackupPath failure.Message
+                            let! backupExists = pathExistsAsync backupPath
+                            Vitest.expect(backupExists).toBe true
+                        | Succeeded _
+                        | PartiallySucceeded _ ->
+                            failwith "Expected a retained-backup failure for the recreated path."
+
+                        let checkoutRan =
+                            observedCommands
+                            |> Seq.exists (fun arguments ->
+                                arguments.Length >= 2
+                                && arguments[0] = "checkout"
+                                && arguments[1] = "HEAD")
+
+                        Vitest.expect(checkoutRan).toBe false
+
+                        let! contentAfter = tryReadUtf8FileAsync objectPath
+                        Vitest.expect(contentAfter).toEqual (Some savedContent)
+                        do! removeDirectoryAsync root
+                    with error ->
+                        stopObserving.Value ()
+                        GitService.freeLocalLfsCopyTestHook <- None
                         do! removeDirectoryAsync root
                         return raise error
             }

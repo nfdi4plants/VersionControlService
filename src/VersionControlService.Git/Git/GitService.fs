@@ -606,12 +606,58 @@ let private moveToLfsBackup (absolutePath: string) (backupDirectory: string) : s
         renameSync absolutePath siblingPath
         siblingPath
 
-let private restoreTemporaryLfsBackup backupPath absolutePath =
-    if existsSync backupPath then
-        if existsSync absolutePath then
-            unlinkSync absolutePath
+type private LfsBackupRestoreOutcome =
+    | LfsBackupRestored
+    | LfsBackupRetained
 
-        renameSync backupPath absolutePath
+let mutable internal freeLocalLfsCopyTestHook: (string -> string -> unit) option = None
+
+// A Git LFS pointer is ASCII text, so equal size and equal decoded text mean equal bytes.
+// Other bytes cannot decode to the same ASCII text.
+let private isExpectedLfsPointerAtPath (absolutePath: string) (expectedPointer: string) (pointerCheckoutRan: bool) =
+    if not pointerCheckoutRan then
+        false
+    else
+        try
+            match tryLstatSync absolutePath with
+            | Some stats when stats.isFile () && stats.size = float expectedPointer.Length ->
+                readFileSync absolutePath Utf8 = expectedPointer
+            | _ -> false
+        with _ ->
+            false
+
+let private restoreTemporaryLfsBackup
+    (backupPath: string)
+    (absolutePath: string)
+    (expectedPointer: string)
+    (pointerCheckoutRan: bool)
+    : LfsBackupRestoreOutcome =
+    if not (existsSync backupPath) then
+        LfsBackupRestored
+    else
+        let pathEntry =
+            try
+                Some(tryLstatSync absolutePath)
+            with _ ->
+                None
+
+        match pathEntry with
+        | None -> LfsBackupRetained
+        | Some None ->
+            renameSync backupPath absolutePath
+            LfsBackupRestored
+        | Some(Some _) ->
+            if isExpectedLfsPointerAtPath absolutePath expectedPointer pointerCheckoutRan then
+                unlinkSync absolutePath
+                renameSync backupPath absolutePath
+                LfsBackupRestored
+            else
+                LfsBackupRetained
+
+let private lfsBackupRetainedFailure safePath backupPath =
+    createFailure
+        GitFailureKind.LfsBackupRetained
+        $"Free did not complete because '{safePath}' changed. The current file was left untouched. The backup is retained at '{backupPath}'."
 
 let private removeTemporaryLfsBackup backupPath =
     if existsSync backupPath then
@@ -685,7 +731,7 @@ let private moveVerifiedFileToLfsBackup
     (absolutePath: string)
     (listing: GitLfsLsFileInfo)
     (context: OperationContext)
-    : JS.Promise<GitResult<string>> =
+    : JS.Promise<GitResult<string * Stats * string>> =
     promise {
         let! verifiedResult =
             promise {
@@ -701,32 +747,61 @@ let private moveVerifiedFileToLfsBackup
         | Error failure -> return Error failure
         | Ok _ when context.Cancellation.IsCancellationRequested() -> return canceledLfsResult ()
         | Ok statsBeforeHash ->
-            match! resolveLfsBackupDirectory arcPath with
-            | Error failure -> return Error failure
-            | Ok backupDirectory ->
-                let movedResult =
-                    try
-                        Ok(moveToLfsBackup absolutePath backupDirectory)
-                    with error ->
-                        errorResult error
+            let! pointerResult =
+                runGitCaptured {
+                    WorkingDirectory = Some arcPath
+                    Arguments = [| "cat-file"; "blob"; "HEAD:" + safePath |]
+                    Environment = None
+                    StandardInput = None
+                    CancelCheck = Some context.Cancellation.IsCancellationRequested
+                    TimeoutMs = Some GitLfsService.DefaultTimeoutMs
+                }
 
-                match movedResult with
+            if context.Cancellation.IsCancellationRequested() then
+                return canceledLfsResult ()
+            elif pointerResult.ExitCode <> 0 || pointerResult.TimedOut then
+                let diagnostic =
+                    [| pointerResult.StderrText.Trim(); pointerResult.StdoutText.Trim() |]
+                    |> Array.filter (String.IsNullOrWhiteSpace >> not)
+                    |> String.concat "\n"
+
+                let detail =
+                    if String.IsNullOrWhiteSpace diagnostic then
+                        "Git could not read the committed pointer."
+                    else
+                        diagnostic
+
+                return errorResult (exn $"Could not read the committed LFS pointer for '{safePath}': {detail}")
+            else
+                match! resolveLfsBackupDirectory arcPath with
                 | Error failure -> return Error failure
-                | Ok backupPath ->
-                    try
-                        let backupStats = statSync backupPath
+                | Ok backupDirectory ->
+                    let movedResult =
+                        try
+                            Ok(moveToLfsBackup absolutePath backupDirectory)
+                        with error ->
+                            errorResult error
 
-                        if
-                            backupStats.size <> statsBeforeHash.size
-                            || backupStats.mtimeMs <> statsBeforeHash.mtimeMs
-                        then
-                            restoreTemporaryLfsBackup backupPath absolutePath
-                            return errorResult (exn $"'{safePath}' changed while it was being freed. Try again.")
-                        else
-                            return Ok backupPath
-                    with error ->
-                        restoreTemporaryLfsBackup backupPath absolutePath
-                        return errorResult error
+                    match movedResult with
+                    | Error failure -> return Error failure
+                    | Ok backupPath ->
+                        try
+                            let backupStats = statSync backupPath
+
+                            if
+                                backupStats.size <> statsBeforeHash.size
+                                || backupStats.mtimeMs <> statsBeforeHash.mtimeMs
+                            then
+                                match restoreTemporaryLfsBackup backupPath absolutePath pointerResult.StdoutText false with
+                                | LfsBackupRetained -> return Error(lfsBackupRetainedFailure safePath backupPath)
+                                | LfsBackupRestored ->
+                                    return errorResult (exn $"'{safePath}' changed while it was being freed. Try again.")
+                            else
+                                return Ok(backupPath, statsBeforeHash, pointerResult.StdoutText)
+                        with error ->
+                            match restoreTemporaryLfsBackup backupPath absolutePath pointerResult.StdoutText false with
+                            | LfsBackupRetained -> return Error(lfsBackupRetainedFailure safePath backupPath)
+                            | LfsBackupRestored -> return errorResult error
     }
 
 let private isMergeInProgress (arcPath: string) =
@@ -2583,64 +2658,148 @@ let freeLocalLfsCopy
 
                     match backupResult with
                     | Error failure -> return Error failure
-                    | Ok backupPath ->
+                    | Ok(backupPath, statsBeforeHash, expectedPointer) ->
+                        let mutable pointerCheckoutRan = false
+
                         try
+                            freeLocalLfsCopyTestHook
+                            |> Option.iter (fun hook -> hook "after-backup-move" absolutePath)
+
                             if context.Cancellation.IsCancellationRequested() then
-                                restoreTemporaryLfsBackup backupPath absolutePath
-                                return canceledLfsResult ()
+                                match
+                                    restoreTemporaryLfsBackup
+                                        backupPath
+                                        absolutePath
+                                        expectedPointer
+                                        pointerCheckoutRan
+                                with
+                                | LfsBackupRetained -> return Error(lfsBackupRetainedFailure safePath backupPath)
+                                | LfsBackupRestored -> return canceledLfsResult ()
                             else
                                 let pointerGit = applyLfsSkipSmudge git
 
-                                let! checkoutResult =
-                                    runSimpleGit
-                                        (fun currentGit ->
-                                            currentGit.raw [|
-                                                "checkout"
-                                                "HEAD"
-                                                "--"
-                                                literalPathspecFromString safePath
-                                            |])
-                                        pointerGit
+                                let pathExistsBeforeCheckout =
+                                    try
+                                        tryLstatSync absolutePath |> Option.isSome
+                                    with _ ->
+                                        true
 
-                                match checkoutResult with
-                                | Error failure ->
-                                    restoreTemporaryLfsBackup backupPath absolutePath
-                                    return Error failure
-                                | Ok _ when context.Cancellation.IsCancellationRequested() ->
-                                    restoreTemporaryLfsBackup backupPath absolutePath
-                                    return canceledLfsResult ()
-                                | Ok _ ->
-                                    let untimedStatusGit = createUntimedOptions arcPath None None |> createGit
-                                    let! finalStatusResult =
-                                        runSimpleGit (fun currentGit -> currentGit.status ()) untimedStatusGit
+                                if pathExistsBeforeCheckout then
+                                    return Error(lfsBackupRetainedFailure safePath backupPath)
+                                else
+                                    pointerCheckoutRan <- true
 
-                                    match finalStatusResult with
+                                    let! checkoutResult =
+                                        runSimpleGit
+                                            (fun currentGit ->
+                                                currentGit.raw [|
+                                                    "checkout"
+                                                    "HEAD"
+                                                    "--"
+                                                    literalPathspecFromString safePath
+                                                |])
+                                            pointerGit
+
+                                    freeLocalLfsCopyTestHook
+                                    |> Option.iter (fun hook -> hook "after-pointer-checkout" absolutePath)
+
+                                    match checkoutResult with
                                     | Error failure ->
-                                        restoreTemporaryLfsBackup backupPath absolutePath
-                                        return Error failure
-                                    | Ok finalStatus when not (isPathCleanInStatus finalStatus safePath) ->
-                                        restoreTemporaryLfsBackup backupPath absolutePath
-
-                                        return
-                                            errorResult (
-                                                exn
-                                                    $"Could not replace '{safePath}' with an LFS pointer without changing Git status."
-                                            )
+                                        match
+                                            restoreTemporaryLfsBackup
+                                                backupPath
+                                                absolutePath
+                                                expectedPointer
+                                                pointerCheckoutRan
+                                        with
+                                        | LfsBackupRetained -> return Error(lfsBackupRetainedFailure safePath backupPath)
+                                        | LfsBackupRestored -> return Error failure
+                                    | Ok _ when context.Cancellation.IsCancellationRequested() ->
+                                        match
+                                            restoreTemporaryLfsBackup
+                                                backupPath
+                                                absolutePath
+                                                expectedPointer
+                                                pointerCheckoutRan
+                                        with
+                                        | LfsBackupRetained -> return Error(lfsBackupRetainedFailure safePath backupPath)
+                                        | LfsBackupRestored -> return canceledLfsResult ()
                                     | Ok _ ->
-                                        removeTemporaryLfsBackup backupPath
+                                        let untimedStatusGit = createUntimedOptions arcPath None None |> createGit
+                                        let! finalStatusResult =
+                                            runSimpleGit (fun currentGit -> currentGit.status ()) untimedStatusGit
 
-                                        context.ReportProgress {
-                                            PhaseCode = "lfs-dematerialize"
-                                            Item = Some safePath
-                                            Completed = Some listing.size
-                                            Total = Some listing.size
-                                            DisplayMessage = Some "Git LFS file dematerialized"
-                                        }
+                                        match finalStatusResult with
+                                        | Error failure ->
+                                            match
+                                                restoreTemporaryLfsBackup
+                                                    backupPath
+                                                    absolutePath
+                                                    expectedPointer
+                                                    pointerCheckoutRan
+                                            with
+                                            | LfsBackupRetained -> return Error(lfsBackupRetainedFailure safePath backupPath)
+                                            | LfsBackupRestored -> return Error failure
+                                        | Ok finalStatus when not (isPathCleanInStatus finalStatus safePath) ->
+                                            match
+                                                restoreTemporaryLfsBackup
+                                                    backupPath
+                                                    absolutePath
+                                                    expectedPointer
+                                                    pointerCheckoutRan
+                                            with
+                                            | LfsBackupRetained -> return Error(lfsBackupRetainedFailure safePath backupPath)
+                                            | LfsBackupRestored ->
+                                                return
+                                                    errorResult (
+                                                        exn
+                                                            $"Could not replace '{safePath}' with an LFS pointer without changing Git status."
+                                                    )
+                                        | Ok _ ->
+                                            if not (isExpectedLfsPointerAtPath absolutePath expectedPointer pointerCheckoutRan) then
+                                                return Error(lfsBackupRetainedFailure safePath backupPath)
+                                            else
+                                                let backupStats = statSync backupPath
 
-                                        return Ok true
+                                                if
+                                                    backupStats.size <> statsBeforeHash.size
+                                                    || backupStats.mtimeMs <> statsBeforeHash.mtimeMs
+                                                then
+                                                    match
+                                                        restoreTemporaryLfsBackup
+                                                            backupPath
+                                                            absolutePath
+                                                            expectedPointer
+                                                            pointerCheckoutRan
+                                                    with
+                                                    | LfsBackupRetained -> return Error(lfsBackupRetainedFailure safePath backupPath)
+                                                    | LfsBackupRestored ->
+                                                        return
+                                                            errorResult (
+                                                                exn $"'{safePath}' changed while it was being freed. Try again."
+                                                            )
+                                                else
+                                                    removeTemporaryLfsBackup backupPath
+
+                                                    context.ReportProgress {
+                                                        PhaseCode = "lfs-dematerialize"
+                                                        Item = Some safePath
+                                                        Completed = Some listing.size
+                                                        Total = Some listing.size
+                                                        DisplayMessage = Some "Git LFS file dematerialized"
+                                                    }
+
+                                                    return Ok true
                         with ex ->
-                            restoreTemporaryLfsBackup backupPath absolutePath
-                            return errorResult ex
+                            match
+                                restoreTemporaryLfsBackup
+                                    backupPath
+                                    absolutePath
+                                    expectedPointer
+                                    pointerCheckoutRan
+                            with
+                            | LfsBackupRetained -> return Error(lfsBackupRetainedFailure safePath backupPath)
+                            | LfsBackupRestored -> return errorResult ex
 }
 
 let downloadLfsFile

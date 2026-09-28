@@ -26,6 +26,7 @@ let private categoryOfKind (kind: GitFailureKind) =
     | GitFailureKind.Timeout -> Timeout
     | GitFailureKind.Canceled -> Canceled
     | GitFailureKind.LfsInstallRequired -> DependencyMissing
+    | GitFailureKind.LfsBackupRetained -> ProviderError
     | GitFailureKind.InvalidLfsThreshold -> Validation
     | GitFailureKind.RemoteProjectAlreadyExists -> ProviderError
     | GitFailureKind.Unknown -> ProviderError
@@ -35,6 +36,11 @@ let private toOperationFailure (failure: GitService.GitFailure) : OperationFailu
     | Some(path, ageSeconds) -> GitInternals.indexLockFailure path ageSeconds
     | None when failure.Kind = GitFailureKind.InvalidLfsThreshold ->
         OperationFailure.create Validation "invalid_lfs_threshold" failure.Message
+    | None when failure.Kind = GitFailureKind.LfsBackupRetained ->
+        {
+            OperationFailure.createRedacted ProviderError "lfs_backup_retained" failure.Message with
+                StateChanged = true
+        }
     | None ->
         OperationFailure.createRedacted (categoryOfKind failure.Kind) "lfs_operation_failed" failure.Message
 

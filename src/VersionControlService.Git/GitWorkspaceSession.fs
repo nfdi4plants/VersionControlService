@@ -82,6 +82,7 @@ let private categoryOfKind (kind: GitFailureKind) =
     | GitFailureKind.Timeout -> Timeout
     | GitFailureKind.Canceled -> Canceled
     | GitFailureKind.LfsInstallRequired -> DependencyMissing
+    | GitFailureKind.LfsBackupRetained -> ProviderError
     | GitFailureKind.InvalidLfsThreshold -> Validation
     | GitFailureKind.RemoteProjectAlreadyExists -> ProviderError
     | GitFailureKind.Unknown -> ProviderError
@@ -94,6 +95,7 @@ let private codeOfKind (kind: GitFailureKind) =
     | GitFailureKind.Timeout -> "timeout"
     | GitFailureKind.Canceled -> "operation_canceled"
     | GitFailureKind.LfsInstallRequired -> "lfs_install_required"
+    | GitFailureKind.LfsBackupRetained -> "lfs_backup_retained"
     | GitFailureKind.InvalidLfsThreshold -> "invalid_lfs_threshold"
     | GitFailureKind.RemoteProjectAlreadyExists -> "remote_project_exists"
     | GitFailureKind.Unknown -> "git_failure"
