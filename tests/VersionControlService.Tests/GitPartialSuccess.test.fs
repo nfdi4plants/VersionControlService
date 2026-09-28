@@ -1480,6 +1480,85 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "dematerialization keeps an object added by an unpushed merge with log.diffMerges off",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let! root, workPath, _, session =
+                        createPublishFixture GitWorkspaceSession.GitSessionHooks.none
+
+                    try
+                        let! _ = runGitOk workPath [| "lfs"; "track"; "*.bin" |]
+                        let! _ = runGitOk workPath [| "add"; ".gitattributes" |]
+                        let! _ = runGitOk workPath [| "commit"; "-m"; "test: configure LFS tracking" |]
+                        let! _ = runGitOk workPath [| "push"; "origin"; "main" |]
+
+                        let! _ = runGitOk workPath [| "checkout"; "-b"; "topic" |]
+                        do! writeUtf8FileAsync (join [| workPath; "topic.txt" |]) "topic change\n"
+                        let! _ = runGitOk workPath [| "add"; "topic.txt" |]
+                        let! _ = runGitOk workPath [| "commit"; "-m"; "test: add topic change" |]
+
+                        let! _ = runGitOk workPath [| "checkout"; "main" |]
+                        do! writeUtf8FileAsync (join [| workPath; "main.txt" |]) "main change\n"
+                        let! _ = runGitOk workPath [| "add"; "main.txt" |]
+                        let! _ = runGitOk workPath [| "commit"; "-m"; "test: add main change" |]
+                        let! _ = runGitOk workPath [| "push"; "origin"; "main" |]
+
+                        let! _ = runGitOk workPath [| "merge"; "--no-commit"; "--no-ff"; "topic" |]
+                        let relativePath = "merge-only.bin"
+                        let content = "content added during merge resolution\n"
+                        do! writeUtf8FileAsync (join [| workPath; relativePath |]) content
+                        let! _ = runGitOk workPath [| "add"; relativePath |]
+                        let! _ = runGitOk workPath [| "commit"; "-m"; "test: add LFS file in merge" |]
+                        let! _ = runGitOk workPath [| "config"; "log.diffMerges"; "off" |]
+
+                        let! pointer = runGitOk workPath [| "show"; $"HEAD:{relativePath}" |]
+                        let oidPrefix = "oid sha256:"
+
+                        let oid =
+                            pointer.Split '\n'
+                            |> Array.tryPick (fun line ->
+                                let trimmed = line.TrimEnd '\r'
+
+                                if trimmed.StartsWith(oidPrefix, StringComparison.Ordinal) then
+                                    Some(trimmed.Substring(oidPrefix.Length))
+                                else
+                                    None)
+                            |> Option.defaultWith (fun () -> failwith "The merge commit did not contain an LFS pointer.")
+
+                        let! _ = runGitOk workPath [| "lfs"; "push"; "--object-id"; "origin"; oid |]
+                        let! localObjectPath = lfsObjectPathForHeadFile workPath relativePath
+                        let! localObjectExistsBefore = pathExistsAsync localObjectPath
+                        Vitest.expect(localObjectExistsBefore).toBe true
+
+                        let materialization =
+                            session.ObjectMaterialization
+                            |> Option.defaultWith (fun () -> failwith "Expected Git object materialization.")
+
+                        let! dematerializeResult =
+                            materialization.Dematerialize (repositoryPath relativePath) (ctx "merge-object-dematerialize")
+                            |> Async.StartAsPromise
+
+                        match dematerializeResult with
+                        | Succeeded _ -> ()
+                        | PartiallySucceeded(_, failure)
+                        | Failed failure ->
+                            failwith $"Dematerialization failed for the merge object ({failure.Code}): {failure.Message}"
+
+                        let! localObjectExistsAfter = pathExistsAsync localObjectPath
+                        Vitest.expect(localObjectExistsAfter).toBe true
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
             "dematerialization frees a pushed object while an unrelated local branch is unpublished",
             TestOptions(timeout = 120000),
             fun () -> promise {
@@ -2048,8 +2127,23 @@ Vitest.describe (
                         Vitest.expect(siblingObjectExistsBefore).toBe false
 
                         let! materializeResult =
-                            materialization.Materialize (repositoryPath requestedPath) (ctx "download-requested")
-                            |> Async.StartAsPromise
+                            promise {
+                                let previousSkipSmudge: obj =
+                                    emitJsExpr () "process.env.GIT_LFS_SKIP_SMUDGE"
+
+                                try
+                                    emitJsStatement () "process.env.GIT_LFS_SKIP_SMUDGE = '1';"
+
+                                    return!
+                                        materialization.Materialize
+                                            (repositoryPath requestedPath)
+                                            (ctx "download-requested")
+                                        |> Async.StartAsPromise
+                                finally
+                                    emitJsStatement
+                                        previousSkipSmudge
+                                        "if ($0 == null) delete process.env.GIT_LFS_SKIP_SMUDGE; else process.env.GIT_LFS_SKIP_SMUDGE = $0;"
+                            }
 
                         match materializeResult with
                         | Succeeded _ -> ()

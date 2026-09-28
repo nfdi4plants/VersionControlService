@@ -1098,6 +1098,13 @@ let withFetchExcludeCleared (environment: obj) : obj =
         ]
     )
 
+let private withLfsSmudgeEnabled (environment: obj) : obj =
+    JS.Constructors.Object.assign (
+        JsInterop.createObj [],
+        environment,
+        JsInterop.createObj [ GitLfsSkipSmudgeEnvKey, box "0" ]
+    )
+
 let dryRunCoversObject (output: string) (oid: string) : bool =
     let prefix = $"fetch {oid} "
 
@@ -1513,17 +1520,21 @@ let downloadObjectFromListing
     (onStarted: unit -> unit)
     : JS.Promise<Result<unit, exn>> =
     promise {
-        let arguments, standardInput =
+        let transferEnvironment = withFetchExcludeCleared commandAuth.Environment
+
+        let arguments, standardInput, environment =
             if exactObjectOnly then
-                buildSmudgePointerArgs relativePath, Some(buildPointerInput listing)
+                buildSmudgePointerArgs relativePath,
+                Some(buildPointerInput listing),
+                withLfsSmudgeEnabled transferEnvironment
             else
-                buildDownloadObjectArgs relativePath, None
+                buildDownloadObjectArgs relativePath, None, transferEnvironment
 
         let! result =
             runGitDiscardingStdoutWithStarted onStarted {
                 WorkingDirectory = Some repoPath
                 Arguments = GitCredentialStrategy.buildLfsTransferArguments commandAuth.ConfigArgs arguments
-                Environment = Some(withFetchExcludeCleared commandAuth.Environment)
+                Environment = Some environment
                 StandardInput = standardInput
                 CancelCheck = cancelCheck
                 TimeoutMs = None

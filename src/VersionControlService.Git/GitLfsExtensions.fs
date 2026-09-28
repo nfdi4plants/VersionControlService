@@ -364,7 +364,10 @@ let createObjectMaterialization
                                                 let! unpushedResult =
                                                     runGit
                                                         [|
+                                                            "-c"
+                                                            "log.diffMerges=separate"
                                                             "log"
+                                                            "-m"
                                                             "HEAD"
                                                             "--branches"
                                                             "--not"
