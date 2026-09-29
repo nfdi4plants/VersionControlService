@@ -2,6 +2,7 @@
 /// runs one request per worker at a time and executes the Git children its workers ask for.
 module VersionControlService.Git.TextDiff.TextDiffPool
 
+open System
 open System.Collections.Generic
 open Fable.Core
 open VersionControlService.Abstractions
@@ -11,11 +12,22 @@ open VersionControlService.Git.TextDiff.TextDiffTransport
 module NodeInterop = VersionControlService.Runtime.Node.Interop
 module Supervisor = VersionControlService.Git.TextDiff.TextDiffSupervisor
 
+[<Literal>]
+let private preparationAffinityLifetimeMs = 300000.0
+
+[<Emit("setTimeout($0, $1)")>]
+let private startTimer (_callback: unit -> unit) (_milliseconds: int) : obj = jsNative
+
+[<Emit("clearTimeout($0)")>]
+let private stopTimer (_timer: obj) : unit = jsNative
+
 type TextDiffPoolOptions = {
     Factory: TextDiffWorkerFactory
     Supervisor: Supervisor.TextDiffSupervisor
     MaxWorkers: int
     SessionsPerWorker: int
+    InitTimeoutMs: int
+    NowMilliseconds: unit -> float
 }
 
 module TextDiffPoolOptions =
@@ -26,6 +38,8 @@ module TextDiffPoolOptions =
         Supervisor = supervisor
         MaxWorkers = 2
         SessionsPerWorker = 4
+        InitTimeoutMs = 15000
+        NowMilliseconds = fun () -> float DateTime.UtcNow.Ticks / 10000.0
     }
 
 type private WorkerPhase =
@@ -40,6 +54,14 @@ type private SessionPhase =
     | Closing
     | Closed
 
+type private PreparationAffinity = {
+    TokenId: string
+    WorkerId: string
+    Epoch: int
+    Owner: TextDiffOwner
+    ExpiresAt: float
+}
+
 type private PoolWorker(index: int, epoch: int, workerId: string, transport: ITextDiffWorkerTransport) =
     member _.Index = index
     member _.Epoch = epoch
@@ -49,6 +71,7 @@ type private PoolWorker(index: int, epoch: int, workerId: string, transport: ITe
     member val Sessions = ResizeArray<PoolSession>()
     member val Queue = ResizeArray<PendingRequest>()
     member val Running: PendingRequest option = None with get, set
+    member val InitTimer: obj option = None with get, set
 
 and private PoolSession(generation: int, worker: PoolWorker, owner: TextDiffOwner) =
     member _.Generation = generation
@@ -71,8 +94,10 @@ and private PendingRequest
     member val Settled = false with get, set
     member val CancelPosted = false with get, set
 
-type private Admission(owner: TextDiffOwner, complete: Result<PoolSession, OperationFailure> -> unit) =
+type private Admission
+    (owner: TextDiffOwner, affinity: PreparationAffinity option, complete: Result<PoolSession, OperationFailure> -> unit) =
     member _.Owner = owner
+    member _.Affinity = affinity
     member _.Complete = complete
     member val Done = false with get, set
 
@@ -94,11 +119,24 @@ let private attempt (work: unit -> JS.Promise<'T>) : JS.Promise<'T> =
     with error ->
         Promise.reject error
 
+let private waitForTermination (work: JS.Promise<unit>) : JS.Promise<unit> =
+    Promise.create (fun resolve _ ->
+        let mutable settled = false
+        let timer = startTimer (fun () -> settled <- true; resolve ()) 2000
+        let finish () =
+            if not settled then
+                settled <- true
+                stopTimer timer
+                resolve ()
+
+        NodeInterop.observePromise work (fun () -> finish ()) (fun _ -> finish ()))
+
 type TextDiffPool internal (options: TextDiffPoolOptions) =
     let supervisor = options.Supervisor
     let workers: PoolWorker option[] = Array.create (max 1 options.MaxWorkers) None
     let sessionsPerWorker = max 1 options.SessionsPerWorker
     let admissions = ResizeArray<Admission>()
+    let preparationAffinities = Dictionary<string, PreparationAffinity>()
     let handles = Dictionary<string, PoolSession>()
     let continuations = Dictionary<string, PoolSession>()
     let mutable disposed = false
@@ -113,6 +151,8 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
         clock <- clock + 1
         clock
 
+    let nowMilliseconds () = options.NowMilliseconds ()
+
     let liveWorkers () =
         workers |> Array.choose id |> Array.filter (fun worker -> worker.Phase <> Gone)
 
@@ -124,6 +164,47 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
             match continuations.TryGetValue continuation with
             | true, registered when obj.ReferenceEquals(registered, session) -> continuations.Remove continuation |> ignore
             | _ -> ())
+
+    let reserveSession (owner: TextDiffOwner) (worker: PoolWorker) =
+        let session = PoolSession(nextGeneration, worker, owner)
+        nextGeneration <- nextGeneration + 1
+        session.LastUsed <- tick ()
+        worker.Sessions.Add session
+        session
+
+    let currentAffinity (owner: TextDiffOwner) (tokenId: string) =
+        let now = nowMilliseconds ()
+
+        match preparationAffinities.TryGetValue tokenId with
+        | true, affinity when affinity.Owner = owner && affinity.ExpiresAt > now ->
+            match
+                workers
+                |> Array.choose id
+                |> Array.tryFind (fun worker -> worker.WorkerId = affinity.WorkerId && worker.Epoch = affinity.Epoch && worker.Phase <> Gone)
+            with
+            | Some worker -> Some(affinity, worker)
+            | None ->
+                preparationAffinities.Remove tokenId |> ignore
+                None
+        | true, affinity when affinity.ExpiresAt <= now ->
+            preparationAffinities.Remove tokenId |> ignore
+            None
+        | _ -> None
+
+    let admissionWorker (admission: Admission) =
+        admission.Affinity
+        |> Option.bind (fun affinity ->
+            match preparationAffinities.TryGetValue affinity.TokenId with
+            | true, current when current = affinity -> currentAffinity admission.Owner affinity.TokenId |> Option.map snd
+            | _ -> None)
+
+    let clearWorkerAffinities (worker: PoolWorker) =
+        for tokenId in
+            preparationAffinities
+            |> Seq.filter (fun entry -> entry.Value.WorkerId = worker.WorkerId && entry.Value.Epoch = worker.Epoch)
+            |> Seq.map _.Key
+            |> Seq.toArray do
+            preparationAffinities.Remove tokenId |> ignore
 
     let rec post (worker: PoolWorker) (message: TextDiffMessage) =
         if worker.Phase <> Gone then
@@ -149,6 +230,9 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
             false
         else
             worker.Phase <- Gone
+            worker.InitTimer |> Option.iter stopTimer
+            worker.InitTimer <- None
+            clearWorkerAffinities worker
 
             match workers[worker.Index] with
             | Some current when obj.ReferenceEquals(current, worker) -> workers[worker.Index] <- None
@@ -175,8 +259,11 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
 
     and failWorker (worker: PoolWorker) (reason: string) =
         if abandonWorker worker reason then
-            observe (attempt (fun () -> supervisor.ReleaseWorker worker.WorkerId)) ignore ignore
-            observe (attempt (fun () -> worker.Transport.Terminate())) ignore ignore
+            promise {
+                do! waitForTermination (attempt (fun () -> worker.Transport.Terminate()))
+                do! attempt (fun () -> supervisor.ReleaseWorker worker.WorkerId)
+            }
+            |> fun cleanup -> observe cleanup ignore ignore
 
             if not disposed then
                 pumpAdmission ()
@@ -212,6 +299,8 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
                 | TextDiffMessage.InitAck(workerId, epoch) ->
                     if worker.Phase = Starting && workerId = worker.WorkerId && epoch = worker.Epoch then
                         worker.Phase <- Ready
+                        worker.InitTimer |> Option.iter stopTimer
+                        worker.InitTimer <- None
                         pumpWorker worker
                 | TextDiffMessage.WorkerFailure reason -> failWorker worker $"The text diff worker reported a failure: {reason}"
                 | TextDiffMessage.Progress(requestId, generation, validated, total) ->
@@ -273,6 +362,14 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
             transport.OnMessage(onWorkerMessage worker)
             transport.OnError(fun reason -> failWorker worker $"The text diff worker failed: {reason}")
             transport.OnExit(fun code -> failWorker worker $"The text diff worker exited with code {code}.")
+            worker.InitTimer <-
+                Some(
+                    startTimer
+                        (fun () ->
+                            if worker.Phase = Starting then
+                                failWorker worker "The text diff worker did not acknowledge initialization in time.")
+                        (max 0 options.InitTimeoutMs)
+                )
 
             observe
                 (attempt (fun () -> supervisor.WorkerDirectory workerId))
@@ -307,14 +404,13 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
             | None, None -> None
 
         chosen
-        |> Option.map (
-            Result.map (fun worker ->
-                let session = PoolSession(nextGeneration, worker, owner)
-                nextGeneration <- nextGeneration + 1
-                session.LastUsed <- tick ()
-                worker.Sessions.Add session
-                session)
-        )
+        |> Option.map (Result.map (reserveSession owner))
+
+    and tryReserveAdmission (admission: Admission) : Result<PoolSession, OperationFailure> option =
+        match admissionWorker admission with
+        | Some worker when worker.Sessions.Count < sessionsPerWorker -> Some(Ok(reserveSession admission.Owner worker))
+        | Some _ -> None
+        | None -> tryReserve admission.Owner
 
     and idleSessions () =
         liveWorkers ()
@@ -329,24 +425,50 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
 
     and pumpAdmission () =
         let mutable blocked = false
+        let mutable blockedAdmission = None
 
         while not blocked && not disposed && admissions.Count > 0 do
             let admission = admissions[0]
 
-            match tryReserve admission.Owner with
+            match tryReserveAdmission admission with
             | Some result ->
                 admissions.RemoveAt 0
                 admission.Done <- true
                 admission.Complete result
-            | None -> blocked <- true
+            | None ->
+                blocked <- true
+                blockedAdmission <- Some admission
 
-        // Evicts only as many idle sessions as there are waiting Opens beyond the slots already being freed.
-        let mutable evicting = true
+        let targetWorker = blockedAdmission |> Option.bind admissionWorker
+        let waitingCount =
+            match targetWorker with
+            | Some worker ->
+                admissions
+                |> Seq.filter (fun admission -> admissionWorker admission |> Option.exists (fun target -> obj.ReferenceEquals(target, worker)))
+                |> Seq.length
+            | None -> admissions.Count
+        let closing =
+            liveWorkers ()
+            |> Seq.collect _.Sessions
+            |> Seq.filter (fun session ->
+                session.Phase = Closing
+                && (targetWorker |> Option.forall (fun worker -> obj.ReferenceEquals(session.Worker, worker))))
+            |> Seq.length
+        let mutable closingSlots = closing
+        let mutable evicting = closingSlots < waitingCount
 
-        while evicting && not disposed && closingCount () < admissions.Count do
-            match idleSessions () |> Seq.sortBy _.LastUsed |> Seq.tryHead with
-            | Some session -> observe (closeSession session) ignore ignore
+        while evicting && not disposed do
+            let candidates =
+                idleSessions ()
+                |> Seq.filter (fun session -> targetWorker |> Option.forall (fun worker -> obj.ReferenceEquals(session.Worker, worker)))
+
+            match candidates |> Seq.sortBy _.LastUsed |> Seq.tryHead with
+            | Some session ->
+                closingSlots <- closingSlots + 1
+                observe (closeSession session) ignore ignore
             | None -> evicting <- false
+
+            evicting <- evicting && closingSlots < waitingCount
 
     and enqueue (session: PoolSession) (body: RequestBody) (context: OperationContext) : JS.Promise<Result<ResultPayload, OperationFailure>> =
         Promise.create (fun resolve _ ->
@@ -420,14 +542,19 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
         | Closing
         | Closed -> ()
 
-    let admit (owner: TextDiffOwner) (context: OperationContext) : JS.Promise<Result<PoolSession, OperationFailure>> =
+    let admit
+        (owner: TextDiffOwner)
+        (preparation: PreparationToken option)
+        (context: OperationContext)
+        : JS.Promise<Result<PoolSession, OperationFailure>> =
         Promise.create (fun resolve _ ->
             if context.Cancellation.IsCancellationRequested() then
                 resolve (Error(canceled ()))
             elif disposed then
                 resolve (Error(workerFailed "The text diff pool was disposed."))
             else
-                let admission = Admission(owner, resolve)
+                let affinity = preparation |> Option.bind (fun token -> currentAffinity owner token.Id |> Option.map fst)
+                let admission = Admission(owner, affinity, resolve)
                 admissions.Add admission
 
                 context.Cancellation.Register(fun () ->
@@ -439,11 +566,20 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
                 pumpAdmission ())
 
     let openDiff (owner: TextDiffOwner) (request: OpenDiffRequest) (context: OperationContext) = promise {
+        let removeRequestAffinity () = request.Preparation |> Option.iter (fun token -> preparationAffinities.Remove token.Id |> ignore)
+        let requestedWorker =
+            request.Preparation
+            |> Option.bind (fun token -> currentAffinity owner token.Id |> Option.map snd)
+
         let resumed =
             request.Continuation
             |> Option.bind (fun continuation ->
                 match continuations.TryGetValue continuation with
-                | true, session when session.Owner = owner && session.Phase = Scanning && session.Active = 0 ->
+                | true, session
+                    when session.Owner = owner
+                         && session.Phase = Scanning
+                         && session.Active = 0
+                         && (requestedWorker |> Option.forall (fun worker -> obj.ReferenceEquals(session.Worker, worker))) ->
                     continuations.Remove continuation |> ignore
                     session.Continuation <- None
                     session.Phase <- Opening
@@ -453,7 +589,7 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
         let! reservation =
             match resumed with
             | Some session -> Promise.lift (Ok session)
-            | None -> admit owner context
+            | None -> admit owner request.Preparation context
 
         match reservation with
         | Error failure -> return Failed failure
@@ -464,6 +600,7 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
             | Ok(ResultPayload.Open result) when session.Phase = Opening ->
                 match result with
                 | Resumable.Ready(OpenDiffResult.Opened(handle, previous, current, first)) ->
+                    removeRequestAffinity ()
                     let publicHandle = { DiffHandle.Id = $"h{nextHandleId}"; Version = handle.Version }
                     nextHandleId <- nextHandleId + 1
                     session.WorkerHandle <- Some handle
@@ -476,16 +613,30 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
                     session.Continuation <- Some continuation
                     continuations[continuation] <- session
                     return OperationResult.succeeded result
+                | Resumable.Ready(OpenDiffResult.NotDiffable(DiffBlocker.EncodingRequired(_, token, _))) ->
+                    preparationAffinities[token.Id] <- {
+                        TokenId = token.Id
+                        WorkerId = session.Worker.WorkerId
+                        Epoch = session.Worker.Epoch
+                        Owner = owner
+                        ExpiresAt = nowMilliseconds () + preparationAffinityLifetimeMs
+                    }
+                    releaseReservation session
+                    return OperationResult.succeeded result
                 | Resumable.Ready(OpenDiffResult.NotDiffable _) ->
+                    removeRequestAffinity ()
                     releaseReservation session
                     return OperationResult.succeeded result
             | Ok(ResultPayload.Open _) ->
+                removeRequestAffinity ()
                 releaseReservation session
                 return Failed(workerFailed "The text diff session ended while it was opening.")
             | Ok _ ->
+                removeRequestAffinity ()
                 releaseReservation session
                 return Failed(workerFailed "The text diff worker answered Open with a different result type.")
             | Error failure ->
+                removeRequestAffinity ()
                 releaseReservation session
                 return Failed failure
     }

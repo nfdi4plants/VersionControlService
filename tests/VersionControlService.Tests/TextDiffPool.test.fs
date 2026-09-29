@@ -5,6 +5,7 @@ open Fable.Core
 open Vitest
 open VersionControlService.Abstractions
 open VersionControlService.Git.TextDiff.TextDiffProtocol
+open VersionControlService.Git.TextDiff.TextDiffPreparation
 open VersionControlService.Git.TextDiff.TextDiffTransport
 open VersionControlService.Git.TextDiff.TextDiffWorkerDispatcher
 open VersionControlService.Git.TextDiff.TextDiffInProcessTransport
@@ -109,6 +110,73 @@ let private testHandler (control: Control) =
         member _.Cancel requestId = control.Canceled.Add requestId
     }
 
+type private PreparationHandler(issueFirstOpen: bool) =
+    let tokens = PreparationTokenStore()
+    let mutable issueNext = issueFirstOpen
+
+    let binding (request: OpenDiffRequest) : PreparationBinding = {
+        Path = RepositoryPath.value request.Path
+        PreviousPath = request.PreviousPath |> Option.map RepositoryPath.value
+        CommitId = None
+        Previous = SideIdentity.NoSource
+        Current = SideIdentity.NoSource
+    }
+
+    let opened (host: WorkerHost) =
+        Ok(
+            Resumable.Ready(
+                OpenDiffResult.Opened({ Id = host.WorkerId; Version = "1" }, sourceInfo, sourceInfo, Resumable.Ready page)
+            )
+        )
+
+    member val PreparationAttempts = 0 with get, set
+
+    interface ITextDiffRequestHandler with
+        member this.Open(host, request, owner) =
+            let sourceBinding = binding request
+
+            match request.Preparation with
+            | Some token ->
+                this.PreparationAttempts <- this.PreparationAttempts + 1
+
+                match tokens.Validate(token, sourceBinding, owner.WindowOwner) with
+                | Ok() -> Promise.lift(opened host)
+                | Error failure -> Promise.lift(Error failure)
+            | None when issueNext ->
+                issueNext <- false
+                let token = tokens.Issue(sourceBinding, owner.WindowOwner)
+
+                Promise.lift(
+                    Ok(
+                        Resumable.Ready(
+                            OpenDiffResult.NotDiffable(
+                                DiffBlocker.EncodingRequired(
+                                    DiffSide.Current,
+                                    token,
+                                    [| { Encoding = "utf-8"; Preview = "" } |]
+                                )
+                            )
+                        )
+                    )
+                )
+            | None -> Promise.lift(opened host)
+
+        member _.ReadPage(_, _) = sessionClosed ()
+        member _.ReplayPage(_, _) = sessionClosed ()
+        member _.Expand(_, _) = sessionClosed ()
+        member _.ReadLine(_, _) = sessionClosed ()
+        member _.GetSourceInfo(_, _) = sessionClosed ()
+        member _.Close(_, _) = Promise.lift ()
+        member _.Cancel _ = ()
+
+let private preparationToken (result: OperationResult<Resumable<OpenDiffResult>>) =
+    match result with
+    | Succeeded outcome ->
+        match outcome.Value with
+        | Resumable.Ready(OpenDiffResult.NotDiffable(DiffBlocker.EncodingRequired(_, token, _))) -> token
+        | other -> failwith $"Expected an encoding token, got %A{other}"
+    | other -> failwith $"Expected an encoding result, got %A{other}"
+
 /// Wraps a transport so a test can hold messages on their way to the pool and inject its own.
 type private Tap(inner: ITextDiffWorkerTransport, hold: obj -> bool) =
     let mutable host: (obj -> unit) option = None
@@ -144,10 +212,11 @@ type private Tap(inner: ITextDiffWorkerTransport, hold: obj -> bool) =
 let private createTempDirectory () : JS.Promise<string> =
     mkdtemp (NodePath.join [| systemTempDirectory (); "vcs-text-diff-pool-" |])
 
-let private withPool
+let private withPoolConfigured
     (maxWorkers: int)
     (sessionsPerWorker: int)
     (factory: TextDiffWorkerFactory)
+    (configure: TextDiffPool.TextDiffPoolOptions -> TextDiffPool.TextDiffPoolOptions)
     (body: TextDiffPool.TextDiffPool -> JS.Promise<unit>)
     : JS.Promise<unit> =
     promise {
@@ -160,12 +229,13 @@ let private withPool
             }
 
         let pool =
-            TextDiffPool.create {
-                Factory = factory
-                Supervisor = supervisor
-                MaxWorkers = maxWorkers
-                SessionsPerWorker = sessionsPerWorker
-            }
+            TextDiffPool.create (
+                configure {
+                    (TextDiffPool.TextDiffPoolOptions.create factory supervisor) with
+                        MaxWorkers = maxWorkers
+                        SessionsPerWorker = sessionsPerWorker
+                }
+            )
 
         let mutable failure = None
 
@@ -184,6 +254,14 @@ let private withPool
         | Some error -> return raise error
         | None -> ()
     }
+
+let private withPool
+    (maxWorkers: int)
+    (sessionsPerWorker: int)
+    (factory: TextDiffWorkerFactory)
+    (body: TextDiffPool.TextDiffPool -> JS.Promise<unit>)
+    : JS.Promise<unit> =
+    withPoolConfigured maxWorkers sessionsPerWorker factory id body
 
 let private context () =
     let source = OperationCancellation.Source()
@@ -435,6 +513,144 @@ Vitest.describe (
                     Vitest.expect(unknown.IsSucceeded).toBe true
                     Vitest.expect(control.Closed.Count).toBe 1
                 })
+        )
+
+        Vitest.test (
+            "keeps a preparation token on its issuing worker",
+            TestOptions(timeout = 60000),
+            fun () ->
+                let handlers = ResizeArray<PreparationHandler>()
+
+                let factory: TextDiffWorkerFactory =
+                    fun _ ->
+                        let handler = PreparationHandler(handlers.Count = 0)
+                        handlers.Add handler
+                        InProcessTransport.create (handler :> ITextDiffRequestHandler)
+
+                withPool 2 2 factory (fun pool -> promise {
+                    let service = pool.Service owner
+                    let! first = service.Open openRequest (OperationContext.detached "open-token") |> run
+                    let token = preparationToken first
+                    do! delay 100
+
+                    let! openedOnA = service.Open openRequest (OperationContext.detached "open-a") |> run
+                    openedHandle openedOnA |> ignore
+
+                    let! openedOnB = service.Open openRequest (OperationContext.detached "open-b") |> run
+                    openedHandle openedOnB |> ignore
+
+                    let! openedOnAAgain = service.Open openRequest (OperationContext.detached "open-a-again") |> run
+                    openedHandle openedOnAAgain |> ignore
+
+                    let! reopened =
+                        service.Open { openRequest with Preparation = Some token } (OperationContext.detached "reopen-token")
+                        |> run
+
+                    openedHandle reopened |> ignore
+                    Vitest.expect(handlers[0].PreparationAttempts).toBe 1
+                    Vitest.expect(handlers[1].PreparationAttempts).toBe 0
+                })
+        )
+
+        Vitest.test (
+            "admits expired and unknown preparation tokens through normal worker selection",
+            TestOptions(timeout = 60000),
+            fun () ->
+                let mutable now = 0.0
+                let firstHandler = PreparationHandler(true)
+                let secondHandler = PreparationHandler(true)
+                let mutable created = 0
+
+                let factory: TextDiffWorkerFactory =
+                    fun _ ->
+                        let handler =
+                            if created = 0 then firstHandler else secondHandler
+
+                        created <- created + 1
+                        InProcessTransport.create (handler :> ITextDiffRequestHandler)
+
+                withPoolConfigured
+                    2
+                    2
+                    factory
+                    (fun options -> { options with NowMilliseconds = (fun () -> now) })
+                    (fun pool -> promise {
+                        let service = pool.Service owner
+                        let! issuedOnA = service.Open openRequest (OperationContext.detached "issue-on-a") |> run
+                        let token = preparationToken issuedOnA
+                        do! delay 100
+
+                        let! openedOnA = service.Open openRequest (OperationContext.detached "open-a") |> run
+                        openedHandle openedOnA |> ignore
+
+                        let! issuedOnB = service.Open openRequest (OperationContext.detached "issue-on-b") |> run
+                        preparationToken issuedOnB |> ignore
+                        do! delay 100
+
+                        now <- TokenLifetimeMilliseconds + 1.0
+                        let! expired =
+                            service.Open { openRequest with Preparation = Some token } (OperationContext.detached "open-expired")
+                            |> run
+
+                        do! delay 100
+                        let unknown = { PreparationToken.Id = "unknown-preparation-token" }
+                        let! unknownResult =
+                            service.Open { openRequest with Preparation = Some unknown } (OperationContext.detached "open-unknown")
+                            |> run
+
+                        Vitest.expect(failureCode expired).toBe TextDiffFailureCodes.PreparationMismatch
+                        Vitest.expect(failureCode unknownResult).toBe TextDiffFailureCodes.PreparationMismatch
+                        Vitest.expect(secondHandler.PreparationAttempts).toBe 2
+                    })
+        )
+
+        Vitest.test (
+            "fails an Open when a worker misses its init timeout",
+            TestOptions(timeout = 60000),
+            fun () ->
+                let control = Control()
+                let mutable created = 0
+                let mutable firstTap: Tap option = None
+
+                let isInitAck (message: obj) =
+                    match decodeMessage message with
+                    | Ok(TextDiffMessage.InitAck _) -> true
+                    | _ -> false
+
+                let factory: TextDiffWorkerFactory =
+                    fun _ ->
+                        if created = 0 then
+                            created <- created + 1
+                            let tap = Tap(InProcessTransport.create (testHandler control), isInitAck)
+                            firstTap <- Some tap
+                            tap :> ITextDiffWorkerTransport
+                        else
+                            created <- created + 1
+                            InProcessTransport.create (testHandler control)
+
+                withPoolConfigured
+                    1
+                    1
+                    factory
+                    (fun options -> { options with InitTimeoutMs = 100 })
+                    (fun pool -> promise {
+                        let service = pool.Service owner
+                        let opening = Watched(service.Open openRequest (OperationContext.detached "open-timeout") |> run)
+
+                        do!
+                            waitUntil (fun () ->
+                                match firstTap with
+                                | Some tap -> tap.Posted.Count > 0
+                                | None -> false)
+
+                        do! delay 250
+                        let! failed = opening.Result
+                        Vitest.expect(failureCode failed).toBe TextDiffFailureCodes.WorkerFailed
+
+                        let! later = service.Open openRequest (OperationContext.detached "open-after-timeout") |> run
+                        openedHandle later |> ignore
+                        Vitest.expect(created).toBe 2
+                    })
         )
 
         Vitest.test (
