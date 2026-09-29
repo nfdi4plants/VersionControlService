@@ -75,9 +75,20 @@ module WorkspaceSession =
     let private textDiffReason = "The provider has no text diff service."
 
     let private noOpTextDiff: TextDiffService = {
-        GetDiff = fun _ _ -> async { return noOp textDiffReason (UnsupportedContent(Some textDiffReason)) }
-        GetWordDiff = fun _ _ -> async { return noOp textDiffReason (UnsupportedContent(Some textDiffReason)) }
-        GetBaseContent = fun _ _ -> async { return noOp textDiffReason (UnsupportedContent(Some textDiffReason)) }
+        Open =
+            fun _ _ ->
+                async {
+                    return
+                        noOp
+                            textDiffReason
+                            (Resumable.Ready(OpenDiffResult.NotDiffable DiffBlocker.ProviderUnsupported))
+                }
+        ReadPage = fun _ _ -> async { return unsupported textDiffReason }
+        ReplayPage = fun _ _ -> async { return unsupported textDiffReason }
+        Expand = fun _ _ -> async { return unsupported textDiffReason }
+        ReadLine = fun _ _ -> async { return unsupported textDiffReason }
+        GetSourceInfo = fun _ _ -> async { return unsupported textDiffReason }
+        Close = fun _ _ -> async { return noOp textDiffReason () }
     }
 
     let private objectMaterializationReason = "The provider has no object materialization service."
@@ -146,12 +157,13 @@ module WorkspaceSession =
     /// The session with every absent optional service filled by a fallback, for a
     /// consumer that wants one code path for every provider. Present services are kept.
     ///
-    /// Each fallback that succeeds does nothing and carries a service_unavailable warning.
-    /// ListObjects returns an empty array, GetSettings returns no threshold with
-    /// MaterializeLargeObjects = true, the text diff reads return UnsupportedContent,
-    /// and GetActiveSession and GetRepositoryWebUrl return None. Prune and Deduplicate
-    /// return the reason as their report. Every synchronization operation and the
-    /// conflict mutations Resolve, Finalize and Cancel fail as Unsupported with the
+    /// Each successful fallback does nothing and carries a service_unavailable warning.
+    /// Opening a paged diff reports an unsupported provider, and later text diff requests
+    /// fail because no diff handle exists.
+    /// ListObjects returns an empty array, and GetSettings returns no threshold with
+    /// MaterializeLargeObjects = true. GetActiveSession and GetRepositoryWebUrl return None.
+    /// Prune and Deduplicate return the reason as their report.
+    /// Synchronization operations and conflict mutations fail as Unsupported with the
     /// service_unavailable code.
     let withFallbackServices (session: WorkspaceSession) : WorkspaceSession = {
         // Naming every field makes a newly added optional service fail compilation until this fallback handles it.

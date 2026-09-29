@@ -347,26 +347,6 @@ let private literalPathspecFromString (path: string) = ":(literal)" + path
 let private literalPathspecsFromStrings (paths: string[]) =
     paths |> Array.map literalPathspecFromString
 
-let private validateLiteralDiffPathspecs (pathSpecs: string[]) =
-    if isNull pathSpecs || pathSpecs.Length = 0 then
-        Error(exn "At least one pathspec is required.")
-    else
-        pathSpecs
-        |> Array.map (fun pathSpec ->
-            if String.IsNullOrWhiteSpace pathSpec then
-                Error(exn "Pathspec must not be empty.")
-            else
-                match RepositoryPath.tryCreate pathSpec with
-                | Ok path -> Ok path
-                | Error message -> Error(exn message))
-        |> Array.fold
-            (fun state next ->
-                match state, next with
-                | Error e, _ -> Error e
-                | _, Error e -> Error e
-                | Ok acc, Ok value -> Ok(Array.append acc [| value |]))
-            (Ok [||])
-
 let private splitGitOutputLines (text: string) =
     text.Replace("\r\n", "\n").Split('\n', StringSplitOptions.RemoveEmptyEntries)
     |> Array.map _.Trim()
@@ -1856,52 +1836,6 @@ let getDiffSummary (arcPath: string) : JS.Promise<GitResult<GitDiffSummaryDto>> 
                 Deletions = diff.deletions
             }
         })
-
-/// Returns raw `git diff` text for validated pathspecs. Used by tests and lower-level consumers.
-let getDiff (arcPath: string) (pathSpecs: string[]) : JS.Promise<GitResult<string>> = promise {
-    match validateLiteralDiffPathspecs pathSpecs with
-    | Error validationError -> return errorResult validationError
-    | Ok literalPaths ->
-        return!
-            withLocalGit
-                arcPath
-                (fun git -> promise {
-                    let pathspecs = literalPaths |> Array.map GitPathTransport.literalPathspec
-                    let! result = runSimpleGitPathspecChunks [| "diff" |] pathspecs git
-
-                    match result with
-                    | Ok output -> return output
-                    | Error failure -> return abortGitPromise failure.Message
-                })
-}
-
-/// Returns porcelain word-diff text for validated pathspecs.
-let getWordDiff
-    (arcPath: string)
-    (pathSpecs: string[])
-    : JS.Promise<GitResult<string>> =
-    promise {
-        match validateLiteralDiffPathspecs pathSpecs with
-        | Error validationError -> return errorResult validationError
-        | Ok literalPaths ->
-            return!
-                withUntimedLocalGit
-                    arcPath
-                    None
-                    (fun git -> promise {
-                        let pathspecs = literalPaths |> Array.map GitPathTransport.literalPathspec
-
-                        let! result =
-                            runSimpleGitPathspecChunks
-                                [| "diff"; "--word-diff=porcelain"; "-U0" |]
-                                pathspecs
-                                git
-
-                        match result with
-                        | Ok output -> return output
-                        | Error failure -> return abortGitPromise failure.Message
-                    })
-    }
 
 /// Loads previous/current text plus word-diff metadata for diff views.
 /// Binary or explicitly unsupported files return the unsupported-content sentinel.

@@ -59,12 +59,6 @@ let private fakeObjectState: ObjectState = {
     ObjectId = None
 }
 
-let private createFakeTextDiff () : TextDiffService = {
-    GetDiff = fun _ _ -> async { return OperationResult.succeeded (TextContent "diff") }
-    GetWordDiff = fun _ _ -> async { return OperationResult.succeeded (TextContent "word diff") }
-    GetBaseContent = fun _ _ -> async { return OperationResult.succeeded (TextContent "base content") }
-}
-
 let private unsupported (operation: string) : OperationResult<'T> =
     OperationResult.failed (
         OperationFailure.create Unsupported "operation_not_supported" $"{operation} is not supported by this provider."
@@ -202,7 +196,6 @@ let private createFakeFactory () : ProviderFactory =
                 return
                     OperationResult.succeeded {
                         WorkspaceSession.createCoreOnly descriptor (createFakeCore ()) with
-                            TextDiff = Some(createFakeTextDiff ())
                             ConflictResolution = Some(createFakeConflictResolution ())
                             Synchronization = Some(createFakeSynchronization ())
                             ObjectMaterialization = Some(createFakeObjectMaterialization ())
@@ -332,14 +325,6 @@ Vitest.describe (
                 let workflow = async {
                     let! session = openFakeSession factory context
 
-                    let textDiff =
-                        match session.TextDiff with
-                        | Some service -> service
-                        | None -> failwith "Expected the fake text-diff service."
-
-                    let! baseResult = textDiff.GetBaseContent fakePath context
-                    let baseContent = expectSucceeded "get base content" baseResult
-
                     let conflicts =
                         match session.ConflictResolution with
                         | Some service -> service
@@ -367,12 +352,11 @@ Vitest.describe (
                     let! objectsResult = objects.ListObjects context
                     let objectState = expectSucceeded "list objects" objectsResult |> Array.exactlyOne
 
-                    return baseContent, conflict.Items[0].CombinedPreview, state.TargetRef, objectState.IsLocallyAvailable
+                    return conflict.Items[0].CombinedPreview, state.TargetRef, objectState.IsLocallyAvailable
                 }
 
-                let! baseContent, combinedPreview, targetRef, isLocallyAvailable = Async.StartAsPromise workflow
+                let! combinedPreview, targetRef, isLocallyAvailable = Async.StartAsPromise workflow
 
-                Vitest.expect(baseContent).toEqual (TextContent "base content")
                 Vitest.expect(combinedPreview).toEqual (Some(TextPreview "<<<<<<< local\n=======\n>>>>>>> target\n"))
                 Vitest.expect(targetRef).toEqual (Some fakeTargetRef)
                 Vitest.expect(isLocallyAvailable).toBe (true)
@@ -399,7 +383,7 @@ Vitest.describe (
                 let! before, after = Async.StartAsPromise workflow
                 let expectedBefore: ServiceAvailability = {
                     Synchronization = true
-                    TextDiff = true
+                    TextDiff = false
                     ConflictResolution = true
                     ObjectMaterialization = true
                     StoragePolicy = false

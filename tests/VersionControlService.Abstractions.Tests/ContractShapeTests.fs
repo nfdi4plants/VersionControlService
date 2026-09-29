@@ -73,12 +73,6 @@ module FakeProvider =
             OperationFailure.create Unsupported "operation_not_supported" $"{operation} is not supported by this provider."
         )
 
-    let createFinalTextDiff () : TextDiffService = {
-        GetDiff = fun _ _ -> async { return OperationResult.succeeded (TextContent "diff") }
-        GetWordDiff = fun _ _ -> async { return OperationResult.succeeded (TextContent "word diff") }
-        GetBaseContent = fun _ _ -> async { return OperationResult.succeeded (TextContent "base content") }
-    }
-
     let createFinalSynchronization () : SynchronizationService =
         let state = {
             BaseRevision = None
@@ -357,7 +351,6 @@ let contractShapeTests =
             let factory =
                 FakeProvider.createFactory id (fun descriptor -> {
                     WorkspaceSession.createCoreOnly descriptor (FakeProvider.createCore ()) with
-                        TextDiff = Some(FakeProvider.createFinalTextDiff ())
                         ConflictResolution = Some(FakeProvider.createFinalConflictResolution ())
                         Synchronization = Some(FakeProvider.createFinalSynchronization ())
                         ObjectMaterialization = Some(FakeProvider.createFinalObjectMaterialization ())
@@ -365,15 +358,6 @@ let contractShapeTests =
 
             let! session = openSession factory
             let context = OperationContext.detached "final-service-surface"
-
-            let textDiff =
-                match session.TextDiff with
-                | Some service -> service
-                | None -> failtest "Expected the text-diff service."
-
-            let! baseResult = textDiff.GetBaseContent (FakeProvider.repositoryPath "portable.txt") context
-            let baseContent = expectSucceeded "get base content" baseResult
-            Expect.equal baseContent (TextContent "base content") "Base content comes from the service result."
 
             let conflicts =
                 match session.ConflictResolution with

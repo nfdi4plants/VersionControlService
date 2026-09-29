@@ -80,6 +80,11 @@ let operationResultTests =
             | Succeeded _
             | PartiallySucceeded _ -> failtest "Expected Failed."
 
+        testCase "creating a failure leaves diff detail unset"
+        <| fun () ->
+            let failure = OperationFailure.create ProviderError "worker_failed" "The diff worker failed."
+            Expect.isNone failure.DiffDetail "The failure has no diff-specific detail."
+
         testCase "partial success is forced to describe changed state and recovery"
         <| fun () ->
             let outcome = {

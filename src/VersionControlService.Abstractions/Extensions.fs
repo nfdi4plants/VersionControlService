@@ -1,18 +1,224 @@
 namespace VersionControlService.Abstractions
 
-/// Diff/preview content: binary or otherwise unsupported content is data, not an exception.
-type ContentView =
-    | TextContent of content: string
-    | UnsupportedContent of reason: string option
+/// Opaque handle for a diff session pinned to its source identities.
+type DiffHandle = { Id: string; Version: string }
 
-/// Optional text-diff extension.
-type TextDiffService = {
-    GetDiff: RepositoryPath -> OperationContext -> Async<OperationResult<ContentView>>
-    GetWordDiff: RepositoryPath -> OperationContext -> Async<OperationResult<ContentView>>
-    /// Providers own base revision lookup. GetBaseContent returns the committed base in materialized form when available locally and never transfers large objects.
-    /// When content is unavailable locally, a provider may return its textual reference or UnsupportedContent, and binary content is UnsupportedContent.
-    GetBaseContent: RepositoryPath -> OperationContext -> Async<OperationResult<ContentView>>
+/// A zero-based range of source lines.
+type LineRange = { Start: int64; Count: int64 }
+
+/// The line terminator found after a line.
+[<RequireQualifiedAccess>]
+type LineEnding =
+    | NoEnding
+    | LF
+    | CRLF
+    | CR
+
+/// Describes whether a highlighted span is unchanged or changed text.
+[<RequireQualifiedAccess>]
+type HighlightKind =
+    | UnchangedText
+    | ChangedText
+
+/// A UTF-16 span inside the text of a line slice.
+type Highlight = { Start: int; Length: int; Kind: HighlightKind }
+
+/// A UTF-16 slice of one line. TotalUtf16 remains absent until the line length is known.
+type LineSlice = { OffsetUtf16: int64; TotalUtf16: int64 option; Text: string; Highlights: Highlight[] }
+
+/// A whole source line with the currently available slice of its text.
+type DiffLine = { Number: int64; Ending: LineEnding; Slice: LineSlice }
+
+/// Describes the relationship represented by a diff row.
+[<RequireQualifiedAccess>]
+type DiffRowKind =
+    | Context
+    | Added
+    | Removed
+    | Replaced
+    | EndingChanged
+
+/// One diff row with a stable identifier and optional lines from each side.
+type DiffRow = { Id: string; Kind: DiffRowKind; Previous: DiffLine option; Current: DiffLine option }
+
+/// Aligned rows or separate line sequences when alignment is unavailable.
+[<RequireQualifiedAccess>]
+type HunkBody =
+    | AlignedRows of DiffRow[]
+    | UnalignedSides of previous: DiffLine[] * current: DiffLine[]
+
+/// A hunk fragment with source ranges and markers for its boundaries.
+type HunkFragment = {
+    HunkId: string
+    PreviousRange: LineRange
+    CurrentRange: LineRange
+    StartsHunk: bool
+    EndsHunk: bool
+    Body: HunkBody
 }
+
+/// A hidden range whose lines and endings have been verified equal.
+type EqualGap = { GapId: string; PreviousRange: LineRange; CurrentRange: LineRange }
+
+/// One visible component of a diff page, including verified equal context.
+[<RequireQualifiedAccess>]
+type DiffPart =
+    | Hunk of HunkFragment
+    | HiddenEqual of EqualGap
+    | ExpandedContext of gapId: string * DiffRow[]
+
+/// Unique validated byte coverage across both sources and the scan completion state.
+type ScanProgress = { ValidatedBytes: int64; TotalBytes: int64; ScanComplete: bool }
+
+/// Describes what follows the final character in a pending snippet.
+[<RequireQualifiedAccess>]
+type SnippetEnd =
+    | Truncated
+    | MoreTextPending
+    | LineEnd
+    | EndOfFile
+
+/// The available portion of one line while scanning continues.
+type PendingSnippet = { Line: int64; OffsetUtf16: int64; Text: string; End: SnippetEnd }
+
+/// State for one side at the pending scan position, including proven exhaustion.
+[<RequireQualifiedAccess>]
+type PendingSide =
+    | NoActiveLine
+    | Snippet of PendingSnippet
+    | Exhausted of lineCount: int64
+
+/// UTF-16 offsets of an advisory mismatch between the two sources.
+type MismatchMarker = { PreviousOffsetUtf16: int64; CurrentOffsetUtf16: int64 }
+
+/// Advisory snippets for lines still being scanned. They never form a diff row.
+type PendingPreview = { Previous: PendingSide; Current: PendingSide; Mismatch: MismatchMarker option }
+
+/// A result that is ready or has a continuation while scanning proceeds.
+[<RequireQualifiedAccess>]
+type Resumable<'T> =
+    | Ready of 'T
+    | Scanning of ScanProgress * continuation: string * pending: PendingPreview option
+
+/// A page of diff parts with its cursor and progress. A pending preview appears only when another page is available.
+type DiffPage = {
+    PageId: string
+    NextCursor: string option
+    Parts: DiffPart[]
+    Progress: ScanProgress
+    OutputComplete: bool
+    Pending: PendingPreview option
+}
+
+/// Text metadata for one source in an opened diff.
+type DiffSourceInfo = {
+    Path: RepositoryPath
+    Revision: RevisionId option
+    IsAbsent: bool
+    ByteLength: int64
+    LineCount: int64 option
+    Encoding: string option
+    EncodingWasChosen: bool
+    HasBom: bool
+}
+
+/// An encoding candidate with a preview of at most 2 KiB of decoded text.
+type EncodingCandidate = { Encoding: string; Preview: string }
+
+/// Binds the selected path, optional previous path, pinned commit, and source identities.
+type PreparationToken = { Id: string }
+
+/// Input for opening a pinned diff session with optional encoding choices and continuation.
+type OpenDiffRequest = {
+    Path: RepositoryPath
+    PreviousPath: RepositoryPath option
+    Preparation: PreparationToken option
+    PreviousEncoding: string option
+    CurrentEncoding: string option
+    ContextLines: int
+    Continuation: string option
+}
+
+/// Reason the provider cannot produce a diff for the requested sources.
+[<RequireQualifiedAccess>]
+type DiffBlocker =
+    | Binary of DiffSide * evidence: string
+    | LocalContentUnavailable of DiffSide * objectId: string option
+    | EncodingRequired of DiffSide * PreparationToken * EncodingCandidate[]
+    | NotRegularFile of DiffSide
+    | ProviderUnsupported
+
+/// The result of opening a diff, with either a blocker or a new handle and initial page.
+[<RequireQualifiedAccess>]
+type OpenDiffResult =
+    | NotDiffable of DiffBlocker
+    | Opened of DiffHandle * previous: DiffSourceInfo * current: DiffSourceInfo * first: Resumable<DiffPage>
+
+/// Request the page that follows a cursor in an opened diff.
+type ReadPageRequest = { Handle: DiffHandle; Cursor: string }
+
+/// Request a previously returned page again by its identifier.
+type ReplayPageRequest = { Handle: DiffHandle; PageId: string }
+
+/// Request part of a verified equal range. The service clamps Count to 100 lines.
+type ExpandRequest = {
+    Handle: DiffHandle
+    GapId: string
+    FromStart: bool
+    Count: int
+    Continuation: string option
+}
+
+/// Request a UTF-16 slice of one whole source line. The service clamps MaxUtf16 to 8,192.
+type ReadLineRequest = {
+    Handle: DiffHandle
+    Side: DiffSide
+    Line: int64
+    OffsetUtf16: int64
+    MaxUtf16: int
+    Continuation: string option
+}
+
+/// Request the pinned metadata for both sources in an opened diff.
+type SourceInfoRequest = { Handle: DiffHandle }
+
+/// Reads and expands paged diffs with resumable work.
+type TextDiffService = {
+    Open: OpenDiffRequest -> OperationContext -> Async<OperationResult<Resumable<OpenDiffResult>>>
+    ReadPage: ReadPageRequest -> OperationContext -> Async<OperationResult<Resumable<DiffPage>>>
+    ReplayPage: ReplayPageRequest -> OperationContext -> Async<OperationResult<DiffPage>>
+    Expand: ExpandRequest -> OperationContext -> Async<OperationResult<Resumable<DiffPart[]>>>
+    ReadLine: ReadLineRequest -> OperationContext -> Async<OperationResult<Resumable<DiffLine>>>
+    GetSourceInfo: SourceInfoRequest -> OperationContext -> Async<OperationResult<DiffSourceInfo * DiffSourceInfo>>
+    Close: DiffHandle -> OperationContext -> Async<OperationResult<unit>>
+}
+
+/// Stable failure codes returned by paged text diff operations.
+module TextDiffFailureCodes =
+
+    /// The selected source content could not be read as text.
+    [<Literal>]
+    let ContentNotText = "diff_content_not_text"
+
+    /// A pinned source identity changed while its diff was open.
+    [<Literal>]
+    let SourceChanged = "source_changed"
+
+    /// The diff handle has already been closed.
+    [<Literal>]
+    let SessionClosed = "diff_session_closed"
+
+    /// The worker could not complete a diff operation.
+    [<Literal>]
+    let WorkerFailed = "diff_worker_failed"
+
+    /// The preparation token does not match the requested sources.
+    [<Literal>]
+    let PreparationMismatch = "preparation_mismatch"
+
+    /// The continuation was produced for a request with different fields.
+    [<Literal>]
+    let ContinuationMismatch = "continuation_mismatch"
 
 /// Materialization state of one lazily-hydrated object.
 type ObjectState = {

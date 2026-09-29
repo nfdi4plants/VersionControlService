@@ -45,7 +45,6 @@ let private createFakeFactory () : ProviderFactory =
     FakeProvider.createFactory fakeProviderId (fun descriptor ->
         {
             WorkspaceSession.createCoreOnly descriptor (createLongOperationCore ()) with
-                TextDiff = Some(FakeProvider.createFinalTextDiff ())
                 ConflictResolution = Some(FakeProvider.createFinalConflictResolution ())
                 Synchronization = Some(FakeProvider.createFinalSynchronization ())
                 ObjectMaterialization = Some(FakeProvider.createFinalObjectMaterialization ())
@@ -102,21 +101,7 @@ let portableConsumerTests =
         <| async {
             let factory = createFakeFactory ()
             let context = OperationContext.detached "portable-final-spi"
-            let path =
-                match RepositoryPath.tryCreate "portable.txt" with
-                | Ok value -> value
-                | Error message -> failtest message
-
             let! session = openFakeSession factory context
-
-            let textDiff =
-                match session.TextDiff with
-                | Some service -> service
-                | None -> failtest "Expected the portable text-diff service."
-
-            let! baseResult = textDiff.GetBaseContent path context
-            let baseContent = expectSucceeded "get base content" baseResult
-            Expect.equal baseContent (TextContent "base content") "Base content comes from the text-diff result."
 
             let conflicts =
                 match session.ConflictResolution with

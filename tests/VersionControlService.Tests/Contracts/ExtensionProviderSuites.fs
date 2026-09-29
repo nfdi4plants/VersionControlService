@@ -26,24 +26,6 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 Vitest.expect(List.toArray discovered).toEqual (List.toArray (List.sort harness.ExpectedServices))
             }
 
-            if harness.ExpectedServices |> List.contains "text-diff" then
-                profileTest "text diff returns content data instead of exceptions"
-                <| fun () -> promise {
-                    let! workspace = harness.CreateWorkspace()
-                    do! workspace.WriteFile "base.txt" "modified base content\n"
-
-                    let textDiff =
-                        match workspace.Session.TextDiff with
-                        | Some service -> service
-                        | None -> failwith "The harness advertises text-diff but the session lacks it."
-
-                    let! diffResult = run (textDiff.GetDiff (mkPath "base.txt") (ctx "text-diff"))
-
-                    match expectValue "text diff" diffResult with
-                    | TextContent content -> Vitest.expect(content.Length > 0).toBe (true)
-                    | UnsupportedContent _ -> failwith "Expected text content for a text file."
-                }
-
             if harness.ExpectedServices |> List.contains "materialization" then
                 profileTest "object materialization lists and hydrates objects"
                 <| fun () -> promise {

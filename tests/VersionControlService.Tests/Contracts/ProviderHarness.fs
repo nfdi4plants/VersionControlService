@@ -1247,33 +1247,6 @@ module FakeHarness =
                 }
         }
 
-    let private createTextDiff (workspace: FakeWorkspace) : TextDiffService =
-        let diffFor (path: RepositoryPath) =
-            let pathText = pathValue path
-            let headFiles = revisionFiles workspace.Target (headRevisionId workspace)
-            let localContent = workspace.LocalFiles.TryFind pathText
-
-            match localContent with
-            | Some content when content.StartsWith " " ->
-                UnsupportedContent(Some "Binary content has no text diff.")
-            | _ ->
-                let before = headFiles.TryFind pathText |> Option.defaultValue ""
-                let after = localContent |> Option.defaultValue ""
-                TextContent $"--- {pathText}\n-{before}\n+{after}"
-
-        {
-            GetDiff = fun path _ -> async { return OperationResult.succeeded (diffFor path) }
-            GetWordDiff = fun path _ -> async { return OperationResult.succeeded (diffFor path) }
-            GetBaseContent =
-                fun _ _ ->
-                    async {
-                        return
-                            OperationResult.succeeded (
-                                UnsupportedContent(Some "Base content is not supported by the fake provider yet.")
-                            )
-                    }
-        }
-
     let private createBrowser () : RepositoryBrowserService = {
         GetRepositoryWebUrl = fun _ -> async { return OperationResult.succeeded (Some "https://fake.example/repo") }
     }
@@ -1289,7 +1262,6 @@ module FakeHarness =
             WorkspaceSession.createCoreOnly descriptor (createCore workspace) with
                 Synchronization = Some(createSynchronization workspace)
                 ConflictResolution = Some(createConflictService workspace)
-                TextDiff = Some(createTextDiff workspace)
                 RepositoryBrowser = Some(createBrowser ())
         }
 
@@ -1510,7 +1482,7 @@ module FakeHarness =
         {
             Name = "fake"
             Factory = factory
-            ExpectedServices = [ "synchronization"; "text-diff"; "conflicts"; "browser" ]
+            ExpectedServices = [ "synchronization"; "conflicts"; "browser" ]
             CreateLocation = fun () -> promise { return newLocation false }
             CreateUnauthorizedLocation = fun () -> promise { return newLocation true }
             CreateLocalPath =

@@ -94,7 +94,7 @@ let fallbackServicesTests =
             let coreOnly = WorkspaceSession.createCoreOnly descriptor (FakeProvider.createCore ())
             let withTwoServices = {
                 coreOnly with
-                    TextDiff = Some(FakeProvider.createFinalTextDiff ())
+                    ConflictResolution = Some(FakeProvider.createFinalConflictResolution ())
                     RepositoryBrowser = Some(FakeProvider.createBrowser ())
             }
             let noneAvailable: ServiceAvailability = {
@@ -106,7 +106,11 @@ let fallbackServicesTests =
                 Maintenance = false
                 RepositoryBrowser = false
             }
-            let twoAvailable = { noneAvailable with TextDiff = true; RepositoryBrowser = true }
+            let twoAvailable = { noneAvailable with ConflictResolution = true; RepositoryBrowser = true }
+            let withoutTextDiff = {
+                WorkspaceSession.withFallbackServices coreOnly with
+                    TextDiff = None
+            }
             let allAvailable: ServiceAvailability = {
                 Synchronization = true
                 TextDiff = true
@@ -119,47 +123,68 @@ let fallbackServicesTests =
 
             Expect.equal (WorkspaceSession.availability coreOnly) noneAvailable "A core-only session has no optional services."
             Expect.equal (WorkspaceSession.availability withTwoServices) twoAvailable "Only provider services are reported."
+            Expect.equal
+                (WorkspaceSession.availability withoutTextDiff)
+                { allAvailable with TextDiff = false }
+                "Text diff availability is reported separately."
 
             withTwoServices
             |> WorkspaceSession.withFallbackServices
             |> WorkspaceSession.availability
             |> fun availability -> Expect.equal availability allAvailable "A filled session reports every service."
 
+        testCaseAsync "the paged text diff fallback opens without a provider and rejects later page reads"
+        <| async {
+            let session = WorkspaceSession.withFallbackServices (WorkspaceSession.createCoreOnly descriptor (FakeProvider.createCore ()))
+            let textDiff = require "text diff" session.TextDiff
+            let reason = "The provider has no text diff service."
+            let openRequest: OpenDiffRequest = {
+                Path = path
+                PreviousPath = None
+                Preparation = None
+                PreviousEncoding = None
+                CurrentEncoding = None
+                ContextLines = 3
+                Continuation = None
+            }
+
+            let! openResult = textDiff.Open openRequest context
+            let opened = expectNoOp reason openResult
+            Expect.equal
+                opened
+                (Resumable.Ready(OpenDiffResult.NotDiffable DiffBlocker.ProviderUnsupported))
+                "Open reports that the provider does not support paged diffs."
+
+            let handle = { Id = "fallback"; Version = "1" }
+            let! closeResult = textDiff.Close handle context
+            Expect.equal (expectNoOp reason closeResult) () "Close returns a warned no-op."
+
+            let! pageResult = textDiff.ReadPage { Handle = handle; Cursor = "cursor" } context
+            expectUnsupported reason pageResult
+        }
+
         testCase "a present service keeps its instance"
         <| fun () ->
-            let original: TextDiffService = {
-                GetDiff = fun _ _ -> async { return OperationResult.succeeded (TextContent "original") }
-                GetWordDiff = fun _ _ -> async { return OperationResult.succeeded (TextContent "original word diff") }
-                GetBaseContent = fun _ _ -> async { return OperationResult.succeeded (TextContent "original base") }
-            }
+            let original = FakeProvider.createBrowser ()
 
             let session = {
                 WorkspaceSession.createCoreOnly descriptor (FakeProvider.createCore ()) with
-                    TextDiff = Some original
+                    RepositoryBrowser = Some original
             }
 
             let filled = WorkspaceSession.withFallbackServices session
-            let kept = require "text diff" filled.TextDiff
+            let kept = require "repository browser" filled.RepositoryBrowser
 
             Expect.isTrue (System.Object.ReferenceEquals(box original, box kept)) "The provider service instance is retained."
 
         testCaseAsync "fallback services return their values, reasons, and warning codes"
         <| async {
             let session = WorkspaceSession.withFallbackServices (WorkspaceSession.createCoreOnly descriptor (FakeProvider.createCore ()))
-            let textDiff = require "text diff" session.TextDiff
             let objectMaterialization = require "object materialization" session.ObjectMaterialization
             let storagePolicy = require "storage policy" session.StoragePolicy
             let maintenance = require "maintenance" session.Maintenance
             let repositoryBrowser = require "repository browser" session.RepositoryBrowser
             let conflicts = require "conflict resolution" session.ConflictResolution
-
-            let textDiffReason = "The provider has no text diff service."
-            let! diffResult = textDiff.GetDiff path context
-            let! wordDiffResult = textDiff.GetWordDiff path context
-            let! baseContentResult = textDiff.GetBaseContent path context
-            Expect.equal (expectNoOp textDiffReason diffResult) (UnsupportedContent(Some textDiffReason)) "GetDiff returns unsupported content."
-            Expect.equal (expectNoOp textDiffReason wordDiffResult) (UnsupportedContent(Some textDiffReason)) "GetWordDiff returns unsupported content."
-            Expect.equal (expectNoOp textDiffReason baseContentResult) (UnsupportedContent(Some textDiffReason)) "GetBaseContent returns unsupported content."
 
             let objectReason = "The provider has no object materialization service."
             let! objectsResult = objectMaterialization.ListObjects context
@@ -257,14 +282,10 @@ let fallbackServicesTests =
 
         testCaseAsync "factory fallback fills successful opens and preserves outcome fields"
         <| async {
-            let originalTextDiff: TextDiffService = {
-                GetDiff = fun _ _ -> async { return OperationResult.succeeded (TextContent "original") }
-                GetWordDiff = fun _ _ -> async { return OperationResult.succeeded (TextContent "original word diff") }
-                GetBaseContent = fun _ _ -> async { return OperationResult.succeeded (TextContent "original base") }
-            }
+            let originalBrowser = FakeProvider.createBrowser ()
             let coreOnly = {
                 WorkspaceSession.createCoreOnly descriptor (FakeProvider.createCore ()) with
-                    TextDiff = Some originalTextDiff
+                    RepositoryBrowser = Some originalBrowser
             }
             let originalOutcome = {
                 OperationOutcome.noOp (Some "open returned without changes") coreOnly with
@@ -300,10 +321,10 @@ let fallbackServicesTests =
                 Expect.equal outcome.Value.Descriptor originalOutcome.Value.Descriptor "The session descriptor is unchanged."
                 Expect.equal outcome.Effect originalOutcome.Effect "The outcome effect is unchanged."
                 Expect.equal outcome.Warnings originalOutcome.Warnings "The outcome warnings are unchanged."
-                let keptTextDiff = require "text diff" outcome.Value.TextDiff
+                let keptBrowser = require "repository browser" outcome.Value.RepositoryBrowser
                 Expect.isTrue
-                    (System.Object.ReferenceEquals(box originalTextDiff, box keptTextDiff))
-                    "The factory keeps the provider text-diff instance."
+                    (System.Object.ReferenceEquals(box originalBrowser, box keptBrowser))
+                    "The factory keeps the provider browser instance."
                 Expect.equal
                     outcome.ResultingWorkspaceVersion
                     originalOutcome.ResultingWorkspaceVersion

@@ -64,7 +64,7 @@ Optional services advertise real capability:
 | Service | Purpose |
 |---|---|
 | `Synchronization` | refresh, preview update, update, publish, and synchronize |
-| `TextDiff` | text, word, and committed-base content |
+| `TextDiff` | paged diffs of a working file against HEAD |
 | `ConflictResolution` | provider-owned conflict sessions and stale-handle checks |
 | `ObjectMaterialization` | list, hydrate, and dematerialize large or lazy objects |
 | `StoragePolicy` | literal-path policy and host-facing settings |

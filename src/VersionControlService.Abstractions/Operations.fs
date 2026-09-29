@@ -124,6 +124,8 @@ type OperationFailure = {
     /// Structured revision evidence for concurrency/race outcomes, e.g.
     /// ("expected_target", rev) and ("observed_target", rev).
     RevisionEvidence: (string * RevisionId)[]
+    /// Structured detail for a diff_content_not_text failure, when present.
+    DiffDetail: DiffContentBlocked option
 }
 
 type OperationWarning = {
@@ -222,6 +224,7 @@ module OperationFailure =
         RecoveryAction = None
         Details = [||]
         RevisionEvidence = [||]
+        DiffDetail = None
     }
 
     /// Creates a failure whose message is passed through the redaction guard.

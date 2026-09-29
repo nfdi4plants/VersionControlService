@@ -7,6 +7,7 @@
   <ItemGroup>
     <Compile Include="Identifiers.fs" />
     <Compile Include="Paths.fs" />
+    <Compile Include="DiffFailureDetail.fs" />
     <Compile Include="Operations.fs" />
     <Compile Include="Workspace.fs" />
     <Compile Include="Refs.fs" />
