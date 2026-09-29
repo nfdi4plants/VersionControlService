@@ -1,6 +1,7 @@
 <Solution>
   <Folder Name="/src/">
     <Project Path="src/VersionControlService.Abstractions/VersionControlService.Abstractions.fsproj" />
+    <Project Path="src/VersionControlService.TextDiff/VersionControlService.TextDiff.fsproj" />
     <Project Path="src/VersionControlService.Runtime.Node/VersionControlService.Runtime.Node.fsproj" />
     <Project Path="src/VersionControlService.Git/VersionControlService.Git.fsproj" />
     <Project Path="src/VersionControlService.LakeFs/VersionControlService.LakeFs.fsproj" />
@@ -8,6 +9,8 @@
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/VersionControlService.Abstractions.Tests/VersionControlService.Abstractions.Tests.fsproj" />
+    <Project Path="tests/VersionControlService.TextDiff.Tests/VersionControlService.TextDiff.Tests.fsproj" />
+    <Project Path="tests/VersionControlService.TextDiff.FableTests/VersionControlService.TextDiff.FableTests.fsproj" />
     <Project Path="tests/VersionControlService.FableConsumer.Tests/VersionControlService.FableConsumer.Tests.fsproj" />
     <Project Path="tests/VersionControlService.Tests/VersionControlService.Tests.fsproj" />
   </Folder>

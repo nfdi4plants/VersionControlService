@@ -8,6 +8,11 @@ open ProjectInfo
 /// Restores and compiles the one-reference consumer, then runs its ES module output.
 /// The Git workspace operation checks that the umbrella package works without a bundle.
 let Compile (version: string) (feed: string) (cache: string) (output: string) =
+    let textDiffPackage = Path.Combine(feed, $"VersionControlService.TextDiff.{version}.nupkg")
+
+    if not (File.Exists textDiffPackage) then
+        failwithf "The local feed is missing VersionControlService.TextDiff %s." version
+
     run
         "dotnet"
         [

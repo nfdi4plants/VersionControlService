@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <PackageId>VersionControlService.TextDiff</PackageId>
+    <Description>Pure incremental text decoding and scanning primitives for VersionControlService.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Host.fs" />
+    <Compile Include="Meter.fs" />
+    <Compile Include="Hash.fs" />
+    <Compile Include="Decoders.fs" />
+    <Compile Include="Scanner.fs" />
+    <Compile Include="Classification.fs" />
+    <Compile Include="Ledger.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\VersionControlService.Abstractions\VersionControlService.Abstractions.fsproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <Content Include="VersionControlService.TextDiff.fsproj" Pack="true" PackagePath="fable\" />
+    <Content Include="**\*.fs" Exclude="bin\**;obj\**" Pack="true" PackagePath="fable\%(RecursiveDir)%(Filename)%(Extension)" />
+  </ItemGroup>
+</Project>

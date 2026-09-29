@@ -9,8 +9,9 @@ let private usage =
         "  test watch                                  The same suite, recompiled and rerun on every change"
         "  test focused <test-file> <filter>           One compiled test file, selecting tests by name"
         "  test consumer                               The Fable consumer suite over the abstractions"
+        "  test textdiff                               The shared text-diff engine cases in Fable and Vitest"
         "  test lakefs                                 The live lakeFS matrix against a pinned container"
-        "  pack --version=<v> --output=<dir>           Pack the five coordinated packages into a local feed"
+        "  pack --version=<v> --output=<dir>           Pack the six coordinated packages into a local feed"
         "  release nuget [--dry-run]                   Pack and verify the latest changelog version, then push to NuGet"
         "  verify packages --feed=<dir> --version=<v>  Check a local feed against the expected package graph"
         "  package-consumer [--version=<v>] [--temp=<dir>]"
@@ -42,6 +43,7 @@ let main args =
     match argv with
     | "test" :: "run" :: _ -> Test.Run.all () |> asExitCode
     | "test" :: "consumer" :: _ -> Test.Run.fableConsumer () |> asExitCode
+    | "test" :: "textdiff" :: _ -> target Test.TextDiff
     | "test" :: "watch" :: _ ->
         Test.Watch()
         0

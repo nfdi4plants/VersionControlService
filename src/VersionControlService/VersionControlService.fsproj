@@ -10,6 +10,7 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\VersionControlService.Abstractions\VersionControlService.Abstractions.fsproj" />
+    <ProjectReference Include="..\VersionControlService.TextDiff\VersionControlService.TextDiff.fsproj" />
     <ProjectReference Include="..\VersionControlService.Runtime.Node\VersionControlService.Runtime.Node.fsproj" />
     <ProjectReference Include="..\VersionControlService.Git\VersionControlService.Git.fsproj" />
     <ProjectReference Include="..\VersionControlService.LakeFs\VersionControlService.LakeFs.fsproj" />

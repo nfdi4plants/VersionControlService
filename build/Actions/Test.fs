@@ -10,6 +10,12 @@ let private cleanGeneratedOutput (testProjectPath: string) =
     if Directory.Exists outputPath then
         Directory.Delete(outputPath, true)
 
+let TextDiff () =
+    let projectPath = Path.GetFullPath "tests/VersionControlService.TextDiff.FableTests"
+    cleanGeneratedOutput projectPath
+    run "dotnet" [ "fable"; "-o"; "output"; "-s" ] projectPath
+    run npx [ "vitest"; "run"; "output/TextDiffEngineCases.test.js"; "--configLoader"; "native" ] projectPath
+
 /// Fable starts the Vitest runner itself, so "npx" is spelled plainly in these arguments.
 let private suiteArgs = [
     "fable"
