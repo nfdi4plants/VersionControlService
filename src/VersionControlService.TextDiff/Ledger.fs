@@ -16,6 +16,8 @@ type AllocationCategory =
 
 type Ledger() =
     let used = Array.zeroCreate<int64> 8
+    let peakWindowLines = Array.zeroCreate<int> 2
+    let mutable commonRunBytes = 0.0
     let caps = [| 32L; 32L; 54L; 16L; 8L; 8L; 1L; 2L |] |> Array.map (fun value -> value * 1024L * 1024L)
 
     let index = function
@@ -27,6 +29,11 @@ type Ledger() =
         | AllocationCategory.ResponseData -> 5
         | AllocationCategory.ResidentCheckpoints -> 6
         | AllocationCategory.RetainedBlobs -> 7
+
+    let windowIndex = function
+        | AllocationCategory.PreviousWindows -> 0
+        | AllocationCategory.CurrentWindows -> 1
+        | category -> invalidArg (nameof category) "Window line counts require a window allocation category."
 
     member _.TryReserve(category: AllocationCategory, bytes: int64) =
         if bytes < 0L then invalidArg (nameof bytes) "The reservation cannot be negative."
@@ -43,6 +50,20 @@ type Ledger() =
         used[slot] <- used[slot] - bytes
 
     member _.Used(category: AllocationCategory) = used[index category]
+
+    member _.RecordWindowLines(category: AllocationCategory, count: int) =
+        if count < 0 then invalidArg (nameof count) "The window line count cannot be negative."
+        let slot = windowIndex category
+        peakWindowLines[slot] <- max peakWindowLines[slot] count
+
+    member _.PeakWindowLines(category: AllocationCategory) = peakWindowLines[windowIndex category]
+
+    /// Counts the bytes per side that the equal-byte phase consumed, so tests can tell it apart from window work.
+    member _.RecordCommonRunBytes(count: float) =
+        if count < 0.0 then invalidArg (nameof count) "The common run byte count cannot be negative."
+        commonRunBytes <- commonRunBytes + count
+
+    member _.CommonRunBytes = commonRunBytes
 
     member this.TryLease(category: AllocationCategory, bytes: int64) =
         if this.TryReserve(category, bytes) then Some(new AllocationLease(this, category, bytes) :> IDisposable)

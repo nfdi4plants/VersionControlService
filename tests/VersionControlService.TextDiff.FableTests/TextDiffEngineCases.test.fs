@@ -1,6 +1,7 @@
 namespace VersionControlService.TextDiff.FableTests
 
 open Fable.Core
+open VersionControlService.Abstractions
 open VersionControlService.TextDiff
 open VersionControlService.TextDiff.Tests
 
@@ -32,7 +33,7 @@ module TextDiffEngineCasesTests =
             Scanner.scanChunk state data 0 data.Length true (createMeter ()) batch ignore ignore)
 
     let private commonRunThroughput encoding (left: byte[]) (right: byte[]) =
-        bestRate left.Length (fun () ->
+        bestRate (left.Length * 2) (fun () ->
             let mutable position = 0
             let mutable pendingCR = false
             let mutable lines = 0
@@ -122,10 +123,80 @@ module TextDiffEngineCasesTests =
         Vitest.log ($"{label}: {rate:F1} MB/s")
         Async.StartAsPromise(async.Return())
 
+    let private benchmarkSessionConfig sessionId contextLines pageRows chunkBytes = {
+        SessionId = sessionId
+        ContextLines = contextLines
+        PageMaxRows = pageRows
+        PageMaxBytes = 512 * 1024
+        PageMaxFragments = 32
+        WindowMaxLines = 65_536
+        WindowMaxBytes = 32 * 1024 * 1024
+        CommonChunkBytes = chunkBytes
+        MyersStepsPerGap = 1_000_000
+        HashMaskForTesting = None
+        Limits = { Limits.defaults with MaxUnits = 2_147_483_647; RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 }
+    }
+
+    let private benchmarkSource (data: byte[]) = {
+        Source = Some(MemoryByteSource(data) :> IByteSource)
+        Encoding = "utf-8"
+        BomLength = 0
+        ByteLength = int64 data.Length
+    }
+
+    let rec private finishFirstPage (session: TextDiffSession) (result: EngineResult<Resumable<DiffPage>>) = async {
+        match result with
+        | EngineResult.Ok(Resumable.Ready page) -> return page
+        | EngineResult.Ok(Resumable.Scanning(_, continuation, _)) ->
+            let! next = session.ReadPage continuation (fun () -> false)
+            return! finishFirstPage session next
+        | EngineResult.Failed(code, message, detail) ->
+            return failwith $"The measured session failed with {code}: {message}. Detail: {detail}."
+        | EngineResult.Canceled -> return failwith "The measured session was canceled."
+    }
+
+    let rec private finishSessionOutput (session: TextDiffSession) (page: DiffPage) = async {
+        if page.OutputComplete then return ()
+        else
+            match page.NextCursor with
+            | Some cursor ->
+                let! result = session.ReadPage cursor (fun () -> false)
+                let! nextPage = finishFirstPage session result
+                return! finishSessionOutput session nextPage
+            | None -> return failwith "The measured scan stopped before output was complete."
+    }
+
+    /// Builds lines of a fixed width that start with a marker letter and an eight digit counter, so every line differs.
+    let private numberedLines (marker: byte) (lineBytes: int) (count: int) =
+        let data = Array.create (count * lineBytes) 0x61uy
+
+        for line = 0 to count - 1 do
+            let start = line * lineBytes
+            data[start] <- marker
+            let mutable value = line
+
+            for digit = 8 downto 1 do
+                data[start + digit] <- byte (0x30 + value % 10)
+                value <- value / 10
+
+            data[start + lineBytes - 1] <- 0x0Auy
+
+        data
+
+    let private createBenchmarkSession config previous current : Async<TextDiffSession> = async {
+        let clock = ManualClock 0.0
+        let host = Host.createInMemory (clock :> IClock)
+        return! TextDiffSession.create host (Ledger()) config (fun _ -> 1) previous current
+    }
+
     Vitest.describe (
         "Text diff engine shared cases",
         fun () ->
             for name, run in TextDiffEngineCases.cases do
+                Vitest.it(name, fun () -> Async.StartAsPromise(run ()))
+            for name, run in TextDiffSessionCases.cases do
+                Vitest.it(name, fun () -> Async.StartAsPromise(run ()))
+            for name, run in TextDiffStreamingCases.cases do
                 Vitest.it(name, fun () -> Async.StartAsPromise(run ()))
     )
 
@@ -151,10 +222,98 @@ module TextDiffEngineCasesTests =
 
     Vitest.it (
         "finds the common run of two identical 64 MiB ASCII buffers",
-        fun () -> reportCommonRun "ASCII common run throughput" (asciiLines benchmarkSize)
+        fun () -> reportCommonRun "Phase 1 ASCII common run throughput" (asciiLines benchmarkSize)
     )
 
     Vitest.it (
         "finds the common run of two identical 64 MiB mixed UTF-8 buffers",
         fun () -> reportCommonRun "UTF-8 common run throughput" (utf8Data ())
+    )
+
+    Vitest.it (
+        "measures a 64 MiB identical session scan",
+        fun () -> Async.StartAsPromise(async {
+            let size = 64 * 1024 * 1024
+            let data = asciiLines size
+            let source = benchmarkSource data
+            let config = benchmarkSessionConfig "benchmark-identical" 3 1_000 (8 * 1024 * 1024)
+            let started = BrowserClock.nowMs()
+            let! session = createBenchmarkSession config source source
+            let! first = session.FirstPage(fun () -> false)
+            let! page = finishFirstPage session first
+            let elapsed = max 1.0 (BrowserClock.nowMs() - started)
+            if not page.OutputComplete then failwith "The identical scan did not complete on its first page."
+            let rate = 2.0 * float size / 1_000_000.0 * 1_000.0 / elapsed
+            Vitest.log ($"Identical 64 MiB session scan: {rate:F1} MB/s across both sources")
+            do! session.Close()
+        })
+    )
+
+    Vitest.it (
+        "measures time to the first page for three edits in a 1 MiB file",
+        fun () -> Async.StartAsPromise(async {
+            let size = 1024 * 1024
+            let previous = asciiLines size
+            let current = Array.copy previous
+            for lineIndex in [| 500; 10_000; 20_000 |] do
+                current[lineIndex * 40] <- 0x62uy
+            let config = benchmarkSessionConfig "benchmark-first-page" 3 1_000 (8 * 1024 * 1024)
+            let started = BrowserClock.nowMs()
+            let! session = createBenchmarkSession config (benchmarkSource previous) (benchmarkSource current)
+            let! first = session.FirstPage(fun () -> false)
+            let! page = finishFirstPage session first
+            let elapsed = max 0.0 (BrowserClock.nowMs() - started)
+            if page.Parts.Length = 0 then failwith "The first page has no edit rows."
+            Vitest.log ($"1 MiB file with three edits, first page: {elapsed:F1} ms")
+            do! session.Close()
+        })
+    )
+
+    Vitest.it (
+        "measures total time and throughput for a 64 MiB file with three early edits",
+        fun () -> Async.StartAsPromise(async {
+            let size = 64 * 1024 * 1024
+            let previous = asciiLines size
+            let current = Array.copy previous
+            for lineIndex in [| 10; 100; 1_000 |] do
+                current[lineIndex * 40] <- 0x62uy
+            let config = benchmarkSessionConfig "benchmark-early-edits-64m" 3 1_000 (8 * 1024 * 1024)
+            let started = BrowserClock.nowMs()
+            let! session = createBenchmarkSession config (benchmarkSource previous) (benchmarkSource current)
+            let! first = session.FirstPage(fun () -> false)
+            let! page = finishFirstPage session first
+            if page.Parts.Length = 0 then failwith "The first page has no edit rows."
+            do! finishSessionOutput session page
+            let elapsed = max 1.0 (BrowserClock.nowMs() - started)
+            let rate = 2.0 * float size / 1_000_000.0 * 1_000.0 / elapsed
+            Vitest.log ($"64 MiB file with three early edits: {elapsed:F1} ms, {rate:F1} MB/s across both sources")
+            do! session.Close()
+        })
+    )
+
+    Vitest.it (
+        "measures total time and throughput for a 64 MiB file with an 8 MiB insertion near the start",
+        fun () -> Async.StartAsPromise(async {
+            let lineBytes = 40
+            let lineCount = benchmarkSize / lineBytes
+            let previous = numberedLines 0x70uy lineBytes lineCount
+            let cutLine = 1_000
+            let insertion = numberedLines 0x69uy 256 (8 * 1024 * 1024 / 256)
+            let current = Array.concat [ previous[.. cutLine * lineBytes - 1]; insertion; previous[cutLine * lineBytes ..] ]
+            let ledger = Ledger()
+            let config = benchmarkSessionConfig "benchmark-insertion-64m" 3 1_000 (8 * 1024 * 1024)
+            let started = BrowserClock.nowMs()
+            let! session = TextDiffSession.create (Host.createInMemory (ManualClock 0.0 :> IClock)) ledger config (fun _ -> 1) (benchmarkSource previous) (benchmarkSource current)
+            let! first = session.FirstPage(fun () -> false)
+            let! page = finishFirstPage session first
+            if page.Parts.Length = 0 then failwith "The first page has no edit rows."
+            do! finishSessionOutput session page
+            let elapsed = max 1.0 (BrowserClock.nowMs() - started)
+            let rate = float (previous.Length + current.Length) / 1_000_000.0 * 1_000.0 / elapsed
+            let equalAfterInsertion = float (previous.Length - cutLine * lineBytes)
+            if ledger.CommonRunBytes < 0.9 * equalAfterInsertion then
+                failwith $"The equal-byte phase consumed {ledger.CommonRunBytes} of {equalAfterInsertion} equal bytes after the insertion."
+            Vitest.log ($"64 MiB file with an 8 MiB insertion near the start: {elapsed:F1} ms, {rate:F1} MB/s across both sources")
+            do! session.Close()
+        })
     )

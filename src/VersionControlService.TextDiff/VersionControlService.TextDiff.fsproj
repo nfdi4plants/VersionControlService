@@ -8,12 +8,18 @@
     <Compile Include="Native.fs" />
     <Compile Include="Host.fs" />
     <Compile Include="Meter.fs" />
+    <Compile Include="Myers.fs" />
     <Compile Include="Hash.fs" />
     <Compile Include="Decoders.fs" />
     <Compile Include="Scanner.fs" />
     <Compile Include="CommonRun.fs" />
     <Compile Include="Classification.fs" />
     <Compile Include="Ledger.fs" />
+    <Compile Include="SessionContracts.fs" />
+    <Compile Include="Journal.fs" />
+    <Compile Include="DiffPlan.fs" />
+    <Compile Include="HunkBuilder.fs" />
+    <Compile Include="TextDiffSession.fs" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\VersionControlService.Abstractions\VersionControlService.Abstractions.fsproj" />

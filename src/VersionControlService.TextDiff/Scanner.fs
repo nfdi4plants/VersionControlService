@@ -21,6 +21,7 @@ type ScannedLine = {
 
 type ScannerStatus =
     | InputConsumed
+    | LineBoundaryReached
     | QuantumReached
     | BudgetReached
     | EndOfInput
@@ -77,6 +78,8 @@ type LineBatch(capacity: int) =
     let texts = Array.zeroCreate<string> capacity
     let mutable count = 0
     let mutable pushed = 0.0
+    let mutable stopAtFull = false
+    let mutable stopRequested = false
 
     new() = LineBatch(4_096)
 
@@ -90,6 +93,8 @@ type LineBatch(capacity: int) =
 
     /// Lines pushed since the batch was created, including lines already handed out and cleared.
     member _.Pushed = pushed
+    member _.StopAtFull with get () = stopAtFull and set value = stopAtFull <- value
+    member _.StopRequested with get () = stopRequested and set value = stopRequested <- value
 
     member _.StartOffsets = startOffsets
     member _.EndOffsets = endOffsets
@@ -303,6 +308,10 @@ module Scanner =
             | Some _ -> Native.utf16Decode state.Retained state.RetainedCount
             | None -> null
         batch.Push(state.LineStart, endOffset, ending, state.KeyLo, state.KeyHi, state.LineLengthUtf16, text)
+        if batch.StopAtFull && batch.Count = batch.Capacity then
+            onLines batch
+            batch.Count <- 0
+            batch.StopRequested <- true
         resetLine state endOffset
 
     let private closePendingCR (state: ScannerState) batch onLines =
@@ -409,7 +418,7 @@ module Scanner =
     // Each encoding has its own loop. The line hash lives in the locals lo and hi and is written to the
     // state around every call that reads or resets it. `origin` is the absolute offset of data[0].
 
-    let private scanUtf8 (state: ScannerState) batch onLines emitEvidence (data: byte[]) (offset: int) (count: int) =
+    let private scanUtf8 (state: ScannerState) (batch: LineBatch) onLines emitEvidence (data: byte[]) (offset: int) (count: int) =
         let origin = state.NextOffset - float offset
         let stop = offset + count
         let limit = retainLimitOf state
@@ -422,7 +431,7 @@ module Scanner =
         let mutable index = offset
         let mutable error: DecodeError option = None
 
-        while index < stop && error.IsNone do
+        while index < stop && error.IsNone && not batch.StopRequested do
             let value = Native.readByte data index
             if pendingCount > 0 then
                 // Continues a sequence that the segment or chunk boundary cut, or that the inline path rejected.
@@ -521,7 +530,7 @@ module Scanner =
         finishSegment state origin index error
         index - offset, error
 
-    let private scanWindows1252 (state: ScannerState) batch onLines emitEvidence (data: byte[]) (offset: int) (count: int) =
+    let private scanWindows1252 (state: ScannerState) (batch: LineBatch) onLines emitEvidence (data: byte[]) (offset: int) (count: int) =
         let origin = state.NextOffset - float offset
         let stop = offset + count
         let limit = retainLimitOf state
@@ -531,7 +540,7 @@ module Scanner =
         let mutable index = offset
         let mutable error: DecodeError option = None
 
-        while index < stop && error.IsNone do
+        while index < stop && error.IsNone && not batch.StopRequested do
             let value = Native.readByte data index
             if value >= 0x20 && value < 0x7F then
                 if state.PendingCR then
@@ -571,7 +580,7 @@ module Scanner =
         finishSegment state origin index error
         index - offset, error
 
-    let private scanUtf16 (state: ScannerState) batch onLines emitEvidence (data: byte[]) (offset: int) (count: int) =
+    let private scanUtf16 (state: ScannerState) (batch: LineBatch) onLines emitEvidence (data: byte[]) (offset: int) (count: int) =
         let littleEndian =
             match state.Encoding with
             | TextEncoding.Utf16LE -> true
@@ -590,7 +599,7 @@ module Scanner =
         let mutable index = offset
         let mutable error: DecodeError option = None
 
-        while index < stop && error.IsNone do
+        while index < stop && error.IsNone && not batch.StopRequested do
             // A whole unit outside the surrogate range with nothing pending takes the inline paths.
             let mutable codeUnit = -1
             if pendingCount = 0 && pendingHigh = 0 && index + 1 < stop then
@@ -711,7 +720,7 @@ module Scanner =
         finishSegment state origin index error
         index - offset, error
 
-    let private scanUtf32 (state: ScannerState) batch onLines emitEvidence (data: byte[]) (offset: int) (count: int) =
+    let private scanUtf32 (state: ScannerState) (batch: LineBatch) onLines emitEvidence (data: byte[]) (offset: int) (count: int) =
         let littleEndian =
             match state.Encoding with
             | TextEncoding.Utf32LE -> true
@@ -728,7 +737,7 @@ module Scanner =
         let mutable index = offset
         let mutable error: DecodeError option = None
 
-        while index < stop && error.IsNone do
+        while index < stop && error.IsNone && not batch.StopRequested do
             if pendingCount = 0 && index + 3 < stop then
                 let first = Native.readByte data index
                 let second = Native.readByte data (index + 1)
@@ -891,6 +900,10 @@ module Scanner =
                     Meter.chargeBytes meter actual
                     advanceWindowsBy state actual emitEvidence
                     consumed <- consumed + actual
+                if batch.StopRequested then
+                    batch.StopRequested <- false
+                    status <- LineBoundaryReached
+                    stopped <- true
                 match segmentError with
                 | Some decodeError ->
                     state.ValidatedBytes <- max state.ValidatedBytes (float decodeError.Offset - float state.StartOffset)
