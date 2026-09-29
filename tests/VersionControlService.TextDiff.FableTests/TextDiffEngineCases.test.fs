@@ -13,14 +13,38 @@ module TextDiffEngineCasesTests =
             (clock :> IClock)
             { Limits.defaults with MaxUnits = 2_147_483_647; RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 }
 
-    let private scanThroughput encoding (data: byte[]) =
-        let state = Scanner.create encoding 0L None
-        let meter = createMeter ()
-        let started = BrowserClock.nowMs()
-        let result = Scanner.scanChunk state data 0 data.Length true meter (fun _ -> ()) (fun _ -> ())
-        let elapsed = max 1.0 (BrowserClock.nowMs() - started)
-        let rate = float data.Length / 1_000_000.0 * 1_000.0 / elapsed
-        result, rate
+    /// Runs `work` three times and reports the best rate of the last two runs in MB/s, so that JIT
+    /// warm-up does not count against the measured code.
+    let private bestRate (size: int) (work: unit -> 'T) =
+        let mutable best = 0.0
+        let mutable result = work ()
+        for _ in 1..2 do
+            let started = BrowserClock.nowMs()
+            result <- work ()
+            let elapsed = max 1.0 (BrowserClock.nowMs() - started)
+            best <- max best (float size / 1_000_000.0 * 1_000.0 / elapsed)
+        result, best
+
+    let private scanThroughput encoding retainLimit (data: byte[]) =
+        let batch = LineBatch()
+        bestRate data.Length (fun () ->
+            let state = Scanner.create encoding 0L retainLimit
+            Scanner.scanChunk state data 0 data.Length true (createMeter ()) batch ignore ignore)
+
+    let private commonRunThroughput encoding (left: byte[]) (right: byte[]) =
+        bestRate left.Length (fun () ->
+            let mutable position = 0
+            let mutable pendingCR = false
+            let mutable lines = 0
+
+            while position < left.Length do
+                let run = CommonRun.find encoding (int64 position) pendingCR left position right position (left.Length - position)
+                if run.Length = 0 then failwith "The common run did not advance."
+                position <- position + run.Length
+                pendingCR <- run.PendingCR
+                lines <- lines + run.Lines
+
+            lines)
 
     let private asciiLines size =
         let data = Array.create size 0x61uy
@@ -87,6 +111,17 @@ module TextDiffEngineCasesTests =
 
         repeatBytes benchmarkSize pattern
 
+    let private reportScan label encoding retainLimit (data: byte[]) =
+        let result, rate = scanThroughput encoding retainLimit data
+        Vitest.log ($"{label}: {rate:F1} MB/s")
+        if result.Status <> EndOfInput then failwith $"{label} did not finish the 64 MiB input."
+        Async.StartAsPromise(async.Return())
+
+    let private reportCommonRun label (data: byte[]) =
+        let _, rate = commonRunThroughput TextEncoding.Utf8 data (Array.copy data)
+        Vitest.log ($"{label}: {rate:F1} MB/s")
+        Async.StartAsPromise(async.Return())
+
     Vitest.describe (
         "Text diff engine shared cases",
         fun () ->
@@ -96,27 +131,30 @@ module TextDiffEngineCasesTests =
 
     Vitest.it (
         "scans a 64 MiB ASCII buffer with 40-byte lines",
-        fun () ->
-            let result, rate = scanThroughput TextEncoding.Utf8 (asciiLines benchmarkSize)
-            Vitest.log ($"ASCII scanner throughput: {rate:F1} MB/s")
-            if result.Status <> EndOfInput then failwith "The ASCII scanner did not finish the 64 MiB input."
-            Async.StartAsPromise (async.Return ())
+        fun () -> reportScan "ASCII scanner throughput" TextEncoding.Utf8 None (asciiLines benchmarkSize)
     )
 
     Vitest.it (
         "scans a 64 MiB UTF-8 buffer with mixed character widths",
-        fun () ->
-            let result, rate = scanThroughput TextEncoding.Utf8 (utf8Data ())
-            Vitest.log ($"UTF-8 scanner throughput: {rate:F1} MB/s")
-            if result.Status <> EndOfInput then failwith "The UTF-8 scanner did not finish the 64 MiB input."
-            Async.StartAsPromise (async.Return ())
+        fun () -> reportScan "UTF-8 scanner throughput" TextEncoding.Utf8 None (utf8Data ())
     )
 
     Vitest.it (
         "scans a 64 MiB UTF-16 LE buffer",
-        fun () ->
-            let result, rate = scanThroughput TextEncoding.Utf16LE (utf16LeData ())
-            Vitest.log ($"UTF-16 LE scanner throughput: {rate:F1} MB/s")
-            if result.Status <> EndOfInput then failwith "The UTF-16 LE scanner did not finish the 64 MiB input."
-            Async.StartAsPromise (async.Return ())
+        fun () -> reportScan "UTF-16 LE scanner throughput" TextEncoding.Utf16LE None (utf16LeData ())
+    )
+
+    Vitest.it (
+        "scans a 64 MiB ASCII buffer with 40-byte lines and retained text",
+        fun () -> reportScan "ASCII scanner throughput with retained text" TextEncoding.Utf8 (Some 4096) (asciiLines benchmarkSize)
+    )
+
+    Vitest.it (
+        "finds the common run of two identical 64 MiB ASCII buffers",
+        fun () -> reportCommonRun "ASCII common run throughput" (asciiLines benchmarkSize)
+    )
+
+    Vitest.it (
+        "finds the common run of two identical 64 MiB mixed UTF-8 buffers",
+        fun () -> reportCommonRun "UTF-8 common run throughput" (utf8Data ())
     )

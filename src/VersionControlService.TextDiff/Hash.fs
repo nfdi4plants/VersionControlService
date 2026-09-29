@@ -8,40 +8,58 @@ type Hash64 = {
 }
 
 module Hash =
-    let create () = { Lo = 0x84222325u; Hi = 0xCBF29CE4u }
+    /// Low word of the FNV-1a 64 offset basis, as a signed 32-bit value.
+    [<Literal>]
+    let OffsetLo = 0x84222325
+
+    /// High word of the FNV-1a 64 offset basis, as a signed 32-bit value.
+    [<Literal>]
+    let OffsetHi = 0xCBF29CE4
+
+    /// High word after multiplying by the FNV prime 2^40 + 435, where `mixed` is the low word already
+    /// combined with the next byte. The carry is the high half of mixed * 435. It is built from two
+    /// 16-bit halves so that every product stays below 2^53 in JavaScript.
+    let inline mixHi (hi: int) (mixed: int) =
+        let bits = uint32 mixed
+        let carry = int (((bits >>> 16) * 435u + (((bits &&& 0xFFFFu) * 435u) >>> 16)) >>> 16)
+        Native.imul hi 435 + (mixed <<< 8) + carry
+
+    /// Low word after multiplying by the FNV prime, where `mixed` is the low word combined with the next byte.
+    let inline mixLo (mixed: int) = Native.imul mixed 435
+
+    let create () = { Lo = uint32 OffsetLo; Hi = uint32 OffsetHi }
 
     let inline reset (hash: Hash64) =
-        hash.Lo <- 0x84222325u
-        hash.Hi <- 0xCBF29CE4u
+        hash.Lo <- uint32 OffsetLo
+        hash.Hi <- uint32 OffsetHi
 
     let inline addByte (hash: Hash64) (value: byte) =
-        let modulus = 4294967296.0
-        let mixed = hash.Lo ^^^ uint32 value
-        let product = float mixed * 435.0
-        let high =
-            float hash.Hi * 435.0
-            + float (mixed <<< 8)
-            + floor (product / modulus)
-        hash.Lo <- uint32 (product % modulus)
-        hash.Hi <- uint32 (high % modulus)
+        let mixed = int hash.Lo ^^^ int value
+        hash.Hi <- uint32 (mixHi (int hash.Hi) mixed)
+        hash.Lo <- uint32 (mixLo mixed)
 
-    let inline addScalar (hash: Hash64) (scalar: int) =
+    /// Calls `emit` with each byte of the UTF-8 encoding of a scalar value. It is not inline because
+    /// Fable declares the lambda's parameter once per inlined call and emits duplicate declarations.
+    let forEachUtf8Byte (scalar: int) (emit: int -> unit) =
         if scalar <= 0x7F then
-            addByte hash (byte scalar)
+            emit scalar
         elif scalar <= 0x7FF then
-            addByte hash (byte (0xC0 ||| (scalar >>> 6)))
-            addByte hash (byte (0x80 ||| (scalar &&& 0x3F)))
+            emit (0xC0 ||| (scalar >>> 6))
+            emit (0x80 ||| (scalar &&& 0x3F))
         elif scalar <= 0xFFFF then
-            addByte hash (byte (0xE0 ||| (scalar >>> 12)))
-            addByte hash (byte (0x80 ||| ((scalar >>> 6) &&& 0x3F)))
-            addByte hash (byte (0x80 ||| (scalar &&& 0x3F)))
+            emit (0xE0 ||| (scalar >>> 12))
+            emit (0x80 ||| ((scalar >>> 6) &&& 0x3F))
+            emit (0x80 ||| (scalar &&& 0x3F))
         else
-            addByte hash (byte (0xF0 ||| (scalar >>> 18)))
-            addByte hash (byte (0x80 ||| ((scalar >>> 12) &&& 0x3F)))
-            addByte hash (byte (0x80 ||| ((scalar >>> 6) &&& 0x3F)))
-            addByte hash (byte (0x80 ||| (scalar &&& 0x3F)))
+            emit (0xF0 ||| (scalar >>> 18))
+            emit (0x80 ||| ((scalar >>> 12) &&& 0x3F))
+            emit (0x80 ||| ((scalar >>> 6) &&& 0x3F))
+            emit (0x80 ||| (scalar &&& 0x3F))
 
-    let inline addCodeUnit (hash: Hash64) (scalar: int) = addScalar hash scalar
+    let addScalar (hash: Hash64) (scalar: int) =
+        forEachUtf8Byte scalar (fun value -> addByte hash (byte value))
+
+    let addCodeUnit (hash: Hash64) (scalar: int) = addScalar hash scalar
 
     let toString (hash: Hash64) =
         let chars = Array.zeroCreate<char> 16

@@ -29,15 +29,20 @@ module TextDiffEngineCases =
         let limits = { Limits.defaults with RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 }
         Meter.create (clock :> IClock) limits
 
+    let private collect (lines: ResizeArray<ScannedLine>) (batch: LineBatch) =
+        for index = 0 to batch.Count - 1 do
+            lines.Add(batch.Line index)
+
     let private scan (encoding: TextEncoding) (retainLimit: int option) (chunks: byte[][]) =
         let state = Scanner.create encoding 0L retainLimit
         let lines = ResizeArray<ScannedLine>()
         let evidence = ResizeArray<ScannerEvidence>()
         let meter = createMeter ()
+        let batch = LineBatch()
 
         for index = 0 to chunks.Length - 1 do
             let chunk = chunks[index]
-            let result = Scanner.scanChunk state chunk 0 chunk.Length (index = chunks.Length - 1) meter lines.Add evidence.Add
+            let result = Scanner.scanChunk state chunk 0 chunk.Length (index = chunks.Length - 1) meter batch (collect lines) evidence.Add
             Check.equal chunk.Length result.Consumed "The scanner consumed each input chunk."
             match result.Error with
             | Some error -> failwith $"The scanner rejected byte {error.Offset}: {error.Reason}"
@@ -132,6 +137,11 @@ module TextDiffEngineCases =
             | Error error -> Check.equal expectedOffset error.Offset "The decoder reported the incomplete sequence start."
             | Ok _ -> failwith "The decoder accepted an incomplete sequence."
         | Ok _ -> failwith "The decoder accepted invalid input."
+
+    let private commonRun (encoding: TextEncoding) (position: int64) (pendingCR: bool) (left: byte[]) (right: byte[]) =
+        CommonRun.find encoding position pendingCR left 0 right 0 left.Length
+
+    let private evidenceKinds (evidence: ScannerEvidence seq) = evidence |> Seq.map (fun item -> item.Kind, item.Offset) |> Seq.toArray
 
     let cases: (string * (unit -> Async<unit>)) list = [
         "FNV-1a hashes canonical line text", fun () -> async {
@@ -343,15 +353,16 @@ module TextDiffEngineCases =
             let suffix = Array.append (Array.create 8_192 0x62uy) (ascii "\n")
             let state = Scanner.create TextEncoding.Utf8 0L (Some 4)
             let meter = createMeter ()
-            let ignoredLine _ = ()
+            let batch = LineBatch()
+            let ignoredLines _ = ()
             let ignoredEvidence _ = ()
-            let first = Scanner.scanChunk state prefix 0 prefix.Length false meter ignoredLine ignoredEvidence
+            let first = Scanner.scanChunk state prefix 0 prefix.Length false meter batch ignoredLines ignoredEvidence
             Check.equal prefix.Length first.Consumed "The prefix was scanned."
             let resumed = Scanner.copyState state
             let originalLines = ResizeArray<ScannedLine>()
             let resumedLines = ResizeArray<ScannedLine>()
-            let originalEnd = Scanner.scanChunk state suffix 0 suffix.Length true meter originalLines.Add ignoredEvidence
-            let resumedEnd = Scanner.scanChunk resumed suffix 0 suffix.Length true meter resumedLines.Add ignoredEvidence
+            let originalEnd = Scanner.scanChunk state suffix 0 suffix.Length true meter batch (collect originalLines) ignoredEvidence
+            let resumedEnd = Scanner.scanChunk resumed suffix 0 suffix.Length true meter batch (collect resumedLines) ignoredEvidence
             Check.equal EndOfInput originalEnd.Status "The original state reached EOF."
             Check.equal EndOfInput resumedEnd.Status "The copied state reached EOF."
             Check.equal (lineHash originalLines[0]) (lineHash resumedLines[0]) "The copied scanner preserved its partial hash."
@@ -365,11 +376,12 @@ module TextDiffEngineCases =
             let limited = Meter.create (clock :> IClock) { MaxUnits = 1; RequestMs = 1000.0; QuantumMs = 1000.0 }
             let input = Array.append (Array.create 8_192 0x61uy) (ascii "\n")
             let lines = ResizeArray<ScannedLine>()
-            let first = Scanner.scanChunk state input 0 input.Length true limited lines.Add (fun _ -> ())
+            let batch = LineBatch()
+            let first = Scanner.scanChunk state input 0 input.Length true limited batch (collect lines) (fun _ -> ())
             Check.equal 4096 first.Consumed "The scanner stops after charging one unit."
             Check.equal BudgetReached first.Status "The scanner reports budget exhaustion."
             let resumedMeter = createMeter ()
-            let second = Scanner.scanChunk state input first.Consumed (input.Length - first.Consumed) true resumedMeter lines.Add (fun _ -> ())
+            let second = Scanner.scanChunk state input first.Consumed (input.Length - first.Consumed) true resumedMeter batch (collect lines) (fun _ -> ())
             Check.equal EndOfInput second.Status "The scanner resumes through EOF."
             Check.equal 1 lines.Count "The resumed scan emits its line once."
             Check.equal 8192L lines[0].Utf16Length "The resumed line length includes both chunks."
@@ -490,6 +502,94 @@ module TextDiffEngineCases =
             Check.equal (8L * 1024L * 1024L) (ledger.Used AllocationCategory.ChunkScratch) "A cached chunk stays reserved."
             pool.Dispose()
             Check.equal 0L (ledger.Used AllocationCategory.ChunkScratch) "Pool disposal releases cached chunk memory."
+            return ()
+        }
+        "a common run counts the scanner's lines across chunk and window boundaries", fun () -> async {
+            let pattern = ascii "common line text 0123456789\r\nshort\rlast line of the group\n"
+            let data = Array.init 200_000 (fun index -> pattern[index % pattern.Length])
+            let position = 70_001L
+            // The split lands between a CR and its LF.
+            let split = (seq { 100_000 .. data.Length - 2 } |> Seq.find (fun index -> data[index] = 13uy && data[index + 1] = 10uy)) + 1
+            let first = commonRun TextEncoding.Utf8 position false data[.. split - 1] (Array.copy data[.. split - 1])
+            Check.equal split first.Length "The equal first slice is one run."
+            Check.true' first.PendingCR "The CR at the slice end waits for the next byte."
+            let second = commonRun TextEncoding.Utf8 (position + int64 split) true data[split..] (Array.copy data[split..])
+            Check.equal (data.Length - split) second.Length "The equal second slice is one run."
+            let state = Scanner.create TextEncoding.Utf8 position None
+            let lines = ResizeArray<ScannedLine>()
+            Scanner.scanChunk state data 0 data.Length false (createMeter ()) (LineBatch()) (collect lines) ignore |> ignore
+            Check.equal lines.Count (first.Lines + second.Lines) "The runs count the lines that the scanner emits."
+            Check.equal lines[lines.Count - 1].EndOffset second.LastLineStart "The open line starts where the scanner's last line ends."
+            Check.true' (Array.isEmpty first.Evidence && Array.isEmpty second.Evidence) "Plain text has no evidence."
+            return ()
+        }
+        "a common run stops after the last line ending before a mismatch", fun () -> async {
+            let run = commonRun TextEncoding.Utf8 1_000L false (ascii "alpha\nbeta\ngamma") (ascii "alpha\nbeta\ngaXma")
+            Check.equal 11 run.Length "The run ends after the last complete line."
+            Check.equal 2 run.Lines "Both complete lines are counted."
+            Check.equal 1_011L run.LastLineStart "The differing line starts at the run end."
+            Check.true' (not run.PendingCR) "No CR is pending."
+            return ()
+        }
+        "a CRLF split at the end of a common run stays pending", fun () -> async {
+            let run = commonRun TextEncoding.Utf8 0L false (ascii "one\r\ntwo\r") (ascii "one\r\ntwo\r")
+            Check.equal 9 run.Length "The whole equal slice is the run."
+            Check.equal 1 run.Lines "Only the CRLF line is complete."
+            Check.equal 5L run.LastLineStart "The open line starts after the CRLF."
+            Check.true' run.PendingCR "The final CR is pending."
+            let crlf = commonRun TextEncoding.Utf8 9L true (ascii "\nthree") (ascii "\nthree")
+            Check.equal 1 crlf.Lines "The LF completes the pending CRLF line."
+            Check.equal 10L crlf.LastLineStart "The next line starts after the LF."
+            let cr = commonRun TextEncoding.Utf8 9L true (ascii "three") (ascii "three")
+            Check.equal 1 cr.Lines "Another byte makes the pending CR a line ending."
+            Check.equal 9L cr.LastLineStart "The CR line ended at the run start."
+            return ()
+        }
+        "a common run leaves out a trailing incomplete UTF-8 sequence", fun () -> async {
+            let data = Array.append (ascii "ab\n") (bytes [ 0xE2; 0x82 ])
+            let run = commonRun TextEncoding.Utf8 0L false data (Array.copy data)
+            Check.equal 3 run.Length "The run stops before the incomplete sequence."
+            Check.equal 1 run.Lines "The complete line is counted."
+            Check.true' run.Error.IsNone "A cut sequence is not an error."
+            return ()
+        }
+        "a UTF-16 common run counts code units and leaves out a trailing high surrogate", fun () -> async {
+            let data = bytes [ 0x61; 0; 0x0D; 0; 0x0A; 0; 0x62; 0; 0x3D; 0xD8 ]
+            let run = commonRun TextEncoding.Utf16LE 0L false data (Array.copy data)
+            Check.equal 8 run.Length "The run stops before the high surrogate."
+            Check.equal 1 run.Lines "The CRLF unit pair ends one line."
+            Check.equal 6L run.LastLineStart "The open line starts after the LF unit."
+            Check.true' run.Error.IsNone "A cut surrogate pair is not an error."
+            return ()
+        }
+        "a common run reports NUL and control evidence like the scanner", fun () -> async {
+            let data = Array.create 70_000 0x61uy
+            data[10] <- 0uy
+            for index = 100 to 799 do data[index] <- 0x01uy
+            let run = commonRun TextEncoding.Utf8 0L false data (Array.copy data)
+            let _, scanned, _, _ = scan TextEncoding.Utf8 None [| data |]
+            Check.sequence (evidenceKinds scanned) (evidenceKinds run.Evidence) "The run finds the scanner's evidence."
+            Check.sequence [| 65_536.0 |] (run.Windows |> Array.map _.Start) "Only the final window waits for more bytes."
+            return ()
+        }
+        "a common run reports invalid UTF-8 inside equal bytes", fun () -> async {
+            let data = Array.concat [ ascii "ok\nfine"; bytes [ 0xC0; 0xAF ]; ascii "\nrest" ]
+            let run = commonRun TextEncoding.Utf8 500L false data (Array.copy data)
+            match run.Error with
+            | Some error -> Check.equal 507L error.Offset "The error has the invalid sequence offset."
+            | None -> failwith "The run accepted invalid UTF-8."
+            Check.equal 7 run.Length "The run stops at the invalid sequence."
+            Check.equal 1 run.Lines "The line before the error is counted."
+            return ()
+        }
+        "a common run reports an undefined Windows-1252 byte", fun () -> async {
+            let data = Array.concat [ ascii "a\nb"; bytes [ 0x81 ]; ascii "c" ]
+            let run = commonRun TextEncoding.Windows1252 0L false data (Array.copy data)
+            match run.Error with
+            | Some error -> Check.equal 3L error.Offset "The error has the undefined byte offset."
+            | None -> failwith "The run accepted an undefined byte."
+            Check.equal 3 run.Length "The run stops at the undefined byte."
+            Check.equal 2L run.LastLineStart "The open line starts after the LF."
             return ()
         }
     ]

@@ -5,16 +5,21 @@
     <Description>Pure incremental text decoding and scanning primitives for VersionControlService.</Description>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="Native.fs" />
     <Compile Include="Host.fs" />
     <Compile Include="Meter.fs" />
     <Compile Include="Hash.fs" />
     <Compile Include="Decoders.fs" />
     <Compile Include="Scanner.fs" />
+    <Compile Include="CommonRun.fs" />
     <Compile Include="Classification.fs" />
     <Compile Include="Ledger.fs" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\VersionControlService.Abstractions\VersionControlService.Abstractions.fsproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Fable.Core" />
   </ItemGroup>
   <ItemGroup>
     <Content Include="VersionControlService.TextDiff.fsproj" Pack="true" PackagePath="fable\" />
