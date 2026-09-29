@@ -5,11 +5,23 @@ open System.Collections.Generic
 open System.Text
 open VersionControlService.Abstractions
 
+/// Collects a record in a byte[] that is a typed array on both runtimes. A ResizeArray would convert to a
+/// plain JavaScript array, which file writes reject.
 type private JournalWriter() =
-    let bytes = ResizeArray<byte>()
+    let mutable bytes = Array.zeroCreate<byte> 256
+    let mutable count = 0
 
-    member _.Position = bytes.Count
-    member _.WriteByte(value: int) = bytes.Add(byte value)
+    member _.Position = count
+
+    member _.WriteByte(value: int) =
+        if count = bytes.Length then
+            let grown = Array.zeroCreate<byte> (bytes.Length * 2)
+            for index = 0 to count - 1 do
+                Native.writeByte grown index (Native.readByte bytes index)
+            bytes <- grown
+        Native.writeByte bytes count value
+        count <- count + 1
+
     member this.WriteBool(value: bool) = this.WriteByte(if value then 1 else 0)
 
     member this.WriteInt32(value: int) =
@@ -31,7 +43,11 @@ type private JournalWriter() =
         | Some text -> this.WriteBool true; this.WriteString text
         | None -> this.WriteBool false
 
-    member _.ToArray() = bytes.ToArray()
+    member _.ToArray() =
+        let result = Array.zeroCreate<byte> count
+        for index = 0 to count - 1 do
+            Native.writeByte result index (Native.readByte bytes index)
+        result
 
 type private JournalReader(bytes: byte[]) =
     let mutable position = 0
@@ -357,7 +373,75 @@ module internal JournalRecord =
         if actual.Lo <> storedLo || actual.Hi <> storedHi then invalidOp "The journal record checksum is invalid."
         JournalCodec.decode payload
 
-type internal Journal(store: ITempStore) =
+type private CachedRecord = {
+    Value: Resumable<DiffPage>
+    Cost: int
+    mutable LastUse: int64
+}
+
+/// Keeps the most recently used journal records in memory. The bytes are charged to the ledger's response
+/// data category and to a per-session cap, and the least recently used records leave first. A record that
+/// does not fit is not cached.
+type private JournalCache(ledger: Ledger, capBytes: int) =
+    let entries = Dictionary<int64, CachedRecord>()
+    let mutable used = 0
+    let mutable tick = 0L
+
+    let evictOldest () =
+        let mutable oldest = -1L
+        let mutable oldestUse = Int64.MaxValue
+        for pair in entries do
+            if pair.Value.LastUse < oldestUse then
+                oldestUse <- pair.Value.LastUse
+                oldest <- pair.Key
+        if oldestUse <> Int64.MaxValue then
+            let removed = entries[oldest]
+            entries.Remove oldest |> ignore
+            used <- used - removed.Cost
+            ledger.Release(AllocationCategory.ResponseData, int64 removed.Cost)
+            true
+        else false
+
+    member _.Used = used
+
+    member _.TryGet(sequence: int64) =
+        match entries.TryGetValue sequence with
+        | true, entry ->
+            tick <- tick + 1L
+            entry.LastUse <- tick
+            Some entry.Value
+        | _ -> None
+
+    member _.Add(sequence: int64, value: Resumable<DiffPage>, cost: int) =
+        if cost <= capBytes then
+            match entries.TryGetValue sequence with
+            | true, existing ->
+                entries.Remove sequence |> ignore
+                used <- used - existing.Cost
+                ledger.Release(AllocationCategory.ResponseData, int64 existing.Cost)
+            | _ -> ()
+            let mutable room = true
+            while room && used + cost > capBytes do
+                room <- evictOldest ()
+            let mutable reserved = false
+            let mutable retry = true
+            while retry do
+                if ledger.TryReserve(AllocationCategory.ResponseData, int64 cost) then
+                    reserved <- true
+                    retry <- false
+                else retry <- evictOldest ()
+            if reserved then
+                tick <- tick + 1L
+                entries[sequence] <- { Value = value; Cost = cost; LastUse = tick }
+                used <- used + cost
+
+    member _.Clear() =
+        if used > 0 then ledger.Release(AllocationCategory.ResponseData, int64 used)
+        used <- 0
+        entries.Clear()
+
+type internal Journal(store: ITempStore, ledger: Ledger, cacheBytes: int) =
+    let cache = JournalCache(ledger, cacheBytes)
     let mutable indexCapacity = 64L
     let mutable dataStart = indexCapacity * 16L
     let mutable count = 0L
@@ -435,15 +519,27 @@ type internal Journal(store: ITempStore) =
         let! offset = store.Append record 0 record.Length
         do! writeEntry sequence offset (int64 record.Length)
         count <- max count (sequence + 1L)
+        cache.Add(sequence, value, record.Length)
     }
 
     member _.Read(sequence: int64) = async {
-        let! entry = readEntry sequence
-        match entry with
-        | None -> return None
-        | Some(offset, length) ->
-            if length > int64 Int32.MaxValue then invalidOp "The journal record is too large."
-            let record = Array.zeroCreate<byte> (int length)
-            do! readFully offset record record.Length
-            return Some(JournalRecord.decode record)
+        match cache.TryGet sequence with
+        | Some value -> return Some value
+        | None ->
+            let! entry = readEntry sequence
+            match entry with
+            | None -> return None
+            | Some(offset, length) ->
+                if length > int64 Int32.MaxValue then invalidOp "The journal record is too large."
+                let record = Array.zeroCreate<byte> (int length)
+                do! readFully offset record record.Length
+                let value = JournalRecord.decode record
+                cache.Add(sequence, value, record.Length)
+                return Some value
     }
+
+    /// Bytes of cached records, which count against the ledger.
+    member _.CachedBytes = cache.Used
+
+    /// Drops the cached records and returns their bytes to the ledger.
+    member _.Release() = cache.Clear()

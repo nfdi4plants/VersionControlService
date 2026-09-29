@@ -7,6 +7,7 @@
     <Compile Include="..\VersionControlService.TextDiff.Tests\TextDiffEngineCases.fs" Link="TextDiffEngineCases.fs" />
     <Compile Include="..\VersionControlService.TextDiff.Tests\TextDiffSessionCases.fs" Link="TextDiffSessionCases.fs" />
     <Compile Include="..\VersionControlService.TextDiff.Tests\TextDiffStreamingCases.fs" Link="TextDiffStreamingCases.fs" />
+    <Compile Include="..\VersionControlService.TextDiff.Tests\TextDiffResyncCases.fs" Link="TextDiffResyncCases.fs" />
     <Compile Include="VitestBindings.fs" />
     <Compile Include="TextDiffEngineCases.test.fs" />
   </ItemGroup>

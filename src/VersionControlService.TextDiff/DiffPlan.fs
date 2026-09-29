@@ -16,32 +16,46 @@ type internal LineTable(category: AllocationCategory, ledger: Ledger, hashMask: 
     let mutable reserved = 0L
     let mutable lineBase = 0L
 
-    let ensure required =
-        if required > capacity then
+    /// Grows the arrays to hold `required` lines. It returns false when the ledger refuses the reservation.
+    let tryEnsure required =
+        if required <= capacity then true
+        else
             let next = max required (max 16 (capacity * 2))
             let nextBytes = int64 next * 40L
             let extra = nextBytes - reserved
-            if not (ledger.TryReserve(category, extra)) then invalidOp "The diff window allocation limit was reached."
-            let growFloat (source: float[]) =
-                let target = Array.zeroCreate<float> next
-                if count > 0 then Array.Copy(source, target, count)
-                target
-            let growInt (source: int[]) =
-                let target = Array.zeroCreate<int> next
-                if count > 0 then Array.Copy(source, target, count)
-                target
-            let growByte (source: byte[]) =
-                let target = Array.zeroCreate<byte> next
-                if count > 0 then Array.Copy(source, target, count)
-                target
-            starts <- growFloat starts
-            finishes <- growFloat finishes
-            keyLow <- growInt keyLow
-            keyHigh <- growInt keyHigh
-            lengths <- growFloat lengths
-            endings <- growByte endings
-            capacity <- next
-            reserved <- nextBytes
+            if not (ledger.TryReserve(category, extra)) then false
+            else
+                let growFloat (source: float[]) =
+                    let target = Array.zeroCreate<float> next
+                    if count > 0 then Array.Copy(source, target, count)
+                    target
+                let growInt (source: int[]) =
+                    let target = Array.zeroCreate<int> next
+                    if count > 0 then Array.Copy(source, target, count)
+                    target
+                let growByte (source: byte[]) =
+                    let target = Array.zeroCreate<byte> next
+                    if count > 0 then Array.Copy(source, target, count)
+                    target
+                starts <- growFloat starts
+                finishes <- growFloat finishes
+                keyLow <- growInt keyLow
+                keyHigh <- growInt keyHigh
+                lengths <- growFloat lengths
+                endings <- growByte endings
+                capacity <- next
+                reserved <- nextBytes
+                true
+
+    let ensure required =
+        if not (tryEnsure required) then invalidOp "The diff window allocation limit was reached."
+
+    member _.TryEnsure(required: int) = tryEnsure required
+
+    /// Sets the line count after the arrays were filled from a spilled copy.
+    member _.SetCount(value: int, firstLine: int64) =
+        count <- value
+        lineBase <- firstLine
 
     member _.Count = count
     member _.Capacity = capacity
@@ -120,6 +134,8 @@ type internal DiffOperation = {
 [<RequireQualifiedAccess>]
 type internal AlignStep =
     | Running
+    /// The step needs scratch memory that other sessions hold. The caller retries later.
+    | Waiting
     | NeedRun of previousIndex: int * currentIndex: int * count: int
     | Complete of DiffOperation[]
 
@@ -283,6 +299,7 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
 
     let finishMiddle () = beginConvert ()
 
+    /// Returns false when the scratch reservation is not available yet, so the caller retries the step.
     let startMiddle () =
         middlePreviousStart <- prefixEnd
         middleCurrentStart <- prefixEnd
@@ -290,24 +307,28 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
         middleCurrentEnd <- suffixCurrent
         let previousMiddle = middlePreviousEnd - middlePreviousStart
         let currentMiddle = middleCurrentEnd - middleCurrentStart
-        if previousMiddle <= 0 && currentMiddle <= 0 then finishMiddle ()
+        if previousMiddle <= 0 && currentMiddle <= 0 then
+            finishMiddle ()
+            true
         elif previousMiddle <= 0 || currentMiddle <= 0 then
             emitBulk middlePreviousStart middlePreviousEnd middleCurrentStart middleCurrentEnd
             finishMiddle ()
+            true
         else
             let mutable slots = 16
             while slots < previousMiddle * 2 do slots <- slots * 2
             let estimate = int64 slots * 10L + int64 (min previousMiddle currentMiddle) * 40L + 4096L
-            if not (ledger.TryReserve(AllocationCategory.AlignmentScratch, estimate)) then
-                invalidOp "The diff alignment allocation limit was reached."
-            reserved <- estimate
-            slotMask <- slots - 1
-            slotPrevious <- Array.create slots -1
-            slotPreviousCount <- Array.zeroCreate slots
-            slotCurrent <- Array.zeroCreate slots
-            slotCurrentCount <- Array.zeroCreate slots
-            cursor <- middlePreviousStart
-            phase <- AlignPhase.BuildSlots
+            if ledger.TryReserve(AllocationCategory.AlignmentScratch, estimate) then
+                reserved <- estimate
+                slotMask <- slots - 1
+                slotPrevious <- Array.create slots -1
+                slotPreviousCount <- Array.zeroCreate slots
+                slotCurrent <- Array.zeroCreate slots
+                slotCurrentCount <- Array.zeroCreate slots
+                cursor <- middlePreviousStart
+                phase <- AlignPhase.BuildSlots
+                true
+            else false
 
     let equalOracle (p: int) (c: int) =
         if not (keysEqual p c) then Some false
@@ -430,9 +451,7 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
                 phase <- if scanned > 0 then AlignPhase.SuffixConfirm else AlignPhase.MiddleStart
                 AlignStep.Running
         | AlignPhase.SuffixConfirm -> AlignStep.NeedRun(suffixPrevious, suffixCurrent, pendingLength)
-        | AlignPhase.MiddleStart ->
-            startMiddle ()
-            AlignStep.Running
+        | AlignPhase.MiddleStart -> if startMiddle () then AlignStep.Running else AlignStep.Waiting
         | AlignPhase.BuildSlots ->
             let mutable count = 0
             while cursor < middlePreviousEnd && count < stepChunk do
@@ -587,7 +606,7 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
                     finishGap ()
                     AlignStep.Running
                 | MyersStepResult.StepLimitExceeded ->
-                    // Forward resynchronization replaces this fallback.
+                    // The gap exceeded its step budget, so its lines are reported as one unaligned region.
                     raw.Add(
                         DiffOperations.make
                             OperationKind.Unaligned

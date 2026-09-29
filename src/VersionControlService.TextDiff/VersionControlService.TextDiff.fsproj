@@ -16,9 +16,15 @@
     <Compile Include="Classification.fs" />
     <Compile Include="Ledger.fs" />
     <Compile Include="SessionContracts.fs" />
+    <Compile Include="Snapshot.fs" />
+    <Compile Include="Checkpoints.fs" />
     <Compile Include="Journal.fs" />
     <Compile Include="DiffPlan.fs" />
     <Compile Include="HunkBuilder.fs" />
+    <Compile Include="LineCompare.fs" />
+    <Compile Include="SampledIndex.fs" />
+    <Compile Include="Resync.fs" />
+    <Compile Include="WorkerScratch.fs" />
     <Compile Include="TextDiffSession.fs" />
   </ItemGroup>
   <ItemGroup>

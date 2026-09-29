@@ -38,8 +38,7 @@ module TextDiffSessionCases =
 
     let private config contextLines pageRows chunkBytes windowLines limits =
         sessionNumber <- sessionNumber + 1
-        {
-            SessionId = $"textdiff-test-{sessionNumber}"
+        { SessionConfig.defaults $"textdiff-test-{sessionNumber}" with
             ContextLines = contextLines
             PageMaxRows = pageRows
             PageMaxBytes = 512 * 1024
@@ -48,6 +47,7 @@ module TextDiffSessionCases =
             WindowMaxBytes = 32 * 1024 * 1024
             CommonChunkBytes = chunkBytes
             MyersStepsPerGap = 100_000
+            ResyncSampleModulus = 1
             HashMaskForTesting = None
             Limits = limits
         }
@@ -234,22 +234,66 @@ module TextDiffSessionCases =
 
         current.ToArray()
 
+    /// A source of several hundred lines and a copy of it with one to three large insertions, deletions or rewrites.
+    let private largeEdit (random: RandomState) caseIndex =
+        let count = 300 + random.Next 700
+        let previous = Array.init count (fun index -> { Text = makeText random caseIndex index; Ending = nextEnding random false })
+        let current = ResizeArray<SourceLine>(previous)
+        let fresh edit amount =
+            Array.init amount (fun offset -> { Text = "large-" + string caseIndex + "-" + string edit + "-" + string offset; Ending = LineEnding.LF })
+        for edit in 0 .. random.Next 3 do
+            let amount = 20 + random.Next 80
+            let start = random.Next(max 1 (current.Count - amount))
+            match random.Next 3 with
+            | 0 -> current.RemoveRange(start, min amount (current.Count - start))
+            | 1 -> current.InsertRange(start, fresh edit amount)
+            | _ ->
+                current.RemoveRange(start, min amount (current.Count - start))
+                current.InsertRange(start, fresh edit amount)
+        previous, current.ToArray()
+
+    /// Reads every page and spills the session between requests, at most spillLimit times.
+    let private readAllSpilling (session: TextDiffSession) spillLimit = async {
+        let pages = ResizeArray<DiffPage>()
+        let mutable spills = 0
+        let mutable requests = 0
+        let mutable result = EngineResult.Canceled
+        let mutable pending = true
+        let! first = session.FirstPage(fun () -> false)
+        result <- first
+        while pending do
+            requests <- requests + 1
+            if requests > 200_000 then failwith "The session did not finish."
+            if spills < spillLimit && (session :> IScratchHolder).HoldsScratch then
+                let! spilled = session.Spill()
+                match spilled with
+                | EngineResult.Ok() -> spills <- spills + 1
+                | other -> failwith $"The spill failed: {other}."
+            match result with
+            | EngineResult.Ok(Resumable.Ready page) ->
+                pages.Add page
+                match page.NextCursor with
+                | None -> pending <- false
+                | Some cursor ->
+                    let! next = session.ReadPage cursor (fun () -> false)
+                    result <- next
+            | EngineResult.Ok(Resumable.Scanning(_, continuation, _)) ->
+                let! next = session.ReadPage continuation (fun () -> false)
+                result <- next
+            | other -> failwith $"The session returned {other}."
+        return pages.ToArray(), spills
+    }
+
     let cases: (string * (unit -> Async<unit>)) list = [
-        "deferred session operations return a named failure", fun () -> async {
+        "unimplemented session operations return a named failure", fun () -> async {
             let source = sourceSpec (Encoding.UTF8.GetBytes "line\n")
             let! session = openSession (defaultConfig ()) source source
             let! expanded = session.Expand "gap-id"
             let! line = session.ReadLine(DiffSide.Previous, 0L, 0L, 64)
             let preview = session.PendingPreview()
-            let resync = session.Resync()
-            let! spill = session.Spill()
-            let! restore = session.Restore()
             checkNotImplemented expanded
             checkNotImplemented line
             checkNotImplemented preview
-            checkNotImplemented resync
-            checkNotImplemented spill
-            checkNotImplemented restore
             do! session.Close()
             return ()
         }
@@ -625,6 +669,36 @@ module TextDiffSessionCases =
             | Some index ->
                 Check.true' (parts |> Array.skip (index + 1) |> Array.exists (function DiffPart.Hunk { Body = HunkBody.AlignedRows values } -> values |> Array.exists (fun row -> row.Kind = DiffRowKind.Replaced) | _ -> false)) "A later edit remains aligned after the unaligned region."
             do! session.Close()
+            return ()
+        }
+        "generated large edits rebuild both complete sources", fun () -> async {
+            let random = RandomState 0x1A26E5u
+
+            for caseIndex in 0 .. 59 do
+                let previous, current = largeEdit random caseIndex
+                let sessionConfig = { config 2 10_000 256 16 Limits.defaults with WindowMaxBytes = 4 * 1024 }
+                let! session = openSession sessionConfig (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+                let! pages = readAll session (fun () -> false)
+                checkOracle previous current pages
+                do! session.Close()
+
+            return ()
+        }
+        "generated large edits rebuild both complete sources across forced spills", fun () -> async {
+            let random = RandomState 0x1A26E5u
+            let limits = { Limits.defaults with MaxUnits = 256 }
+            let mutable totalSpills = 0
+
+            for caseIndex in 0 .. 29 do
+                let previous, current = largeEdit random caseIndex
+                let sessionConfig = { config 2 10_000 256 16 limits with WindowMaxBytes = 4 * 1024 }
+                let! session = openSession sessionConfig (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+                let! pages, spills = readAllSpilling session 12
+                totalSpills <- totalSpills + spills
+                checkOracle previous current pages
+                do! session.Close()
+
+            Check.true' (totalSpills > 0) "The sessions were spilled between requests."
             return ()
         }
         "deterministic edit scripts rebuild both complete sources", fun () -> async {

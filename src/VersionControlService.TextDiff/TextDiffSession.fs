@@ -7,6 +7,7 @@ open VersionControlService.Abstractions
 type private Mode =
     | Common
     | Window
+    | Resync
     | Done
 
 [<RequireQualifiedAccess>]
@@ -15,353 +16,6 @@ type private WindowState =
     | Aligning
     | Comparing
     | Feeding
-
-type private ReadStep =
-    | ReadData of count: int * endOfSource: bool
-    | ReadWaiting
-    | ReadWindowFull
-    | ReadFinished
-    | ReadChanged
-
-[<RequireQualifiedAccess>]
-type private CompareStep =
-    | Continue
-    | Waiting
-    | Finished of matched: int
-    | Changed
-
-module private Widths =
-    let unitBytes (encoding: TextEncoding) =
-        match encoding with
-        | TextEncoding.Utf16LE
-        | TextEncoding.Utf16BE -> 2
-        | TextEncoding.Utf32LE
-        | TextEncoding.Utf32BE -> 4
-        | _ -> 1
-
-    let isLittleEndian (encoding: TextEncoding) =
-        match encoding with
-        | TextEncoding.Utf16LE
-        | TextEncoding.Utf32LE -> true
-        | _ -> false
-
-    let endingWidth (encoding: TextEncoding) (code: int) =
-        let width = float (unitBytes encoding)
-        if code = LineEndingCode.CRLF then width * 2.0
-        elif code = LineEndingCode.LF || code = LineEndingCode.CR then width
-        else 0.0
-
-    /// Reads the code unit that starts at index. UTF-32 units above 24 bits are irrelevant because only
-    /// the values of CR and LF are compared.
-    let unitAt (encoding: TextEncoding) (data: byte[]) (index: int) =
-        match unitBytes encoding with
-        | 1 -> Native.readByte data index
-        | 2 ->
-            if isLittleEndian encoding then Native.readByte data index ||| (Native.readByte data (index + 1) <<< 8)
-            else (Native.readByte data index <<< 8) ||| Native.readByte data (index + 1)
-        | _ ->
-            if isLittleEndian encoding then
-                Native.readByte data index
-                ||| (Native.readByte data (index + 1) <<< 8)
-                ||| (Native.readByte data (index + 2) <<< 16)
-                ||| (Native.readByte data (index + 3) <<< 24)
-            else
-                (Native.readByte data index <<< 24)
-                ||| (Native.readByte data (index + 1) <<< 16)
-                ||| (Native.readByte data (index + 2) <<< 8)
-                ||| Native.readByte data (index + 3)
-
-type private ScanSide(
-    spec: SourceSpec,
-    encoding: TextEncoding,
-    category: AllocationCategory,
-    side: DiffSide,
-    ledger: Ledger,
-    hashMask: (uint32 * uint32) option,
-    reportEvidence: DiffSide -> string -> int64 -> unit
-) =
-    let table = LineTable(category, ledger, hashMask)
-    let mutable scanner = Scanner.create encoding (int64 spec.BomLength) None
-    let mutable finished = spec.Source.IsNone
-    let mutable coverage = float spec.BomLength
-    let mutable windowStart = float spec.BomLength
-    let mutable windowLineLimit = Int32.MaxValue
-    let mutable windowByteLimit = Int32.MaxValue
-    let mutable windowAccountedBytes = 0.0
-
-    member _.Spec = spec
-    member _.Encoding = encoding
-    member _.Table = table
-    member _.Scanner = scanner
-    member _.Finished = finished
-    member _.Coverage = coverage
-
-    member _.SetLimits(maxLines: int, maxBytes: int) =
-        windowLineLimit <- max 1 maxLines
-        windowByteLimit <- max 1 maxBytes
-
-    member _.BeginWindow(firstLine: int64, maxLines: int, maxBytes: int) =
-        windowLineLimit <- max 1 maxLines
-        windowByteLimit <- max 1 maxBytes
-        windowStart <- if scanner.LineLengthUtf16 > 0.0 then scanner.LineStart else scanner.NextOffset
-        windowAccountedBytes <- 0.0
-        table.BeginWindow firstLine
-
-    member _.WindowFull =
-        table.Count >= windowLineLimit
-        || windowAccountedBytes >= float windowByteLimit
-           && scanner.LineLengthUtf16 = 0.0
-           && not scanner.PendingCR
-           && scanner.PendingCount = 0
-           && scanner.PendingHigh = 0
-
-    member _.ByteFull = windowAccountedBytes >= float windowByteLimit
-
-    /// Continues with the same scanner after the caller consumed every line of the window.
-    member this.Advance(firstLine: int64, maxLines: int, maxBytes: int) =
-        table.ReleaseWindow()
-        this.BeginWindow(firstLine, maxLines, maxBytes)
-
-    /// Restarts scanning at a line start.
-    member _.SetCursor(offset: float, firstLine: int64, maxLines: int, maxBytes: int) =
-        table.ReleaseWindow()
-        scanner <- Scanner.create encoding (int64 offset) None
-        finished <- spec.Source.IsNone
-        windowLineLimit <- max 1 maxLines
-        windowByteLimit <- max 1 maxBytes
-        windowStart <- offset
-        windowAccountedBytes <- 0.0
-        table.BeginWindow firstLine
-
-    member _.ReadInto(buffer: byte[], maximum: int) = async {
-        if finished then return ReadFinished
-        elif table.Count >= windowLineLimit then return ReadWindowFull
-        else
-            match spec.Source with
-            | None ->
-                finished <- true
-                return ReadFinished
-            | Some source ->
-                let position = int64 scanner.NextOffset
-                if position > spec.ByteLength then return ReadChanged
-                elif position = spec.ByteLength then
-                    if source.IsComplete() then return ReadData(0, true)
-                    else return ReadWaiting
-                else
-                    let remaining = spec.ByteLength - position
-                    let consumedWindowBytes = int (scanner.NextOffset - windowStart)
-                    let rawRoom = max 1 (windowByteLimit - consumedWindowBytes)
-                    let readLimit =
-                        if consumedWindowBytes >= windowByteLimit && scanner.LineLengthUtf16 > 0.0 then maximum
-                        else min maximum rawRoom
-                    let count = min buffer.Length (int (min (int64 readLimit) remaining))
-                    let! outcome = source.ReadAt position buffer 0 count
-                    match outcome with
-                    | ReadOutcome.NotYetAvailable -> return ReadWaiting
-                    | ReadOutcome.EndOfSource -> return if source.IsComplete() then ReadChanged else ReadWaiting
-                    | ReadOutcome.Bytes actual when actual = 0 ->
-                        return if source.IsComplete() && position < spec.ByteLength then ReadChanged else ReadWaiting
-                    | ReadOutcome.Bytes actual -> return ReadData(actual, position + int64 actual >= spec.ByteLength && source.IsComplete())
-    }
-
-    member _.Consume(buffer: byte[], count: int, endOfSource: bool, meter: Meter) =
-        let emitLineBatch batch = table.AppendBatch batch
-        let emitEvidence (evidence: ScannerEvidence) = reportEvidence side evidence.Kind evidence.Offset
-        let remainingLines = max 1 (windowLineLimit - table.Count)
-        let batch = LineBatch(max 1 (min 4_096 remainingLines))
-        batch.StopAtFull <- true
-        let previousCount = table.Count
-        let result = Scanner.scanChunk scanner buffer 0 count endOfSource meter batch emitLineBatch emitEvidence
-        for index = previousCount to table.Count - 1 do
-            windowAccountedBytes <- windowAccountedBytes + table.Finish index - table.Start index + table.Length index * 2.0 + 40.0
-        ledger.RecordWindowLines(category, table.Count)
-        coverage <- max coverage (float scanner.StartOffset + scanner.ValidatedBytes)
-        match result.Error with
-        | Some error -> reportEvidence side ("invalid " + Decoders.name encoding + " sequence: " + error.Reason) error.Offset
-        | None -> ()
-        if result.Status = EndOfInput then finished <- true
-        result
-
-    member _.SetCoverage(value: float) = coverage <- max coverage value
-
-    member _.Dispose() = table.Dispose()
-
-/// Confirms a claimed run of equal lines against the source bytes when both sources share an encoding.
-/// Consecutive pairs with equal endings and equal byte spans are compared as one byte range.
-type private RunCompare(previous: ScanSide, current: ScanSide, previousIndex: int, currentIndex: int, count: int, bufferA: byte[], bufferB: byte[]) =
-    let previousTable = previous.Table
-    let currentTable = current.Table
-    let encoding = previous.Encoding
-    let mutable pair = 0
-    let mutable groupOpen = false
-    let mutable groupEnd = 0
-    let mutable wholeGroup = false
-    let mutable groupBytes = 0.0
-    let mutable groupPreviousStart = 0.0
-    let mutable groupCurrentStart = 0.0
-    let mutable doneBytes = 0.0
-
-    let span (table: LineTable) index = table.Finish index - table.Start index
-
-    let sameShape offset =
-        previousTable.EndingCode(previousIndex + offset) = currentTable.EndingCode(currentIndex + offset)
-        && span previousTable (previousIndex + offset) = span currentTable (currentIndex + offset)
-
-    let readOnce (source: IByteSource) (position: float) (buffer: byte[]) (want: int) =
-        source.ReadAt (int64 position) buffer 0 want
-
-    member _.Step(meter: Meter) : Async<CompareStep> = async {
-        if pair >= count then return CompareStep.Finished count
-        elif not groupOpen then
-            Meter.charge meter 1
-            let endingP = previousTable.EndingCode(previousIndex + pair)
-            let endingC = currentTable.EndingCode(currentIndex + pair)
-            groupPreviousStart <- previousTable.Start(previousIndex + pair)
-            groupCurrentStart <- currentTable.Start(currentIndex + pair)
-            doneBytes <- 0.0
-            if sameShape pair then
-                let mutable next = pair + 1
-                while next < count && sameShape next do
-                    next <- next + 1
-                Meter.charge meter ((next - pair) / 64)
-                groupEnd <- next
-                wholeGroup <- true
-                groupBytes <- previousTable.Finish(previousIndex + next - 1) - groupPreviousStart
-                groupOpen <- true
-                return CompareStep.Continue
-            else
-                let contentP = span previousTable (previousIndex + pair) - Widths.endingWidth encoding endingP
-                let contentC = span currentTable (currentIndex + pair) - Widths.endingWidth encoding endingC
-                if contentP <> contentC then return CompareStep.Finished pair
-                else
-                    groupEnd <- pair + 1
-                    wholeGroup <- false
-                    groupBytes <- contentP
-                    groupOpen <- true
-                    return CompareStep.Continue
-        else
-            let remaining = groupBytes - doneBytes
-            if remaining <= 0.0 then
-                pair <- groupEnd
-                groupOpen <- false
-                return CompareStep.Continue
-            else
-                let want = int (min remaining (float (min 65_536 (min bufferA.Length bufferB.Length))))
-                let! first = readOnce previous.Spec.Source.Value (groupPreviousStart + doneBytes) bufferA want
-                let! second = readOnce current.Spec.Source.Value (groupCurrentStart + doneBytes) bufferB want
-                match first, second with
-                | ReadOutcome.NotYetAvailable, _
-                | _, ReadOutcome.NotYetAvailable -> return CompareStep.Waiting
-                | ReadOutcome.EndOfSource, _
-                | _, ReadOutcome.EndOfSource -> return CompareStep.Changed
-                | ReadOutcome.Bytes a, ReadOutcome.Bytes b ->
-                    let got = min a b
-                    if got <= 0 then return CompareStep.Waiting
-                    else
-                        Meter.chargeBytes meter got
-                        if Native.bytesEqual bufferA 0 bufferB 0 got then
-                            doneBytes <- doneBytes + float got
-                            return CompareStep.Continue
-                        else
-                            let mutable index = 0
-                            while Native.readByte bufferA index = Native.readByte bufferB index do
-                                index <- index + 1
-                            let mismatchAt = doneBytes + float index
-                            if not wholeGroup then return CompareStep.Finished pair
-                            else
-                                let mutable matched = pair
-                                while matched < groupEnd
-                                      && previousTable.Finish(previousIndex + matched) - groupPreviousStart <= mismatchAt do
-                                    matched <- matched + 1
-                                Meter.charge meter ((matched - pair) / 64)
-                                return CompareStep.Finished matched
-    }
-
-/// Decodes one side of a line pair in bounded chunks so that lines of different encodings can be compared.
-type private DecodeFeed(side: ScanSide, buffer: byte[]) =
-    let units = Array.zeroCreate<int> 4_104
-    let mutable decoder = Decoders.createAt side.Encoding 0L
-    let mutable head = 0
-    let mutable filled = 0
-    let mutable position = 0.0
-    let mutable finish = 0.0
-
-    member _.Begin(start: float, contentEnd: float) =
-        decoder <- Decoders.createAt side.Encoding (int64 start)
-        position <- start
-        finish <- contentEnd
-        head <- 0
-        filled <- 0
-
-    member _.Available = filled - head
-    member _.Exhausted = position >= finish
-    member _.Peek(offset: int) = units[head + offset]
-    member _.Consume(count: int) = head <- head + count
-
-    /// Reads and decodes the next chunk. It returns 1 after decoding data, 0 when the source has no data yet
-    /// and -1 when the source ended early.
-    member _.Fill(meter: Meter) = async {
-        head <- 0
-        filled <- 0
-        let want = int (min 4_096.0 (min (finish - position) (float buffer.Length)))
-        let! outcome = side.Spec.Source.Value.ReadAt (int64 position) buffer 0 want
-        match outcome with
-        | ReadOutcome.Bytes got when got > 0 ->
-            let next, _ =
-                Decoders.decode decoder buffer 0 got (fun _ _ value ->
-                    units[filled] <- value
-                    filled <- filled + 1)
-            decoder <- next
-            position <- position + float got
-            Meter.chargeBytes meter got
-            return 1
-        | ReadOutcome.EndOfSource -> return -1
-        | _ -> return 0
-    }
-
-/// Confirms a claimed run of equal lines when the two sources use different encodings, by comparing the
-/// decoded UTF-16 units of each line pair.
-type private DecodeCompare(previous: ScanSide, current: ScanSide, previousIndex: int, currentIndex: int, count: int, bufferA: byte[], bufferB: byte[]) =
-    let feedA = DecodeFeed(previous, bufferA)
-    let feedB = DecodeFeed(current, bufferB)
-    let mutable pair = 0
-    let mutable open' = false
-
-    member _.Step(meter: Meter) : Async<CompareStep> = async {
-        if pair >= count then return CompareStep.Finished count
-        elif not open' then
-            Meter.charge meter 1
-            let pt = previous.Table
-            let ct = current.Table
-            let startP = pt.Start(previousIndex + pair)
-            let startC = ct.Start(currentIndex + pair)
-            feedA.Begin(startP, pt.Finish(previousIndex + pair) - Widths.endingWidth previous.Encoding (pt.EndingCode(previousIndex + pair)))
-            feedB.Begin(startC, ct.Finish(currentIndex + pair) - Widths.endingWidth current.Encoding (ct.EndingCode(currentIndex + pair)))
-            open' <- true
-            return CompareStep.Continue
-        elif feedA.Available = 0 && not feedA.Exhausted then
-            let! filled = feedA.Fill meter
-            return if filled > 0 then CompareStep.Continue elif filled = 0 then CompareStep.Waiting else CompareStep.Changed
-        elif feedB.Available = 0 && not feedB.Exhausted then
-            let! filled = feedB.Fill meter
-            return if filled > 0 then CompareStep.Continue elif filled = 0 then CompareStep.Waiting else CompareStep.Changed
-        elif feedA.Available = 0 && feedB.Available = 0 then
-            pair <- pair + 1
-            open' <- false
-            return CompareStep.Continue
-        elif feedA.Available = 0 || feedB.Available = 0 then return CompareStep.Finished pair
-        else
-            let n = min feedA.Available feedB.Available
-            let mutable index = 0
-            while index < n && feedA.Peek index = feedB.Peek index do
-                index <- index + 1
-            Meter.charge meter (index / 256)
-            if index < n then return CompareStep.Finished pair
-            else
-                feedA.Consume n
-                feedB.Consume n
-                return CompareStep.Continue
-    }
 
 [<RequireQualifiedAccess>]
 type private PageBuild =
@@ -446,13 +100,45 @@ type TextDiffSession internal (
     let mutable partialAlign = false
     let mutable partialPrevious = -1
     let mutable partialCurrent = -1
+    let mutable resync: ResyncEngine option = None
+
+    // Answers that the aligner received from run comparisons. A restored aligner replays them instead of
+    // comparing the same lines again.
+    let replayLog = ResizeArray<int>()
+    let mutable replayPosition = 0
+
+    // Spilled state. The snapshot lives in its own temp store and is read back in bounded steps.
+    let mutable spilled = false
+    let mutable spillStore: ITempStore option = None
+    let mutable restoreStage = 0
+    let mutable restoreReader: SnapshotReader option = None
+    let mutable restoreEngine: ResyncEngine option = None
+    let mutable restoreSlots: ArraySlot[] = Array.empty
+    let mutable restoreSlot = 0
+    let restoreLines = Array.zeroCreate<float> 4
+    let restoreCounts = Array.zeroCreate<int> 4
+    let mutable restoreOps = Array.empty<int>
+    let mutable restoreLog = Array.empty<int>
+    let mutable restoreResync = false
+    let mutable restoreAligning = false
+    let mutable scratch: WorkerScratch option = None
+    let mutable holder: IScratchHolder option = None
 
     // Text decoding scratch for page building.
     let textUnits = Array.zeroCreate<uint16> 8_192
     let mutable textCount = 0
 
     let builder = HunkBuilder(config.ContextLines, config.PageMaxRows)
-    let journal = Journal(store)
+    let journal = Journal(store, ledger, config.JournalCacheBytes)
+
+    let checkpoints =
+        Checkpoints(
+            ledger,
+            config.CheckpointIntervalBytes,
+            config.CheckpointResidentBytes,
+            [| previousEncoding; currentEncoding |],
+            fun () -> host.CreateTempStore(config.SessionId + ":checkpoints")
+        )
 
     let report (side: DiffSide) (kind: string) (offset: int64) =
         if invalidDetail.IsNone then
@@ -468,6 +154,8 @@ type TextDiffSession internal (
         ScanSide(currentSpec, currentEncoding, AllocationCategory.CurrentWindows, DiffSide.Current, ledger, config.HashMaskForTesting, report)
 
     do
+        previousSide.Observer <- fun state line -> checkpoints.Observe(0, state, line)
+        currentSide.Observer <- fun state line -> checkpoints.Observe(1, state, line)
         previousSide.BeginWindow(0L, windowLimit, config.WindowMaxBytes)
         currentSide.BeginWindow(0L, windowLimit, config.WindowMaxBytes)
 
@@ -684,6 +372,14 @@ type TextDiffSession internal (
                 handover commonStart
     }
 
+    /// Records a checkpoint at the last line start when a side passed its interval boundary. The equal-byte phase
+    /// has no scanner state, so the checkpoint starts a fresh scanner at that line.
+    let observeCommon () =
+        if checkpoints.IsDue(0, lineStart) then
+            checkpoints.Observe(0, Scanner.create previousEncoding (int64 lineStart) None, builder.NextPrevious + commonLines)
+        if checkpoints.IsDue(1, lineStart + delta) then
+            checkpoints.Observe(1, Scanner.create currentEncoding (int64 (lineStart + delta)) None, builder.NextCurrent + commonLines)
+
     let commonStep (meter: Meter) = async {
         if backActive then return! backtrackStep meter
         elif pos >= previousLength || pos + delta >= currentLength then
@@ -723,6 +419,7 @@ type TextDiffSession internal (
                         if run.Lines > 0 then lineStart <- float run.LastLineStart
                         commonLines <- commonLines + float run.Lines
                         pendingCR <- run.PendingCR
+                        if not pendingCR then observeCommon ()
                         previousSide.SetCoverage pos
                         currentSide.SetCoverage(pos + delta)
                     if invalidDetail.IsSome then ()
@@ -747,6 +444,36 @@ type TextDiffSession internal (
         feedPrevious <- 0
         feedCurrent <- 0
         regionStarted <- false
+
+    /// Searches forward from the window start for the place where the two sources line up again. The window
+    /// tables are released because the search scans the same lines again with its own tables.
+    let createEngine (startOffsets: float[]) (startLines: float[]) =
+        let coverage (side: int) (value: float) =
+            if side = 0 then previousSide.SetCoverage value else currentSide.SetCoverage value
+        ResyncEngine(
+            config,
+            ledger,
+            builder,
+            [| previousSpec; currentSpec |],
+            [| previousEncoding; currentEncoding |],
+            report,
+            sourceChanged,
+            coverage,
+            (fun side state line -> checkpoints.Observe(side, state, line)),
+            startOffsets,
+            startLines
+        )
+
+    let startResync () =
+        let startLines = [| float previousSide.Table.LineBase; float currentSide.Table.LineBase |]
+        resync <- Some(createEngine [| pBase; cBase |] startLines)
+        replayLog.Clear()
+        replayPosition <- 0
+        ops <- Array.empty
+        commitCount <- 0
+        windowState <- WindowState.Loading
+        releaseWindows ()
+        mode <- Mode.Resync
 
     /// Chooses how many operations the window commits. Trailing changes stay unsettled because the next window
     /// may match them differently.
@@ -790,10 +517,9 @@ type TextDiffSession internal (
                 ops <- Array.empty
                 windowState <- WindowState.Loading
             else
-                // Forward resynchronization replaces this whole-window fallback.
-                ops <- [| DiffOperations.make OperationKind.Unaligned 0 0 previousTable.Count currentTable.Count |]
-                commitCount <- 1
-                beginFeeding ()
+                // The window is at its largest size and no operation anchors it, so the diff continues with a
+                // forward search for the next matching lines.
+                startResync ()
 
     let startAlign () =
         let previousTable = previousSide.Table
@@ -805,6 +531,8 @@ type TextDiffSession internal (
                 else Array.empty
             decideCommit ()
         else
+            replayLog.Clear()
+            replayPosition <- 0
             aligner <- Some(WindowAligner(previousTable, currentTable, config.MyersStepsPerGap, ledger))
             windowState <- WindowState.Aligning
 
@@ -860,9 +588,20 @@ type TextDiffSession internal (
         | Some active ->
             match active.Step meter with
             | AlignStep.Running -> ()
-            | AlignStep.NeedRun(previousIndex, currentIndex, count) -> startCompare previousIndex currentIndex count
+            | AlignStep.Waiting ->
+                // The alignment scratch is held by other sessions. Ending the request budget suspends the job
+                // with a Scanning result, and the next request tries the reservation again.
+                Meter.charge meter 1
+                meter.Units <- meter.MaxUnits
+            | AlignStep.NeedRun(previousIndex, currentIndex, count) ->
+                if replayPosition < replayLog.Count then
+                    replayPosition <- replayPosition + 1
+                    active.ResolveRun replayLog[replayPosition - 1]
+                else startCompare previousIndex currentIndex count
             | AlignStep.Complete completed ->
                 ops <- completed
+                replayLog.Clear()
+                replayPosition <- 0
                 active.Dispose()
                 aligner <- None
                 decideCommit ()
@@ -878,6 +617,8 @@ type TextDiffSession internal (
             | CompareStep.Waiting -> waited <- true
             | CompareStep.Finished matched ->
                 compareJob <- None
+                replayLog.Add matched
+                replayPosition <- replayLog.Count
                 aligner.Value.ResolveRun matched
                 windowState <- WindowState.Aligning
             | CompareStep.Changed -> sourceChanged ()
@@ -898,6 +639,56 @@ type TextDiffSession internal (
         pendingWindow <- None
         backActive <- false
         releaseWindows ()
+
+    let disposeResync () =
+        match resync with
+        | Some engine ->
+            engine.Dispose()
+            resync <- None
+        | None -> ()
+
+    /// Continues with windows at line starts that the forward search found. The sides may be at different
+    /// offsets and line numbers.
+    let resumeAt (previousOffset: float) (previousLine: float) (currentOffset: float) (currentLine: float) =
+        disposeResync ()
+        mode <- Mode.Window
+        windowState <- WindowState.Loading
+        windowLimit <- initialWindowLines
+        partialAlign <- false
+        partialPrevious <- -1
+        partialCurrent <- -1
+        ops <- Array.empty
+        commitCount <- 0
+        previousSide.SetCursor(previousOffset, int64 previousLine, windowLimit, config.WindowMaxBytes)
+        currentSide.SetCursor(currentOffset, int64 currentLine, windowLimit, config.WindowMaxBytes)
+        pBase <- previousOffset
+        cBase <- currentOffset
+        if canStartCommon && builder.IsIdle && previousOffset < previousLength && currentOffset < currentLength then
+            reenterCommon previousOffset currentOffset
+
+    let finishResync () =
+        disposeResync ()
+        builder.Finish()
+        previousSide.SetCoverage(float previousSpec.ByteLength)
+        currentSide.SetCoverage(float currentSpec.ByteLength)
+        releaseWindows ()
+        mode <- Mode.Done
+
+    let resyncStep (meter: Meter) (bufferA: byte[]) (bufferB: byte[]) = async {
+        let! step = resync.Value.Step(meter, bufferA, bufferB)
+        match step with
+        | ResyncStep.Running -> ()
+        | ResyncStep.Waiting ->
+            waited <- true
+            Meter.charge meter 1
+        | ResyncStep.Reserving ->
+            // Other sessions hold the index memory. The request ends and the next one reserves again.
+            Meter.charge meter 1
+            meter.Units <- meter.MaxUnits
+        | ResyncStep.Handover(previousOffset, previousLine, currentOffset, currentLine) ->
+            resumeAt previousOffset previousLine currentOffset currentLine
+        | ResyncStep.Finished -> finishResync ()
+    }
 
     let finishWindow () =
         let previousTable = previousSide.Table
@@ -1000,12 +791,232 @@ type TextDiffSession internal (
                     regionStarted <- false
                     advanceOperation ()
 
+    // Spill and restore of a suspended alignment step.
+
+    let operationCode (kind: OperationKind) =
+        match kind with
+        | OperationKind.Equal -> 0
+        | OperationKind.Added -> 1
+        | OperationKind.Removed -> 2
+        | OperationKind.Replaced -> 3
+        | OperationKind.EndingChanged -> 4
+        | OperationKind.Unaligned -> 5
+
+    let operationKind (code: int) =
+        match code with
+        | 0 -> OperationKind.Equal
+        | 1 -> OperationKind.Added
+        | 2 -> OperationKind.Removed
+        | 3 -> OperationKind.Replaced
+        | 4 -> OperationKind.EndingChanged
+        | _ -> OperationKind.Unaligned
+
+    let tableSlots (table: LineTable) (count: int) : ArraySlot list = [
+        ArraySlot.OfFloats(table.Starts, count)
+        ArraySlot.OfFloats(table.Finishes, count)
+        ArraySlot.OfFloats(table.Lengths, count)
+        ArraySlot.OfInts(table.KeyLow, count)
+        ArraySlot.OfInts(table.KeyHigh, count)
+        ArraySlot.OfBytes(table.Endings, count)
+    ]
+
+    let ensureSpillStore () = async {
+        match spillStore with
+        | Some value -> return value
+        | None ->
+            let! created = host.CreateTempStore(config.SessionId + ":spill")
+            spillStore <- Some created
+            return created
+    }
+
+    let writeSnapshot () = async {
+        let! target = ensureSpillStore ()
+        let writer = SnapshotWriter target
+        let header = HeaderBuilder()
+        let inResync = mode = Mode.Resync
+        header.Bool inResync
+        header.Bool(windowState = WindowState.Aligning || windowState = WindowState.Comparing)
+        header.Int(
+            match windowState with
+            | WindowState.Loading -> 0
+            | WindowState.Feeding -> 3
+            | _ -> 1
+        )
+        header.Int windowLimit
+        header.Int commitCount
+        header.Int opIndex
+        header.Int feedPrevious
+        header.Int feedCurrent
+        header.Bool regionStarted
+        header.Number pBase
+        header.Number cBase
+        header.Bool partialAlign
+        header.Int partialPrevious
+        header.Int partialCurrent
+        header.Int ops.Length
+        header.Int replayLog.Count
+        if inResync then resync.Value.Export header
+        else
+            previousSide.Export header
+            currentSide.Export header
+        do! writer.Header(header.ToArray())
+        if inResync then
+            for slot in resync.Value.Slots do
+                do! writer.Slot slot
+        else
+            for slot in tableSlots previousSide.Table previousSide.Table.Count do
+                do! writer.Slot slot
+            for slot in tableSlots currentSide.Table currentSide.Table.Count do
+                do! writer.Slot slot
+            let opValues = Array.zeroCreate<int> (ops.Length * 5)
+            for index = 0 to ops.Length - 1 do
+                let operation = ops[index]
+                opValues[index * 5] <- operationCode operation.Kind
+                opValues[index * 5 + 1] <- operation.PreviousIndex
+                opValues[index * 5 + 2] <- operation.CurrentIndex
+                opValues[index * 5 + 3] <- operation.PreviousCount
+                opValues[index * 5 + 4] <- operation.CurrentCount
+            do! writer.Slot(ArraySlot.OfInts(opValues, opValues.Length))
+            let logValues = Array.zeroCreate<int> replayLog.Count
+            for index = 0 to replayLog.Count - 1 do
+                logValues[index] <- replayLog[index]
+            do! writer.Slot(ArraySlot.OfInts(logValues, logValues.Length))
+        let! _ = writer.Complete()
+        ()
+    }
+
+    let dropRestore () =
+        restoreReader <- None
+        restoreSlots <- Array.empty
+        restoreSlot <- 0
+        restoreOps <- Array.empty
+        restoreLog <- Array.empty
+        match restoreEngine with
+        | Some engine ->
+            engine.Dispose()
+            restoreEngine <- None
+        | None -> ()
+        restoreStage <- 0
+
+    /// Writes the suspended step to the spill store and releases its scratch memory. A step that was only
+    /// partly restored keeps its snapshot and gives back what the restore had taken.
+    let spillNow () = async {
+        if spilled then
+            releaseWindows ()
+            dropRestore ()
+        elif mode = Mode.Window || mode = Mode.Resync then
+            do! writeSnapshot ()
+            releaseWindows ()
+            match aligner with
+            | Some active ->
+                active.Dispose()
+                aligner <- None
+            | None -> ()
+            compareJob <- None
+            replayLog.Clear()
+            replayPosition <- 0
+            disposeResync ()
+            dropRestore ()
+            spilled <- true
+        releaseBuffers ()
+    }
+
+    /// Reads the scalar state of a snapshot.
+    let restoreHeader () = async {
+        let scratchBytes = Array.zeroCreate<byte> 65_536
+        let reader = SnapshotReader(spillStore.Value, scratchBytes)
+        let! values = reader.Header()
+        let header = HeaderReader values
+        restoreResync <- header.Bool()
+        restoreAligning <- header.Bool()
+        let savedState = header.Int()
+        windowState <- if savedState = 0 then WindowState.Loading elif savedState = 3 then WindowState.Feeding else WindowState.Aligning
+        windowLimit <- header.Int()
+        commitCount <- header.Int()
+        opIndex <- header.Int()
+        feedPrevious <- header.Int()
+        feedCurrent <- header.Int()
+        regionStarted <- header.Bool()
+        pBase <- header.Number()
+        cBase <- header.Number()
+        partialAlign <- header.Bool()
+        partialPrevious <- header.Int()
+        partialCurrent <- header.Int()
+        let opCount = header.Int()
+        let logCount = header.Int()
+        restoreOps <- Array.zeroCreate<int> (opCount * 5)
+        restoreLog <- Array.zeroCreate<int> logCount
+        if restoreResync then
+            let engine = createEngine [| 0.0; 0.0 |] [| 0.0; 0.0 |]
+            engine.Import header
+            restoreEngine <- Some engine
+        else
+            let struct (previousFirst, previousCount) = previousSide.Import header
+            let struct (currentFirst, currentCount) = currentSide.Import header
+            restoreLines[0] <- float previousFirst
+            restoreLines[1] <- float currentFirst
+            restoreCounts[0] <- previousCount
+            restoreCounts[1] <- currentCount
+        restoreReader <- Some reader
+    }
+
+    /// Takes the memory that the snapshot needs. It returns false while other sessions hold it.
+    let restoreMemory () =
+        let acquired =
+            if restoreResync then restoreEngine.Value.TryAllocate()
+            else previousSide.Table.TryEnsure restoreCounts[0] && currentSide.Table.TryEnsure restoreCounts[1]
+        if acquired then
+            restoreSlots <-
+                if restoreResync then List.toArray restoreEngine.Value.Slots
+                else
+                    Array.ofList (
+                        tableSlots previousSide.Table restoreCounts[0]
+                        @ tableSlots currentSide.Table restoreCounts[1]
+                        @ [ ArraySlot.OfInts(restoreOps, restoreOps.Length); ArraySlot.OfInts(restoreLog, restoreLog.Length) ]
+                    )
+            restoreSlot <- 0
+        acquired
+
+    let finishRestore () =
+        if restoreResync then
+            resync <- restoreEngine
+            restoreEngine <- None
+            mode <- Mode.Resync
+        else
+            previousSide.Table.SetCount(restoreCounts[0], int64 restoreLines[0])
+            currentSide.Table.SetCount(restoreCounts[1], int64 restoreLines[1])
+            ops <-
+                Array.init (restoreOps.Length / 5) (fun index ->
+                    DiffOperations.make
+                        (operationKind restoreOps[index * 5])
+                        restoreOps[index * 5 + 1]
+                        restoreOps[index * 5 + 2]
+                        restoreOps[index * 5 + 3]
+                        restoreOps[index * 5 + 4])
+            replayLog.Clear()
+            for value in restoreLog do
+                replayLog.Add value
+            replayPosition <- 0
+            mode <- Mode.Window
+            if restoreAligning then
+                aligner <- Some(WindowAligner(previousSide.Table, currentSide.Table, config.MyersStepsPerGap, ledger))
+                windowState <- WindowState.Aligning
+        restoreReader <- None
+        restoreSlots <- Array.empty
+        restoreOps <- Array.empty
+        restoreLog <- Array.empty
+        restoreStage <- 0
+        spilled <- false
+
     /// True when the next microstep touches no source, so a run of them needs no asynchronous scheduling.
     let synchronousStep () =
-        match mode with
-        | Mode.Common -> false
-        | Mode.Window -> windowState = WindowState.Aligning || windowState = WindowState.Feeding
-        | Mode.Done -> true
+        if spilled then false
+        else
+            match mode with
+            | Mode.Common -> false
+            | Mode.Resync -> false
+            | Mode.Window -> windowState = WindowState.Aligning || windowState = WindowState.Feeding
+            | Mode.Done -> true
 
     let synchronousMicrostep (meter: Meter) =
         match mode with
@@ -1032,16 +1043,68 @@ type TextDiffSession internal (
                 && not (Meter.overBudget meter)
                 && not (Meter.quantumDue meter)
 
+    /// Restores a spilled step in bounded pieces: the scalar state, then the memory, then the arrays.
+    let restoreStep (meter: Meter) = async {
+        Meter.charge meter 1
+        if restoreStage = 0 then
+            do! restoreHeader ()
+            restoreStage <- 1
+        elif restoreStage = 1 then
+            if restoreMemory () then restoreStage <- 2
+            else
+                // Other sessions hold the memory. The request ends and the next one tries again.
+                meter.Units <- meter.MaxUnits
+        elif restoreSlot < restoreSlots.Length then
+            let slot = restoreSlots[restoreSlot]
+            if slot.Filled >= slot.Count then restoreSlot <- restoreSlot + 1
+            else
+                let! bytes = restoreReader.Value.Fill(slot, 65_536)
+                Meter.chargeBytes meter bytes
+        else finishRestore ()
+    }
+
+    // HDF5 superblocks can start at 512 times a power of two. The classifier samples only the first 64 KiB,
+    // so the scan checks the later offsets when its coverage passes them. The signature is read directly from the
+    // source, which covers a signature that straddles two chunks.
+    let hdf5Signature = [| 0x89uy; 0x48uy; 0x44uy; 0x46uy; 0x0Duy; 0x0Auy; 0x1Auy; 0x0Auy |]
+    let nextHdf5 = [| 65_536.0; 65_536.0 |]
+    let hdf5Buffer = Array.zeroCreate<byte> 8
+
+    let hdf5Due () =
+        invalidDetail.IsNone
+        && (nextHdf5[0] + 8.0 <= min previousSide.Coverage previousLength
+            || nextHdf5[1] + 8.0 <= min currentSide.Coverage currentLength)
+
+    let probeHdf5 () = async {
+        for side in 0..1 do
+            let spec = if side = 0 then previousSpec else currentSpec
+            let coverage = if side = 0 then previousSide.Coverage else currentSide.Coverage
+            if spec.Source.IsSome then
+                let mutable waiting = false
+                while not waiting && invalidDetail.IsNone && nextHdf5[side] + 8.0 <= min coverage (float spec.ByteLength) do
+                    let! status = readFully spec.Source.Value nextHdf5[side] hdf5Buffer 8
+                    if status = 1 then
+                        let mutable same = true
+                        for index = 0 to 7 do
+                            if Native.readByte hdf5Buffer index <> int hdf5Signature[index] then same <- false
+                        if same then report (if side = 0 then DiffSide.Previous else DiffSide.Current) "HDF5 signature" (int64 nextHdf5[side])
+                        nextHdf5[side] <- nextHdf5[side] * 2.0
+                    else waiting <- true
+    }
+
     let microstep (meter: Meter) = async {
-        match mode with
-        | Mode.Common -> do! commonStep meter
-        | Mode.Window ->
-            match windowState with
-            | WindowState.Loading -> do! loadStep meter
-            | WindowState.Aligning -> alignStep meter
-            | WindowState.Comparing -> do! compareStep meter
-            | WindowState.Feeding -> feedStep meter
-        | Mode.Done -> Meter.charge meter 1
+        if spilled then do! restoreStep meter
+        else
+            match mode with
+            | Mode.Common -> do! commonStep meter
+            | Mode.Resync -> do! resyncStep meter bufA bufB
+            | Mode.Window ->
+                match windowState with
+                | WindowState.Loading -> do! loadStep meter
+                | WindowState.Aligning -> alignStep meter
+                | WindowState.Comparing -> do! compareStep meter
+                | WindowState.Feeding -> feedStep meter
+            | Mode.Done -> Meter.charge meter 1
     }
 
     // Page building. Stage one reads row text and builds the parts without changing any state. Stage two records
@@ -1319,12 +1382,20 @@ type TextDiffSession internal (
     }
 
     let advance (sequence: int64) (cancel: unit -> bool) : Async<EngineResult<Resumable<DiffPage>>> = async {
-        if not (ensureBuffers ()) then return failWorker "The diff scratch memory is not available."
+        match scratch, holder with
+        | Some coordinator, Some self -> do! coordinator.BeginRequest self
+        | _ -> ()
+        if not (ensureBuffers ()) then
+            // Other sessions hold the chunk scratch. The job suspends and the next request reserves again.
+            let value = Resumable.Scanning(progress (), identifier "c" (sequence + 1L), None)
+            do! recordResult sequence value
+            return EngineResult.Ok value
         else
             let meter = Meter.create host.Clock config.Limits
             let mutable result: EngineResult<Resumable<DiffPage>> option = None
             let mutable first = true
             while result.IsNone do
+                if hdf5Due () then do! probeHdf5 ()
                 if cancel () || closing then result <- Some EngineResult.Canceled
                 elif invalidDetail.IsSome then result <- Some(failContent ())
                 elif failure.IsSome then
@@ -1351,6 +1422,7 @@ type TextDiffSession internal (
                             do! recordResult sequence value
                             result <- Some(EngineResult.Ok value)
                     else
+                        if checkpoints.HasPending then do! checkpoints.Flush()
                         if Meter.quantumDue meter then
                             do! host.Yield()
                             Meter.beginNextQuantum meter
@@ -1361,6 +1433,88 @@ type TextDiffSession internal (
                             do! host.Yield()
                 first <- false
             return result.Value
+    }
+
+    /// Finds the line that a line number or a byte offset names. The scan resumes from the nearest checkpoint at
+    /// or before the target and reads the source in 64 KiB pieces.
+    let seekScan (sideIndex: int) (byLine: bool) (target: float) : Async<ScannedLine option> = async {
+        let spec = if sideIndex = 0 then previousSpec else currentSpec
+        let encoding = if sideIndex = 0 then previousEncoding else currentEncoding
+        match spec.Source with
+        | None -> return None
+        | Some source ->
+            let! hit = checkpoints.Find(sideIndex, byLine, target)
+            let state, firstLine =
+                match hit with
+                | Some found -> found.State, found.Line
+                | None -> Scanner.create encoding (int64 spec.BomLength) None, 0.0
+            let buffer = Array.zeroCreate<byte> 65_536
+            let batch = LineBatch(256)
+            let meter = Meter.create host.Clock { config.Limits with MaxUnits = Int32.MaxValue; RequestMs = 1e15; QuantumMs = 1e15 }
+            let mutable line = firstLine
+            let mutable found: ScannedLine option = None
+            let mutable position = state.NextOffset
+            let mutable stop = false
+            let onLines (lines: LineBatch) =
+                for index = 0 to lines.Count - 1 do
+                    if found.IsNone then
+                        let scanned = lines.Line index
+                        if (byLine && line = target) || (not byLine && float scanned.EndOffset > target) then found <- Some scanned
+                        line <- line + 1.0
+            let ignoreEvidence (_: ScannerEvidence) = ()
+            while found.IsNone && not stop && not state.IsComplete do
+                if position >= float spec.ByteLength then
+                    let result = Scanner.scanChunk state buffer 0 0 true meter batch onLines ignoreEvidence
+                    stop <- result.Status <> EndOfInput
+                else
+                    let count = int (min 65_536.0 (float spec.ByteLength - position))
+                    let! outcome = source.ReadAt (int64 position) buffer 0 count
+                    match outcome with
+                    | ReadOutcome.Bytes actual when actual > 0 ->
+                        meter.Units <- 0
+                        let atEnd = position + float actual >= float spec.ByteLength
+                        let result = Scanner.scanChunk state buffer 0 actual atEnd meter batch onLines ignoreEvidence
+                        position <- position + float result.Consumed
+                        if result.Status = DecodeFailure || result.Consumed < actual then stop <- true
+                    | _ -> stop <- true
+            return found
+    }
+
+    let seek (side: DiffSide) (byLine: bool) (target: float) : Async<EngineResult<ScannedLine option>> = async {
+        if closed || closing then return failClosed ()
+        elif target < 0.0 then return EngineResult.Ok None
+        else
+            try
+                let! result = seekScan (if side = DiffSide.Previous then 0 else 1) byLine target
+                return EngineResult.Ok result
+            with error -> return failWorker error.Message
+    }
+
+    let holdsScratch () =
+        bufA.Length > 0
+        || aligner.IsSome
+        || previousSide.Table.Capacity > 0
+        || currentSide.Table.Capacity > 0
+        || (match resync with
+            | Some engine -> engine.HoldsScratch
+            | None -> false)
+        || (match restoreEngine with
+            | Some engine -> engine.HoldsScratch
+            | None -> false)
+
+    /// Spills an idle session. A busy session keeps its state because its request is using it.
+    let spillSession () : Async<EngineResult<unit>> = async {
+        if closed || closing then return failClosed ()
+        elif invalidDetail.IsSome then return failContent ()
+        elif busy then return EngineResult.Ok()
+        else
+            busy <- true
+            try
+                try
+                    do! spillNow ()
+                    return EngineResult.Ok()
+                with error -> return failWorker error.Message
+            finally busy <- false
     }
 
     let acquire (cancel: unit -> bool) = async {
@@ -1445,11 +1599,21 @@ type TextDiffSession internal (
 
     member _.PendingPreview() = extensionResult "Pending preview"
 
-    member _.Resync() = extensionResult "Forward resynchronization"
+    /// Writes the suspended step to the spill store and releases its scratch memory. The next request restores it.
+    member _.Spill() = spillSession ()
 
-    member _.Spill() = async.Return(extensionResult "Suspended-state spill")
+    /// Returns the line with the given zero-based number, or None past the end of the source.
+    member _.SeekLine(side: DiffSide, line: int64) = seek side true (float line)
 
-    member _.Restore() = async.Return(extensionResult "Suspended-state restore")
+    /// Returns the line that contains the given byte offset, or None past the end of the source.
+    member _.SeekOffset(side: DiffSide, offset: int64) = seek side false (float offset)
+
+    /// Registers the session with the coordinator of its worker.
+    member internal this.Attach(coordinator: WorkerScratch) =
+        let self = this :> IScratchHolder
+        scratch <- Some coordinator
+        holder <- Some self
+        coordinator.Register self
 
     member _.Close() = async {
         if not closed then
@@ -1463,14 +1627,37 @@ type TextDiffSession internal (
                     active.Dispose()
                     aligner <- None
                 | None -> ()
+                disposeResync ()
+                dropRestore ()
+                match scratch, holder with
+                | Some coordinator, Some self -> coordinator.Unregister self
+                | _ -> ()
                 previousSide.Dispose()
                 currentSide.Dispose()
                 releaseBuffers ()
+                journal.Release()
+                do! checkpoints.Dispose()
                 do! store.Dispose()
+                match spillStore with
+                | Some value ->
+                    spillStore <- None
+                    do! value.Dispose()
+                | None -> ()
     }
 
+    interface IScratchHolder with
+        member _.HoldsScratch = holdsScratch ()
+        member _.IsBusy = busy
+
+        member _.Spill() =
+            async {
+                let! _ = spillSession ()
+                ()
+            }
+
 module TextDiffSession =
-    let create
+    let private createWith
+        (scratch: WorkerScratch option)
         (host: EngineHost)
         (ledger: Ledger)
         (config: SessionConfig)
@@ -1490,6 +1677,18 @@ module TextDiffSession =
                 || config.CommonChunkBytes <= 0
                 || config.CommonChunkBytes > CommonRun.MaxRunBytes
                 || config.MyersStepsPerGap <= 0
+                || config.JournalCacheBytes < 0
+                || config.ResyncSampleModulus <= 0
+                || (config.ResyncSampleModulus &&& (config.ResyncSampleModulus - 1)) <> 0
+                || config.ResyncIndexCapacity <= 0
+                || config.ResyncIndexCapacity > 1_000_000
+                || config.ResyncScanLines <= 0
+                || config.ResyncScanBytes <= 0.0
+                || config.ResyncChainLimit <= 0
+                || config.ResyncProbeLimit <= 0
+                || config.ResyncConfirmLines <= 0
+                || config.CheckpointIntervalBytes <= 0.0
+                || config.CheckpointResidentBytes < 0
             then
                 invalidArg (nameof config) "The session limits must be positive and the context count cannot be negative."
             for source in [| previous; current |] do
@@ -1507,5 +1706,13 @@ module TextDiffSession =
             let! store = host.CreateTempStore config.SessionId
             let session = TextDiffSession(host, ledger, config, sizer, previous, current, previousEncoding, currentEncoding, store)
             do! session.InitializeJournal()
+            scratch |> Option.iter session.Attach
             return session
         }
+
+    let create host ledger config sizer previous current = createWith None host ledger config sizer previous current
+
+    /// Creates a session that shares scratch memory with the other sessions of a worker. A request on this
+    /// session first spills the idle sessions that hold scratch memory.
+    let createWithScratch (scratch: WorkerScratch) host ledger config sizer previous current =
+        createWith (Some scratch) host ledger config sizer previous current

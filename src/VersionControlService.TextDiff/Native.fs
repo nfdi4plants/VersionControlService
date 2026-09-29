@@ -45,6 +45,10 @@ module Native =
     [<Emit("(ArrayBuffer.isView($0) ? Buffer.prototype.indexOf.call($0, $1, $2) : $0.indexOf($1, $2))")>]
     let private indexOfFrom (bytes: byte[]) (value: int) (start: int) : int = jsNative
 
+    /// True when the array is a typed array, which file writes require.
+    [<Emit("ArrayBuffer.isView($0)")>]
+    let isTypedBytes (bytes: byte[]) : bool = jsNative
+
     // Fable builds byte[] as a Uint8Array, but Seq.toArray and array literals can produce a plain
     // array. Views work on typed arrays only, so a plain array is copied into one first.
     [<Emit("(ArrayBuffer.isView($0) ? $0.subarray($1, $2) : Uint8Array.from($0.slice($1, $2)))")>]
@@ -91,6 +95,9 @@ module Native =
         if count = 0 then "" else decodeUnits utf16Decoder units count
 #else
     let inline imul (left: int) (right: int) = left * right
+
+    /// True when the array is a typed array, which file writes require. Every .NET byte array qualifies.
+    let inline isTypedBytes (_bytes: byte[]) = true
 
     let inline readByte (bytes: byte[]) (index: int) = int bytes[index]
 

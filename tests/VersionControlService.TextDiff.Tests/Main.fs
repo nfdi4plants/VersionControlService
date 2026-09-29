@@ -6,7 +6,7 @@ open VersionControlService.TextDiff.Tests
 [<Tests>]
 let textDiffTests =
     let tests =
-        (TextDiffEngineCases.cases @ TextDiffSessionCases.cases @ TextDiffStreamingCases.cases)
+        (TextDiffEngineCases.cases @ TextDiffSessionCases.cases @ TextDiffStreamingCases.cases @ TextDiffResyncCases.cases)
         |> List.map (fun (name, run) -> testCaseAsync name (run ()))
 
     testList "TextDiffEngine" (FnvReferenceTests.randomReferenceTests :: tests)

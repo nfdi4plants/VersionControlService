@@ -160,7 +160,106 @@ module TextDiffStreamingCases =
         return ()
     }
 
+    let private hdf5Signature = [| 0x89uy; 0x48uy; 0x44uy; 0x46uy; 0x0Duy; 0x0Auy; 0x1Auy; 0x0Auy |]
+
+    /// UTF-16LE text of 49-letter lines with an HDF5 signature written over the bytes at the given even offset.
+    /// The signature bytes form valid UTF-16 code units, so only the offset check can flag them.
+    let private withSignatureAt (head: string) (length: int) (offset: int) =
+        let bytes = Array.zeroCreate<byte> length
+        bytes[0] <- 0xFFuy
+        bytes[1] <- 0xFEuy
+        let headBytes = Encoding.Unicode.GetBytes head
+        for index in 2 .. length - 1 do
+            let rel = index - 2
+            bytes[index] <-
+                if rel < headBytes.Length then headBytes[rel]
+                elif (rel - headBytes.Length) % 2 = 1 then 0uy
+                elif ((rel - headBytes.Length) / 2) % 50 = 49 then 10uy
+                else 65uy
+        Array.blit hdf5Signature 0 bytes offset hdf5Signature.Length
+        bytes
+
+    let private utf16Spec (bytes: byte[]) = { sourceSpec bytes with Encoding = "utf-16le"; BomLength = 2 }
+
     let cases = [
+        "an HDF5 signature at 65536 is binary evidence before the first page", fun () -> async {
+            let bytes = withSignatureAt "" 100_000 65_536
+            let! session = openSession (Ledger()) (config "hdf5-early" 64 16 Limits.defaults None) (utf16Spec bytes) (utf16Spec bytes)
+            let! result = session.FirstPage(fun () -> false)
+            match result with
+            | EngineResult.Failed(code, _, Some detail) ->
+                Check.equal TextDiffFailureCodes.ContentNotText code "The later signature reports the text failure code."
+                Check.true' (detail.Evidence.Contains "65536") "The evidence names the signature offset."
+            | other -> failwith $"The later signature returned {other}."
+            do! session.Close()
+            return ()
+        }
+        "an HDF5 signature at 131072 invalidates a session after its first page", fun () -> async {
+            let previous = withSignatureAt "before\n" 300_000 131_072
+            let current = withSignatureAt "after\n" 300_000 131_072
+            let! session = openSession (Ledger()) (config "hdf5-late" 64 16 Limits.defaults None) (utf16Spec previous) (utf16Spec current)
+            let! firstResult = session.FirstPage(fun () -> false)
+            let! first, _ = resolvePageAsync session (fun () -> false) firstResult
+            match first.NextCursor with
+            | None -> failwith "The first page did not leave more content to validate."
+            | Some cursor ->
+                let mutable outcome = None
+                let mutable attempts = 0
+                let mutable next = cursor
+                while outcome.IsNone do
+                    attempts <- attempts + 1
+                    if attempts > 10_000 then failwith "The session did not report the signature."
+                    let! result = session.ReadPage next (fun () -> false)
+                    match result with
+                    | EngineResult.Failed(code, _, Some detail) -> outcome <- Some(code, detail.Evidence)
+                    | EngineResult.Ok(Resumable.Scanning(_, continuation, _)) -> next <- continuation
+                    | EngineResult.Ok(Resumable.Ready page) ->
+                        match page.NextCursor with
+                        | Some following -> next <- following
+                        | None -> failwith "The session finished without reporting the signature."
+                    | other -> failwith $"The session returned {other}."
+                let code, evidence = outcome.Value
+                Check.equal TextDiffFailureCodes.ContentNotText code "The later signature reports the text failure code."
+                Check.true' (evidence.Contains "131072") "The evidence names the signature offset."
+            do! session.Close()
+            return ()
+        }
+        "journal records reach the temp store as typed arrays and read back", fun () -> async {
+            let previous = makeLines 40 "line-"
+            let current = Array.copy previous
+            current[7] <- { current[7] with Text = "changed" }
+            let untyped = ref 0
+            let writes = ref 0
+            let recording (inner: ITempStore) =
+                let check (bytes: byte[]) =
+                    writes.Value <- writes.Value + 1
+                    if not (Native.isTypedBytes bytes) then untyped.Value <- untyped.Value + 1
+                { new ITempStore with
+                    member _.Append bytes offset count = check bytes; inner.Append bytes offset count
+                    member _.WriteAt position bytes offset count = check bytes; inner.WriteAt position bytes offset count
+                    member _.ReadAt position bytes offset count = inner.ReadAt position bytes offset count
+                    member _.Length() = inner.Length()
+                    member _.Dispose() = inner.Dispose() }
+            let host = {
+                Host.createInMemory (ManualClock 0.0 :> IClock) with
+                    CreateTempStore = fun _ -> async.Return(recording (MemoryTempStore() :> ITempStore))
+            }
+            let! session = TextDiffSession.create host (Ledger()) (config "stream-journal-bytes" 64 1_000_000 Limits.defaults None) (fun _ -> 1) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+            let! first = session.FirstPage(fun () -> false)
+            let! pageId =
+                async {
+                    let! page, _ = resolvePageAsync session (fun () -> false) first
+                    return page.PageId
+                }
+            let! replayed = session.ReplayPage pageId
+            match replayed with
+            | EngineResult.Ok page -> Check.equal pageId page.PageId "A replayed page reads back from the journal."
+            | _ -> failwith "The journal did not return the recorded page."
+            Check.true' (writes.Value > 0) "The session wrote to the temp store."
+            Check.equal 0 untyped.Value "Every temp store write passes a typed array."
+            do! session.Close()
+            return ()
+        }
         "validated byte progress stops at an incomplete scalar", fun () -> async {
             let clock = ManualClock 0.0
             let meter = Meter.create (clock :> IClock) Limits.defaults
@@ -175,6 +274,17 @@ module TextDiffStreamingCases =
             | Some error -> Check.equal 0L error.Offset "The scanner reports the incomplete scalar start."
             | None -> failwith "The scanner returned no decoding error."
             Check.equal 0.0 state.ValidatedBytes "Validated progress stops before the invalid scalar."
+            return ()
+        }
+        "validated byte progress stops before a pending high surrogate and a partial unit", fun () -> async {
+            let meter = Meter.create (ManualClock 0.0 :> IClock) Limits.defaults
+            let state = Scanner.create TextEncoding.Utf16LE 0L None
+            let result = Scanner.scanChunk state [| 0x00uy; 0xD8uy; 0x41uy |] 0 3 true meter (LineBatch()) ignore ignore
+            Check.equal DecodeFailure result.Status "A surrogate without a partner is a decoding failure."
+            match result.Error with
+            | Some error -> Check.equal 2L error.Offset "The failure is reported where the partial unit starts."
+            | None -> failwith "The scanner returned no decoding error."
+            Check.equal 0.0 state.ValidatedBytes "Validated progress stops before the pending high surrogate."
             return ()
         }
         "the equal-byte phase resumes after a large insertion", fun () ->

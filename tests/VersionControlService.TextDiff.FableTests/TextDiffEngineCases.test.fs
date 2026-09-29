@@ -123,18 +123,47 @@ module TextDiffEngineCasesTests =
         Vitest.log ($"{label}: {rate:F1} MB/s")
         Async.StartAsPromise(async.Return())
 
+    /// Three 64 KiB samples taken from the start, the middle and the end of a 256 MiB source.
+    let private classificationSamples (pattern: byte[]) =
+        let length = 65_536 / pattern.Length * pattern.Length
+        let bytes = repeatBytes length pattern
+        let sourceLength = 256L * 1024L * 1024L
+        let samples =
+            [| for offset in [| 0L; sourceLength / 2L; sourceLength - int64 length |] ->
+                ({ BufferOffset = offset; Bytes = bytes; SampleOffset = 0; SampleLength = length }: ClassificationSample) |]
+        sourceLength, samples
+
+    let private reportClassification label (pattern: byte[]) =
+        let sourceLength, samples = classificationSamples pattern
+        let started = BrowserClock.nowMs()
+        let mutable result = Classification.classify sourceLength samples
+        let first = BrowserClock.nowMs() - started
+        let mutable best = first
+
+        for _ in 1..3 do
+            let repeated = BrowserClock.nowMs()
+            result <- Classification.classify sourceLength samples
+            best <- min best (BrowserClock.nowMs() - repeated)
+
+        match result with
+        | BinaryEvidence evidence -> failwith $"{label} was classified as binary: {evidence}."
+        | _ -> ()
+
+        Vitest.log ($"{label}: {first:F2} ms for the first run, {best:F2} ms best of the rest, for three 64 KiB samples")
+        Async.StartAsPromise(async.Return())
+
     let private benchmarkSessionConfig sessionId contextLines pageRows chunkBytes = {
-        SessionId = sessionId
-        ContextLines = contextLines
-        PageMaxRows = pageRows
-        PageMaxBytes = 512 * 1024
-        PageMaxFragments = 32
-        WindowMaxLines = 65_536
-        WindowMaxBytes = 32 * 1024 * 1024
-        CommonChunkBytes = chunkBytes
-        MyersStepsPerGap = 1_000_000
-        HashMaskForTesting = None
-        Limits = { Limits.defaults with MaxUnits = 2_147_483_647; RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 }
+        SessionConfig.defaults sessionId with
+            ContextLines = contextLines
+            PageMaxRows = pageRows
+            PageMaxBytes = 512 * 1024
+            PageMaxFragments = 32
+            WindowMaxLines = 65_536
+            WindowMaxBytes = 32 * 1024 * 1024
+            CommonChunkBytes = chunkBytes
+            MyersStepsPerGap = 1_000_000
+            HashMaskForTesting = None
+            Limits = { Limits.defaults with MaxUnits = 2_147_483_647; RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 }
     }
 
     let private benchmarkSource (data: byte[]) = {
@@ -197,6 +226,8 @@ module TextDiffEngineCasesTests =
             for name, run in TextDiffSessionCases.cases do
                 Vitest.it(name, fun () -> Async.StartAsPromise(run ()))
             for name, run in TextDiffStreamingCases.cases do
+                Vitest.it(name, fun () -> Async.StartAsPromise(run ()))
+            for name, run in TextDiffResyncCases.cases do
                 Vitest.it(name, fun () -> Async.StartAsPromise(run ()))
     )
 
@@ -316,4 +347,80 @@ module TextDiffEngineCasesTests =
             Vitest.log ($"64 MiB file with an 8 MiB insertion near the start: {elapsed:F1} ms, {rate:F1} MB/s across both sources")
             do! session.Close()
         })
+    )
+
+    /// Measures a whole session with the default budgets and logs the time to the first page and the total time.
+    let private reportSessionRun label sessionId (previous: byte[]) (current: byte[]) (checkLedger: Ledger -> unit) =
+        Async.StartAsPromise(async {
+            let ledger = Ledger()
+            let config = { SessionConfig.defaults sessionId with Limits = { Limits.defaults with MaxUnits = 2_147_483_647; RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 } }
+            let started = BrowserClock.nowMs()
+            let! session = TextDiffSession.create (Host.createInMemory (ManualClock 0.0 :> IClock)) ledger config (fun _ -> 1) (benchmarkSource previous) (benchmarkSource current)
+            let! first = session.FirstPage(fun () -> false)
+            let! page = finishFirstPage session first
+            let firstPageMs = BrowserClock.nowMs() - started
+            if page.Parts.Length = 0 then failwith "The first page has no edit rows."
+            do! finishSessionOutput session page
+            let elapsed = max 1.0 (BrowserClock.nowMs() - started)
+            checkLedger ledger
+            Vitest.log ($"{label}: first page {firstPageMs:F1} ms, total {elapsed:F1} ms")
+            do! session.Close()
+        })
+
+    let private measureMiddleInsertion () =
+        let lineBytes = 40
+        let lineCount = benchmarkSize / lineBytes
+        let previous = numberedLines 0x70uy lineBytes lineCount
+        let cutLine = lineCount / 2
+        let insertion = numberedLines 0x69uy lineBytes (8 * 1024 * 1024 / lineBytes)
+        let current = Array.concat [ previous[.. cutLine * lineBytes - 1]; insertion; previous[cutLine * lineBytes ..] ]
+        let check (ledger: Ledger) =
+            let equalAfterInsertion = float (previous.Length - cutLine * lineBytes)
+            if ledger.CommonRunBytes < 0.9 * equalAfterInsertion then
+                failwith $"The equal-byte phase consumed {ledger.CommonRunBytes} of {equalAfterInsertion} equal bytes after the insertion."
+        reportSessionRun "64 MiB file with an 8 MiB insertion in the middle" "benchmark-insertion-middle" previous current check
+
+    let private measureFullRewrite () =
+        let lineBytes = 40
+        let lineCount = benchmarkSize / lineBytes
+        let previous = numberedLines 0x70uy lineBytes lineCount
+        let current = numberedLines 0x71uy lineBytes lineCount
+        reportSessionRun "64 MiB full rewrite" "benchmark-rewrite" previous current ignore
+
+    Vitest.itWithTimeout("measures a 64 MiB file with an 8 MiB insertion of 40-byte lines in the middle", measureMiddleInsertion, 1_800_000)
+
+    Vitest.itWithTimeout("measures a 64 MiB full rewrite of 40-byte lines", measureFullRewrite, 1_800_000)
+
+    Vitest.it (
+        "classifies three 64 KiB samples of mixed UTF-8 text",
+        fun () ->
+            let pattern =
+                Array.concat [
+                    Array.create 14 0x61uy
+                    [| 0xC3uy; 0xA9uy; 0xC3uy; 0xA9uy; 0xC3uy; 0xA9uy |]
+                    [| 0xE2uy; 0x82uy; 0xACuy; 0xE2uy; 0x82uy; 0xACuy; 0xE2uy; 0x82uy; 0xACuy |]
+                    [| 0xF0uy; 0x9Fuy; 0x98uy; 0x80uy; 0x0Auy |]
+                ]
+            reportClassification "Classification of UTF-8 text" pattern
+    )
+
+    Vitest.it (
+        "classifies three 64 KiB samples of Windows-1252 text",
+        fun () ->
+            let pattern =
+                Array.concat [ Array.create 20 0x61uy; [| 0xE9uy; 0xE9uy; 0x80uy; 0x93uy; 0x94uy; 0xFCuy; 0x0Auy |] ]
+            reportClassification "Classification of Windows-1252 text" pattern
+    )
+
+    Vitest.it (
+        "classifies three 64 KiB samples of UTF-16 LE text",
+        fun () ->
+            let units = Array.concat [ Array.create 20 0x0061; [| 0x00E9; 0x20AC; 0xD83D; 0xDE00; 0x000A |] ]
+            let pattern = Array.zeroCreate<byte> (units.Length * 2)
+
+            for index = 0 to units.Length - 1 do
+                pattern[index * 2] <- byte units[index]
+                pattern[index * 2 + 1] <- byte (units[index] >>> 8)
+
+            reportClassification "Classification of UTF-16 LE text" pattern
     )

@@ -410,9 +410,8 @@ module Scanner =
         let nextOffset = origin + float index
         state.NextOffset <- nextOffset
         let completedBoundary =
-            if state.PendingCount > 0 then state.PendingStart
-            elif state.PendingHigh <> 0 then state.PendingHighStart
-            else nextOffset
+            let byteBoundary = if state.PendingCount > 0 then state.PendingStart else nextOffset
+            if state.PendingHigh <> 0 then min byteBoundary state.PendingHighStart else byteBoundary
         let validatedBoundary =
             match error with
             | Some decodeError -> min completedBoundary (float decodeError.Offset)

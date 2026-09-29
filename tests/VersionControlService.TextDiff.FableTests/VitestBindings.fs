@@ -8,6 +8,10 @@ module Vitest =
 
     [<ImportMember("vitest")>]
     let inline it(name: string, fn: unit -> JS.Promise<unit>) : unit = jsNative
+    /// Registers a test with its own timeout in milliseconds, for measurements that run for minutes.
+    [<Import("it", "vitest")>]
+    let inline itWithTimeout(name: string, fn: unit -> JS.Promise<unit>, timeoutMs: int) : unit = jsNative
+
 
     [<ImportMember("vitest")>]
     let inline expect(value: 'a) : obj = jsNative
