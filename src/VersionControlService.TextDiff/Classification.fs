@@ -1,8 +1,6 @@
 namespace VersionControlService.TextDiff
 
 open System
-open System.Collections.Generic
-open System.Text
 open VersionControlService.Abstractions
 
 type ClassificationSample = {
@@ -19,13 +17,17 @@ type ClassificationResult =
 
 module Classification =
     type private Bom = { Encoding: TextEncoding; Length: int; Bytes: byte[] }
-    type private WindowCount = { mutable Scalars: int; mutable Controls: int }
     type private Evaluation = {
         Encoding: TextEncoding
-        Text: string
-        Preview: string
         Error: string option
         ControlEvidence: string option
+    }
+
+    /// The decoded text of one candidate, built only when two candidates must be compared or previewed.
+    type private DecodedText = {
+        Units: uint16[]
+        Count: int
+        FirstSampleCount: int
     }
 
     let private utf8Bom = [| 0xEFuy; 0xBBuy; 0xBFuy |]
@@ -167,69 +169,290 @@ module Classification =
         elif remainder > 0L && remainder < 4096L && offset >= sourceLength - (window + remainder) then max 0L (sourceLength - (window + remainder))
         else (offset / window) * window
 
-    let private evaluate sourceLength samples encoding bomLength =
-        let ordered = samples |> Array.sortBy (fun s -> s.BufferOffset + int64 (properStart s))
-        let fullText = StringBuilder()
-        let firstPreview = StringBuilder()
-        let windows = Dictionary<int64, WindowCount>()
-        let countedScalarStarts = HashSet<int64>()
-        let mutable nulEvidence = None
+    /// The end of the window that starts at `key`, or the maximum value when it is the last one.
+    let private windowEnd sourceLength key =
+        if windowStart sourceLength (key + 65536L) = key then Int64.MaxValue else key + 65536L
+
+    // Scalar values 0 to 127 map to 2 for NUL, 1 for the other control characters and 0 for the rest.
+    let private controlKinds =
+        Array.init 128 (fun value ->
+            if value = 0 then 2uy
+            elif (value >= 1 && value <= 8) || value = 11 || (value >= 14 && value <= 31) || value = 127 then 1uy
+            else 0uy)
+
+    let private controlKind (value: int) =
+        if value < 128 then Native.readByte controlKinds value else 0
+
+    let private clampIndex (value: int64) =
+        if value < -1L then -1
+        elif value > int64 Int32.MaxValue then Int32.MaxValue
+        else int value
+
+    /// Counts scalars per window and remembers the first NUL and the first window with too many controls.
+    /// Scalars arrive in increasing offset order, so a high-water mark counts each source scalar once even
+    /// when samples overlap. Offsets inside a sample are relative to the sample buffer, which keeps the hot
+    /// loops on 32-bit integers.
+    type private Tally(sourceLength: int64) =
+        let mutable baseOffset = 0L
+        let mutable highWater = -1L
+        let mutable highIndex = -1
+        let mutable highIndexAtBegin = -1
+        let mutable windowKey = 0L
+        let mutable windowEndOffset = 0L
+        let mutable windowEndIndex = -1
+        let mutable scalars = 0
+        let mutable controls = 0
+        let mutable controlKey = -1L
+        let mutable nulAt = 0L
+        let mutable hasNul = false
+
+        let closeWindow () =
+            if scalars > 0 && controls * 100 > scalars && controlKey < 0L then controlKey <- windowKey
+
+        member _.Begin(sampleOffset: int64) =
+            baseOffset <- sampleOffset
+            highIndex <- clampIndex (highWater - sampleOffset)
+            highIndexAtBegin <- highIndex
+            windowEndIndex <-
+                if windowEndOffset = Int64.MaxValue then Int32.MaxValue
+                else clampIndex (windowEndOffset - sampleOffset)
+
+        /// Records the scalar that starts at byte `index` of the sample. `kind` comes from `controlKind`.
+        member _.Scalar(index: int, kind: int) =
+            if index > highIndex then
+                highIndex <- index
+                if index >= windowEndIndex then
+                    closeWindow ()
+                    windowKey <- windowStart sourceLength (baseOffset + int64 index)
+                    windowEndOffset <- windowEnd sourceLength windowKey
+                    windowEndIndex <-
+                        if windowEndOffset = Int64.MaxValue then Int32.MaxValue
+                        else clampIndex (windowEndOffset - baseOffset)
+                    scalars <- 0
+                    controls <- 0
+                scalars <- scalars + 1
+                if kind = 1 then controls <- controls + 1
+                elif kind = 2 && not hasNul then
+                    hasNul <- true
+                    nulAt <- baseOffset + int64 index
+
+        member _.End() =
+            if highIndex > highIndexAtBegin then highWater <- baseOffset + int64 highIndex
+
+        member _.HasNul = hasNul
+
+        member _.Evidence() =
+            closeWindow ()
+            if hasNul then Some(sprintf "NUL character at byte %d" nulAt)
+            elif controlKey >= 0L then Some(sprintf "control ratio above 1%% in window at byte %d" controlKey)
+            else None
+
+    let private failure encoding (offset: int64) =
+        Some(sprintf "invalid %s sequence at byte %d" (Decoders.name encoding) offset)
+
+    /// Counts a range that is known to be valid UTF-8. Every lead byte and ASCII byte starts one scalar.
+    let private countUtf8 (tally: Tally) (bytes: byte[]) start stop =
+        for i = start to stop - 1 do
+            let value = Native.readByte bytes i
+            if value < 0x80 then tally.Scalar(i, controlKind value)
+            elif value >= 0xC0 then tally.Scalar(i, 0)
+
+    /// Returns the byte index of the first undefined byte, or -1.
+    let private countWindows1252 (tally: Tally) (bytes: byte[]) start stop =
+        let mutable index = start
+        let mutable failedAt = -1
+        while failedAt < 0 && index < stop do
+            let value = Native.readByte bytes index
+            if value < 0x80 then
+                tally.Scalar(index, controlKind value)
+                index <- index + 1
+            elif value <= 0x9F && Native.readInt Decoders.windows1252 value < 0 then failedAt <- index
+            else
+                tally.Scalar(index, 0)
+                index <- index + 1
+        failedAt
+
+    /// Returns the byte index where the decoder reports its error, or -1. A high surrogate counts once its
+    /// low surrogate arrives, so an unfinished pair at the end of a sample is not counted.
+    let private countUtf16 (tally: Tally) (bytes: byte[]) start stop littleEndian endsAtEof =
+        let mutable index = start
+        let mutable failedAt = -1
+        let mutable highAt = -1
+        while failedAt < 0 && index + 1 < stop do
+            let first = Native.readByte bytes index
+            let second = Native.readByte bytes (index + 1)
+            let unit = if littleEndian then first ||| (second <<< 8) else (first <<< 8) ||| second
+            if highAt >= 0 then
+                if unit >= 0xDC00 && unit <= 0xDFFF then
+                    tally.Scalar(highAt, 0)
+                    highAt <- -1
+                else failedAt <- highAt
+            elif unit >= 0xD800 && unit <= 0xDBFF then highAt <- index
+            elif unit >= 0xDC00 && unit <= 0xDFFF then failedAt <- index
+            else tally.Scalar(index, controlKind unit)
+            index <- index + 2
+        if failedAt < 0 && endsAtEof then
+            if index < stop then failedAt <- index
+            elif highAt >= 0 then failedAt <- highAt
+        failedAt
+
+    /// Runs the strict decoder for the encodings and inputs without a loop of their own, so that partial
+    /// counts and error offsets stay exactly those of the decoder.
+    let private countWithDecoder (tally: Tally) encoding (sample: ClassificationSample) start stop endsAtEof =
+        let baseOffset = sample.BufferOffset
+        let mutable pendingHigh = 0
+        let mutable pendingIndex = 0
+        let sink (startOffset: int64) (_endOffset: int64) (codeUnit: int) =
+            let index = int (startOffset - baseOffset)
+            if pendingHigh <> 0 && codeUnit >= 0xDC00 && codeUnit <= 0xDFFF then
+                pendingHigh <- 0
+                tally.Scalar(pendingIndex, 0)
+            elif codeUnit >= 0xD800 && codeUnit <= 0xDBFF then
+                pendingHigh <- codeUnit
+                pendingIndex <- index
+            else tally.Scalar(index, controlKind codeUnit)
+        let state = Decoders.createAt encoding (baseOffset + int64 start)
+        let updated, decoded = Decoders.decode state sample.Bytes start (stop - start) sink
+        match decoded with
+        | Error error -> failure encoding error.Offset
+        | Ok _ ->
+            if endsAtEof then
+                match Decoders.flush updated with
+                | Error error -> failure encoding error.Offset
+                | Ok _ -> None
+            else None
+
+    let private countSample (tally: Tally) encoding (sample: ClassificationSample) start stop endsAtEof =
+        tally.Begin sample.BufferOffset
+        let indexFailure failedAt =
+            if failedAt >= 0 then failure encoding (sample.BufferOffset + int64 failedAt) else None
+        let result =
+            match encoding with
+            | TextEncoding.Windows1252 -> indexFailure (countWindows1252 tally sample.Bytes start stop)
+            | TextEncoding.Utf16LE -> indexFailure (countUtf16 tally sample.Bytes start stop true endsAtEof)
+            | TextEncoding.Utf16BE -> indexFailure (countUtf16 tally sample.Bytes start stop false endsAtEof)
+            | TextEncoding.Utf8 when Native.isUtf8 sample.Bytes start (stop - start) ->
+                countUtf8 tally sample.Bytes start stop
+                None
+            | _ -> countWithDecoder tally encoding sample start stop endsAtEof
+        tally.End()
+        result
+
+    let private orderedSamples samples =
+        samples |> Array.sortBy (fun s -> s.BufferOffset + int64 (properStart s))
+
+    let private sampleRange sourceLength encoding bomLength (sample: ClassificationSample) =
+        let mutable start, stop = adjustedBounds sourceLength encoding sample
+        if sample.BufferOffset + int64 start = 0L && bomLength > 0 then start <- min stop (start + bomLength)
+        start, stop
+
+    /// Walks the samples in order. With `stopAtNul` it skips the remaining samples once a NUL is counted.
+    /// Only callers that treat any NUL evidence as decisive may ask for it, because the error is then incomplete.
+    let private evaluate sourceLength samples encoding bomLength stopAtNul =
+        let ordered = orderedSamples samples
+        let tally = Tally(sourceLength)
         let mutable decodeFailure = None
-        for sampleIndex = 0 to ordered.Length - 1 do
+        let mutable sampleIndex = 0
+        while decodeFailure.IsNone && not (stopAtNul && tally.HasNul) && sampleIndex < ordered.Length do
             let sample = ordered[sampleIndex]
-            let mutable start, stop = adjustedBounds sourceLength encoding sample
-            if sample.BufferOffset + int64 start = 0L && bomLength > 0 then start <- min stop (start + bomLength)
-            if stop > start && decodeFailure.IsNone then
-                let text = StringBuilder()
-                let mutable pendingHigh = 0
-                let mutable pendingStart = 0L
-                let sink startOffset _endOffset codeUnit =
-                    text.Append(char codeUnit) |> ignore
-                    fullText.Append(char codeUnit) |> ignore
-                    if sampleIndex = 0 && firstPreview.Length < 2049 then firstPreview.Append(char codeUnit) |> ignore
-                    let scalar, scalarStart =
-                        if pendingHigh <> 0 && codeUnit >= 0xDC00 && codeUnit <= 0xDFFF then
-                            let value = 0x10000 + ((pendingHigh - 0xD800) <<< 10) + codeUnit - 0xDC00
-                            pendingHigh <- 0
-                            value, pendingStart
-                        elif codeUnit >= 0xD800 && codeUnit <= 0xDBFF then
-                            pendingHigh <- codeUnit
-                            pendingStart <- startOffset
-                            -1, startOffset
-                        else codeUnit, startOffset
-                    if scalar >= 0 && countedScalarStarts.Add scalarStart then
-                        let key = windowStart sourceLength scalarStart
-                        let count =
-                            match windows.TryGetValue key with
-                            | true, found -> found
-                            | _ ->
-                                let fresh = { Scalars = 0; Controls = 0 }
-                                windows.Add(key, fresh)
-                                fresh
-                        count.Scalars <- count.Scalars + 1
-                        if scalar = 0 && nulEvidence.IsNone then nulEvidence <- Some(sprintf "NUL character at byte %d" scalarStart)
-                        elif (scalar >= 1 && scalar <= 8) || scalar = 11 || (scalar >= 14 && scalar <= 31) || scalar = 127 then count.Controls <- count.Controls + 1
-                let state = Decoders.createAt encoding (sample.BufferOffset + int64 start)
-                let updated, decoded = Decoders.decode state sample.Bytes start (stop - start) sink
-                match decoded with
-                | Error error -> decodeFailure <- Some(sprintf "invalid %s sequence at byte %d" (Decoders.name encoding) error.Offset)
-                | Ok _ ->
-                    let endsAtEof = sample.BufferOffset + int64 stop = sourceLength
-                    if endsAtEof then
-                        match Decoders.flush updated with
-                        | Error error -> decodeFailure <- Some(sprintf "invalid %s sequence at byte %d" (Decoders.name encoding) error.Offset)
-                        | Ok _ -> ()
-        let control =
-            windows
-            |> Seq.tryPick (fun pair ->
-                let count = pair.Value
-                if count.Scalars > 0 && count.Controls * 100 > count.Scalars then Some(sprintf "control ratio above 1%% in window at byte %d" pair.Key) else None)
-        let preview =
-            let value = firstPreview.ToString()
-            if value.Length <= 2048 then value
-            elif value.Length > 2048 && int value[2047] >= 0xD800 && int value[2047] <= 0xDBFF then value.Substring(0, 2047)
-            else value.Substring(0, 2048)
-        { Encoding = encoding; Text = fullText.ToString(); Preview = preview; Error = decodeFailure; ControlEvidence = nulEvidence |> Option.orElse control }
+            let start, stop = sampleRange sourceLength encoding bomLength sample
+            if stop > start then
+                let endsAtEof = sample.BufferOffset + int64 stop = sourceLength
+                decodeFailure <- countSample tally encoding sample start stop endsAtEof
+            sampleIndex <- sampleIndex + 1
+        { Encoding = encoding; Error = decodeFailure; ControlEvidence = tally.Evidence() }
+
+    /// Writes the code units of a range that is known to be valid UTF-8 and returns the new unit count.
+    let private writeUtf8Units (bytes: byte[]) start stop (units: uint16[]) count =
+        let mutable index = start
+        let mutable next = count
+        while index < stop do
+            let lead = Native.readByte bytes index
+            if lead < 0x80 then
+                Native.writeUnit units next lead
+                next <- next + 1
+                index <- index + 1
+            elif lead < 0xE0 then
+                Native.writeUnit units next (((lead &&& 0x1F) <<< 6) ||| (Native.readByte bytes (index + 1) &&& 0x3F))
+                next <- next + 1
+                index <- index + 2
+            elif lead < 0xF0 then
+                let scalar =
+                    ((lead &&& 0x0F) <<< 12)
+                    ||| ((Native.readByte bytes (index + 1) &&& 0x3F) <<< 6)
+                    ||| (Native.readByte bytes (index + 2) &&& 0x3F)
+                Native.writeUnit units next scalar
+                next <- next + 1
+                index <- index + 3
+            else
+                let scalar =
+                    ((lead &&& 0x07) <<< 18)
+                    ||| ((Native.readByte bytes (index + 1) &&& 0x3F) <<< 12)
+                    ||| ((Native.readByte bytes (index + 2) &&& 0x3F) <<< 6)
+                    ||| (Native.readByte bytes (index + 3) &&& 0x3F)
+                let offset = scalar - 0x10000
+                Native.writeUnit units next (0xD800 + (offset >>> 10))
+                Native.writeUnit units (next + 1) (0xDC00 + (offset &&& 0x3FF))
+                next <- next + 2
+                index <- index + 4
+        next
+
+    let private writeWindows1252Units (bytes: byte[]) start stop (units: uint16[]) count =
+        let mutable next = count
+        for index = start to stop - 1 do
+            Native.writeUnit units next (Native.readInt Decoders.windows1252 (Native.readByte bytes index))
+            next <- next + 1
+        next
+
+    let private writeUtf16Units (bytes: byte[]) start stop littleEndian (units: uint16[]) count =
+        let mutable index = start
+        let mutable next = count
+        while index + 1 < stop do
+            let first = Native.readByte bytes index
+            let second = Native.readByte bytes (index + 1)
+            Native.writeUnit units next (if littleEndian then first ||| (second <<< 8) else (first <<< 8) ||| second)
+            next <- next + 1
+            index <- index + 2
+        next
+
+    /// Decodes every sample the way `evaluate` walks them, for an encoding that evaluated without an error.
+    let private decodedText sourceLength samples encoding =
+        let ordered = orderedSamples samples
+        let ranges = ordered |> Array.map (sampleRange sourceLength encoding 0)
+        let capacity = ranges |> Array.sumBy (fun (start, stop) -> stop - start)
+        let units = Array.zeroCreate<uint16> capacity
+        let mutable count = 0
+        let mutable firstSampleCount = 0
+        for sampleIndex = 0 to ordered.Length - 1 do
+            let start, stop = ranges[sampleIndex]
+            let bytes = ordered[sampleIndex].Bytes
+            if stop > start then
+                count <-
+                    match encoding with
+                    | TextEncoding.Utf8 -> writeUtf8Units bytes start stop units count
+                    | TextEncoding.Windows1252 -> writeWindows1252Units bytes start stop units count
+                    | TextEncoding.Utf16LE -> writeUtf16Units bytes start stop true units count
+                    | TextEncoding.Utf16BE -> writeUtf16Units bytes start stop false units count
+                    | _ -> count
+            if sampleIndex = 0 then firstSampleCount <- count
+        { Units = units; Count = count; FirstSampleCount = firstSampleCount }
+
+    let private sameText (left: DecodedText) (right: DecodedText) =
+        let mutable equal = left.Count = right.Count
+        let mutable index = 0
+        while equal && index < left.Count do
+            equal <- Native.readUnit left.Units index = Native.readUnit right.Units index
+            index <- index + 1
+        equal
+
+    /// The first up to 2048 units of the first sample, without splitting a surrogate pair.
+    let private previewOf (text: DecodedText) =
+        let taken = min text.FirstSampleCount 2049
+        let length =
+            if taken <= 2048 then taken
+            elif Decoders.isHighSurrogate (Native.readUnit text.Units 2047) then 2047
+            else 2048
+        Native.utf16Decode text.Units length
 
     let private parityCandidate samples oddOffsets =
         let mutable zeros = 0
@@ -238,18 +461,22 @@ module Classification =
         for sample in samples do
             let first = properStart sample
             let finish = first + properLength sample
-            for i = first to finish - 1 do
-                total <- total + 1
-                if sample.Bytes[i] = 0uy then
-                    zeros <- zeros + 1
-                    let absolute = sample.BufferOffset + int64 i
-                    if ((absolute &&& 1L) = 1L) = oddOffsets then parityZeros <- parityZeros + 1
+            let baseOdd = int (sample.BufferOffset &&& 1L)
+            let bytes = sample.Bytes
+            total <- total + (finish - first)
+            // A native search skips the whole sample when it has no zero, which is the case for most text.
+            let firstZero = Native.indexOfByte bytes 0 first finish
+            if firstZero >= 0 then
+                for i = firstZero to finish - 1 do
+                    if Native.readByte bytes i = 0 then
+                        zeros <- zeros + 1
+                        if (((baseOdd + i) &&& 1) = 1) = oddOffsets then parityZeros <- parityZeros + 1
         total > 0 && zeros * 10 >= total && parityZeros * 10 >= zeros * 9
 
     let classifyWithChoice sourceLength samples encoding =
         match detectBom samples with
         | Some bom ->
-            let evaluation = evaluate sourceLength samples bom.Encoding bom.Length
+            let evaluation = evaluate sourceLength samples bom.Encoding bom.Length false
             match evaluation.Error, evaluation.ControlEvidence with
             | Some error, _ -> BinaryEvidence error
             | None, Some evidence -> BinaryEvidence evidence
@@ -258,7 +485,7 @@ module Classification =
             match binarySignature sourceLength samples with
             | Some evidence -> BinaryEvidence evidence
             | None ->
-                let evaluation = evaluate sourceLength samples encoding 0
+                let evaluation = evaluate sourceLength samples encoding 0 false
                 match evaluation.Error, evaluation.ControlEvidence with
                 | Some error, _ -> BinaryEvidence error
                 | None, Some evidence -> BinaryEvidence evidence
@@ -271,35 +498,35 @@ module Classification =
             match binarySignature sourceLength samples with
             | Some evidence -> BinaryEvidence evidence
             | None ->
-                let eligible = ResizeArray<TextEncoding>()
-                if parityCandidate samples true then eligible.Add TextEncoding.Utf16LE
-                if parityCandidate samples false then eligible.Add TextEncoding.Utf16BE
-                let evaluations = ResizeArray<Evaluation>()
-                for encoding in eligible do
-                    let value = evaluate sourceLength samples encoding 0
-                    if value.Error.IsNone && value.ControlEvidence.IsNone then evaluations.Add value
-                let utf8 = evaluate sourceLength samples TextEncoding.Utf8 0
-                if utf8.Error.IsNone && utf8.ControlEvidence.IsNone then evaluations.Add utf8
-                let windows1252 = evaluate sourceLength samples TextEncoding.Windows1252 0
-                if windows1252.Error.IsNone && windows1252.ControlEvidence.IsNone then evaluations.Add windows1252
-                if evaluations.Count = 0 then
-                    let utf8 = evaluate sourceLength samples TextEncoding.Utf8 0
-                    let cp = evaluate sourceLength samples TextEncoding.Windows1252 0
-                    match utf8.Error, utf8.ControlEvidence, cp.Error, cp.ControlEvidence with
+                let accepted = ResizeArray<Evaluation>()
+                let consider (value: Evaluation) =
+                    if value.Error.IsNone && value.ControlEvidence.IsNone then accepted.Add value
+                if parityCandidate samples true then consider (evaluate sourceLength samples TextEncoding.Utf16LE 0 true)
+                if parityCandidate samples false then consider (evaluate sourceLength samples TextEncoding.Utf16BE 0 true)
+                let utf8 = evaluate sourceLength samples TextEncoding.Utf8 0 true
+                consider utf8
+                let windows1252 = evaluate sourceLength samples TextEncoding.Windows1252 0 true
+                consider windows1252
+                if accepted.Count = 0 then
+                    match utf8.Error, utf8.ControlEvidence, windows1252.Error, windows1252.ControlEvidence with
                     | _, Some evidence, _, _ | _, _, _, Some evidence -> BinaryEvidence evidence
                     | Some error, _, _, _ -> BinaryEvidence error
                     | _, _, Some error, _ -> BinaryEvidence error
                     | _ -> BinaryEvidence "no supported text encoding"
+                elif accepted.Count = 1 then Classified(accepted[0].Encoding, false, 0)
                 else
                     let distinct = ResizeArray<Evaluation>()
-                    for evaluation in evaluations do
-                        if not (distinct |> Seq.exists (fun existing -> String.Equals(existing.Text, evaluation.Text, StringComparison.Ordinal))) then distinct.Add evaluation
+                    let texts = ResizeArray<DecodedText>()
+                    for evaluation in accepted do
+                        let text = decodedText sourceLength samples evaluation.Encoding
+                        if not (texts |> Seq.exists (fun existing -> sameText existing text)) then
+                            distinct.Add evaluation
+                            texts.Add text
                     if distinct.Count = 1 then Classified(distinct[0].Encoding, false, 0)
                     else
                         let candidates =
-                            distinct
-                            |> Seq.map (fun evaluation -> { Encoding = Decoders.name evaluation.Encoding; Preview = evaluation.Preview })
-                            |> Seq.toArray
+                            Array.init distinct.Count (fun index ->
+                                ({ Encoding = Decoders.name distinct[index].Encoding; Preview = previewOf texts[index] }: EncodingCandidate))
                         Candidates candidates
 
     let hdf5OffsetsBeyondPrefix sourceLength =
