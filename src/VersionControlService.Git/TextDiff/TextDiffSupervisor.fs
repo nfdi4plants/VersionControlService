@@ -346,6 +346,8 @@ type TextDiffSupervisor internal (instanceDirectory: string, gitExecutable: stri
             let validCommand =
                 match arguments with
                 | [| "cat-file"; "-s"; _ |] -> true
+                // A blob read here is bounded by the stdout limit below. Larger blobs go to a spool.
+                | [| "cat-file"; "blob"; _ |] -> true
                 | [| "cat-file"; _ |] -> false
                 | [| "cat-file"; _; _; _ |] -> false
                 | [| command |] when command = "rev-parse" || command = "symbolic-ref" || command = "for-each-ref" || command = "ls-tree" -> true

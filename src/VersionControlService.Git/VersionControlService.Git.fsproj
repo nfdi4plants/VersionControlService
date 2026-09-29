@@ -17,6 +17,9 @@
     <Compile Include="TextDiff\TextDiffPool.fs" />
     <Compile Include="TextDiff\TextDiffWorkerDispatcher.fs" />
     <Compile Include="TextDiff\TextDiffInProcessTransport.fs" />
+    <Compile Include="TextDiff\TextDiffLfsPointer.fs" />
+    <Compile Include="TextDiff\TextDiffSourceResolver.fs" />
+    <Compile Include="TextDiff\TextDiffPreparation.fs" />
     <Compile Include="TextDiff\TextDiffWorker.fs" />
     <Compile Include="Git\GitAuthAdapter.fs" />
     <Compile Include="GitCredentialStrategy.fs" />
@@ -31,6 +34,7 @@
     <Compile Include="GitConflictSession.fs" />
     <Compile Include="GitLfsExtensions.fs" />
     <Compile Include="GitSelectedRevision.fs" />
+    <Compile Include="TextDiff\GitTextDiffService.fs" />
     <Compile Include="GitWorkspaceSession.fs" />
   </ItemGroup>
   <ItemGroup>

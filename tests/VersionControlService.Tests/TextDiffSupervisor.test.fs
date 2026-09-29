@@ -214,6 +214,24 @@ Vitest.describe (
                     Vitest.expect(result.ExitCode).toEqual (Some 0)
                     Vitest.expect(result.Error).toBe None
                     Vitest.expect(bytesToUtf8 result.Stdout |> _.Trim()).toBe ".git"
+
+                    NodeFileSystem.writeFileSync (NodePath.join [| repo; "small.txt" |]) "small blob\n" NodeFileSystem.Utf8
+                    do! runGitOk repo [| "add"; "--"; "small.txt" |]
+                    do! runGitOk repo [| "commit"; "-q"; "-m"; "small blob" |]
+                    let! oid = runGit repo [| "rev-parse"; "HEAD:small.txt" |]
+                    let oid = oid.Trim()
+                    let! blob = created.RunShort(owner, repo, [| "cat-file"; "blob"; oid |])
+                    Vitest.expect(blob.ExitCode).toEqual (Some 0)
+                    Vitest.expect(bytesToUtf8 blob.Stdout).toBe "small blob\n"
+                    let mutable prettyPrintRejected = false
+
+                    try
+                        let! _ = created.RunShort(owner, repo, [| "cat-file"; "-p"; oid |])
+                        ()
+                    with _ ->
+                        prettyPrintRejected <- true
+
+                    Vitest.expect(prettyPrintRejected).toBe true
                     do! created.Dispose ()
                     supervisor <- None
                 with error ->

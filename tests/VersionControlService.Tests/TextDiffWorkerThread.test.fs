@@ -222,7 +222,8 @@ let private withWorkerPool
 
 let private owner () : TextDiffOwner = {
     WorkspaceRoot = currentFixture().Repository
-    SessionKey = "window-1"
+    LfsMediaDirectory = NodePath.join [| currentFixture().Repository; ".git"; "lfs"; "objects" |]
+    WindowOwner = "window-1"
 }
 
 Vitest.describe (

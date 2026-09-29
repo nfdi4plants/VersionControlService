@@ -159,7 +159,11 @@ let private openRequest: OpenDiffRequest = {
     Continuation = Some "continue-1"
 }
 
-let private owner: TextDiffOwner = { WorkspaceRoot = "C:\\work\\repo"; SessionKey = "window-1" }
+let private owner: TextDiffOwner = {
+    WorkspaceRoot = "C:\\work\\repo"
+    LfsMediaDirectory = "C:\\work\\repo\\.git\\lfs\\objects"
+    WindowOwner = "window-1"
+}
 
 let private childOwner: Supervisor.ChildOwner = { WorkerId = "worker-0-1"; SessionId = "3"; RequestId = "r7" }
 
@@ -403,7 +407,7 @@ Vitest.describe (
                     """{"v":1,"t":"sourceInfo","requestId":"r1","generation":1,"handle":{"id":"a","version":"1"},"request":{"handle":{"id":"b","version":"1"}}}"""
 
                 expectRejected
-                    """{"v":1,"t":"open","requestId":"r1","generation":1,"request":{"path":"../escape","previousPath":null,"preparation":null,"previousEncoding":null,"currentEncoding":null,"contextLines":3,"continuation":null},"owner":{"workspaceRoot":"r","sessionKey":"k"}}"""
+                    """{"v":1,"t":"open","requestId":"r1","generation":1,"request":{"path":"../escape","previousPath":null,"preparation":null,"previousEncoding":null,"currentEncoding":null,"contextLines":3,"continuation":null},"owner":{"workspaceRoot":"r","lfsMediaDirectory":"m","windowOwner":"k"}}"""
         )
 
         Vitest.test (

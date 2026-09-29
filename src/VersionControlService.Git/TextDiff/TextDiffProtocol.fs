@@ -14,8 +14,13 @@ module Supervisor = VersionControlService.Git.TextDiff.TextDiffSupervisor
 [<Literal>]
 let ProtocolVersion = 1
 
-/// The workspace and consumer that own a diff session. Handles of one owner are never usable by another.
-type TextDiffOwner = { WorkspaceRoot: string; SessionKey: string }
+/// The workspace and window that own a diff session. Handles of one owner are never usable by another.
+/// The worker reads LFS objects from the media directory.
+type TextDiffOwner = {
+    WorkspaceRoot: string
+    LfsMediaDirectory: string
+    WindowOwner: string
+}
 
 /// A request the pool sends to a worker, with the contract record it carries.
 [<RequireQualifiedAccess>]
@@ -824,13 +829,23 @@ let private decodeOpenRequest: Decoder<OpenDiffRequest> =
     })
 
 let private encodeOwner (owner: TextDiffOwner) =
-    createObj [ "workspaceRoot" ==> owner.WorkspaceRoot; "sessionKey" ==> owner.SessionKey ]
+    createObj [
+        "workspaceRoot" ==> owner.WorkspaceRoot
+        "lfsMediaDirectory" ==> owner.LfsMediaDirectory
+        "windowOwner" ==> owner.WindowOwner
+    ]
 
 let private decodeOwner: Decoder<TextDiffOwner> =
     decodeObject (fun value -> decode {
         let! workspaceRoot = field "workspaceRoot" decodeString value
-        let! sessionKey = field "sessionKey" decodeString value
-        return { WorkspaceRoot = workspaceRoot; SessionKey = sessionKey }
+        let! lfsMediaDirectory = field "lfsMediaDirectory" decodeString value
+        let! windowOwner = field "windowOwner" decodeString value
+
+        return {
+            WorkspaceRoot = workspaceRoot
+            LfsMediaDirectory = lfsMediaDirectory
+            WindowOwner = windowOwner
+        }
     })
 
 let private encodeRequestBody (body: RequestBody) : string * DiffHandle option * (string * obj) list =

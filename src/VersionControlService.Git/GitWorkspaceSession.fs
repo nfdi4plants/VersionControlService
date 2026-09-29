@@ -15,6 +15,7 @@ module GitExecution = VersionControlService.Git.GitExecution
 module GitInternals = VersionControlService.Git.GitInternals
 module GitLfsExtensions = VersionControlService.Git.GitLfsExtensions
 module GitProvisioningService = VersionControlService.Git.GitProvisioningService
+module GitTextDiffService = VersionControlService.Git.TextDiff.GitTextDiffService
 module NodeProcess = VersionControlService.Runtime.Node.Process
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodePath = VersionControlService.Runtime.Node.Path
@@ -39,6 +40,18 @@ module GitSessionHooks =
     /// A test seam for the post-merge inspection deadline, in milliseconds. Production
     /// leaves it None and the built-in deadline applies.
     let mutable postMergeInspectionTimeoutOverride: int option = None
+
+/// Session options. Without text diff options the session's text diff service fails Open with
+/// diff_worker_failed, because the provider diffs only in the worker pool.
+type GitSessionOptions = {
+    Hooks: GitSessionHooks
+    TextDiff: GitTextDiffService.GitTextDiffOptions option
+}
+
+type private TextDiffMode =
+    | NoTextDiff
+    | WithoutPool
+    | WithPool of GitTextDiffService.GitTextDiffOptions
 
 let private publicationVerificationTimeoutMilliseconds = 30_000
 /// The deadline cancels the inspection. The runner resolves after the process closes.
@@ -5757,8 +5770,9 @@ let private createBrowser (state: SessionState) : RepositoryBrowserService = {
 // Session and factory
 // ---------------------------------------------------------------------------
 
-let createSessionWithCredentialsIdentityAndPolicy
+let private createSessionWithTextDiff
     (hooks: GitSessionHooks)
+    (textDiffMode: TextDiffMode)
     (credentials: GitCredentialStrategy.GitCredentialStrategy)
     (revisionIdentity: GitCredentialStrategy.GitIdentityStrategy)
     (revisionPolicy: RevisionPolicyStrategy)
@@ -5821,8 +5835,19 @@ let createSessionWithCredentialsIdentityAndPolicy
                     }
         }
 
+    let textDiff =
+        match textDiffMode with
+        | NoTextDiff -> None
+        | WithoutPool -> Some GitTextDiffService.unavailable
+        | WithPool options ->
+            Some(
+                GitTextDiffService.create options state.RepoPath (fun context ->
+                    resolveSessionMediaDirectory state (fun arguments -> runGit state.Hooks state.RepoPath arguments None context))
+            )
+
     {
         WorkspaceSession.createCoreOnly descriptor core with
+            TextDiff = textDiff
             Synchronization =
                 Some {
                     Refresh = fun context -> refresh state context
@@ -5916,6 +5941,31 @@ let createSessionWithCredentialsIdentityAndPolicy
                 )
             RepositoryBrowser = Some(createBrowser state)
     }
+
+let createSessionWithCredentialsIdentityAndPolicy
+    (hooks: GitSessionHooks)
+    (credentials: GitCredentialStrategy.GitCredentialStrategy)
+    (revisionIdentity: GitCredentialStrategy.GitIdentityStrategy)
+    (revisionPolicy: RevisionPolicyStrategy)
+    (binding: WorkspaceBinding)
+    : WorkspaceSession =
+    createSessionWithTextDiff hooks NoTextDiff credentials revisionIdentity revisionPolicy binding
+
+/// Session with a text diff service. The service uses the worker pool from the options, or fails Open with
+/// diff_worker_failed when the options carry no pool.
+let createSessionWithOptions
+    (options: GitSessionOptions)
+    (credentials: GitCredentialStrategy.GitCredentialStrategy)
+    (revisionIdentity: GitCredentialStrategy.GitIdentityStrategy)
+    (revisionPolicy: RevisionPolicyStrategy)
+    (binding: WorkspaceBinding)
+    : WorkspaceSession =
+    let textDiffMode =
+        match options.TextDiff with
+        | Some textDiff -> WithPool textDiff
+        | None -> WithoutPool
+
+    createSessionWithTextDiff options.Hooks textDiffMode credentials revisionIdentity revisionPolicy binding
 
 let createSessionWithCredentialsAndIdentity
     (hooks: GitSessionHooks)
@@ -6019,11 +6069,10 @@ let private expandLocationUrl (hooks: GitSessionHooks) (location: string) (conte
         | _ -> return location
     }
 
-let createFactoryWithCredentialsIdentityAndPolicy
+let private createFactoryWithSessions
     (hooks: GitSessionHooks)
     (credentials: GitCredentialStrategy.GitCredentialStrategy)
-    (revisionIdentity: GitCredentialStrategy.GitIdentityStrategy)
-    (revisionPolicy: RevisionPolicyStrategy)
+    (openSession: WorkspaceBinding -> WorkspaceSession)
     : ProviderFactory =
     let checkDependencies (context: OperationContext) : Async<OperationResult<DependencyStatus[]>> =
         async {
@@ -6666,14 +6715,7 @@ let createFactoryWithCredentialsIdentityAndPolicy
         }
     Open =
         fun binding _ -> async {
-            return
-                OperationResult.succeeded
-                    (createSessionWithCredentialsIdentityAndPolicy
-                        hooks
-                        credentials
-                        revisionIdentity
-                        revisionPolicy
-                        binding)
+            return OperationResult.succeeded (openSession binding)
         }
     CheckDependencies = checkDependencies
     InstallDependency =
@@ -6747,6 +6789,29 @@ let createFactoryWithCredentialsIdentityAndPolicy
                         )
             }
     }
+
+let createFactoryWithCredentialsIdentityAndPolicy
+    (hooks: GitSessionHooks)
+    (credentials: GitCredentialStrategy.GitCredentialStrategy)
+    (revisionIdentity: GitCredentialStrategy.GitIdentityStrategy)
+    (revisionPolicy: RevisionPolicyStrategy)
+    : ProviderFactory =
+    createFactoryWithSessions
+        hooks
+        credentials
+        (createSessionWithCredentialsIdentityAndPolicy hooks credentials revisionIdentity revisionPolicy)
+
+/// Factory whose sessions carry the text diff service described by the options.
+let createFactoryWithOptions
+    (options: GitSessionOptions)
+    (credentials: GitCredentialStrategy.GitCredentialStrategy)
+    (revisionIdentity: GitCredentialStrategy.GitIdentityStrategy)
+    (revisionPolicy: RevisionPolicyStrategy)
+    : ProviderFactory =
+    createFactoryWithSessions
+        options.Hooks
+        credentials
+        (createSessionWithOptions options credentials revisionIdentity revisionPolicy)
 
 let createFactoryWithCredentialsAndIdentity
     (hooks: GitSessionHooks)

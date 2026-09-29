@@ -61,8 +61,8 @@ let private openRequest: OpenDiffRequest = {
     Continuation = None
 }
 
-let private owner: TextDiffOwner = { WorkspaceRoot = "workspace"; SessionKey = "window-1" }
-let private otherOwner: TextDiffOwner = { WorkspaceRoot = "workspace"; SessionKey = "window-2" }
+let private owner: TextDiffOwner = { WorkspaceRoot = "workspace"; LfsMediaDirectory = "media"; WindowOwner = "window-1" }
+let private otherOwner: TextDiffOwner = { WorkspaceRoot = "workspace"; LfsMediaDirectory = "media"; WindowOwner = "window-2" }
 
 /// Lets a test hold ReadPage calls inside the in-process worker and observe what the handler saw.
 type private Control() =
