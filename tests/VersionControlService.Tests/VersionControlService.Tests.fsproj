@@ -27,6 +27,10 @@
     <Compile Include="ProviderResolver.test.fs" />
     <Compile Include="NodeRuntime.test.fs" />
     <Compile Include="TextDiffSupervisor.test.fs" />
+    <Compile Include="TextDiffProtocol.test.fs" />
+    <Compile Include="TextDiffPool.test.fs" />
+    <Compile Include="TextDiffTestWorker.fs" />
+    <Compile Include="TextDiffWorkerThread.test.fs" />
     <Compile Include="ConformanceSuiteDiscovery.test.fs" />
   </ItemGroup>
   <ItemGroup>

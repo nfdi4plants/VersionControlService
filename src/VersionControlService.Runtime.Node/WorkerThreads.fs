@@ -3,10 +3,9 @@ module VersionControlService.Runtime.Node.WorkerThreads
 open Fable.Core
 
 [<JS.PojoAttribute>]
-type WorkerOptions = {
-    eval: bool
-    workerData: obj option
-}
+type WorkerOptions(?eval: bool, ?workerData: obj) =
+    member val eval: bool option = eval with get, set
+    member val workerData: obj option = workerData with get, set
 
 [<AllowNullLiteral>]
 type MessagePort =

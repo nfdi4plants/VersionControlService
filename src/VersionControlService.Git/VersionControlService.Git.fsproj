@@ -12,6 +12,12 @@
     <Compile Include="Git\GitCommandResolver.fs" />
     <Compile Include="GitExecution.fs" />
     <Compile Include="TextDiff\TextDiffSupervisor.fs" />
+    <Compile Include="TextDiff\TextDiffProtocol.fs" />
+    <Compile Include="TextDiff\TextDiffTransport.fs" />
+    <Compile Include="TextDiff\TextDiffPool.fs" />
+    <Compile Include="TextDiff\TextDiffWorkerDispatcher.fs" />
+    <Compile Include="TextDiff\TextDiffInProcessTransport.fs" />
+    <Compile Include="TextDiff\TextDiffWorker.fs" />
     <Compile Include="Git\GitAuthAdapter.fs" />
     <Compile Include="GitCredentialStrategy.fs" />
     <Compile Include="Git\GitLfsAdapter.fs" />

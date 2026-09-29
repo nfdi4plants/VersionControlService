@@ -268,6 +268,80 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "stops a short command whose request is released while it starts",
+            TestOptions(timeout = 180000),
+            fun () -> promise {
+                let! root = createTempDirectory ()
+                let repo = NodePath.join [| root; "repo" |]
+                let events = ResizeArray<TextDiffSupervisor.SupervisorEvent>()
+                let mutable supervisor: TextDiffSupervisor.TextDiffSupervisor option = None
+
+                try
+                    do! initializeRepository repo
+                    let longStem = Microsoft.FSharp.Core.String.replicate 160 "a"
+
+                    for index in 0 .. 999 do
+                        let name = $"{longStem}{index:D4}.txt"
+                        do! NodeFileSystem.writeFileAsync (NodePath.join [| repo; name |]) "x" NodeFileSystem.TextEncoding.Utf8
+
+                    do! runGitOk repo [| "add"; "--"; "." |]
+                    do! runGitOk repo [| "commit"; "-q"; "-m"; "many files" |]
+                    let! created = createSupervisor root (Some events)
+                    supervisor <- Some created
+                    let owner: TextDiffSupervisor.ChildOwner = { WorkerId = "worker-release"; SessionId = "session-release"; RequestId = "request-release" }
+                    let run = created.RunShort(owner, repo, [| "ls-tree"; "-r"; "--name-only"; "HEAD" |])
+                    let release = created.ReleaseRequest owner
+                    let mutable runSettled = false
+                    let observedRun = promise {
+                        try
+                            let! result = run
+                            runSettled <- true
+                            return Some result
+                        with _ ->
+                            runSettled <- true
+                            return None
+                    }
+
+                    do! release
+                    let! _ = observedRun
+                    Vitest.expect(runSettled).toBe true
+
+                    let childClosed =
+                        events
+                        |> Seq.exists (fun event ->
+                            match event.Kind with
+                            | TextDiffSupervisor.ChildClosed _ -> true
+                            | _ -> false)
+
+                    Vitest.expect(childClosed).toBe true
+                    let childPid =
+                        events
+                        |> Seq.tryPick (fun event ->
+                            match event.Kind with
+                            | TextDiffSupervisor.ChildSpawned pid -> Some pid
+                            | _ -> None)
+
+                    match childPid with
+                    | Some pid ->
+                        let! goneAfter = waitForGone pid 2000.0
+                        Vitest.expect(goneAfter.IsSome).toBe true
+                    | None -> failwith "The short command did not register a child process."
+
+                    do! created.Dispose ()
+                    supervisor <- None
+                with error ->
+                    match supervisor with
+                    | Some created -> do! created.Dispose ()
+                    | None -> ()
+
+                    do! removeDirectory root
+                    return raise error
+
+                do! removeDirectory root
+            }
+        )
+
+        Vitest.test (
             "keeps a missing promisor object lookup local",
             TestOptions(timeout = 120000),
             fun () -> promise {

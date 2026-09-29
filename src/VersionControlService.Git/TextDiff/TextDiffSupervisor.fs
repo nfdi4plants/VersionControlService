@@ -335,43 +335,54 @@ type TextDiffSupervisor internal (instanceDirectory: string, gitExecutable: stri
 
         trackOperation owner operation
 
-    member _.RunShort(owner: ChildOwner, cwd: string, arguments: string[]) : JS.Promise<ShortResult> = promise {
-        ensureOwnerMaySpawn owner
+    member _.RunShort(owner: ChildOwner, cwd: string, arguments: string[]) : JS.Promise<ShortResult> =
+        // A release waits for the spawn step only. Once the child is registered the release kills it.
+        let mutable markSpawned: unit -> unit = ignore
+        let spawning = JS.Constructors.Promise.Create(fun resolve _ -> markSpawned <- fun () -> resolve ())
 
-        let validCommand =
-            match arguments with
-            | [| "cat-file"; "-s"; _ |] -> true
-            | [| "cat-file"; _ |] -> false
-            | [| "cat-file"; _; _; _ |] -> false
-            | [| command |] when command = "rev-parse" || command = "symbolic-ref" || command = "for-each-ref" || command = "ls-tree" -> true
-            | arguments when arguments.Length > 0 ->
-                let command = arguments[0]
-                command = "rev-parse" || command = "symbolic-ref" || command = "for-each-ref" || command = "ls-tree"
-            | _ -> false
+        let operation = promise {
+            ensureOwnerMaySpawn owner
 
-        if not validCommand then
-            return raise (InvalidOperationException("The Git command is not allowed for a text diff request."))
-        else
-            let gitArguments = Microsoft.FSharp.Collections.Array.concat [| [| "--literal-pathspecs"; "-c"; "protocol.allow=never" |]; arguments |]
-            let environment = GitExecution.resolvedEnvironment () |> localOnlyEnvironment
+            let validCommand =
+                match arguments with
+                | [| "cat-file"; "-s"; _ |] -> true
+                | [| "cat-file"; _ |] -> false
+                | [| "cat-file"; _; _; _ |] -> false
+                | [| command |] when command = "rev-parse" || command = "symbolic-ref" || command = "for-each-ref" || command = "ls-tree" -> true
+                | arguments when arguments.Length > 0 ->
+                    let command = arguments[0]
+                    command = "rev-parse" || command = "symbolic-ref" || command = "for-each-ref" || command = "ls-tree"
+                | _ -> false
 
-            let! result =
-                NodeProcess.runBoundedWithLifecycle
-                    gitExecutable
-                    gitArguments
-                    cwd
-                    environment
-                    65536
-                    65536
-                    (fun pid closed -> registerChild owner pid closed)
+            if not validCommand then
+                return raise (InvalidOperationException("The Git command is not allowed for a text diff request."))
+            else
+                let gitArguments = Microsoft.FSharp.Collections.Array.concat [| [| "--literal-pathspecs"; "-c"; "protocol.allow=never" |]; arguments |]
+                let environment = GitExecution.resolvedEnvironment () |> localOnlyEnvironment
 
-            return {
-                ExitCode = result.ExitCode
-                Stdout = result.Stdout
-                Stderr = result.Stderr
-                Error = result.Error
-            }
-    }
+                let! result =
+                    NodeProcess.runBoundedWithLifecycle
+                        gitExecutable
+                        gitArguments
+                        cwd
+                        environment
+                        65536
+                        65536
+                        (fun pid closed ->
+                            registerChild owner pid closed
+                            markSpawned ())
+
+                return {
+                    ExitCode = result.ExitCode
+                    Stdout = result.Stdout
+                    Stderr = result.Stderr
+                    Error = result.Error
+                }
+        }
+
+        NodeInterop.observePromise operation (fun _ -> markSpawned ()) (fun _ -> markSpawned ())
+        trackOperation owner spawning |> ignore
+        operation
 
     member this.StartBlobToSpool(owner: ChildOwner, cwd: string, oid: string, spoolPath: string) : JS.Promise<SpoolChild> =
         let operation = promise {
