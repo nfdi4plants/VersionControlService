@@ -10,7 +10,7 @@ type Hash64 = {
 module Hash =
     let create () = { Lo = 0x84222325u; Hi = 0xCBF29CE4u }
 
-    let reset (hash: Hash64) =
+    let inline reset (hash: Hash64) =
         hash.Lo <- 0x84222325u
         hash.Hi <- 0xCBF29CE4u
 

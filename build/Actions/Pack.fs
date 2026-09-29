@@ -51,17 +51,8 @@ let private prepareOutput (output: string) =
 /// already restored by the time a target gets here, which is why packing skips restore.
 let Local (version: string) (output: string) (releaseNotes: string option) =
     let outputPath = prepareOutput output
-    let textDiffProject =
-        "VersionControlService.TextDiff",
-        Path.GetFullPath "src/VersionControlService.TextDiff/VersionControlService.TextDiff.fsproj"
 
-    let projects =
-        Packages.projects
-        |> List.collect (fun project ->
-            if fst project = Packages.abstractions then [ project; textDiffProject ]
-            else [ project ])
-
-    for packageId, projectPath in projects do
+    for packageId, projectPath in Packages.projects do
         printGreenfn "Packing %s %s" packageId version
 
         let args =

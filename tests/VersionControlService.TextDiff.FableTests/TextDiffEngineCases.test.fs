@@ -5,6 +5,88 @@ open VersionControlService.TextDiff
 open VersionControlService.TextDiff.Tests
 
 module TextDiffEngineCasesTests =
+    let private benchmarkSize = 64 * 1024 * 1024
+
+    let private createMeter () =
+        let clock = ManualClock 0.0
+        Meter.create
+            (clock :> IClock)
+            { Limits.defaults with MaxUnits = 2_147_483_647; RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 }
+
+    let private scanThroughput encoding (data: byte[]) =
+        let state = Scanner.create encoding 0L None
+        let meter = createMeter ()
+        let started = BrowserClock.nowMs()
+        let result = Scanner.scanChunk state data 0 data.Length true meter (fun _ -> ()) (fun _ -> ())
+        let elapsed = max 1.0 (BrowserClock.nowMs() - started)
+        let rate = float data.Length / 1_000_000.0 * 1_000.0 / elapsed
+        result, rate
+
+    let private asciiLines size =
+        let data = Array.create size 0x61uy
+        let mutable lineEnd = 39
+
+        while lineEnd < size do
+            data[lineEnd] <- 0x0Auy
+            lineEnd <- lineEnd + 40
+
+        data
+
+    let private repeatWithAsciiTail size (pattern: byte[]) =
+        let data = Array.zeroCreate<byte> size
+        let mutable offset = 0
+
+        while offset + pattern.Length <= size do
+            Array.blit pattern 0 data offset pattern.Length
+            offset <- offset + pattern.Length
+
+        while offset < size do
+            data[offset] <- 0x61uy
+            offset <- offset + 1
+
+        data
+
+    let private repeatBytes size (pattern: byte[]) =
+        let data = Array.zeroCreate<byte> size
+        let mutable offset = 0
+
+        while offset < size do
+            let copied = min pattern.Length (size - offset)
+            Array.blit pattern 0 data offset copied
+            offset <- offset + copied
+
+        data
+
+    let private utf8Data () =
+        let cycle =
+            Array.concat [
+                Array.create 14 0x61uy
+                [| 0xC3uy; 0xA9uy; 0xC3uy; 0xA9uy; 0xC3uy; 0xA9uy |]
+                [| 0xE2uy; 0x82uy; 0xACuy; 0xE2uy; 0x82uy; 0xACuy; 0xE2uy; 0x82uy; 0xACuy |]
+            ]
+        let pattern = Array.zeroCreate<byte> (cycle.Length * 16)
+
+        for repeat = 0 to 15 do
+            Array.blit cycle 0 pattern (repeat * cycle.Length) cycle.Length
+
+        repeatWithAsciiTail benchmarkSize pattern
+
+    let private utf16LeData () =
+        let units =
+            Array.concat [
+                Array.create 14 0x0061
+                [| 0x00E9; 0x00E9; 0x00E9 |]
+                [| 0x20AC; 0x20AC; 0x20AC |]
+            ]
+        let pattern = Array.zeroCreate<byte> (units.Length * 2)
+
+        for index = 0 to units.Length - 1 do
+            let value = units[index]
+            pattern[index * 2] <- byte value
+            pattern[index * 2 + 1] <- byte (value >>> 8)
+
+        repeatBytes benchmarkSize pattern
+
     Vitest.describe (
         "Text diff engine shared cases",
         fun () ->
@@ -13,21 +95,28 @@ module TextDiffEngineCasesTests =
     )
 
     Vitest.it (
-        "scans a 64 MiB ASCII buffer",
+        "scans a 64 MiB ASCII buffer with 40-byte lines",
         fun () ->
-            let size = 64 * 1024 * 1024
-            let data = Array.create size 0x61uy
-            let state = Scanner.create TextEncoding.Utf8 0L None
-            let clock = ManualClock 0.0
-            let meter =
-                Meter.create
-                    (clock :> IClock)
-                    { Limits.defaults with RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 }
-            let started = BrowserClock.nowMs()
-            let result = Scanner.scanChunk state data 0 data.Length true meter (fun _ -> ()) (fun _ -> ())
-            let elapsed = max 1.0 (BrowserClock.nowMs() - started)
-            let rate = float size / 1_000_000.0 * 1_000.0 / elapsed
-            Vitest.log ($"Scanner throughput: {rate:F1} MB/s")
-            if result.Status <> EndOfInput then failwith "The scanner did not finish the 64 MiB input."
+            let result, rate = scanThroughput TextEncoding.Utf8 (asciiLines benchmarkSize)
+            Vitest.log ($"ASCII scanner throughput: {rate:F1} MB/s")
+            if result.Status <> EndOfInput then failwith "The ASCII scanner did not finish the 64 MiB input."
+            Async.StartAsPromise (async.Return ())
+    )
+
+    Vitest.it (
+        "scans a 64 MiB UTF-8 buffer with mixed character widths",
+        fun () ->
+            let result, rate = scanThroughput TextEncoding.Utf8 (utf8Data ())
+            Vitest.log ($"UTF-8 scanner throughput: {rate:F1} MB/s")
+            if result.Status <> EndOfInput then failwith "The UTF-8 scanner did not finish the 64 MiB input."
+            Async.StartAsPromise (async.Return ())
+    )
+
+    Vitest.it (
+        "scans a 64 MiB UTF-16 LE buffer",
+        fun () ->
+            let result, rate = scanThroughput TextEncoding.Utf16LE (utf16LeData ())
+            Vitest.log ($"UTF-16 LE scanner throughput: {rate:F1} MB/s")
+            if result.Status <> EndOfInput then failwith "The UTF-16 LE scanner did not finish the 64 MiB input."
             Async.StartAsPromise (async.Return ())
     )

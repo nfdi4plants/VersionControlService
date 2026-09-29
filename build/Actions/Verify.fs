@@ -32,7 +32,7 @@ let PackageGraph (feed: string) (version: string) =
     ]
 
     if packageFiles.Length <> Packages.all.Length then
-        errors.Add $"Expected exactly five .nupkg files, found {packageFiles.Length}."
+        errors.Add $"Expected exactly six .nupkg files, found {packageFiles.Length}."
 
     for file in packageFiles do
         try
@@ -117,4 +117,4 @@ let PackageGraph (feed: string) (version: string) =
         let report = String.Join(Environment.NewLine + " - ", errors)
         failwith $"Package graph verification failed:{Environment.NewLine} - {report}"
 
-    printGreenfn "Verified exact five-package graph at version %s." version
+    printGreenfn "Verified exact six-package graph at version %s." version

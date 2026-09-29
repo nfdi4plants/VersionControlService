@@ -12,6 +12,9 @@ module ProjectPaths =
     let abstractionsProject =
         Path.GetFullPath "src/VersionControlService.Abstractions/VersionControlService.Abstractions.fsproj"
 
+    let textDiffProject =
+        Path.GetFullPath "src/VersionControlService.TextDiff/VersionControlService.TextDiff.fsproj"
+
     let runtimeNodeProject =
         Path.GetFullPath "src/VersionControlService.Runtime.Node/VersionControlService.Runtime.Node.fsproj"
 
@@ -46,11 +49,12 @@ let packageLicense = "MIT"
 /// Source Link writes this prefix into the portable PDBs of the symbol packages.
 let sourceLinkPrefix = $"raw.githubusercontent.com/{gitOwner}/{project}/"
 
-/// The five coordinated packages, in the order they are packed. Dependency order keeps
-/// the umbrella last, and the graph verification expects exactly these ids.
+/// The six coordinated packages, in dependency order. The umbrella stays last so the
+/// graph verification can check the complete set of package ids.
 module Packages =
 
     let abstractions = "VersionControlService.Abstractions"
+    let textDiff = "VersionControlService.TextDiff"
     let runtimeNode = "VersionControlService.Runtime.Node"
     let git = "VersionControlService.Git"
     let lakeFs = "VersionControlService.LakeFs"
@@ -58,6 +62,7 @@ module Packages =
 
     let projects = [
         abstractions, ProjectPaths.abstractionsProject
+        textDiff, ProjectPaths.textDiffProject
         runtimeNode, ProjectPaths.runtimeNodeProject
         git, ProjectPaths.gitProject
         lakeFs, ProjectPaths.lakeFsProject
@@ -66,16 +71,17 @@ module Packages =
 
     let all = projects |> List.map fst
 
-    /// The umbrella ships metadata only; the other four carry assemblies and symbols.
+    /// The umbrella ships metadata only. The other five carry assemblies and symbols.
     let implementations = all |> List.filter (fun id -> id <> umbrella)
 
     let internalDependencies =
         Map [
             abstractions, []
+            textDiff, [ abstractions ]
             runtimeNode, [ abstractions ]
             git, [ abstractions; runtimeNode ]
             lakeFs, [ abstractions; runtimeNode ]
-            umbrella, [ abstractions; runtimeNode; git; lakeFs ]
+            umbrella, [ abstractions; textDiff; runtimeNode; git; lakeFs ]
         ]
 
 /// The live lakeFS matrix runs against this pinned image; docs/conformance-profiles.md

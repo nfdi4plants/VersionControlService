@@ -45,6 +45,18 @@ module TextDiffEngineCases =
 
         lines.ToArray(), evidence.ToArray(), state, meter
 
+    let private chunksOfSize size (data: byte[]) =
+        if size >= data.Length then [| data |]
+        else
+            [|
+                for offset in 0 .. size .. data.Length - 1 do
+                    let length = min size (data.Length - offset)
+                    yield data[offset .. offset + length - 1]
+            |]
+
+    let private lineHash (line: ScannedLine) =
+        Hash.toString { Lo = line.KeyLo; Hi = line.KeyHi }
+
     let private hashText (text: string) =
         let hash = Hash.create ()
         let mutable index = 0
@@ -268,9 +280,35 @@ module TextDiffEngineCases =
             let utf8 = bytes [ 0x61; 0xE2; 0x82; 0xAC; 0xF0; 0x9F; 0x98; 0x80 ]
             let utf16 = bytes [ 0x61; 0; 0xAC; 0x20; 0x3D; 0xD8; 0; 0xDE ]
             let utf32 = bytes [ 0x61; 0; 0; 0; 0xAC; 0x20; 0; 0; 0; 0xF6; 1; 0 ]
-            let one encoding data = scan encoding None [| data |] |> fun (lines, _, _, _) -> lines[0].KeyHash |> Hash.toString
+            let one encoding data = scan encoding None [| data |] |> fun (lines, _, _, _) -> lineHash lines[0]
             Check.equal (one TextEncoding.Utf8 utf8) (one TextEncoding.Utf16LE utf16) "UTF-16 text uses the same canonical key."
             Check.equal (one TextEncoding.Utf8 utf8) (one TextEncoding.Utf32LE utf32) "UTF-32 text uses the same canonical key."
+            return ()
+        }
+        "multi-byte scans preserve complete results across chunk sizes", fun () -> async {
+            let utf8 = bytes [
+                0x63; 0x61; 0x66; 0xC3; 0xA9; 0; 0x20; 0xE2; 0x82; 0xAC; 0x20
+                0xF0; 0x9F; 0x98; 0x80; 0x0D; 0x0A; 0xE9; 0x9B; 0xAA; 0x0A; 0x65; 0x6E; 0x64
+            ]
+            let utf16 = bytes [
+                0x63; 0; 0x61; 0; 0x66; 0; 0xE9; 0; 0; 0; 0x20; 0; 0xAC; 0x20; 0x20; 0
+                0x3D; 0xD8; 0; 0xDE; 0x0D; 0; 0x0A; 0; 0xEA; 0x96; 0x0A; 0; 0x65; 0; 0x6E; 0; 0x64; 0
+            ]
+
+            let verify (encoding: TextEncoding) (data: byte[]) =
+                let runs =
+                    [| 1; 3; 4096; data.Length |]
+                    |> Array.map (fun size ->
+                        let lines, evidence, _, _ = scan encoding (Some 64) (chunksOfSize size data)
+                        lines, evidence)
+                let expectedLines, expectedEvidence = runs[0]
+                for index = 1 to runs.Length - 1 do
+                    let lines, evidence = runs[index]
+                    Check.sequence expectedLines lines "Chunk sizes produce equal scanned lines and key hashes."
+                    Check.sequence expectedEvidence evidence "Chunk sizes produce equal scanner evidence."
+
+            verify TextEncoding.Utf8 utf8
+            verify TextEncoding.Utf16LE utf16
             return ()
         }
         "control evidence uses a strict one percent threshold", fun () -> async {
@@ -316,7 +354,7 @@ module TextDiffEngineCases =
             let resumedEnd = Scanner.scanChunk resumed suffix 0 suffix.Length true meter resumedLines.Add ignoredEvidence
             Check.equal EndOfInput originalEnd.Status "The original state reached EOF."
             Check.equal EndOfInput resumedEnd.Status "The copied state reached EOF."
-            Check.equal (Hash.toString originalLines[0].KeyHash) (Hash.toString resumedLines[0].KeyHash) "The copied scanner preserved its partial hash."
+            Check.equal (lineHash originalLines[0]) (lineHash resumedLines[0]) "The copied scanner preserved its partial hash."
             Check.equal originalLines[0].Utf16Length resumedLines[0].Utf16Length "The copied scanner preserved its line length."
             Check.equal (Some "aaaa") originalLines[0].Text "The retained prefix is bounded."
             return ()

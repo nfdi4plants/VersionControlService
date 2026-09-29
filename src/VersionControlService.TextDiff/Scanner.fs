@@ -13,7 +13,8 @@ type ScannedLine = {
     StartOffset: int64
     EndOffset: int64
     Ending: LineEnding
-    KeyHash: Hash64
+    KeyLo: uint32
+    KeyHi: uint32
     Utf16Length: int64
     Text: string option
 }
@@ -33,10 +34,10 @@ type ScannerStep = {
 
 type ObservationWindow = {
     Start: int64
-    mutable Bytes: int64
-    mutable Scalars: int64
-    mutable Controls: int64
-    mutable FirstControl: int64 option
+    mutable Bytes: int
+    mutable Scalars: int
+    mutable Controls: int
+    mutable FirstControl: int
 }
 
 type ScannerState = {
@@ -47,6 +48,7 @@ type ScannerState = {
     mutable ValidatedBytes: int64
     mutable LineStart: int64
     mutable LineLengthUtf16: int64
+    mutable LineLengthUtf16Delta: int
     mutable LineHasText: bool
     mutable LineHash: Hash64
     RetainLimit: int option
@@ -54,10 +56,17 @@ type ScannerState = {
     mutable RetainedCount: int
     mutable RetainStopped: bool
     mutable PendingCR: bool
-    mutable PendingCRStart: int64
     mutable PendingCREnd: int64
-    mutable PendingHigh: int
-    mutable PendingHighStart: int64
+    mutable PendingBytesBase: int64
+    mutable PendingBytesIndex: int
+    mutable PendingBytesWindowIndex: int
+    mutable PendingBytesWindowIsPrevious: bool
+    mutable PendingHighBase: int64
+    mutable PendingHighIndex: int
+    mutable PendingHighEndBase: int64
+    mutable PendingHighEndIndex: int
+    mutable PendingHighWindowIndex: int
+    mutable PendingHighWindowIsPrevious: bool
     mutable CurrentWindow: ObservationWindow
     mutable PreviousWindow: ObservationWindow option
     mutable IsComplete: bool
@@ -68,16 +77,24 @@ module Scanner =
     let ObservationWindowBytes = 65_536L
 
     [<Literal>]
-    let SmallFinalWindowBytes = 4_096L
+    let SmallFinalWindowBytes = 4_096
+
+    [<Literal>]
+    let private ObservationWindowByteCount = 65_536
+
+    let private noEnding = LineEnding.NoEnding
+    let private lfEnding = LineEnding.LF
+    let private crlfEnding = LineEnding.CRLF
+    let private crEnding = LineEnding.CR
 
     let private windowStart offset = offset / ObservationWindowBytes * ObservationWindowBytes
 
     let private newWindow start bytes = {
         Start = start
         Bytes = bytes
-        Scalars = 0L
-        Controls = 0L
-        FirstControl = None
+        Scalars = 0
+        Controls = 0
+        FirstControl = -1
     }
 
     let create encoding startOffset retainLimit =
@@ -100,6 +117,7 @@ module Scanner =
             ValidatedBytes = 0L
             LineStart = startOffset
             LineLengthUtf16 = 0L
+            LineLengthUtf16Delta = 0
             LineHasText = false
             LineHash = Hash.create ()
             RetainLimit = retainLimit
@@ -107,11 +125,18 @@ module Scanner =
             RetainedCount = 0
             RetainStopped = false
             PendingCR = false
-            PendingCRStart = 0L
             PendingCREnd = 0L
-            PendingHigh = 0
-            PendingHighStart = 0L
-            CurrentWindow = newWindow start (startOffset - start)
+            PendingBytesBase = startOffset
+            PendingBytesIndex = 0
+            PendingBytesWindowIndex = 0
+            PendingBytesWindowIsPrevious = false
+            PendingHighBase = startOffset
+            PendingHighIndex = 0
+            PendingHighEndBase = startOffset
+            PendingHighEndIndex = 0
+            PendingHighWindowIndex = 0
+            PendingHighWindowIsPrevious = false
+            CurrentWindow = newWindow start (int (startOffset - start))
             PreviousWindow = None
             IsComplete = false
         }
@@ -139,10 +164,13 @@ module Scanner =
         || scalar = 0x7F
 
     let private finalizeWindow (window: ObservationWindow) emitEvidence =
-        if window.Scalars > 0L && window.Controls * 100L > window.Scalars then
-            match window.FirstControl with
-            | Some offset -> emitEvidence { Offset = offset; Kind = "control ratio"; WindowStart = window.Start }
-            | None -> ()
+        if window.Scalars > 0 && window.Controls * 100 > window.Scalars then
+            if window.FirstControl >= 0 then
+                emitEvidence {
+                    Offset = window.Start + int64 window.FirstControl
+                    Kind = "control ratio"
+                    WindowStart = window.Start
+                }
 
     let private settlePrevious (state: ScannerState) emitEvidence =
         match state.PreviousWindow with
@@ -153,29 +181,46 @@ module Scanner =
 
     let private shiftWindow (state: ScannerState) emitEvidence =
         settlePrevious state emitEvidence
+        if state.Decoder.PendingCount > 0 then
+            state.PendingBytesWindowIsPrevious <- true
+        if state.Decoder.PendingHighSurrogate <> 0 then
+            state.PendingHighWindowIsPrevious <- true
         let previous = state.CurrentWindow
         let nextStart = previous.Start + ObservationWindowBytes
         state.PreviousWindow <- Some previous
-        state.CurrentWindow <- newWindow nextStart 0L
+        state.CurrentWindow <- newWindow nextStart 0
 
-    let private advanceWindowsTo (state: ScannerState) endOffset emitEvidence =
-        let mutable done' = false
-
-        while not done' do
-            let windowEnd = state.CurrentWindow.Start + ObservationWindowBytes
-
-            if endOffset >= windowEnd then
-                state.CurrentWindow.Bytes <- ObservationWindowBytes
+    let private advanceWindowsBy (state: ScannerState) count emitEvidence =
+        if count > 0 then
+            let byteCount = state.CurrentWindow.Bytes + count
+            if byteCount >= ObservationWindowByteCount then
+                state.CurrentWindow.Bytes <- ObservationWindowByteCount
                 shiftWindow state emitEvidence
             else
-                state.CurrentWindow.Bytes <- max state.CurrentWindow.Bytes (max 0L (endOffset - state.CurrentWindow.Start))
-
+                state.CurrentWindow.Bytes <- byteCount
                 if state.CurrentWindow.Bytes >= SmallFinalWindowBytes then
                     settlePrevious state emitEvidence
 
-                done' <- true
+    let private windowForScalar (state: ScannerState) isPrevious =
+        if isPrevious then
+            match state.PreviousWindow with
+            | Some previous -> previous
+            | None -> state.CurrentWindow
+        else state.CurrentWindow
 
-    let private addRetained (state: ScannerState) (units: int) (first: char) (second: char option) =
+    let private recordScalar (window: ObservationWindow) windowIndex scalar emitEvidence =
+        window.Scalars <- window.Scalars + 1
+        if isControl scalar then
+            window.Controls <- window.Controls + 1
+            if window.FirstControl < 0 then window.FirstControl <- windowIndex
+        if scalar = 0 then
+            emitEvidence {
+                Offset = window.Start + int64 windowIndex
+                Kind = "nul"
+                WindowStart = window.Start
+            }
+
+    let inline private addRetained (state: ScannerState) units (first: char) (second: char option) =
         match state.RetainLimit with
         | None -> ()
         | Some limit ->
@@ -183,7 +228,6 @@ module Scanner =
                 if state.RetainedCount + units <= limit then
                     state.Retained[state.RetainedCount] <- first
                     state.RetainedCount <- state.RetainedCount + 1
-
                     match second with
                     | Some value ->
                         state.Retained[state.RetainedCount] <- value
@@ -192,17 +236,20 @@ module Scanner =
                 else
                     state.RetainStopped <- true
 
-    let private lineText (state: ScannerState) =
+    let inline private lineText (state: ScannerState) =
         match state.RetainLimit with
         | None -> None
         | Some _ -> Some(String(state.Retained, 0, state.RetainedCount))
 
     let private emitLine (state: ScannerState) endOffset ending meter onLine =
+        state.LineLengthUtf16 <- state.LineLengthUtf16 + int64 state.LineLengthUtf16Delta
+        state.LineLengthUtf16Delta <- 0
         onLine {
             StartOffset = state.LineStart
             EndOffset = endOffset
             Ending = ending
-            KeyHash = { Lo = state.LineHash.Lo; Hi = state.LineHash.Hi }
+            KeyLo = state.LineHash.Lo
+            KeyHi = state.LineHash.Hi
             Utf16Length = state.LineLengthUtf16
             Text = lineText state
         }
@@ -210,95 +257,350 @@ module Scanner =
         state.LineStart <- endOffset
         state.LineLengthUtf16 <- 0L
         state.LineHasText <- false
-        state.LineHash <- Hash.create ()
+        Hash.reset state.LineHash
         state.RetainedCount <- 0
         state.RetainStopped <- false
 
-    let private recordScalar (state: ScannerState) start finish scalar emitEvidence =
-        advanceWindowsTo state start emitEvidence
-        state.CurrentWindow.Scalars <- state.CurrentWindow.Scalars + 1L
-        state.CurrentWindow.Bytes <- max state.CurrentWindow.Bytes (min ObservationWindowBytes (finish - state.CurrentWindow.Start))
-
-        if isControl scalar then
-            state.CurrentWindow.Controls <- state.CurrentWindow.Controls + 1L
-
-            if state.CurrentWindow.FirstControl.IsNone then
-                state.CurrentWindow.FirstControl <- Some start
-
-        if scalar = 0 then
-            emitEvidence { Offset = start; Kind = "nul"; WindowStart = windowStart start }
-
-    let private addTextScalar (state: ScannerState) scalar =
+    let inline private addTextScalar (state: ScannerState) scalar =
         state.LineHasText <- true
         Hash.addCodeUnit state.LineHash scalar
-
         if scalar <= 0xFFFF then
-            state.LineLengthUtf16 <- state.LineLengthUtf16 + 1L
+            state.LineLengthUtf16Delta <- state.LineLengthUtf16Delta + 1
             addRetained state 1 (char scalar) None
         else
             let value = scalar - 0x10000
             let high = char (0xD800 + (value >>> 10))
             let low = char (0xDC00 + (value &&& 0x3FF))
-            state.LineLengthUtf16 <- state.LineLengthUtf16 + 2L
+            state.LineLengthUtf16Delta <- state.LineLengthUtf16Delta + 2
             addRetained state 2 high (Some low)
 
-    let rec private processLineScalar state start finish scalar meter onLine =
+    let inline private addAsciiText (state: ScannerState) value =
+        state.LineHasText <- true
+        Hash.addByte state.LineHash (byte value)
+        state.LineLengthUtf16Delta <- state.LineLengthUtf16Delta + 1
+        match state.RetainLimit with
+        | Some limit when not state.RetainStopped ->
+            if state.RetainedCount < limit then
+                state.Retained[state.RetainedCount] <- char value
+                state.RetainedCount <- state.RetainedCount + 1
+            else
+                state.RetainStopped <- true
+        | _ -> ()
+
+    let private processLineScalar state segmentBase finishIndex scalar meter onLine =
+        let mutable processCurrent = true
         if state.PendingCR then
             if scalar = 0x0A then
                 state.PendingCR <- false
-                emitLine state finish LineEnding.CRLF meter onLine
+                emitLine state (segmentBase + int64 finishIndex) crlfEnding meter onLine
+                processCurrent <- false
             else
                 let crEnd = state.PendingCREnd
                 state.PendingCR <- false
-                emitLine state crEnd LineEnding.CR meter onLine
-                processLineScalar state start finish scalar meter onLine
-        elif scalar = 0x0D then
-            state.PendingCR <- true
-            state.PendingCRStart <- start
-            state.PendingCREnd <- finish
-        elif scalar = 0x0A then
-            emitLine state finish LineEnding.LF meter onLine
-        else
-            addTextScalar state scalar
+                emitLine state crEnd crEnding meter onLine
 
-    let private processScalar state start finish scalar meter onLine emitEvidence =
-        recordScalar state start finish scalar emitEvidence
-        processLineScalar state start finish scalar meter onLine
-
-    let private processCodeUnit state start finish unit meter onLine emitEvidence =
-        if state.PendingHigh <> 0 then
-            if unit >= 0xDC00 && unit <= 0xDFFF then
-                let scalar = 0x10000 + ((state.PendingHigh - 0xD800) <<< 10) + unit - 0xDC00
-                let scalarStart = state.PendingHighStart
-                state.PendingHigh <- 0
-                processScalar state scalarStart finish scalar meter onLine emitEvidence
+        if processCurrent then
+            if scalar = 0x0D then
+                state.PendingCR <- true
+                state.PendingCREnd <- segmentBase + int64 finishIndex
+            elif scalar = 0x0A then
+                emitLine state (segmentBase + int64 finishIndex) lfEnding meter onLine
             else
-                state.PendingHigh <- 0
-                processScalar state start finish unit meter onLine emitEvidence
-        elif unit >= 0xD800 && unit <= 0xDBFF then
-            state.PendingHigh <- unit
-            state.PendingHighStart <- start
+                addTextScalar state scalar
+
+    let private processAscii state segmentBase window windowIndex finishIndex value meter onLine emitEvidence =
+        recordScalar window windowIndex value emitEvidence
+        let mutable processCurrent = true
+        if state.PendingCR then
+            if value = 0x0A then
+                state.PendingCR <- false
+                emitLine state (segmentBase + int64 finishIndex) crlfEnding meter onLine
+                processCurrent <- false
+            else
+                let crEnd = state.PendingCREnd
+                state.PendingCR <- false
+                emitLine state crEnd crEnding meter onLine
+
+        if processCurrent then
+            if value = 0x0D then
+                state.PendingCR <- true
+                state.PendingCREnd <- segmentBase + int64 finishIndex
+            elif value = 0x0A then
+                emitLine state (segmentBase + int64 finishIndex) lfEnding meter onLine
+            else
+                addAsciiText state value
+
+    let private processDecodedScalar state segmentBase window windowIndex finishIndex scalar meter onLine emitEvidence =
+        if scalar <= 0x7F then
+            recordScalar window windowIndex scalar emitEvidence
+            let mutable processCurrent = true
+            if state.PendingCR then
+                if scalar = 0x0A then
+                    state.PendingCR <- false
+                    emitLine state (segmentBase + int64 finishIndex) crlfEnding meter onLine
+                    processCurrent <- false
+                else
+                    let crEnd = state.PendingCREnd
+                    state.PendingCR <- false
+                    emitLine state crEnd crEnding meter onLine
+
+            if processCurrent then
+                if scalar = 0x0D then
+                    state.PendingCR <- true
+                    state.PendingCREnd <- segmentBase + int64 finishIndex
+                elif scalar = 0x0A then
+                    emitLine state (segmentBase + int64 finishIndex) lfEnding meter onLine
+                else
+                    addAsciiText state scalar
         else
-            processScalar state start finish unit meter onLine emitEvidence
+            recordScalar window windowIndex scalar emitEvidence
+            processLineScalar state segmentBase finishIndex scalar meter onLine
+
+    let private scanSegment (state: ScannerState) (bytes: byte[]) offset count meter onLine emitEvidence =
+        let segmentBase = state.NextOffset
+        let windowByteBase = state.CurrentWindow.Bytes
+        let utf16LittleEndian =
+            match state.Encoding with
+            | TextEncoding.Utf16LE -> true
+            | _ -> false
+        let utf32LittleEndian =
+            match state.Encoding with
+            | TextEncoding.Utf32LE -> true
+            | _ -> false
+        let initialDecoder = state.Decoder
+        let mutable pendingValue = initialDecoder.PendingValue
+        let mutable pendingCount = initialDecoder.PendingCount
+        let mutable expectedCount = initialDecoder.ExpectedCount
+        let mutable pendingBytesBase = state.PendingBytesBase
+        let mutable pendingBytesIndex = state.PendingBytesIndex
+        let mutable pendingBytesWindowIndex = state.PendingBytesWindowIndex
+        let mutable pendingBytesWindowIsPrevious = state.PendingBytesWindowIsPrevious
+        let mutable pendingHigh = initialDecoder.PendingHighSurrogate
+        let mutable pendingHighBase = state.PendingHighBase
+        let mutable pendingHighIndex = state.PendingHighIndex
+        let mutable pendingHighEndBase = state.PendingHighEndBase
+        let mutable pendingHighEndIndex = state.PendingHighEndIndex
+        let mutable pendingHighWindowIndex = state.PendingHighWindowIndex
+        let mutable pendingHighWindowIsPrevious = state.PendingHighWindowIsPrevious
+        let mutable index = 0
+        let mutable error: DecodeError option = None
+
+        while index < count && error.IsNone do
+            let value = int bytes[offset + index]
+            match state.Encoding with
+            | TextEncoding.Windows1252 ->
+                let scalar = Decoders.windows1252Scalar value
+                if scalar < 0 then
+                    error <- Some { Offset = segmentBase + int64 index; Reason = "Undefined Windows-1252 byte." }
+                else
+                    let windowIndex = windowByteBase + index
+                    processDecodedScalar state segmentBase state.CurrentWindow windowIndex (index + 1) scalar meter onLine emitEvidence
+                    index <- index + 1
+            | TextEncoding.Utf8 ->
+                if pendingCount = 0 then
+                    if value <= 0x7F then
+                        let windowIndex = windowByteBase + index
+                        processAscii state segmentBase state.CurrentWindow windowIndex (index + 1) value meter onLine emitEvidence
+                        index <- index + 1
+                    else
+                        let expected = Decoders.utf8ExpectedCount value
+                        if expected = 0 then
+                            error <- Some { Offset = segmentBase + int64 index; Reason = "Invalid UTF-8 leading byte." }
+                        else
+                            pendingBytesBase <- segmentBase
+                            pendingBytesIndex <- index
+                            pendingBytesWindowIndex <- windowByteBase + index
+                            pendingBytesWindowIsPrevious <- false
+                            pendingValue <- value &&& (if expected = 2 then 0x1F elif expected = 3 then 0x0F else 0x07)
+                            pendingCount <- 1
+                            expectedCount <- expected
+                            index <- index + 1
+                elif not (Decoders.isUtf8Continuation value) then
+                    error <- Some {
+                        Offset = pendingBytesBase + int64 pendingBytesIndex
+                        Reason = "Invalid UTF-8 continuation byte."
+                    }
+                else
+                    let nextValue = (pendingValue <<< 6) ||| (value &&& 0x3F)
+                    let nextCount = pendingCount + 1
+                    index <- index + 1
+                    if nextCount = expectedCount then
+                        if not (Decoders.isValidUtf8Scalar expectedCount nextValue) then
+                            error <- Some {
+                                Offset = pendingBytesBase + int64 pendingBytesIndex
+                                Reason = "Invalid UTF-8 scalar value."
+                            }
+                        else
+                            let window = windowForScalar state pendingBytesWindowIsPrevious
+                            processDecodedScalar state segmentBase window pendingBytesWindowIndex index nextValue meter onLine emitEvidence
+                            pendingValue <- 0
+                            pendingCount <- 0
+                            expectedCount <- 0
+                            pendingBytesIndex <- -1
+                            pendingBytesWindowIndex <- -1
+                            pendingBytesWindowIsPrevious <- false
+                    else
+                        pendingValue <- nextValue
+                        pendingCount <- nextCount
+            | TextEncoding.Utf16LE
+            | TextEncoding.Utf16BE ->
+                let unitStartBase = if pendingCount = 0 then segmentBase else pendingBytesBase
+                let unitStartIndex = if pendingCount = 0 then index else pendingBytesIndex
+                let unitWindowIndex = if pendingCount = 0 then windowByteBase + index else pendingBytesWindowIndex
+                let unitWindowIsPrevious = pendingCount > 0 && pendingBytesWindowIsPrevious
+                let partial =
+                    if utf16LittleEndian then pendingValue ||| (value <<< (pendingCount * 8))
+                    else (pendingValue <<< 8) ||| value
+                let nextCount = pendingCount + 1
+                index <- index + 1
+                if nextCount = 1 then
+                    pendingBytesBase <- unitStartBase
+                    pendingBytesIndex <- unitStartIndex
+                    pendingBytesWindowIndex <- unitWindowIndex
+                    pendingBytesWindowIsPrevious <- unitWindowIsPrevious
+                    pendingValue <- partial
+                    pendingCount <- 1
+                    expectedCount <- 2
+                else
+                    pendingValue <- 0
+                    pendingCount <- 0
+                    expectedCount <- 0
+                    pendingBytesIndex <- -1
+                    pendingBytesWindowIndex <- -1
+                    pendingBytesWindowIsPrevious <- false
+                    if pendingHigh <> 0 then
+                        if Decoders.isLowSurrogate partial then
+                            let scalar = 0x10000 + ((pendingHigh - 0xD800) <<< 10) + partial - 0xDC00
+                            let window = windowForScalar state pendingHighWindowIsPrevious
+                            processDecodedScalar state segmentBase window pendingHighWindowIndex index scalar meter onLine emitEvidence
+                            pendingHigh <- 0
+                            pendingHighBase <- segmentBase
+                            pendingHighIndex <- index
+                            pendingHighEndBase <- segmentBase
+                            pendingHighEndIndex <- index
+                            pendingHighWindowIndex <- -1
+                            pendingHighWindowIsPrevious <- false
+                        else
+                            error <- Some {
+                                Offset = pendingHighBase + int64 pendingHighIndex
+                                Reason = "Unpaired UTF-16 high surrogate."
+                            }
+                    elif Decoders.isHighSurrogate partial then
+                        pendingHigh <- partial
+                        pendingHighBase <- unitStartBase
+                        pendingHighIndex <- unitStartIndex
+                        pendingHighEndBase <- segmentBase
+                        pendingHighEndIndex <- index
+                        pendingHighWindowIndex <- unitWindowIndex
+                        pendingHighWindowIsPrevious <- unitWindowIsPrevious
+                    elif Decoders.isLowSurrogate partial then
+                        error <- Some {
+                            Offset = unitStartBase + int64 unitStartIndex
+                            Reason = "Unpaired UTF-16 low surrogate."
+                        }
+                    else
+                        let window = windowForScalar state unitWindowIsPrevious
+                        processDecodedScalar state segmentBase window unitWindowIndex index partial meter onLine emitEvidence
+            | TextEncoding.Utf32LE
+            | TextEncoding.Utf32BE ->
+                let unitStartBase = if pendingCount = 0 then segmentBase else pendingBytesBase
+                let unitStartIndex = if pendingCount = 0 then index else pendingBytesIndex
+                let unitWindowIndex = if pendingCount = 0 then windowByteBase + index else pendingBytesWindowIndex
+                let unitWindowIsPrevious = pendingCount > 0 && pendingBytesWindowIsPrevious
+                if pendingCount < 3 then
+                    let partial =
+                        if utf32LittleEndian then pendingValue ||| (value <<< (pendingCount * 8))
+                        else (pendingValue <<< 8) ||| value
+                    if pendingCount = 0 then
+                        pendingBytesBase <- unitStartBase
+                        pendingBytesIndex <- unitStartIndex
+                        pendingBytesWindowIndex <- unitWindowIndex
+                        pendingBytesWindowIsPrevious <- false
+                    pendingValue <- partial
+                    pendingCount <- pendingCount + 1
+                    expectedCount <- 4
+                    index <- index + 1
+                else
+                    let first, second, third, fourth =
+                        if utf32LittleEndian then
+                            pendingValue &&& 0xFF,
+                            (pendingValue >>> 8) &&& 0xFF,
+                            (pendingValue >>> 16) &&& 0xFF,
+                            value
+                        else
+                            (pendingValue >>> 16) &&& 0xFF,
+                            (pendingValue >>> 8) &&& 0xFF,
+                            pendingValue &&& 0xFF,
+                            value
+                    index <- index + 1
+                    pendingCount <- 0
+                    expectedCount <- 0
+                    pendingValue <- 0
+                    pendingBytesIndex <- -1
+                    pendingBytesWindowIndex <- -1
+                    pendingBytesWindowIsPrevious <- false
+                    if not (Decoders.isValidUtf32Bytes first second third fourth utf32LittleEndian) then
+                        error <- Some {
+                            Offset = unitStartBase + int64 unitStartIndex
+                            Reason = "Invalid UTF-32 scalar value."
+                        }
+                    else
+                        let scalar =
+                            if utf32LittleEndian then first ||| (second <<< 8) ||| (third <<< 16)
+                            else (second <<< 16) ||| (third <<< 8) ||| fourth
+                        let window = windowForScalar state unitWindowIsPrevious
+                        processDecodedScalar state segmentBase window unitWindowIndex index scalar meter onLine emitEvidence
+
+        let nextOffset = segmentBase + int64 index
+        state.NextOffset <- nextOffset
+        if error.IsNone then
+            state.ValidatedBytes <- nextOffset - state.StartOffset
+        let pendingStart =
+            if pendingCount > 0 then pendingBytesBase + int64 pendingBytesIndex
+            else nextOffset
+        let pendingHighStart =
+            if pendingHigh <> 0 then pendingHighBase + int64 pendingHighIndex
+            else nextOffset
+        let pendingHighEnd =
+            if pendingHigh <> 0 then pendingHighEndBase + int64 pendingHighEndIndex
+            else nextOffset
+        state.Decoder <- {
+            initialDecoder with
+                AbsoluteOffset = nextOffset
+                PendingStart = pendingStart
+                PendingValue = pendingValue
+                PendingCount = pendingCount
+                ExpectedCount = expectedCount
+                PendingHighSurrogate = pendingHigh
+                PendingHighStart = pendingHighStart
+                PendingHighEnd = pendingHighEnd
+        }
+        state.PendingBytesBase <- pendingBytesBase
+        state.PendingBytesIndex <- pendingBytesIndex
+        state.PendingBytesWindowIndex <- pendingBytesWindowIndex
+        state.PendingBytesWindowIsPrevious <- pendingBytesWindowIsPrevious
+        state.PendingHighBase <- pendingHighBase
+        state.PendingHighIndex <- pendingHighIndex
+        state.PendingHighEndBase <- pendingHighEndBase
+        state.PendingHighEndIndex <- pendingHighEndIndex
+        state.PendingHighWindowIndex <- pendingHighWindowIndex
+        state.PendingHighWindowIsPrevious <- pendingHighWindowIsPrevious
+        index, error
 
     let private finishWindows (state: ScannerState) emitEvidence =
-        advanceWindowsTo state state.NextOffset emitEvidence
-
         let current = state.CurrentWindow
-
         match state.PreviousWindow with
-        | Some previous when current.Bytes > 0L && current.Bytes < SmallFinalWindowBytes ->
+        | Some previous when current.Bytes > 0 && current.Bytes < SmallFinalWindowBytes ->
+            let firstControl =
+                if previous.FirstControl >= 0 then previous.FirstControl
+                elif current.FirstControl >= 0 then ObservationWindowByteCount + current.FirstControl
+                else -1
             let merged = {
                 Start = previous.Start
                 Bytes = previous.Bytes + current.Bytes
                 Scalars = previous.Scalars + current.Scalars
                 Controls = previous.Controls + current.Controls
-                FirstControl =
-                    match previous.FirstControl, current.FirstControl with
-                    | Some left, Some right -> Some(min left right)
-                    | Some left, None -> Some left
-                    | None, Some right -> Some right
-                    | None, None -> None
+                FirstControl = firstControl
             }
             finalizeWindow merged emitEvidence
             state.PreviousWindow <- None
@@ -307,81 +609,6 @@ module Scanner =
             finalizeWindow current emitEvidence
             state.PreviousWindow <- None
         | None -> finalizeWindow current emitEvidence
-
-    let private scanAsciiPrefix state (bytes: byte[]) offset count meter onLine emitEvidence =
-        let mutable consumed = 0
-        let mutable stopped = false
-
-        while consumed < count && not stopped do
-            advanceWindowsTo state state.NextOffset emitEvidence
-            let windowRemaining = state.CurrentWindow.Start + ObservationWindowBytes - state.NextOffset
-            let segmentCount = min (count - consumed) (int windowRemaining)
-            let startOffset = state.NextOffset
-            let mutable index = 0
-
-            while index < segmentCount && bytes[offset + consumed + index] < 0x80uy do
-                let value = int bytes[offset + consumed + index]
-                let absolute = startOffset + int64 index
-                let window = state.CurrentWindow
-                window.Scalars <- window.Scalars + 1L
-
-                if isControl value then
-                    window.Controls <- window.Controls + 1L
-
-                    if window.FirstControl.IsNone then
-                        window.FirstControl <- Some absolute
-
-                if value = 0 then
-                    emitEvidence { Offset = absolute; Kind = "nul"; WindowStart = window.Start }
-
-                let mutable continueValue = true
-
-                if state.PendingCR then
-                    state.PendingCR <- false
-
-                    if value = 0x0A then
-                        emitLine state (absolute + 1L) LineEnding.CRLF meter onLine
-                        continueValue <- false
-                    else
-                        emitLine state state.PendingCREnd LineEnding.CR meter onLine
-
-                if continueValue then
-                    if value = 0x0D then
-                        state.PendingCR <- true
-                        state.PendingCRStart <- absolute
-                        state.PendingCREnd <- absolute + 1L
-                    elif value = 0x0A then
-                        emitLine state (absolute + 1L) LineEnding.LF meter onLine
-                    else
-                        state.LineHasText <- true
-                        state.LineLengthUtf16 <- state.LineLengthUtf16 + 1L
-                        Hash.addByte state.LineHash (byte value)
-
-                        match state.RetainLimit with
-                        | Some limit when not state.RetainStopped ->
-                            if state.RetainedCount < limit then
-                                state.Retained[state.RetainedCount] <- char value
-                                state.RetainedCount <- state.RetainedCount + 1
-                            else
-                                state.RetainStopped <- true
-                        | _ -> ()
-
-                index <- index + 1
-
-            if index = 0 then
-                stopped <- true
-            else
-                state.NextOffset <- startOffset + int64 index
-                state.ValidatedBytes <- state.NextOffset - state.StartOffset
-                state.Decoder <- { state.Decoder with AbsoluteOffset = state.NextOffset }
-                Meter.chargeBytes meter index
-                consumed <- consumed + index
-                advanceWindowsTo state state.NextOffset emitEvidence
-
-                if index < segmentCount || Meter.overBudget meter || Meter.quantumDue meter then
-                    stopped <- true
-
-        consumed
 
     let scanChunk (state: ScannerState) (bytes: byte[]) offset count endOfSource (meter: Meter) onLine emitEvidence =
         if isNull bytes then nullArg (nameof bytes)
@@ -393,58 +620,33 @@ module Scanner =
         let mutable error: DecodeError option = None
         let mutable status = InputConsumed
         let mutable stopped = false
+        let mutable checkedMeter = false
 
         while consumed < count && not stopped && error.IsNone do
-            if Meter.overBudget meter then
-                status <- BudgetReached
-                stopped <- true
-            elif Meter.quantumDue meter then
-                status <- QuantumReached
-                stopped <- true
-            else
-                let chunkCount = min 4096 (count - consumed)
-                let canScanAscii =
-                    state.Encoding = TextEncoding.Utf8
-                    && state.Decoder.PendingCount = 0
-                    && state.Decoder.PendingHighSurrogate = 0
-                    && state.PendingHigh = 0
-
-                let asciiConsumed =
-                    if canScanAscii then scanAsciiPrefix state bytes (offset + consumed) chunkCount meter onLine emitEvidence
-                    else 0
-
-                consumed <- consumed + asciiConsumed
-
+            if not checkedMeter then
+                checkedMeter <- true
                 if Meter.overBudget meter then
                     status <- BudgetReached
                     stopped <- true
                 elif Meter.quantumDue meter then
                     status <- QuantumReached
                     stopped <- true
-                elif asciiConsumed < chunkCount then
-                    let inputOffset = offset + consumed
-                    let remaining = chunkCount - asciiConsumed
-                    let sink start finish unit = processCodeUnit state start finish unit meter onLine emitEvidence
-                    let decoder, result = Decoders.decode state.Decoder bytes inputOffset remaining sink
-                    state.Decoder <- decoder
-
-                    match result with
-                    | Ok actual ->
-                        consumed <- consumed + actual
-                        state.NextOffset <- decoder.AbsoluteOffset
-                        state.ValidatedBytes <- state.NextOffset - state.StartOffset
-                        Meter.chargeBytes meter actual
-                        advanceWindowsTo state state.NextOffset emitEvidence
-                    | Error decodeError ->
-                        let actual = int (decoder.AbsoluteOffset - state.NextOffset)
-                        if actual > 0 then Meter.chargeBytes meter actual
-                        state.NextOffset <- decoder.AbsoluteOffset
-                        state.ValidatedBytes <- max state.ValidatedBytes (decodeError.Offset - state.StartOffset)
-                        consumed <- consumed + max 0 actual
-                        advanceWindowsTo state state.NextOffset emitEvidence
-                        error <- Some decodeError
-
-                if error.IsNone then
+            if not stopped then
+                let windowRemaining = ObservationWindowByteCount - state.CurrentWindow.Bytes
+                let segmentCount = min 4096 (min (count - consumed) windowRemaining)
+                let actual, segmentError =
+                    scanSegment state bytes (offset + consumed) segmentCount meter onLine emitEvidence
+                if actual > 0 then
+                    Meter.chargeBytes meter actual
+                    advanceWindowsBy state actual emitEvidence
+                    state.LineLengthUtf16 <- state.LineLengthUtf16 + int64 state.LineLengthUtf16Delta
+                    state.LineLengthUtf16Delta <- 0
+                    consumed <- consumed + actual
+                match segmentError with
+                | Some decodeError ->
+                    state.ValidatedBytes <- max state.ValidatedBytes (decodeError.Offset - state.StartOffset)
+                    error <- Some decodeError
+                | None ->
                     if Meter.overBudget meter then
                         status <- BudgetReached
                         stopped <- true
@@ -462,24 +664,16 @@ module Scanner =
                 status <- DecodeFailure
             | Ok decoder ->
                 state.Decoder <- decoder
-                if state.PendingHigh <> 0 then
-                    error <- Some { Offset = state.PendingHighStart; Reason = "Unpaired decoded high surrogate." }
-                    status <- DecodeFailure
-                else
-                    if state.PendingCR then
-                        state.PendingCR <- false
-                        emitLine state state.PendingCREnd LineEnding.CR meter onLine
-
-                    if state.LineHasText then
-                        emitLine state state.NextOffset LineEnding.NoEnding meter onLine
-
-                    finishWindows state emitEvidence
-                    state.IsComplete <- true
-                    status <- EndOfInput
+                if state.PendingCR then
+                    state.PendingCR <- false
+                    emitLine state state.PendingCREnd crEnding meter onLine
+                if state.LineHasText then
+                    emitLine state state.NextOffset noEnding meter onLine
+                finishWindows state emitEvidence
+                state.IsComplete <- true
+                status <- EndOfInput
         | None when consumed = count && not stopped -> status <- InputConsumed
         | None when consumed = count -> ()
         | None -> ()
 
         { Consumed = consumed; Status = status; Error = error }
-
-    let validatedBytes (state: ScannerState) = state.ValidatedBytes

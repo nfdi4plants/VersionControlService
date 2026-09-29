@@ -32,7 +32,7 @@ module Meter =
             Clock = clock
         }
 
-    let charge (meter: Meter) (units: int) =
+    let inline charge (meter: Meter) (units: int) =
         if units > 0 then
             if meter.Units > System.Int32.MaxValue - units then meter.Units <- System.Int32.MaxValue
             else meter.Units <- meter.Units + units

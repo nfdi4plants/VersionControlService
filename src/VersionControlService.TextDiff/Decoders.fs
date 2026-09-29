@@ -68,7 +68,7 @@ module Decoders =
             sink start finish (0xD800 + (value >>> 10))
             sink start finish (0xDC00 + (value &&& 0x3FF))
 
-    let private windows1252 = [|
+    let windows1252 = [|
         0x0000; 0x0001; 0x0002; 0x0003; 0x0004; 0x0005; 0x0006; 0x0007
         0x0008; 0x0009; 0x000A; 0x000B; 0x000C; 0x000D; 0x000E; 0x000F
         0x0010; 0x0011; 0x0012; 0x0013; 0x0014; 0x0015; 0x0016; 0x0017
@@ -103,6 +103,36 @@ module Decoders =
         0x00F8; 0x00F9; 0x00FA; 0x00FB; 0x00FC; 0x00FD; 0x00FE; 0x00FF
     |]
 
+    let inline utf8ExpectedCount value =
+        if value >= 0xC2 && value <= 0xDF then 2
+        elif value >= 0xE0 && value <= 0xEF then 3
+        elif value >= 0xF0 && value <= 0xF4 then 4
+        else 0
+
+    let inline isUtf8Continuation value = value >= 0x80 && value <= 0xBF
+
+    let inline isValidUtf8Scalar expectedCount scalar =
+        not (
+            (expectedCount = 3 && scalar < 0x800)
+            || (expectedCount = 4 && scalar < 0x10000)
+            || (scalar >= 0xD800 && scalar <= 0xDFFF)
+            || scalar > 0x10FFFF
+        )
+
+    let inline isHighSurrogate unit = unit >= 0xD800 && unit <= 0xDBFF
+
+    let inline isLowSurrogate unit = unit >= 0xDC00 && unit <= 0xDFFF
+
+    let inline isValidUtf32Bytes first second third fourth littleEndian =
+        if littleEndian then
+            let scalar = first ||| (second <<< 8) ||| (third <<< 16)
+            fourth = 0 && third <= 0x10 && not (scalar >= 0xD800 && scalar <= 0xDFFF)
+        else
+            let scalar = (second <<< 16) ||| (third <<< 8) ||| fourth
+            first = 0 && second <= 0x10 && not (scalar >= 0xD800 && scalar <= 0xDFFF)
+
+    let inline windows1252Scalar value = windows1252[value]
+
     let decode (initial: DecoderState) (bytes: byte[]) offset count (sink: int64 -> int64 -> int -> unit) =
         if isNull bytes then nullArg (nameof bytes)
         if offset < 0 || count < 0 || offset > bytes.Length - count then invalidArg (nameof offset) "The byte range is outside the input buffer."
@@ -122,7 +152,7 @@ module Decoders =
 
         let acceptUtf16Unit unit start finish =
             if pendingHigh <> 0 then
-                if unit >= 0xDC00 && unit <= 0xDFFF then
+                if isLowSurrogate unit then
                     sink pendingHighStart pendingHighEnd pendingHigh
                     sink start finish unit
                     pendingHigh <- 0
@@ -130,11 +160,11 @@ module Decoders =
                     pendingHighEnd <- 0L
                 else
                     error <- Some { Offset = pendingHighStart; Reason = "Unpaired UTF-16 high surrogate." }
-            elif unit >= 0xD800 && unit <= 0xDBFF then
+            elif isHighSurrogate unit then
                 pendingHigh <- unit
                 pendingHighStart <- start
                 pendingHighEnd <- finish
-            elif unit >= 0xDC00 && unit <= 0xDFFF then
+            elif isLowSurrogate unit then
                 error <- Some { Offset = start; Reason = "Unpaired UTF-16 low surrogate." }
             else
                 sink start finish unit
@@ -144,7 +174,7 @@ module Decoders =
             let value = int bytes[index]
             match encoding with
             | TextEncoding.Windows1252 ->
-                let scalar = windows1252[value]
+                let scalar = windows1252Scalar value
                 if scalar < 0 then error <- Some { Offset = currentOffset; Reason = "Undefined Windows-1252 byte." }
                 else
                     sink currentOffset (currentOffset + 1L) scalar
@@ -157,11 +187,7 @@ module Decoders =
                         absoluteOffset <- currentOffset + 1L
                         index <- index + 1
                     else
-                        let expected =
-                            if value >= 0xC2 && value <= 0xDF then 2
-                            elif value >= 0xE0 && value <= 0xEF then 3
-                            elif value >= 0xF0 && value <= 0xF4 then 4
-                            else 0
+                        let expected = utf8ExpectedCount value
                         if expected = 0 then error <- Some { Offset = currentOffset; Reason = "Invalid UTF-8 leading byte." }
                         else
                             absoluteOffset <- currentOffset + 1L
@@ -170,7 +196,7 @@ module Decoders =
                             pendingCount <- 1
                             expectedCount <- expected
                             index <- index + 1
-                elif value < 0x80 || value > 0xBF then
+                elif not (isUtf8Continuation value) then
                     error <- Some { Offset = pendingStart; Reason = "Invalid UTF-8 continuation byte." }
                 else
                     let nextValue = (pendingValue <<< 6) ||| (value &&& 0x3F)
@@ -179,11 +205,7 @@ module Decoders =
                     index <- index + 1
                     if nextCount = expectedCount then
                         let scalar = nextValue
-                        let isInvalid =
-                            (expectedCount = 3 && scalar < 0x800)
-                            || (expectedCount = 4 && scalar < 0x10000)
-                            || (scalar >= 0xD800 && scalar <= 0xDFFF)
-                            || scalar > 0x10FFFF
+                        let isInvalid = not (isValidUtf8Scalar expectedCount scalar)
                         if isInvalid then
                             absoluteOffset <- nextOffset
                             error <- Some { Offset = pendingStart; Reason = "Invalid UTF-8 scalar value." }
@@ -235,7 +257,19 @@ module Decoders =
                     pendingValue <- 0
                     pendingCount <- 0
                     expectedCount <- 0
-                    if scalarBits > 0x10FFFFu || (scalarBits >= 0xD800u && scalarBits <= 0xDFFFu) then
+                    let littleEndian = encoding = TextEncoding.Utf32LE
+                    let first, second, third, fourth =
+                        if littleEndian then
+                            int (scalarBits &&& 0xFFu),
+                            int ((scalarBits >>> 8) &&& 0xFFu),
+                            int ((scalarBits >>> 16) &&& 0xFFu),
+                            int ((scalarBits >>> 24) &&& 0xFFu)
+                        else
+                            int ((scalarBits >>> 24) &&& 0xFFu),
+                            int ((scalarBits >>> 16) &&& 0xFFu),
+                            int ((scalarBits >>> 8) &&& 0xFFu),
+                            int (scalarBits &&& 0xFFu)
+                    if not (isValidUtf32Bytes first second third fourth littleEndian) then
                         error <- Some { Offset = start; Reason = "Invalid UTF-32 scalar value." }
                     else
                         let scalar = int scalarBits
