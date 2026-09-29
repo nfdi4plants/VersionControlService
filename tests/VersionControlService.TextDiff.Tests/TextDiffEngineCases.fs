@@ -472,6 +472,63 @@ module TextDiffEngineCases =
             expectBinary "NUL" (Classification.classifyWithChoice 2L [| sample (bytes [ 0x41; 0 ]) |] TextEncoding.Utf8)
             return ()
         }
+        "overlapping samples count each source scalar once", fun () -> async {
+            let samples =
+                [|
+                    for bufferOffset in [| 0L; 17_232L; 34_464L |] do
+                        let contents =
+                            Array.init 65_536 (fun index ->
+                                let sourceOffset = bufferOffset + int64 index
+                                if sourceOffset >= 34_464L && sourceOffset < 35_064L then 0x01uy else 0x41uy)
+                        yield {
+                            BufferOffset = bufferOffset
+                            Bytes = contents
+                            SampleOffset = 0
+                            SampleLength = contents.Length
+                        }
+                |]
+            expectClassified (Classification.classify 100_000L samples) TextEncoding.Utf8 false 0
+            return ()
+        }
+        "an unobserved PE target does not count as a signature", fun () -> async {
+            let totalLength = 151_587_085L
+            let sampleLength = 65_536
+            let middleOffset = (totalLength - int64 sampleLength) / 2L
+            let endOffset = totalLength - int64 sampleLength
+            let start = Array.create sampleLength 0x41uy
+            start[0] <- 0x4Duy
+            start[1] <- 0x5Auy
+            for index = 60 to 63 do start[index] <- 0x09uy
+            let makeSample bufferOffset contents = {
+                BufferOffset = bufferOffset
+                Bytes = contents
+                SampleOffset = 0
+                SampleLength = contents.Length
+            }
+            let samples = [|
+                makeSample 0L start
+                makeSample middleOffset (Array.create sampleLength 0x41uy)
+                makeSample endOffset (Array.create sampleLength 0x41uy)
+            |]
+            expectClassified (Classification.classify totalLength samples) TextEncoding.Utf8 false 0
+            return ()
+        }
+        "an HDF5 signature at byte zero is binary evidence", fun () -> async {
+            let data = Array.create 100 0x41uy
+            Array.blit (bytes [ 0x89; 0x48; 0x44; 0x46; 13; 10; 26; 10 ]) 0 data 0 8
+            expectBinary "HDF5" (classify data)
+            return ()
+        }
+        "a chosen encoding still checks binary signatures", fun () -> async {
+            let data = ascii "%PDF-1.7"
+            expectBinary "PDF" (Classification.classifyWithChoice (int64 data.Length) [| sample data |] TextEncoding.Utf8)
+            return ()
+        }
+        "a byte order mark fixes the chosen encoding", fun () -> async {
+            let data = bytes [ 0xEF; 0xBB; 0xBF; 0x41 ]
+            expectClassified (Classification.classifyWithChoice (int64 data.Length) [| sample data |] TextEncoding.Windows1252) TextEncoding.Utf8 true 3
+            return ()
+        }
         "allocation reservations enforce caps and release leases", fun () -> async {
             let ledger = Ledger()
             Check.true' (ledger.TryReserve(AllocationCategory.PreviousWindows, 32L * 1024L * 1024L)) "A full previous-side window budget fits."

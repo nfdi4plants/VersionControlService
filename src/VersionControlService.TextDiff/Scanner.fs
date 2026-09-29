@@ -409,7 +409,15 @@ module Scanner =
     let private finishSegment (state: ScannerState) (origin: float) (index: int) (error: DecodeError option) =
         let nextOffset = origin + float index
         state.NextOffset <- nextOffset
-        if error.IsNone then state.ValidatedBytes <- nextOffset - float state.StartOffset
+        let completedBoundary =
+            if state.PendingCount > 0 then state.PendingStart
+            elif state.PendingHigh <> 0 then state.PendingHighStart
+            else nextOffset
+        let validatedBoundary =
+            match error with
+            | Some decodeError -> min completedBoundary (float decodeError.Offset)
+            | None -> completedBoundary
+        state.ValidatedBytes <- validatedBoundary - float state.StartOffset
         if state.PendingCount = 0 then state.PendingStart <- nextOffset
         if state.PendingHigh = 0 then
             state.PendingHighStart <- nextOffset
@@ -906,7 +914,7 @@ module Scanner =
                     stopped <- true
                 match segmentError with
                 | Some decodeError ->
-                    state.ValidatedBytes <- max state.ValidatedBytes (float decodeError.Offset - float state.StartOffset)
+                    state.ValidatedBytes <- min state.ValidatedBytes (float decodeError.Offset - float state.StartOffset)
                     error <- Some decodeError
                 | None ->
                     if Meter.overBudget meter then
@@ -922,7 +930,7 @@ module Scanner =
             match Decoders.flush (decoderState state) with
             | Error decodeError ->
                 error <- Some decodeError
-                state.ValidatedBytes <- float decodeError.Offset - float state.StartOffset
+                state.ValidatedBytes <- min state.ValidatedBytes (float decodeError.Offset - float state.StartOffset)
                 status <- DecodeFailure
             | Ok _ ->
                 let linesBefore = batch.Pushed

@@ -161,6 +161,22 @@ module TextDiffStreamingCases =
     }
 
     let cases = [
+        "validated byte progress stops at an incomplete scalar", fun () -> async {
+            let clock = ManualClock 0.0
+            let meter = Meter.create (clock :> IClock) Limits.defaults
+            let state = Scanner.create TextEncoding.Utf8 0L None
+            let batch = LineBatch()
+            let first = Scanner.scanChunk state [| 0xE2uy |] 0 1 false meter batch ignore ignore
+            Check.equal InputConsumed first.Status "The incomplete scalar waits for its next byte."
+            Check.equal 0.0 state.ValidatedBytes "An incomplete scalar does not advance validated progress."
+            let second = Scanner.scanChunk state [| 0x28uy |] 0 1 true meter batch ignore ignore
+            Check.equal DecodeFailure second.Status "An invalid continuation stops the scan."
+            match second.Error with
+            | Some error -> Check.equal 0L error.Offset "The scanner reports the incomplete scalar start."
+            | None -> failwith "The scanner returned no decoding error."
+            Check.equal 0.0 state.ValidatedBytes "Validated progress stops before the invalid scalar."
+            return ()
+        }
         "the equal-byte phase resumes after a large insertion", fun () ->
             shiftedTailCase "stream-insertion-reentry" (fun previous ->
                 let inserted = makeLines 5_000 "inserted-"

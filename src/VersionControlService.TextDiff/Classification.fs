@@ -104,9 +104,7 @@ module Classification =
         elif starts (ascii "MZ") &&
              (match readU32Le samples 0x3CL with
               | Some offset when offset <= uint32 Int32.MaxValue && int64 offset + 4L <= sourceLength ->
-                  match hasBytesAt samples (int64 offset) (ascii "PE\000\000") with
-                  | true -> true
-                  | false -> int64 offset + 4L > int64 (samples |> Array.filter (fun s -> s.BufferOffset = 0L) |> Array.tryHead |> Option.map (fun s -> s.Bytes.Length) |> Option.defaultValue 0)
+                  hasBytesAt samples (int64 offset) (ascii "PE\000\000")
               | _ -> false) then Some "PE executable"
         elif starts [| 0xFEuy; 0xEDuy; 0xFAuy; 0xCEuy |] || starts [| 0xFEuy; 0xEDuy; 0xFAuy; 0xCFuy |] ||
              starts [| 0xCEuy; 0xFAuy; 0xEDuy; 0xFEuy |] || starts [| 0xCFuy; 0xFAuy; 0xEDuy; 0xFEuy |] then
@@ -118,10 +116,10 @@ module Classification =
              (readU32Be samples 4L |> Option.exists (fun count -> count >= 1u && count <= 4096u)) then Some "Mach-O universal binary"
         else
             let rec findHdf offset =
-                if offset > 65536L || offset >= sourceLength then None
+                if offset + int64 hdf5Signature.Length > 65536L || offset + int64 hdf5Signature.Length > sourceLength then None
                 elif hasBytesAt samples offset hdf5Signature then Some "HDF5 file"
-                else findHdf (offset * 2L)
-            findHdf 512L
+                else findHdf (if offset = 0L then 512L else offset * 2L)
+            findHdf 0L
 
     let private adjustedBounds sourceLength encoding (sample: ClassificationSample) =
         let first = properStart sample
@@ -174,6 +172,7 @@ module Classification =
         let fullText = StringBuilder()
         let firstPreview = StringBuilder()
         let windows = Dictionary<int64, WindowCount>()
+        let countedScalarStarts = HashSet<int64>()
         let mutable nulEvidence = None
         let mutable decodeFailure = None
         for sampleIndex = 0 to ordered.Length - 1 do
@@ -198,7 +197,7 @@ module Classification =
                             pendingStart <- startOffset
                             -1, startOffset
                         else codeUnit, startOffset
-                    if scalar >= 0 then
+                    if scalar >= 0 && countedScalarStarts.Add scalarStart then
                         let key = windowStart sourceLength scalarStart
                         let count =
                             match windows.TryGetValue key with
@@ -249,18 +248,21 @@ module Classification =
 
     let classifyWithChoice sourceLength samples encoding =
         match detectBom samples with
-        | Some bom when bom.Encoding = encoding ->
-            let evaluation = evaluate sourceLength samples encoding bom.Length
+        | Some bom ->
+            let evaluation = evaluate sourceLength samples bom.Encoding bom.Length
             match evaluation.Error, evaluation.ControlEvidence with
             | Some error, _ -> BinaryEvidence error
             | None, Some evidence -> BinaryEvidence evidence
-            | _ -> Classified(encoding, true, bom.Length)
+            | _ -> Classified(bom.Encoding, true, bom.Length)
         | _ ->
-            let evaluation = evaluate sourceLength samples encoding 0
-            match evaluation.Error, evaluation.ControlEvidence with
-            | Some error, _ -> BinaryEvidence error
-            | None, Some evidence -> BinaryEvidence evidence
-            | _ -> Classified(encoding, false, 0)
+            match binarySignature sourceLength samples with
+            | Some evidence -> BinaryEvidence evidence
+            | None ->
+                let evaluation = evaluate sourceLength samples encoding 0
+                match evaluation.Error, evaluation.ControlEvidence with
+                | Some error, _ -> BinaryEvidence error
+                | None, Some evidence -> BinaryEvidence evidence
+                | _ -> Classified(encoding, false, 0)
 
     let classify sourceLength samples =
         match detectBom samples with
