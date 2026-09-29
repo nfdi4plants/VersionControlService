@@ -23,8 +23,16 @@ let private delay (milliseconds: int) : JS.Promise<unit> = jsNative
 let private spoolingHandler: ITextDiffRequestHandler =
     { new ITextDiffRequestHandler with
         member _.Open(host, request, owner) = promise {
-            let! resolved = host.SpawnShort(owner.WorkspaceRoot, [| "rev-parse"; $"HEAD:{RepositoryPath.value request.Path}" |])
-            let oid = (bytesToUtf8 resolved.Stdout).Trim()
+            // Two calls because the supervisor only allows a rev-parse that verifies a commit, not
+            // one that resolves a path straight to a blob oid.
+            let! commit = host.SpawnShort(owner.WorkspaceRoot, [| "rev-parse"; "--verify"; "--quiet"; "HEAD^{commit}" |])
+            let commitOid = (bytesToUtf8 commit.Stdout).Trim()
+            let! listing =
+                host.SpawnShort(
+                    owner.WorkspaceRoot,
+                    [| "ls-tree"; "-z"; "--full-tree"; commitOid; "--"; RepositoryPath.value request.Path |]
+                )
+            let oid = (bytesToUtf8 listing.Stdout).Split('\t').[0].Split(' ').[2]
             let spoolPath = NodePath.join [| host.TempDirectory; $"{host.RequestId}.spool" |]
             // The blob result arrives only after the child ends, which in these tests happens after cancellation.
             NodeInterop.observePromise (host.SpawnBlob(owner.WorkspaceRoot, oid, spoolPath)) ignore ignore
@@ -44,8 +52,22 @@ let private spoolingHandler: ITextDiffRequestHandler =
         member _.Cancel _ = ()
     }
 
+let private slowResolverHandler =
+    TextDiffWorker.createDefaultHandlerWithRunner(fun host owner arguments -> promise {
+        let! result = host.SpawnShort(owner.WorkspaceRoot, arguments)
+
+        match arguments with
+        | [| "ls-tree"; "-z"; "--full-tree"; _; "--"; "large.txt" |] ->
+            let header = (bytesToUtf8 result.Stdout).Split('\t').[0].Split(' ')
+            let spoolPath = NodePath.join [| host.TempDirectory; $"{host.RequestId}.spool" |]
+            let! _ = host.SpawnBlob(owner.WorkspaceRoot, header.[2], spoolPath)
+            return result
+        | _ -> return result
+    })
+
 do
     match NodeWorkerThreads.parentPort with
     | Some port when workerMode () = "default" -> TextDiffWorker.bootstrap port
+    | Some port when workerMode () = "slow-resolver" -> TextDiffWorker.bootstrapWith port slowResolverHandler
     | Some port -> TextDiffWorker.bootstrapWith port spoolingHandler
     | None -> ()

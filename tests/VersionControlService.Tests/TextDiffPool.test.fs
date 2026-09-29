@@ -130,6 +130,11 @@ type private PreparationHandler(issueFirstOpen: bool) =
         )
 
     member val PreparationAttempts = 0 with get, set
+    member val IssuedOn: string option = None with get, set
+    member val PreparationWorkers = ResizeArray<string>()
+    member val OpenedOn = ResizeArray<string>()
+    member val HoldReadPage = false with get, set
+    member val ReadPageCalls = 0 with get, set
 
     interface ITextDiffRequestHandler with
         member this.Open(host, request, owner) =
@@ -138,12 +143,14 @@ type private PreparationHandler(issueFirstOpen: bool) =
             match request.Preparation with
             | Some token ->
                 this.PreparationAttempts <- this.PreparationAttempts + 1
+                this.PreparationWorkers.Add host.WorkerId
 
                 match tokens.Validate(token, sourceBinding, owner.WindowOwner) with
                 | Ok() -> Promise.lift(opened host)
                 | Error failure -> Promise.lift(Error failure)
             | None when issueNext ->
                 issueNext <- false
+                this.IssuedOn <- Some host.WorkerId
                 let token = tokens.Issue(sourceBinding, owner.WindowOwner)
 
                 Promise.lift(
@@ -159,9 +166,21 @@ type private PreparationHandler(issueFirstOpen: bool) =
                         )
                     )
                 )
-            | None -> Promise.lift(opened host)
+            | None ->
+                this.OpenedOn.Add host.WorkerId
+                Promise.lift(opened host)
 
-        member _.ReadPage(_, _) = sessionClosed ()
+        member this.ReadPage(host, request) = promise {
+            this.ReadPageCalls <- this.ReadPageCalls + 1
+
+            while this.HoldReadPage && not (host.IsCanceled()) do
+                do! delay 10
+
+            if host.IsCanceled() then
+                return Error(canceledFailure ())
+            else
+                return Ok(Resumable.Ready { page with PageId = request.Cursor })
+          }
         member _.ReplayPage(_, _) = sessionClosed ()
         member _.Expand(_, _) = sessionClosed ()
         member _.ReadLine(_, _) = sessionClosed ()
@@ -549,6 +568,68 @@ Vitest.describe (
                     openedHandle reopened |> ignore
                     Vitest.expect(handlers[0].PreparationAttempts).toBe 1
                     Vitest.expect(handlers[1].PreparationAttempts).toBe 0
+                })
+        )
+
+        Vitest.test (
+            "keeps token affinity after a queued reopen is canceled",
+            TestOptions(timeout = 60000),
+            fun () ->
+                let handlers = ResizeArray<PreparationHandler>()
+
+                let factory: TextDiffWorkerFactory =
+                    fun _ ->
+                        let handler = PreparationHandler(handlers.Count = 0)
+                        handlers.Add handler
+                        InProcessTransport.create (handler :> ITextDiffRequestHandler)
+
+                withPool 2 2 factory (fun pool -> promise {
+                    pool.Prewarm()
+                    do! waitUntil (fun () -> handlers.Count = 2)
+                    let service = pool.Service owner
+                    let! issued = service.Open openRequest (OperationContext.detached "issue-token") |> run
+                    let token = preparationToken issued
+                    let issuingHandler = handlers |> Seq.find (fun handler -> handler.IssuedOn.IsSome)
+                    let issuingWorker = issuingHandler.IssuedOn |> Option.get
+                    // The issuing worker's reservation for the token request releases asynchronously.
+                    // Waiting here lets both workers settle back to idle before the next Open is admitted,
+                    // so the pool's preference for an empty worker lands it on the issuing worker.
+                    do! delay 100
+
+                    let! opened = service.Open openRequest (OperationContext.detached "open-issuing-worker") |> run
+                    let handle = openedHandle opened
+                    Vitest.expect(issuingHandler.OpenedOn[0]).toBe issuingWorker
+
+                    issuingHandler.HoldReadPage <- true
+                    let running = Watched(readPage service handle "held" (OperationContext.detached "held-read"))
+                    do! waitUntil (fun () -> issuingHandler.ReadPageCalls = 1)
+
+                    let source, cancellationContext = context ()
+                    let reopening =
+                        Watched(
+                            service.Open
+                                { openRequest with Preparation = Some token }
+                                cancellationContext
+                            |> run
+                        )
+
+                    do! delay 30
+                    source.Cancel()
+                    let! canceledOpen = reopening.Result
+                    Vitest.expect(failureCode canceledOpen).toBe "operation_canceled"
+                    Vitest.expect(running.Settled).toBe false
+
+                    issuingHandler.HoldReadPage <- false
+                    let! _ = running.Result
+                    let! retried =
+                        service.Open { openRequest with Preparation = Some token } (OperationContext.detached "retry-token")
+                        |> run
+
+                    openedHandle retried |> ignore
+                    Vitest.expect(issuingHandler.PreparationWorkers.ToArray()).toEqual [| issuingWorker |]
+                    for handler in handlers do
+                        if not (obj.ReferenceEquals(handler, issuingHandler)) then
+                            Vitest.expect(handler.PreparationAttempts).toBe 0
                 })
         )
 

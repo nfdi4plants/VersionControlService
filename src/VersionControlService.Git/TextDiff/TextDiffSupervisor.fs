@@ -92,6 +92,42 @@ let private isWrapperPath (path: string) =
     | ".bat" -> true
     | _ -> false
 
+let private isObjectId (value: string) =
+    not (isNull value)
+    && (value.Length = 40 || value.Length = 64)
+    && (value
+        |> Seq.forall (fun character ->
+            (character >= '0' && character <= '9')
+            || (character >= 'a' && character <= 'f')
+            || (character >= 'A' && character <= 'F')))
+
+let private isRefPattern (value: string) =
+    not (String.IsNullOrEmpty value)
+    && not (value.StartsWith("-", StringComparison.Ordinal))
+    && not (value |> Seq.exists Char.IsWhiteSpace)
+
+let private isCommitVerification (value: string) =
+    let suffix = "^{commit}"
+
+    not (String.IsNullOrEmpty value)
+    && value.EndsWith(suffix, StringComparison.Ordinal)
+    && value.Length > suffix.Length
+    && not (value.StartsWith("-", StringComparison.Ordinal))
+    && not (value |> Seq.exists Char.IsWhiteSpace)
+
+let private isAllowedShortCommand (arguments: string[]) =
+    match arguments with
+    | [| "rev-parse"; "--absolute-git-dir" |]
+    | [| "rev-parse"; "--git-common-dir" |]
+    | [| "rev-parse"; "--git-dir" |]
+    | [| "symbolic-ref"; "-q"; "HEAD" |] -> true
+    | [| "rev-parse"; "--verify"; "--quiet"; expression |] -> isCommitVerification expression
+    | [| "for-each-ref"; "--format=%(refname)"; "--"; refPattern |] -> isRefPattern refPattern
+    | [| "ls-tree"; "-z"; "--full-tree"; oid; "--"; _path |] -> isObjectId oid
+    | [| "cat-file"; "-s"; oid |]
+    | [| "cat-file"; "blob"; oid |] -> isObjectId oid
+    | _ -> false
+
 let private checkRegularFile (path: string) : JS.Promise<bool> = promise {
     try
         do! accessAsync path 1
@@ -343,18 +379,7 @@ type TextDiffSupervisor internal (instanceDirectory: string, gitExecutable: stri
         let operation = promise {
             ensureOwnerMaySpawn owner
 
-            let validCommand =
-                match arguments with
-                | [| "cat-file"; "-s"; _ |] -> true
-                // A blob read here is bounded by the stdout limit below. Larger blobs go to a spool.
-                | [| "cat-file"; "blob"; _ |] -> true
-                | [| "cat-file"; _ |] -> false
-                | [| "cat-file"; _; _; _ |] -> false
-                | [| command |] when command = "rev-parse" || command = "symbolic-ref" || command = "for-each-ref" || command = "ls-tree" -> true
-                | arguments when arguments.Length > 0 ->
-                    let command = arguments[0]
-                    command = "rev-parse" || command = "symbolic-ref" || command = "for-each-ref" || command = "ls-tree"
-                | _ -> false
+            let validCommand = isAllowedShortCommand arguments
 
             if not validCommand then
                 return raise (InvalidOperationException("The Git command is not allowed for a text diff request."))
@@ -389,8 +414,8 @@ type TextDiffSupervisor internal (instanceDirectory: string, gitExecutable: stri
     member this.StartBlobToSpool(owner: ChildOwner, cwd: string, oid: string, spoolPath: string) : JS.Promise<SpoolChild> =
         let operation = promise {
             ensureOwnerMaySpawn owner
-            if String.IsNullOrWhiteSpace oid then
-                return raise (InvalidOperationException("A blob object id is required."))
+            if not (isObjectId oid) then
+                return raise (InvalidOperationException("A blob object id must contain 40 or 64 hexadecimal characters."))
             else
                 let! workerDirectory = this.WorkerDirectory owner.WorkerId
                 let targetPath = NodePath.resolve [| spoolPath |]

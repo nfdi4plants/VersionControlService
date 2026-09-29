@@ -2,6 +2,7 @@
 module VersionControlService.Git.TextDiff.TextDiffWorker
 
 open Fable.Core
+open System.Collections.Generic
 open VersionControlService.Abstractions
 open VersionControlService.Git.TextDiff.TextDiffProtocol
 open VersionControlService.Git.TextDiff.TextDiffWorkerDispatcher
@@ -69,70 +70,88 @@ let private readPrefix (path: string) (count: int) : Async<byte[]> =
     |> Async.AwaitPromise
 
 /// A resolver host that runs Git through the given runner and reads files on the calling thread.
-let localFileHost (runGit: string[] -> Async<GitShort>) : IResolverHost =
+let localFileHostWithCancellation (runGit: string[] -> Async<GitShort>) (isCanceled: unit -> bool) : IResolverHost =
     { new IResolverHost with
         member _.RunGit arguments = runGit arguments
         member _.Lstat path = lstat path
+        member _.IsCanceled() = isCanceled ()
         member _.ReadPrefix path count = readPrefix path count
     }
 
-let private openSources (tokens: PreparationTokenStore) (host: WorkerHost) (request: OpenDiffRequest) (owner: TextDiffOwner) = promise {
-    let path = RepositoryPath.value request.Path
-    let previousPath = request.PreviousPath |> Option.map RepositoryPath.value
+let localFileHost (runGit: string[] -> Async<GitShort>) : IResolverHost =
+    localFileHostWithCancellation runGit (fun () -> false)
 
-    if request.Preparation.IsNone then
-        tokens.ReleaseForPath(owner.WindowOwner, path)
+let private openSources
+    (tokens: PreparationTokenStore)
+    (activeOpens: Dictionary<string, WorkerHost>)
+    (runShort: WorkerHost -> TextDiffOwner -> string[] -> JS.Promise<GitShort>)
+    (host: WorkerHost)
+    (request: OpenDiffRequest)
+    (owner: TextDiffOwner)
+    =
+    promise {
+        let requestId = host.RequestId
+        activeOpens[requestId] <- host
 
-    let input = {
-        RepositoryRoot = owner.WorkspaceRoot
-        LfsMediaDirectory = owner.LfsMediaDirectory
-        Path = path
-        PreviousPath = previousPath
+        try
+            let path = RepositoryPath.value request.Path
+            let previousPath = request.PreviousPath |> Option.map RepositoryPath.value
+
+            if request.Preparation.IsNone then
+                tokens.ReleaseForPath(owner.WindowOwner, path)
+
+            let input = {
+                RepositoryRoot = owner.WorkspaceRoot
+                LfsMediaDirectory = owner.LfsMediaDirectory
+                Path = path
+                PreviousPath = previousPath
+            }
+
+            let runGit arguments = runShort host owner arguments |> Async.AwaitPromise
+
+            let! outcome = resolve (localFileHostWithCancellation runGit host.IsCanceled) input |> Async.StartAsPromise
+
+            if host.IsCanceled() then
+                return Error(canceledFailure ())
+            else
+                match outcome with
+                | ResolveOutcome.Canceled -> return Error(canceledFailure ())
+                | ResolveOutcome.Blocked blocker -> return Ok(Resumable.Ready(OpenDiffResult.NotDiffable blocker))
+                | ResolveOutcome.ReadError message -> return Error(OperationFailure.create ProviderError ReadFailedCode message)
+                | ResolveOutcome.Resolved sources ->
+                    let binding = bindingOf path previousPath sources
+
+                    let validation =
+                        match request.Preparation with
+                        | Some token -> tokens.Validate(token, binding, owner.WindowOwner)
+                        | None -> Ok()
+
+                    match validation with
+                    | Error failure -> return Error failure
+                    | Ok() ->
+                        let result = Resumable.Ready(OpenDiffResult.NotDiffable DiffBlocker.ProviderUnsupported)
+
+                        match result, request.Preparation with
+                        | Resumable.Ready(OpenDiffResult.Opened _), Some token -> tokens.Release token
+                        | _ -> ()
+
+                        return Ok result
+        finally
+            activeOpens.Remove requestId |> ignore
     }
-
-    // Git runs through the supervisor in the main process. Files are read inside the worker.
-    let runGit arguments =
-        host.SpawnShort(owner.WorkspaceRoot, arguments) |> Async.AwaitPromise
-
-    let! outcome = resolve (localFileHost runGit) input |> Async.StartAsPromise
-
-    if host.IsCanceled() then
-        return Error(canceledFailure ())
-    else
-        match outcome with
-        | ResolveOutcome.Blocked blocker -> return Ok(Resumable.Ready(OpenDiffResult.NotDiffable blocker))
-        | ResolveOutcome.ReadError message -> return Error(OperationFailure.create ProviderError ReadFailedCode message)
-        | ResolveOutcome.Resolved sources ->
-            let binding = bindingOf path previousPath sources
-
-            let validation =
-                match request.Preparation with
-                | Some token -> tokens.Validate(token, binding, owner.WindowOwner)
-                | None -> Ok()
-
-            match validation with
-            | Error failure -> return Error failure
-            | Ok() ->
-                // The diff engine replaces this answer. Until it is connected, a diffable pair reports that the
-                // provider cannot diff it.
-                let result = Resumable.Ready(OpenDiffResult.NotDiffable DiffBlocker.ProviderUnsupported)
-
-                match result, request.Preparation with
-                | Resumable.Ready(OpenDiffResult.Opened _), Some token -> tokens.Release token
-                | _ -> ()
-
-                return Ok result
-}
 
 /// Creates the handler used until a diff engine is plugged in. Open resolves both sources and answers
 /// ProviderUnsupported for a diffable pair. A blocked source answers its blocker, and an unreadable one fails
 /// with diff_read_failed. Calls on a handle report a closed session and Close succeeds. The handler keeps the
 /// preparation tokens of its worker.
-let createDefaultHandler () : ITextDiffRequestHandler =
+let createDefaultHandlerWithRunner
+    (runShort: WorkerHost -> TextDiffOwner -> string[] -> JS.Promise<GitShort>)
+    : ITextDiffRequestHandler =
     let tokens = PreparationTokenStore()
+    let activeOpens = Dictionary<string, WorkerHost>()
 
     { new ITextDiffRequestHandler with
-        member _.Open(host, request, owner) = openSources tokens host request owner
+        member _.Open(host, request, owner) = openSources tokens activeOpens runShort host request owner
 
         member _.ReadPage(_, _) = sessionClosed ()
         member _.ReplayPage(_, _) = sessionClosed ()
@@ -140,8 +159,14 @@ let createDefaultHandler () : ITextDiffRequestHandler =
         member _.ReadLine(_, _) = sessionClosed ()
         member _.GetSourceInfo(_, _) = sessionClosed ()
         member _.Close(_, _) = Promise.lift ()
-        member _.Cancel _ = ()
+        member _.Cancel requestId =
+            match activeOpens.TryGetValue requestId with
+            | true, host -> host.ReleaseRequest()
+            | _ -> ()
     }
+
+let createDefaultHandler () : ITextDiffRequestHandler =
+    createDefaultHandlerWithRunner (fun host owner arguments -> host.SpawnShort(owner.WorkspaceRoot, arguments))
 
 /// Serves text diff requests on the given port with the given handler.
 let bootstrapWith (port: NodeWorkerThreads.MessagePort) (handler: ITextDiffRequestHandler) : unit =

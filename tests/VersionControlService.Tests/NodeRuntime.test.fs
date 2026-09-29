@@ -10,6 +10,7 @@ module NodeInterop = VersionControlService.Runtime.Node.Interop
 module NodeBinaryIO = VersionControlService.Runtime.Node.BinaryIO
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodePath = VersionControlService.Runtime.Node.Path
+module NodePositionalFile = VersionControlService.Runtime.Node.PositionalFile
 
 let private run (operation: Async<'T>) : JS.Promise<'T> = Async.StartAsPromise operation
 
@@ -516,6 +517,90 @@ Vitest.describe (
 
                     Vitest.expect(temporaryExists).toBe false
                     Vitest.expect(reportCount > 0).toBe true
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+)
+
+Vitest.describe (
+    "Node positional file IO",
+    fun () ->
+        Vitest.test (
+            "writes at offset zero after the descriptor offset advances",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root = createTempDirectoryAsync ()
+
+                try
+                    let filePath = NodePath.join [| root; "position-zero.bin" |]
+                    let! fd = NodePositionalFile.openCreateExclusiveReadWrite filePath
+
+                    try
+                        let initial = [| 1uy; 2uy; 3uy; 4uy; 5uy; 6uy; 7uy; 8uy; 9uy; 10uy |]
+                        let firstWrite = [| 201uy; 202uy |]
+                        let! initialWritten =
+                            NodePositionalFile.writeAt fd initial 0 initial.Length 0L
+
+                        Vitest.expect(initialWritten).toBe initial.Length
+
+                        let! overwritten =
+                            NodePositionalFile.writeAt fd firstWrite 0 firstWrite.Length 0L
+
+                        Vitest.expect(overwritten).toBe firstWrite.Length
+
+                        let actual = Array.zeroCreate<byte> initial.Length
+                        let! bytesRead = NodePositionalFile.readAt fd actual 0 actual.Length 0L
+
+                        Vitest.expect(bytesRead).toBe initial.Length
+                        Vitest.expect(actual).toEqual [| 201uy; 202uy; 3uy; 4uy; 5uy; 6uy; 7uy; 8uy; 9uy; 10uy |]
+                    with error ->
+                        do! NodePositionalFile.close fd
+                        return raise error
+
+                    do! NodePositionalFile.close fd
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "overwrites bytes in the middle of a file",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root = createTempDirectoryAsync ()
+
+                try
+                    let filePath = NodePath.join [| root; "middle-overwrite.bin" |]
+                    let! fd = NodePositionalFile.openCreateExclusiveReadWrite filePath
+
+                    try
+                        let initial = [| 1uy; 2uy; 3uy; 4uy; 5uy; 6uy; 7uy; 8uy; 9uy; 10uy |]
+                        let replacement = [| 151uy; 152uy |]
+                        let! initialWritten =
+                            NodePositionalFile.writeAt fd initial 0 initial.Length 0L
+
+                        Vitest.expect(initialWritten).toBe initial.Length
+
+                        let! overwritten =
+                            NodePositionalFile.writeAt fd replacement 0 replacement.Length 4L
+
+                        Vitest.expect(overwritten).toBe replacement.Length
+
+                        let actual = Array.zeroCreate<byte> initial.Length
+                        let! bytesRead = NodePositionalFile.readAt fd actual 0 actual.Length 0L
+
+                        Vitest.expect(bytesRead).toBe initial.Length
+                        Vitest.expect(actual).toEqual [| 1uy; 2uy; 3uy; 4uy; 151uy; 152uy; 7uy; 8uy; 9uy; 10uy |]
+                    with error ->
+                        do! NodePositionalFile.close fd
+                        return raise error
+
+                    do! NodePositionalFile.close fd
                     do! removeDirectoryAsync root
                 with error ->
                     do! removeDirectoryAsync root

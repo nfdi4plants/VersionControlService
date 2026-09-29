@@ -45,7 +45,7 @@ type private FileSystem =
         buffer: byte[] *
         offset: int *
         length: int *
-        position: int64 *
+        position: float *
         callback: Action<NodeError, int, byte[]> -> unit
 
     abstract member fstat:
@@ -66,6 +66,11 @@ let private setTimeout (callback: unit -> unit) (delayMs: int) : obj = jsNative
 
 [<Emit("$0.toString(10)")>]
 let private bigintToDecimalString (_value: int64) : string = jsNative
+
+[<Emit("Number($0)")>]
+let private int64ToNumber (_value: int64) : float = jsNative
+
+let private maxSafeFilePosition = 9007199254740991L
 
 let private rejectNodeError (reject: exn -> unit) (error: NodeError) =
     reject (unbox<exn> error)
@@ -90,6 +95,10 @@ let openRead (path: string) : JS.Promise<int> =
 
 let openCreateExclusive (path: string) : JS.Promise<int> =
     openWithFlags path "wx"
+
+/// Opens a new file for both reading and writing, failing if it already exists.
+let openCreateExclusiveReadWrite (path: string) : JS.Promise<int> =
+    openWithFlags path "wx+"
 
 let readAt
     (fd: int)
@@ -123,21 +132,24 @@ let writeAt
     (position: int64)
     : JS.Promise<int> =
     JS.Constructors.Promise.Create(fun resolve reject ->
-        try
-            fileSystem.write(
-                fd,
-                buffer,
-                offset,
-                length,
-                position,
-                Action<NodeError, int, byte[]>(fun error bytesWritten _ ->
-                    if isNull error then
-                        resolve bytesWritten
-                    else
-                        rejectNodeError reject error)
-            )
-        with error ->
-            reject error)
+        if position < 0L || position > maxSafeFilePosition then
+            reject (Exception("File position must be between zero and JavaScript's maximum safe integer."))
+        else
+            try
+                fileSystem.write(
+                    fd,
+                    buffer,
+                    offset,
+                    length,
+                    int64ToNumber position,
+                    Action<NodeError, int, byte[]>(fun error bytesWritten _ ->
+                        if isNull error then
+                            resolve bytesWritten
+                        else
+                            rejectNodeError reject error)
+                )
+            with error ->
+                reject error)
 
 let private toFileStats (stats: BigIntStats) = {
     Size = stats.size

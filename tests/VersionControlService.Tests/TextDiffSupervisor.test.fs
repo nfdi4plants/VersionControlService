@@ -199,15 +199,27 @@ Vitest.describe (
                     let! created = createSupervisor root (Some events)
                     supervisor <- Some created
                     let owner: TextDiffSupervisor.ChildOwner = { WorkerId = "worker-a"; SessionId = "session-a"; RequestId = "request-a" }
-                    let mutable rejected = false
+                    let assertRejected arguments = promise {
+                        let mutable rejected = false
 
-                    try
-                        let! _ = created.RunShort(owner, repo, [| "fetch"; "origin" |])
-                        ()
-                    with _ ->
-                        rejected <- true
+                        try
+                            let! _ = created.RunShort(owner, repo, arguments)
+                            ()
+                        with _ ->
+                            rejected <- true
 
-                    Vitest.expect(rejected).toBe true
+                        return rejected
+                    }
+
+                    for arguments in
+                        [| [| "fetch"; "origin" |]
+                           [| "symbolic-ref"; "HEAD"; "refs/heads/x" |]
+                           [| "rev-parse"; "--git-path"; "x" |]
+                           [| "for-each-ref"; "--contains"; "HEAD" |]
+                           [| "cat-file"; "-s"; "HEAD" |] |] do
+                        let! rejected = assertRejected arguments
+                        Vitest.expect(rejected).toBe true
+
                     Vitest.expect(events |> Seq.exists (fun event -> match event.Kind with | TextDiffSupervisor.ChildSpawned _ -> true | _ -> false)).toBe false
 
                     let! result = created.RunShort(owner, repo, [| "rev-parse"; "--git-dir" |])
@@ -258,16 +270,14 @@ Vitest.describe (
                     do! initializeRepository repo
                     let! created = createSupervisor root None
                     supervisor <- Some created
-                    let longStem = Microsoft.FSharp.Core.String.replicate 200 "a"
-
-                    for index in 0 .. 499 do
-                        let name = $"{longStem}{index:D4}.txt"
-                        do! NodeFileSystem.writeFileAsync (NodePath.join [| repo; name |]) "x" NodeFileSystem.TextEncoding.Utf8
-
-                    do! runGitOk repo [| "add"; "--"; "." |]
-                    do! runGitOk repo [| "commit"; "-q"; "-m"; "many files" |]
+                    let largePath = NodePath.join [| repo; "large.txt" |]
+                    do! writeLargeTextFile largePath (128L * 1024L)
+                    do! runGitOk repo [| "add"; "--"; "large.txt" |]
+                    do! runGitOk repo [| "commit"; "-q"; "-m"; "large blob" |]
+                    let! oid = runGit repo [| "rev-parse"; "HEAD:large.txt" |]
+                    let oid = oid.Trim()
                     let owner: TextDiffSupervisor.ChildOwner = { WorkerId = "worker-b"; SessionId = "session-b"; RequestId = "request-b" }
-                    let! result = created.RunShort(owner, repo, [| "ls-tree"; "-r"; "--name-only"; "HEAD" |])
+                    let! result = created.RunShort(owner, repo, [| "cat-file"; "blob"; oid |])
 
                     Vitest.expect(result.Error.IsSome).toBe true
                     Vitest.expect(result.Stdout.Length <= 65536).toBe true
@@ -296,18 +306,16 @@ Vitest.describe (
 
                 try
                     do! initializeRepository repo
-                    let longStem = Microsoft.FSharp.Core.String.replicate 160 "a"
-
-                    for index in 0 .. 999 do
-                        let name = $"{longStem}{index:D4}.txt"
-                        do! NodeFileSystem.writeFileAsync (NodePath.join [| repo; name |]) "x" NodeFileSystem.TextEncoding.Utf8
-
-                    do! runGitOk repo [| "add"; "--"; "." |]
-                    do! runGitOk repo [| "commit"; "-q"; "-m"; "many files" |]
+                    let largePath = NodePath.join [| repo; "large.txt" |]
+                    do! writeLargeTextFile largePath (16L * 1024L * 1024L)
+                    do! runGitOk repo [| "add"; "--"; "large.txt" |]
+                    do! runGitOk repo [| "commit"; "-q"; "-m"; "large blob" |]
+                    let! oid = runGit repo [| "rev-parse"; "HEAD:large.txt" |]
+                    let oid = oid.Trim()
                     let! created = createSupervisor root (Some events)
                     supervisor <- Some created
                     let owner: TextDiffSupervisor.ChildOwner = { WorkerId = "worker-release"; SessionId = "session-release"; RequestId = "request-release" }
-                    let run = created.RunShort(owner, repo, [| "ls-tree"; "-r"; "--name-only"; "HEAD" |])
+                    let run = created.RunShort(owner, repo, [| "cat-file"; "blob"; oid |])
                     let release = created.ReleaseRequest owner
                     let mutable runSettled = false
                     let observedRun = promise {

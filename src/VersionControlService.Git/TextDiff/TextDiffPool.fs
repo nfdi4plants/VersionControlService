@@ -567,6 +567,10 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
 
     let openDiff (owner: TextDiffOwner) (request: OpenDiffRequest) (context: OperationContext) = promise {
         let removeRequestAffinity () = request.Preparation |> Option.iter (fun token -> preparationAffinities.Remove token.Id |> ignore)
+        let removeRequestAffinityForFailure (failure: OperationFailure) =
+            if failure.Code = TextDiffFailureCodes.PreparationMismatch || failure.Code = TextDiffFailureCodes.WorkerFailed then
+                removeRequestAffinity ()
+
         let requestedWorker =
             request.Preparation
             |> Option.bind (fun token -> currentAffinity owner token.Id |> Option.map snd)
@@ -624,7 +628,6 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
                     releaseReservation session
                     return OperationResult.succeeded result
                 | Resumable.Ready(OpenDiffResult.NotDiffable _) ->
-                    removeRequestAffinity ()
                     releaseReservation session
                     return OperationResult.succeeded result
             | Ok(ResultPayload.Open _) ->
@@ -636,7 +639,7 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
                 releaseReservation session
                 return Failed(workerFailed "The text diff worker answered Open with a different result type.")
             | Error failure ->
-                removeRequestAffinity ()
+                removeRequestAffinityForFailure failure
                 releaseReservation session
                 return Failed failure
     }

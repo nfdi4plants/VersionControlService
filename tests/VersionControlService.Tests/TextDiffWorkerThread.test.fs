@@ -269,17 +269,17 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "cancels a running Open inside the worker",
+            "cancels a running Open and releases the resolver child",
             TestOptions(timeout = 120000),
             fun () ->
                 let events = ResizeArray<TextDiffSupervisor.SupervisorEvent>()
 
-                withWorkerPool "spool" events (fun pool _ _ -> promise {
+                withWorkerPool "slow-resolver" events (fun pool _ _ -> promise {
                     let source = OperationCancellation.Source()
                     let context = OperationContext.create "open" source.Cancellation ignore
                     let opening = (pool.Service(owner ())).Open openRequest context |> Async.StartAsPromise
-                    do! waitFor "the blob child" 30000.0 (fun () -> Promise.lift ((spawnedPids events).Length >= 2))
-                    let blobPid = (spawnedPids events)[1]
+                    do! waitFor "the resolver Git child" 30000.0 (fun () -> Promise.lift ((spawnedPids events).Length >= 3))
+                    let blobPid = (spawnedPids events)[2]
 
                     let started = performanceNow ()
                     source.Cancel()
@@ -305,8 +305,8 @@ Vitest.describe (
 
                 withWorkerPool "spool" events (fun pool supervisor transports -> promise {
                     let opening = (pool.Service(owner ())).Open openRequest (OperationContext.detached "open") |> Async.StartAsPromise
-                    do! waitFor "the blob child" 30000.0 (fun () -> Promise.lift ((spawnedPids events).Length >= 2))
-                    let blobPid = (spawnedPids events)[1]
+                    do! waitFor "the blob child" 30000.0 (fun () -> Promise.lift ((spawnedPids events).Length >= 3))
+                    let blobPid = (spawnedPids events)[2]
 
                     do!
                         waitFor "the spool to grow" 30000.0 (fun () ->

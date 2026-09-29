@@ -38,6 +38,7 @@ type StatResult =
 type IResolverHost =
     abstract member RunGit: string[] -> Async<GitShort>
     abstract member Lstat: string -> Async<StatResult>
+    abstract member IsCanceled: unit -> bool
     /// Reads at most the given number of bytes from the start of a file.
     abstract member ReadPrefix: string -> int -> Async<byte[]>
 
@@ -68,10 +69,25 @@ type ResolveOutcome =
     | Resolved of ResolvedSources
     | Blocked of DiffBlocker
     | ReadError of message: string
+    | Canceled
 
 type private Step<'T> =
     | Continue of 'T
     | Stop of ResolveOutcome
+
+exception private ResolveCanceled
+
+let private awaitHost (host: IResolverHost) (work: Async<'T>) : Async<'T> = async {
+    if host.IsCanceled() then
+        return raise ResolveCanceled
+
+    let! result = work
+
+    if host.IsCanceled() then
+        return raise ResolveCanceled
+
+    return result
+}
 
 let private identityOf (stat: SourceStat) : FileIdentity = {
     Size = stat.Size
@@ -108,19 +124,19 @@ let private outputLines (bytes: byte[]) =
 
 /// Pins HEAD to a commit id. None means HEAD is unborn.
 let private resolveHead (host: IResolverHost) : Async<Step<string option>> = async {
-    let! revParse = host.RunGit [| "rev-parse"; "--verify"; "--quiet"; "HEAD^{commit}" |]
+    let! revParse = awaitHost host (host.RunGit [| "rev-parse"; "--verify"; "--quiet"; "HEAD^{commit}" |])
     let commitId = (utf8 revParse.Stdout).Trim()
 
     if succeeded revParse && isObjectId commitId then
         return Continue(Some commitId)
     else
-        let! symbolicRef = host.RunGit [| "symbolic-ref"; "-q"; "HEAD" |]
+        let! symbolicRef = awaitHost host (host.RunGit [| "symbolic-ref"; "-q"; "HEAD" |])
         let refName = (utf8 symbolicRef.Stdout).Trim()
 
         if not (succeeded symbolicRef) || String.IsNullOrEmpty refName then
             return Stop(ResolveOutcome.ReadError "HEAD does not resolve to a commit and is not a symbolic reference.")
         else
-            let! forEachRef = host.RunGit [| "for-each-ref"; "--format=%(refname)"; "--"; refName |]
+            let! forEachRef = awaitHost host (host.RunGit [| "for-each-ref"; "--format=%(refname)"; "--"; refName |])
 
             if not (succeeded forEachRef) || forEachRef.Stderr.Length > 0 then
                 return Stop(commandFailure "for-each-ref" forEachRef)
@@ -163,7 +179,7 @@ let private resolveLfsObject
     (pointerIdentity: FileIdentity option)
     : Async<Step<ResolvedSide>> = async {
     let path = objectPath input.LfsMediaDirectory pointer.Oid
-    let! stat = host.Lstat path
+    let! stat = awaitHost host (host.Lstat path)
 
     match stat with
     | StatResult.Stat stat when stat.IsFile && not stat.IsSymbolicLink && stat.Size = pointer.Size ->
@@ -176,7 +192,7 @@ let private resolvePrevious (host: IResolverHost) (input: ResolverInput) (commit
     | None -> return Continue ResolvedSide.Absent
     | Some commit ->
         let path = input.PreviousPath |> Option.defaultValue input.Path
-        let! listing = host.RunGit [| "ls-tree"; "-z"; "--full-tree"; commit; "--"; path |]
+        let! listing = awaitHost host (host.RunGit [| "ls-tree"; "-z"; "--full-tree"; commit; "--"; path |])
 
         if not (succeeded listing) then
             return Stop(commandFailure "ls-tree" listing)
@@ -187,7 +203,7 @@ let private resolvePrevious (host: IResolverHost) (input: ResolverInput) (commit
             | Ok(Some entry) when entry.Mode = "040000" || entry.Mode = "120000" || entry.Mode = "160000" ->
                 return Stop(ResolveOutcome.Blocked(DiffBlocker.NotRegularFile DiffSide.Previous))
             | Ok(Some entry) when (entry.Mode = "100644" || entry.Mode = "100755") && entry.Kind = "blob" && isObjectId entry.Oid ->
-                let! sizeResult = host.RunGit [| "cat-file"; "-s"; entry.Oid |]
+                let! sizeResult = awaitHost host (host.RunGit [| "cat-file"; "-s"; entry.Oid |])
 
                 if not (succeeded sizeResult) then
                     if isMissingObject sizeResult then
@@ -198,7 +214,7 @@ let private resolvePrevious (host: IResolverHost) (input: ResolverInput) (commit
                     match Int64.TryParse((utf8 sizeResult.Stdout).Trim()) with
                     | false, _ -> return Stop(ResolveOutcome.ReadError "git cat-file -s returned an unreadable size.")
                     | true, size when size <= int64 MaximumPointerBytes ->
-                        let! blob = host.RunGit [| "cat-file"; "blob"; entry.Oid |]
+                        let! blob = awaitHost host (host.RunGit [| "cat-file"; "blob"; entry.Oid |])
 
                         if not (succeeded blob) then
                             if isMissingObject blob then
@@ -215,7 +231,7 @@ let private resolvePrevious (host: IResolverHost) (input: ResolverInput) (commit
 
 let private resolveCurrent (host: IResolverHost) (input: ResolverInput) : Async<Step<ResolvedSide>> = async {
     let path = NodePath.join [| input.RepositoryRoot; input.Path |]
-    let! stat = host.Lstat path
+    let! stat = awaitHost host (host.Lstat path)
 
     match stat with
     | StatResult.Missing -> return Continue ResolvedSide.Absent
@@ -226,7 +242,7 @@ let private resolveCurrent (host: IResolverHost) (input: ResolverInput) : Async<
 
         if stat.Size <= int64 MaximumPointerBytes then
             // Reading one byte past the limit lets the strict parser reject a file that grew since lstat.
-            let! prefix = host.ReadPrefix path (MaximumPointerBytes + 1)
+            let! prefix = awaitHost host (host.ReadPrefix path (MaximumPointerBytes + 1))
 
             match tryParseStrict prefix with
             | Some pointer -> return! resolveLfsObject host input DiffSide.Current pointer (Some identity)
@@ -259,6 +275,8 @@ let resolve (host: IResolverHost) (input: ResolverInput) : Async<ResolveOutcome>
                             Previous = previous
                             Current = current
                         }
-    with error ->
+    with
+    | ResolveCanceled -> return ResolveOutcome.Canceled
+    | error ->
         return ResolveOutcome.ReadError error.Message
 }
