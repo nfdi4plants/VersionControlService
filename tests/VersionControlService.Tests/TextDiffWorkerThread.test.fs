@@ -255,7 +255,7 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "answers Open with ProviderUnsupported from the default handler",
+            "opens a diff with the default handler",
             TestOptions(timeout = 60000),
             fun () ->
                 withWorkerPool "default" (ResizeArray()) (fun pool _ _ -> promise {
@@ -263,7 +263,9 @@ Vitest.describe (
 
                     match result with
                     | Succeeded outcome ->
-                        Vitest.expect(outcome.Value = Resumable.Ready(OpenDiffResult.NotDiffable DiffBlocker.ProviderUnsupported)).toBe true
+                        match outcome.Value with
+                        | Resumable.Ready(OpenDiffResult.Opened _) -> ()
+                        | other -> failwith $"Expected an opened diff, got %A{other}"
                     | other -> failwith $"Open failed: %A{other}"
                 })
         )

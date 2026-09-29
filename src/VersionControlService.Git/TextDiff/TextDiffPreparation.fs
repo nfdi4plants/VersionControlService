@@ -59,10 +59,19 @@ let private checksum (value: string) =
 
     (string hash).PadLeft(10, '0')
 
+/// The encoding an earlier Open settled for one side, so a later Open with the token does not classify it again.
+type KeptClassification = {
+    Side: DiffSide
+    Encoding: string
+    BomLength: int
+    WasChosen: bool
+}
+
 type private TokenEntry = {
     Binding: PreparationBinding
     WindowOwner: string
     IssuedAt: float
+    Kept: KeptClassification[]
 }
 
 /// Issued tokens of one worker. The clock returns milliseconds.
@@ -85,7 +94,7 @@ type PreparationTokenStore(now: unit -> float) =
         pruneExpired ()
         let random = NodeInterop.randomUuid().Replace("-", "").ToLowerInvariant()
         let id = random + checksum random
-        tokens[id] <- { Binding = binding; WindowOwner = windowOwner; IssuedAt = now () }
+        tokens[id] <- { Binding = binding; WindowOwner = windowOwner; IssuedAt = now (); Kept = [||] }
         { Id = id }
 
     /// Fails with preparation_mismatch when the token is unknown, expired, bound to other sources or owned by another window.
@@ -99,6 +108,18 @@ type PreparationTokenStore(now: unit -> float) =
             match tokens.TryGetValue id with
             | true, entry when entry.WindowOwner = windowOwner && entry.Binding = binding -> Ok()
             | _ -> Error(mismatch ())
+
+    /// Stores the classified sides of an Open that ended with EncodingRequired.
+    member _.Keep(token: PreparationToken, kept: KeptClassification[]) =
+        match tokens.TryGetValue token.Id with
+        | true, entry -> tokens[token.Id] <- { entry with Kept = kept }
+        | _ -> ()
+
+    /// The classified sides stored for a token, or none when the token is unknown.
+    member _.Kept(token: PreparationToken) : KeptClassification[] =
+        match tokens.TryGetValue token.Id with
+        | true, entry -> entry.Kept
+        | _ -> [||]
 
     member _.Release(token: PreparationToken) = tokens.Remove token.Id |> ignore
 

@@ -338,6 +338,15 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
                 | TextDiffMessage.ReleaseSession(workerId, sessionId) ->
                     if workerId = worker.WorkerId then
                         observe (attempt (fun () -> supervisor.ReleaseSession(workerId, sessionId))) ignore ignore
+                | TextDiffMessage.SessionExpired generation ->
+                    match worker.Sessions |> Seq.tryFind (fun session -> session.Generation = generation) with
+                    | Some session when session.Phase = Opened || session.Phase = Scanning ->
+                        forgetSession session
+                        session.Phase <- Closed
+                        worker.Sessions.Remove session |> ignore
+                        observe (attempt (fun () -> supervisor.ReleaseSession(worker.WorkerId, string generation))) ignore ignore
+                        pumpAdmission ()
+                    | _ -> ()
                 | _ -> ()
 
     and startWorker (index: int) : PoolWorker option =
@@ -689,6 +698,43 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
                     try
                         startWorker index |> ignore
                     with _ -> ()
+
+    member _.CloseWorkspace(workspaceRoot: string) : JS.Promise<unit> =
+        let targets =
+            liveWorkers ()
+            |> Seq.collect _.Sessions
+            |> Seq.filter (fun session ->
+                session.Owner.WorkspaceRoot = workspaceRoot
+                && (session.Phase = Opened || session.Phase = Scanning))
+            |> Seq.toArray
+
+        Promise.create (fun resolve _ ->
+            let finished = ref false
+            let remaining = ref targets.Length
+            let timer: obj option ref = ref None
+
+            let finish () =
+                if not finished.Value then
+                    finished.Value <- true
+                    timer.Value |> Option.iter stopTimer
+                    resolve ()
+
+            timer.Value <- Some(startTimer finish 5000)
+
+            let completeOne () =
+                remaining.Value <- remaining.Value - 1
+
+                if remaining.Value = 0 then
+                    finish ()
+
+            if targets.Length = 0 then
+                finish ()
+            else
+                for session in targets do
+                    observe
+                        (attempt (fun () -> closeSession session))
+                        (fun () -> completeOne ())
+                        (fun _ -> completeOne ()))
 
     /// Shuts every worker down and disposes the supervisor. Waiting and running calls fail with diff_worker_failed.
     member _.Dispose() : JS.Promise<unit> = promise {

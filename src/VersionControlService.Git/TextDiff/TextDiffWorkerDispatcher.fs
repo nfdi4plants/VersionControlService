@@ -79,6 +79,9 @@ type WorkerHost
     member _.ReleaseSession() =
         send (TextDiffMessage.ReleaseSession(workerId, owner.SessionId))
 
+    member _.ReportSessionExpired() =
+        send (TextDiffMessage.SessionExpired generation)
+
 /// Serves the diff calls inside a worker. Cancel is called for the running request when the pool cancels it.
 type ITextDiffRequestHandler =
     abstract member Open: host: WorkerHost * request: OpenDiffRequest * owner: TextDiffOwner -> JS.Promise<Result<Resumable<OpenDiffResult>, OperationFailure>>

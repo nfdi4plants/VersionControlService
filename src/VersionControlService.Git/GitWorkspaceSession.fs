@@ -5845,9 +5845,16 @@ let private createSessionWithTextDiff
                     resolveSessionMediaDirectory state (fun arguments -> runGit state.Hooks state.RepoPath arguments None context))
             )
 
+    let closeTextDiff =
+        match textDiffMode with
+        | WithPool options -> fun () -> options.Pool.CloseWorkspace state.RepoPath |> Async.AwaitPromise
+        | NoTextDiff
+        | WithoutPool -> fun () -> async.Return ()
+
     {
         WorkspaceSession.createCoreOnly descriptor core with
             TextDiff = textDiff
+            Close = closeTextDiff
             Synchronization =
                 Some {
                     Refresh = fun context -> refresh state context

@@ -67,6 +67,7 @@ type TextDiffMessage =
     | SpawnResult of callId: int * outcome: SpawnOutcome
     | ReleaseRequest of owner: Supervisor.ChildOwner
     | ReleaseSession of workerId: string * sessionId: string
+    | SessionExpired of generation: int
 
 [<Emit("Buffer.byteLength(JSON.stringify($0), 'utf8')")>]
 let private jsonByteLength (_message: obj) : int = jsNative
@@ -390,6 +391,8 @@ let private encodePart (part: DiffPart) =
         ]
     | DiffPart.HiddenEqual gap -> tagged "HiddenEqual" [ "gap" ==> encodeGap gap ]
     | DiffPart.ExpandedContext(gapId, rows) -> tagged "ExpandedContext" [ "gapId" ==> gapId; "rows" ==> encodeArray encodeRow rows ]
+
+let partByteLength (part: DiffPart) = jsonByteLength (encodePart part)
 
 let private decodeFragment: Decoder<HunkFragment> =
     decodeObject (fun value -> decode {
@@ -1124,6 +1127,7 @@ let encode (message: TextDiffMessage) : obj =
     | TextDiffMessage.ReleaseRequest owner -> envelope "releaseRequest" [ "owner" ==> encodeChildOwner owner ]
     | TextDiffMessage.ReleaseSession(workerId, sessionId) ->
         envelope "releaseSession" [ "workerId" ==> workerId; "sessionId" ==> sessionId ]
+    | TextDiffMessage.SessionExpired generation -> envelope "sessionExpired" [ "generation" ==> generation ]
 
 let private decodeEnvelope (messageType: string) (value: obj) : Result<TextDiffMessage, string> =
     let requestKey () = decode {
@@ -1198,6 +1202,7 @@ let private decodeEnvelope (messageType: string) (value: obj) : Result<TextDiffM
             let! sessionId = field "sessionId" decodeString value
             return TextDiffMessage.ReleaseSession(workerId, sessionId)
         }
+    | "sessionExpired" -> field "generation" decodeInt value |> Result.map TextDiffMessage.SessionExpired
     | other ->
         match decodeRequestBody other value with
         | Some body ->

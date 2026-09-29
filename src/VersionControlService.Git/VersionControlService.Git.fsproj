@@ -20,6 +20,7 @@
     <Compile Include="TextDiff\TextDiffLfsPointer.fs" />
     <Compile Include="TextDiff\TextDiffSourceResolver.fs" />
     <Compile Include="TextDiff\TextDiffPreparation.fs" />
+    <Compile Include="TextDiff\TextDiffSources.fs" />
     <Compile Include="TextDiff\TextDiffWorker.fs" />
     <Compile Include="Git\GitAuthAdapter.fs" />
     <Compile Include="GitCredentialStrategy.fs" />
@@ -40,6 +41,7 @@
   <ItemGroup>
     <ProjectReference Include="..\VersionControlService.Abstractions\VersionControlService.Abstractions.fsproj" />
     <ProjectReference Include="..\VersionControlService.Runtime.Node\VersionControlService.Runtime.Node.fsproj" />
+    <ProjectReference Include="..\VersionControlService.TextDiff\VersionControlService.TextDiff.fsproj" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Fable.Core" />

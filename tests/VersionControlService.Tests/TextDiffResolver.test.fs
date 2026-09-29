@@ -538,7 +538,14 @@ Vitest.describe (
 
                 try
                     let! modified = openDiff session "a.txt"
-                    expectOpenResult (OpenDiffResult.NotDiffable DiffBlocker.ProviderUnsupported) modified
+
+                    match modified with
+                    | Succeeded outcome ->
+                        match outcome.Value with
+                        | Resumable.Ready(OpenDiffResult.Opened _) -> ()
+                        | other -> failwith $"Expected an opened diff, got %A{other}"
+                    | other -> failwith $"Expected an opened diff, got %A{other}"
+
                     let! lfs = openDiff session "data.bin"
 
                     expectOpenResult
