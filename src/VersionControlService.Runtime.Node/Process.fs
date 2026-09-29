@@ -310,6 +310,336 @@ let run (request: ProcessRequest) (context: OperationContext) : Async<OperationR
                     child?stdin?``end`` () |> ignore
                 | None -> child?stdin?``end`` () |> ignore)
 
+type ProcessExistence =
+    | Alive
+    | Gone
+    | Unknown of string
+
+type ChildExit = {
+    ExitCode: int option
+    Signal: string option
+    Stderr: string
+    StderrTruncated: bool
+    SpawnError: string option
+}
+
+type SpawnToFileHandle = {
+    Pid: int
+    Closed: JS.Promise<ChildExit>
+}
+
+type BoundedResult = {
+    ExitCode: int option
+    Stdout: byte[]
+    Stderr: string
+    Error: string option
+}
+
+[<AllowNullLiteral>]
+type private TypedProcessStream =
+    abstract member on: eventName: string * listener: (obj -> unit) -> TypedProcessStream
+
+[<AllowNullLiteral>]
+type private TypedChildProcess =
+    abstract member pid: int
+    abstract member stdout: TypedProcessStream
+    abstract member stderr: TypedProcessStream
+    abstract member on: eventName: string * listener: (obj -> unit) -> TypedChildProcess
+    abstract member on: eventName: string * listener: (obj -> obj -> unit) -> TypedChildProcess
+
+type private TypedChildProcessModule =
+    abstract member spawn: command: string * arguments: string[] * options: obj -> TypedChildProcess
+
+type private TypedProcessGlobal =
+    abstract member platform: string
+    abstract member kill: pid: int * signal: obj -> bool
+
+[<ImportAll("node:child_process")>]
+let private typedChildProcess: TypedChildProcessModule = jsNative
+
+[<Emit("process")>]
+let private typedProcessGlobal () : TypedProcessGlobal = jsNative
+
+let private closeDescriptor (descriptor: int) : JS.Promise<unit> =
+    VersionControlService.Runtime.Node.PositionalFile.close descriptor
+
+[<Emit("Array.from($0)")>]
+let private bufferToIntegers (_buffer: obj) : int[] = jsNative
+
+[<Emit("$0 && $0.code ? $0.code : ''")>]
+let private nodeErrorCode (_error: obj) : string = jsNative
+
+let private processIsWindows () = (typedProcessGlobal ()).platform = "win32"
+
+let private processKill (pid: int) (signal: obj) =
+    (typedProcessGlobal ()).kill(pid, signal) |> ignore
+
+let killProcessTreeAsync (pid: int) : JS.Promise<unit> =
+    JS.Constructors.Promise.Create(fun resolve _ ->
+        if processIsWindows () then
+            let options = createObj [ "windowsHide" ==> true; "shell" ==> false; "stdio" ==> "ignore" ]
+
+            try
+                let child =
+                    typedChildProcess.spawn("taskkill", [| "/pid"; string pid; "/T"; "/F" |], options)
+
+                let mutable settled = false
+                let finish () =
+                    if not settled then
+                        settled <- true
+                        resolve ()
+
+                child.on("close", fun _ -> finish ()) |> ignore
+                child.on("error", fun _ -> ()) |> ignore
+            with _ ->
+                resolve ()
+        else
+            try processKill (-pid) (box "SIGKILL") with _ -> ()
+            try processKill pid (box "SIGKILL") with _ -> ()
+            resolve ())
+
+let processExistence (pid: int) : ProcessExistence =
+    try
+        processKill pid (box 0)
+        Alive
+    with error ->
+        match nodeErrorCode (box error) with
+        | "EPERM" -> Alive
+        | "ESRCH" -> Gone
+        | _ -> Unknown(Interop.errorMessage error)
+
+let private spawnOptions (cwd: string) (environment: obj) (stdio: obj) =
+    createObj [
+        "cwd" ==> cwd
+        "env" ==> environment
+        "stdio" ==> stdio
+        "shell" ==> false
+        "windowsHide" ==> true
+        "detached" ==> not (processIsWindows ())
+    ]
+
+let private createClosedPromise () =
+    let mutable complete: (ChildExit -> unit) option = None
+    let task =
+        JS.Constructors.Promise.Create(fun resolve _ ->
+            complete <- Some resolve)
+
+    let finish value = complete |> Option.iter (fun resolve -> resolve value)
+    task, finish
+
+let private emptyChildExit (spawnError: string option) = {
+    ExitCode = None
+    Signal = None
+    Stderr = ""
+    StderrTruncated = false
+    SpawnError = spawnError
+}
+
+let private captureBounded
+    (chunks: ResizeArray<obj>)
+    (limit: int)
+    (length: int ref)
+    (truncated: bool ref)
+    (data: obj)
+    =
+    let bytes = Interop.bufferLength data
+    let available = max 0 (limit - length.Value)
+    let copied = min bytes available
+
+    if copied > 0 then
+        chunks.Add(if copied = bytes then data else Interop.bufferSubarray data 0 copied)
+        length.Value <- length.Value + copied
+
+    if copied < bytes then
+        truncated.Value <- true
+
+let private stdoutBytes (chunks: ResizeArray<obj>) =
+    Interop.bufferConcat (chunks.ToArray())
+    |> bufferToIntegers
+    |> Array.map byte
+
+let private stderrText (chunks: ResizeArray<obj>) =
+    Interop.bufferConcat (chunks.ToArray()) |> Interop.bufferToUtf8String
+
+let private closeDescriptorThen
+    (descriptor: int)
+    (onClosed: unit -> unit)
+    (onError: obj -> unit)
+    =
+    Interop.observePromise (closeDescriptor descriptor) onClosed onError
+
+let spawnToFileTracked
+    (command: string)
+    (arguments: string[])
+    (cwd: string)
+    (environment: obj)
+    (descriptor: int)
+    (onStarted: int -> JS.Promise<ChildExit> -> unit)
+    : JS.Promise<SpawnToFileHandle> =
+    JS.Constructors.Promise.Create(fun resolve reject ->
+        let closed, finishClosed = createClosedPromise ()
+        let options = spawnOptions cwd environment (box [| box "ignore"; box descriptor; box "pipe" |])
+
+        try
+            let child = typedChildProcess.spawn(command, arguments, options)
+            let pid =
+                try unbox<int> (box child.pid)
+                with _ -> 0
+
+            let stderrChunks = ResizeArray<obj>()
+            let stderrLength = ref 0
+            let stderrTruncated = ref false
+            let spawnError = ref None
+
+            child.stderr.on("data", fun data ->
+                captureBounded stderrChunks 65536 stderrLength stderrTruncated data)
+            |> ignore
+
+            child.on("error", fun error -> spawnError.Value <- Some(Interop.errorMessage error)) |> ignore
+
+            child.on("close", fun code signal ->
+                let exitCode = if isNull code then None else Some(unbox<int> code)
+                let signalName = if isNull signal then None else Some(unbox<string> signal)
+
+                finishClosed {
+                    ExitCode = exitCode
+                    Signal = signalName
+                    Stderr = stderrText stderrChunks
+                    StderrTruncated = stderrTruncated.Value
+                    SpawnError = spawnError.Value
+                })
+            |> ignore
+
+            if pid > 0 then
+                onStarted pid closed
+
+            closeDescriptorThen
+                descriptor
+                (fun () -> resolve { Pid = pid; Closed = closed })
+                (fun error ->
+                    if pid > 0 then
+                        let rejectAfterClose () =
+                            Interop.observePromise
+                                closed
+                                (fun _ -> reject (Exception(Interop.errorMessage error)))
+                                (fun _ -> reject (Exception(Interop.errorMessage error)))
+
+                        Interop.observePromise
+                            (killProcessTreeAsync pid)
+                            (fun () -> rejectAfterClose ())
+                            (fun _ -> rejectAfterClose ())
+                    else
+                        reject (Exception(Interop.errorMessage error)))
+        with error ->
+            let failure = Interop.errorMessage (box error)
+            finishClosed (emptyChildExit (Some failure))
+
+            closeDescriptorThen
+                descriptor
+                (fun () -> resolve { Pid = 0; Closed = closed })
+                (fun closeError -> reject (Exception(Interop.errorMessage closeError))))
+
+let spawnToFile
+    (command: string)
+    (arguments: string[])
+    (cwd: string)
+    (environment: obj)
+    (descriptor: int)
+    : JS.Promise<SpawnToFileHandle> =
+    spawnToFileTracked command arguments cwd environment descriptor (fun _ _ -> ())
+
+let runBoundedWithLifecycle
+    (command: string)
+    (arguments: string[])
+    (cwd: string)
+    (environment: obj)
+    (stdoutLimit: int)
+    (stderrLimit: int)
+    (onStarted: int -> JS.Promise<ChildExit> -> unit)
+    : JS.Promise<BoundedResult> =
+    JS.Constructors.Promise.Create(fun resolve _ ->
+        let options = spawnOptions cwd environment (box [| box "ignore"; box "pipe"; box "pipe" |])
+
+        try
+            let child = typedChildProcess.spawn(command, arguments, options)
+            let pid =
+                try unbox<int> (box child.pid)
+                with _ -> 0
+
+            let closed, finishClosed = createClosedPromise ()
+            let stdoutChunks = ResizeArray<obj>()
+            let stderrChunks = ResizeArray<obj>()
+            let stdoutLength = ref 0
+            let stderrLength = ref 0
+            let stdoutTruncated = ref false
+            let stderrTruncated = ref false
+            let spawnError = ref None
+            let mutable overflowKillStarted = false
+
+            child.stdout.on("data", fun data ->
+                captureBounded stdoutChunks stdoutLimit stdoutLength stdoutTruncated data
+
+                if stdoutTruncated.Value && not overflowKillStarted then
+                    overflowKillStarted <- true
+
+                    if pid > 0 then
+                        Interop.observePromise (killProcessTreeAsync pid) ignore ignore)
+            |> ignore
+
+            child.stderr.on("data", fun data ->
+                captureBounded stderrChunks stderrLimit stderrLength stderrTruncated data)
+            |> ignore
+
+            child.on("error", fun error -> spawnError.Value <- Some(Interop.errorMessage error)) |> ignore
+
+            child.on("close", fun code signal ->
+                let exitCode = if isNull code then None else Some(unbox<int> code)
+                let signalName = if isNull signal then None else Some(unbox<string> signal)
+                let stderr = stderrText stderrChunks
+                let childExit = {
+                    ExitCode = exitCode
+                    Signal = signalName
+                    Stderr = stderr
+                    StderrTruncated = stderrTruncated.Value
+                    SpawnError = spawnError.Value
+                }
+
+                finishClosed childExit
+
+                let failure =
+                    if stdoutTruncated.Value then
+                        Some $"Standard output exceeded the {stdoutLimit}-byte limit."
+                    else
+                        spawnError.Value
+
+                resolve {
+                    ExitCode = exitCode
+                    Stdout = stdoutBytes stdoutChunks
+                    Stderr = stderr
+                    Error = failure
+                })
+            |> ignore
+
+            if pid > 0 then
+                onStarted pid closed
+        with error ->
+            resolve {
+                ExitCode = None
+                Stdout = [||]
+                Stderr = ""
+                Error = Some(Interop.errorMessage (box error))
+            })
+
+let runBounded
+    (command: string)
+    (arguments: string[])
+    (cwd: string)
+    (environment: obj)
+    (stdoutLimit: int)
+    (stderrLimit: int)
+    : JS.Promise<BoundedResult> =
+    runBoundedWithLifecycle command arguments cwd environment stdoutLimit stderrLimit (fun _ _ -> ())
+
 /// Runs a child process while preserving stdout as raw bytes. Stderr is decoded
 /// only after every chunk has arrived so diagnostics remain byte-boundary safe.
 let runBytes

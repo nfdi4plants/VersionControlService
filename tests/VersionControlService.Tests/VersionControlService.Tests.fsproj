@@ -26,6 +26,7 @@
     <Compile Include="LakeFsIntegration.test.fs" />
     <Compile Include="ProviderResolver.test.fs" />
     <Compile Include="NodeRuntime.test.fs" />
+    <Compile Include="TextDiffSupervisor.test.fs" />
     <Compile Include="ConformanceSuiteDiscovery.test.fs" />
   </ItemGroup>
   <ItemGroup>
