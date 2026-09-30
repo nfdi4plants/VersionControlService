@@ -982,8 +982,8 @@ type TextDiffSession internal (
                 commitCount <- last + 1
                 beginFeeding ()
             elif bothFinished then
-                // A partial alignment starts only while a side can still grow, so this branch is a guard
-                // for a window that finished during the step.
+                // A partial alignment starts only while a side can still grow, so both sides cannot be
+                // finished here. The branch is a guard in case that changes.
                 if canGrow then
                     windowLimit <- min config.WindowMaxLines (windowLimit * 2)
                     previousSide.SetLimits(windowLimit, config.WindowMaxBytes)
