@@ -122,7 +122,11 @@ let private removeWorkingFile (repository: string) (relativePath: string) = prom
 let private writePatternFile (filePath: string) (size: int64) (firstLine: string) (repeatLine: string) = promise {
     let first = Encoding.UTF8.GetBytes(firstLine + "\n")
     let repeated = Encoding.UTF8.GetBytes(repeatLine + "\n")
-    let chunk = Array.init (64 * 1024) (fun index -> repeated[index % repeated.Length])
+    let chunkLength =
+        if repeated.Length > 64 * 1024 then repeated.Length
+        else (64 * 1024 / repeated.Length) * repeated.Length
+
+    let chunk = Array.init chunkLength (fun index -> repeated[index % repeated.Length])
     do! NodePositionalFile.removeWithRetry filePath 1 0
     let! descriptor = NodePositionalFile.openCreateExclusive filePath
     let mutable position = 0L
@@ -546,6 +550,20 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "rejects temporary store names that are empty or contain path syntax",
+            fun () ->
+                for fileName in [| ""; "."; ".."; "pairs/data.tmp"; "pairs\\data.tmp" |] do
+                    let mutable rejected = false
+
+                    try
+                        TextDiffSources.NodeTempStore.Create((currentFixture ()).Root, fileName) |> ignore
+                    with _ ->
+                        rejected <- true
+
+                    Vitest.expect(rejected).toBe true
+        )
+
+        Vitest.test (
             "validates a spool after its child exits during a pending read",
             TestOptions(timeout = 30000),
             fun () -> promise {
@@ -608,6 +626,15 @@ Vitest.describe (
                 Vitest.expect(readFailure.IsNone).toBe true
                 Vitest.expect(source.Failure.IsNone).toBe true
                 Vitest.expect(source.IsComplete()).toBe true
+
+                for position = 0 to finalBytes.Length - 1 do
+                    let target = [| 0uy |]
+                    let! outcome = source.ReadAt(int64 position) target 0 1 |> Async.StartAsPromise
+
+                    match outcome with
+                    | ReadOutcome.Bytes 1 -> Vitest.expect(target[0]).toBe finalBytes[position]
+                    | other -> failwith $"Expected byte {position}, got %A{other}"
+
                 do! source.Dispose()
                 do! NodePositionalFile.close writer
             }
@@ -665,7 +692,7 @@ Vitest.describe (
 
         Vitest.test (
             "pages large diffs in turns with shared scratch",
-            TestOptions(timeout = 600000),
+            TestOptions(timeout = 60000),
             fun () -> promise {
                 let! repository = newRepository ()
                 let relativePaths = [| "scratch-a.txt"; "scratch-b.txt"; "scratch-c.txt" |]

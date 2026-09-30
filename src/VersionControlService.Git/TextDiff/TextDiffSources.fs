@@ -421,6 +421,21 @@ type SpoolSource private (
         else
             report (childFailure path exit expectedLength (Some actualLength)) |> ignore
 
+    let fillRetained memory availableLength = async {
+        let limit = min availableLength expectedLength
+        let mutable stalled = false
+
+        // Overlapping calls can read the same range, so cached only moves forward.
+        while cached < limit && not stalled do
+            let start = cached
+
+            let! amount =
+                readAt descriptor memory (int start) (int (min (limit - start) 262144L)) start
+                |> Async.AwaitPromise
+
+            if amount <= 0 then stalled <- true else cached <- max cached (start + int64 amount)
+    }
+
     let refresh () = async {
         ensureOpen ()
 
@@ -433,26 +448,16 @@ type SpoolSource private (
                 available <- stats.Size
 
                 match retained with
-                | Some memory ->
-                    let limit = min available expectedLength
-                    let mutable stalled = false
-
-                    // A call that overlaps this one may read the same range. Both copy the same bytes, so
-                    // the cached length only moves forward.
-                    while cached < limit && not stalled do
-                        let start = cached
-
-                        let! amount =
-                            readAt descriptor memory (int start) (int (min (limit - start) 262144L)) start
-                            |> Async.AwaitPromise
-
-                        if amount <= 0 then stalled <- true else cached <- max cached (start + int64 amount)
+                | Some memory -> do! fillRetained memory available
                 | None -> ()
 
                 match childExit with
                 | Some exit when exitBeforeStat.IsNone ->
                     let! afterExit = NodePositionalFile.fstat descriptor |> Async.AwaitPromise
                     available <- afterExit.Size
+                    match retained with
+                    | Some memory -> do! fillRetained memory available
+                    | None -> ()
                     validateChild exit available
                 | Some exit -> validateChild exit available
                 | None -> ()
@@ -550,13 +555,13 @@ type SpoolSource private (
             if complete then return ReadOutcome.Bytes 0
             else return notYetAvailable ()
         elif position >= expectedLength then
-            if complete then return ReadOutcome.EndOfSource
+            if complete && (retained.IsNone || cached >= expectedLength) then return ReadOutcome.EndOfSource
             else return notYetAvailable ()
         elif retained.IsSome then
             let memory = retained.Value
 
             if position >= cached then
-                if complete then return ReadOutcome.EndOfSource
+                if complete && cached >= expectedLength then return ReadOutcome.EndOfSource
                 else return notYetAvailable ()
             else
                 let amount = int (min (int64 count) (cached - position))
@@ -735,6 +740,9 @@ type NodeTempStore private (path: string, descriptor: int, initialLength: int64)
         if String.IsNullOrWhiteSpace fileName then
             invalidArg (nameof fileName) "The temporary store name cannot be empty."
 
+        if fileName = "." || fileName = ".." || fileName.Contains("/") || fileName.Contains("\\") then
+            invalidArg (nameof fileName) "The temporary store name must identify a file."
+
         let safeFileName =
             fileName
             |> Seq.map (fun character ->
@@ -751,9 +759,6 @@ type NodeTempStore private (path: string, descriptor: int, initialLength: int64)
                     '-')
             |> Seq.toArray
             |> String
-
-        if safeFileName = "." || safeFileName = ".." then
-            invalidArg (nameof fileName) "The temporary store name must identify a file."
 
         NodeTempStore.Open(NodePath.join [| directory; safeFileName |])
 

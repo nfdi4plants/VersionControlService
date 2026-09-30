@@ -92,7 +92,6 @@ and private PendingRequest
     member _.Context = context
     member _.Complete = complete
     member val Settled = false with get, set
-    member val CancelPosted = false with get, set
 
 type private Admission
     (owner: TextDiffOwner, affinity: PreparationAffinity option, complete: Result<PoolSession, OperationFailure> -> unit) =
@@ -282,20 +281,29 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
             worker.Running <- None
 
             if request.Settled then
-                let closeHandle =
-                    match request.Body, result with
-                    | RequestBody.Open _, Ok(ResultPayload.Open(Resumable.Ready(OpenDiffResult.Opened(handle, _, _, _)))) ->
-                        Some handle
-                    | RequestBody.Open _, Ok(ResultPayload.Open(Resumable.Scanning _)) ->
-                        Some { DiffHandle.Id = ""; Version = "" }
-                    | _ -> None
+                match request.Body with
+                | RequestBody.Open _ ->
+                    let session = request.Session
+                    session.Phase <- Closing
+                    forgetSession session
 
-                closeHandle
-                |> Option.iter (fun handle ->
-                    observe
-                        (enqueue request.Session (RequestBody.Close handle) (OperationContext.detached "text-diff-close"))
-                        ignore
-                        ignore)
+                    let closeHandle =
+                        match result with
+                        | Ok(ResultPayload.Open(Resumable.Ready(OpenDiffResult.Opened(handle, _, _, _)))) -> Some handle
+                        | Ok(ResultPayload.Open(Resumable.Scanning _)) -> Some { DiffHandle.Id = ""; Version = "" }
+                        | _ -> None
+
+                    match closeHandle with
+                    | Some handle ->
+                        observe
+                            (promise {
+                                let! _ = enqueueAt true session (RequestBody.Close handle) (OperationContext.detached "text-diff-close")
+                                do! releaseSlot session
+                            })
+                            ignore
+                            ignore
+                    | None -> observe (releaseSlot session) ignore ignore
+                | _ -> ()
             else
                 settle request result
 
@@ -323,7 +331,7 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
                 | TextDiffMessage.WorkerFailure reason -> failWorker worker $"The text diff worker reported a failure: {reason}"
                 | TextDiffMessage.Progress(requestId, generation, validated, total) ->
                     match worker.Running with
-                    | Some request when request.RequestId = requestId && request.Session.Generation = generation ->
+                    | Some request when request.RequestId = requestId && request.Session.Generation = generation && not request.Settled ->
                         request.Context.ReportProgress {
                             PhaseCode = "text_diff_scan"
                             Item = None
@@ -497,7 +505,7 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
 
             evicting <- evicting && closingSlots < waitingCount
 
-    and enqueue (session: PoolSession) (body: RequestBody) (context: OperationContext) : JS.Promise<Result<ResultPayload, OperationFailure>> =
+    and enqueueAt (atFront: bool) (session: PoolSession) (body: RequestBody) (context: OperationContext) : JS.Promise<Result<ResultPayload, OperationFailure>> =
         Promise.create (fun resolve _ ->
             let worker = session.Worker
 
@@ -511,9 +519,12 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
                 let request = PendingRequest(requestId, session, body, context, resolve)
                 session.Active <- session.Active + 1
                 session.LastUsed <- tick ()
-                worker.Queue.Add request
+                if atFront then worker.Queue.Insert(0, request) else worker.Queue.Add request
                 context.Cancellation.Register(fun () -> cancelRequest request)
                 pumpWorker worker)
+
+    and enqueue (session: PoolSession) (body: RequestBody) (context: OperationContext) =
+        enqueueAt false session body context
 
     and cancelRequest (request: PendingRequest) =
         if not request.Settled then
@@ -525,8 +536,7 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
                 settle request (Error(canceled ()))
             else
                 match worker.Running with
-                | Some running when obj.ReferenceEquals(running, request) && not request.CancelPosted ->
-                    request.CancelPosted <- true
+                | Some running when obj.ReferenceEquals(running, request) ->
                     post worker (TextDiffMessage.Cancel(request.RequestId, request.Session.Generation))
                     settle request (Error(canceled ()))
                 | _ -> ()
@@ -559,13 +569,41 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
         pumpAdmission ()
     }
 
+    // A canceled Open keeps running on the worker until its late answer arrives. The session slot stays taken until then.
+    let canceledOpenStillRunning (session: PoolSession) =
+        match session.Worker.Running with
+        | Some request when obj.ReferenceEquals(request.Session, session) && request.Settled ->
+            match request.Body with
+            | RequestBody.Open _ -> true
+            | _ -> false
+        | _ -> false
+
     let releaseReservation (session: PoolSession) =
         match session.Phase with
         | Opening
         | Scanning ->
             session.Phase <- Closing
             forgetSession session
-            observe (releaseSlot session) ignore ignore
+            if not (canceledOpenStillRunning session) then observe (releaseSlot session) ignore ignore
+        | Opened
+        | Closing
+        | Closed -> ()
+
+    let closeResumedSession (session: PoolSession) =
+        match session.Phase with
+        | Opening
+        | Scanning ->
+            session.Phase <- Closing
+            forgetSession session
+
+            if not (canceledOpenStillRunning session) then
+                observe
+                    (promise {
+                        let! _ = enqueueAt true session (RequestBody.Close { DiffHandle.Id = ""; Version = "" }) (OperationContext.detached "text-diff-close")
+                        do! releaseSlot session
+                    })
+                    ignore
+                    ignore
         | Opened
         | Closing
         | Closed -> ()
@@ -668,7 +706,12 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
                 return Failed(workerFailed "The text diff worker answered Open with a different result type.")
             | Error failure ->
                 removeRequestAffinityForFailure failure
-                releaseReservation session
+
+                if resumed.IsSome && failure.Code = "operation_canceled" then
+                    closeResumedSession session
+                else
+                    releaseReservation session
+
                 return Failed failure
     }
 

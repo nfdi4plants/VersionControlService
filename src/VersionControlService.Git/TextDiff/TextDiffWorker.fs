@@ -1007,7 +1007,7 @@ let private openRequest
         | Error problem ->
             if problem.Code = TextDiffFailureCodes.ContinuationMismatch then
                 match worker.Slots.TryGetValue host.Generation with
-                | true, slot -> do! disposeSlot worker slot
+                | true, slot when isPreparing slot -> do! disposeSlot worker slot
                 | _ -> ()
 
             return Error problem

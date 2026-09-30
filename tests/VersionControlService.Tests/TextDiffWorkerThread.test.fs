@@ -274,6 +274,40 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "keeps an active session after a mismatched continuation",
+            TestOptions(timeout = 60000),
+            fun () ->
+                withWorkerPool "default" (ResizeArray()) (fun pool _ transports -> promise {
+                    let service = pool.Service(owner ())
+                    let! result = service.Open openRequest (OperationContext.detached "open") |> Async.StartAsPromise
+
+                    match result with
+                    | Succeeded outcome ->
+                        match outcome.Value with
+                        | Resumable.Ready(OpenDiffResult.Opened(handle, _, _, _)) ->
+                            transports[0].Post(
+                                encode(
+                                    TextDiffMessage.Request(
+                                        "active-slot-mismatch",
+                                        1,
+                                        RequestBody.Open({ openRequest with Continuation = Some "invalid-continuation" }, owner ())
+                                    )
+                                )
+                            )
+
+                            let! sourceInfo =
+                                service.GetSourceInfo
+                                    { SourceInfoRequest.Handle = handle }
+                                    (OperationContext.detached "source-info-after-mismatch")
+                                |> Async.StartAsPromise
+
+                            Vitest.expect(sourceInfo.IsSucceeded).toBe true
+                        | other -> failwith $"Expected an opened diff, got %A{other}"
+                    | other -> failwith $"Open failed: %A{other}"
+                })
+        )
+
+        Vitest.test (
             "disposes the preparation slot after a mismatched continuation",
             TestOptions(timeout = 120000),
             fun () ->
