@@ -9,6 +9,29 @@ open VersionControlService.TextDiff
 module TextDiffResyncCases =
     type private SourceLine = { Text: string; Ending: LineEnding }
 
+    type private TestScratchHolder() =
+        let mutable holdsScratch = false
+        let mutable busy = false
+        let mutable mustKeepScratch = false
+
+        member _.Set(holds, isBusy, mustKeep) =
+            holdsScratch <- holds
+            busy <- isBusy
+            mustKeepScratch <- mustKeep
+
+        interface IScratchHolder with
+            member _.HoldsScratch = holdsScratch
+            member _.IsBusy = busy
+            member _.MustKeepScratch = mustKeepScratch
+            member _.YieldScratch() = async {
+                holdsScratch <- false
+                mustKeepScratch <- false
+            }
+            member _.Spill() = async {
+                holdsScratch <- false
+                mustKeepScratch <- false
+            }
+
     let private encode (lines: SourceLine array) =
         lines
         |> Array.map (fun line -> line.Text + "\n")
@@ -432,51 +455,118 @@ module TextDiffResyncCases =
             do! second.Close()
             Check.equal 0 coordinator.Count "Closed sessions leave the coordinator."
         }
-        "two sessions alternating on one worker both finish with their uninterrupted output", fun () -> async {
-            let previous = lines "line-" 0 800
-            let current = Array.concat [ previous[.. 99]; lines "new-" 0 300; previous[100 .. 399]; lines "other-" 0 200; previous[600 ..] ]
+        "four sessions alternating on one worker all finish with their uninterrupted output", fun () -> async {
+            let previous = lines "line-" 0 300
+            let current = Array.concat [ previous[.. 39]; lines "new-" 0 100; previous[40 .. 149]; lines "other-" 0 60; previous[220 ..] ]
             let! plain = run { smallConfig "alternate-plain" with Limits = tinyLimits } previous current
             let coordinator = WorkerScratch()
             let host = Host.createInMemory (ManualClock 0.0 :> IClock)
             let! first = openOnWorker coordinator host "alternate-first" previous current
             let! second = openOnWorker coordinator host "alternate-second" previous current
+            let! third = openOnWorker coordinator host "alternate-third" previous current
+            let! fourth = openOnWorker coordinator host "alternate-fourth" previous current
             let! firstStart = first.FirstPage(fun () -> false)
             let! secondStart = second.FirstPage(fun () -> false)
-            let runners = [| newRunner first firstStart; newRunner second secondStart |]
+            let! thirdStart = third.FirstPage(fun () -> false)
+            let! fourthStart = fourth.FirstPage(fun () -> false)
+            let runners = [| newRunner first firstStart; newRunner second secondStart; newRunner third thirdStart; newRunner fourth fourthStart |]
             do! alternate runners
             for runner in runners do
                 checkSameOutput plain runner previous current
                 do! runner.Session.Close()
             Check.equal 0 coordinator.Count "Closed sessions leave the coordinator."
         }
-        "a waiting session returns a scan while another session is in the middle of a step and completes later", fun () -> async {
-            let previous = lines "line-" 0 800
-            let current = Array.concat [ previous[.. 99]; lines "new-" 0 300; previous[100 .. 399]; lines "other-" 0 200; previous[600 ..] ]
-            let! plain = run { smallConfig "waiting-plain" with Limits = tinyLimits } previous current
+        "a stopped alignment yields to a tiny diff and resumes from committed lines", fun () -> async {
+            // Scattered edits queue finished hunks while the next window still aligns, so a page can end mid step.
+            let random = Random(3)
+            let previous = Array.init 800 (fun index -> { Text = $"b {index} {random.Next 1000}"; Ending = LineEnding.LF })
+            let current = previous |> Array.map (fun line -> if random.Next 4 = 0 then { line with Text = line.Text + " changed" } else line)
+            let smallPrevious = [| { Text = "one"; Ending = LineEnding.LF }; { Text = "two"; Ending = LineEnding.LF }; { Text = "three"; Ending = LineEnding.LF } |]
+            let smallCurrent = [| { Text = "one"; Ending = LineEnding.LF }; { Text = "TWO"; Ending = LineEnding.LF }; { Text = "three"; Ending = LineEnding.LF } |]
+            let! plainLarge = run { smallConfig "yield-plain-large" with Limits = tinyLimits } previous current
+            let! plainSmall = run { smallConfig "yield-plain-small" with Limits = tinyLimits } smallPrevious smallCurrent
             let coordinator = WorkerScratch()
             let host = Host.createInMemory (ManualClock 0.0 :> IClock)
-            let! first = openOnWorker coordinator host "waiting-first" previous current
-            let! second = openOnWorker coordinator host "waiting-second" previous current
+            let! first = openOnWorker coordinator host "yield-large" previous current
+            let! second = openOnWorker coordinator host "yield-small" smallPrevious smallCurrent
             let holder = first :> IScratchHolder
             let! firstStart = first.FirstPage(fun () -> false)
             let firstRunner = newRunner first firstStart
             let mutable requests = 0
-            while not holder.MustKeepScratch && not firstRunner.Finished do
+            let hasReadyPage = function
+                | EngineResult.Ok(Resumable.Ready _) -> true
+                | _ -> false
+            while not (holder.MustKeepScratch && hasReadyPage firstRunner.Result) && not firstRunner.Finished do
                 requests <- requests + 1
                 if requests > 200_000 then failwith "The first session never entered an alignment step."
                 do! advanceRunner firstRunner
-            Check.true' holder.MustKeepScratch "The first session is in the middle of a step."
-            let! blocked = second.FirstPage(fun () -> false)
-            match blocked with
-            | EngineResult.Ok(Resumable.Scanning _) -> ()
-            | other -> failwith $"The waiting request did not return a scan: {other}."
-            Check.true' holder.HoldsScratch "The waiting request did not spill the holder."
-            Check.true' holder.MustKeepScratch "The holder is still in the middle of its step."
-            let runners = [| firstRunner; newRunner second blocked |]
-            do! alternate runners
-            for runner in runners do
-                checkSameOutput plain runner previous current
-                do! runner.Session.Close()
+            Check.true' (holder.MustKeepScratch && hasReadyPage firstRunner.Result) "The viewer stops after a ready page while alignment is incomplete."
+            let! secondStart = second.FirstPage(fun () -> false)
+            let secondRunner = newRunner second secondStart
+            let mutable secondRequests = 1
+            while not secondRunner.Finished && secondRequests < 64 do
+                do! advanceRunner secondRunner
+                secondRequests <- secondRequests + 1
+            Check.true' secondRunner.Finished "The small diff reaches its end within a bounded number of requests."
+            Check.true' (not holder.MustKeepScratch) "The unfinished alignment released its scratch."
+            checkSameOutput plainSmall secondRunner smallPrevious smallCurrent
+            let mutable firstRequests = 0
+            while not firstRunner.Finished && firstRequests < 200_000 do
+                do! advanceRunner firstRunner
+                firstRequests <- firstRequests + 1
+            Check.true' firstRunner.Finished "The original diff resumes and reaches its end."
+            checkSameOutput plainLarge firstRunner previous current
+            do! first.Close()
+            do! second.Close()
+            Check.equal 0 coordinator.Count "Closed sessions leave the coordinator."
+        }
+        "a requester that stops waiting does not keep its place", fun () -> async {
+            let coordinator = WorkerScratch()
+            let holder = TestScratchHolder()
+            let stopped = TestScratchHolder()
+            let next = TestScratchHolder()
+            holder.Set(true, true, true)
+            coordinator.Register(holder :> IScratchHolder)
+            coordinator.Register(stopped :> IScratchHolder)
+            coordinator.Register(next :> IScratchHolder)
+            let! firstAttempt = coordinator.BeginRequest(stopped :> IScratchHolder)
+            Check.equal false firstAttempt "The requester waits while a busy session keeps scratch."
+            holder.Set(true, false, false)
+            let! nextAttempt = coordinator.BeginRequest(next :> IScratchHolder)
+            Check.true' nextAttempt "A requester that stopped asking does not hold up the next session."
+            coordinator.Unregister(holder :> IScratchHolder)
+            coordinator.Unregister(stopped :> IScratchHolder)
+            coordinator.Unregister(next :> IScratchHolder)
+            Check.equal 0 coordinator.Count "Unregistered holders leave the coordinator."
+        }
+        "an invalidated session releases worker scratch for the next session", fun () -> async {
+            let coordinator = WorkerScratch()
+            let ledger = Ledger()
+            let host = Host.createInMemory (ManualClock 0.0 :> IClock)
+            let invalid = Encoding.UTF8.GetBytes("first\nbad\u0000line\n")
+            let previous = [| { Text = "one"; Ending = LineEnding.LF }; { Text = "two"; Ending = LineEnding.LF } |]
+            let current = Array.copy previous
+            current[1] <- { Text = "TWO"; Ending = LineEnding.LF }
+            let create id previousSpec currentSpec =
+                TextDiffSession.createWithScratch coordinator host ledger { smallConfig id with Limits = tinyLimits } (fun _ -> 1) previousSpec currentSpec
+            let! invalidSession = create "invalid-scratch" (spec (Encoding.UTF8.GetBytes "first\nbad\n")) (spec invalid)
+            let! invalidResult = invalidSession.FirstPage(fun () -> false)
+            match invalidResult with
+            | EngineResult.Failed("diff_content_not_text", _, _) -> ()
+            | other -> failwith $"The invalid source returned {other}."
+            let invalidHolder = invalidSession :> IScratchHolder
+            Check.true' invalidHolder.HoldsScratch "The invalidated session still holds worker scratch before another request."
+            let! expected = run { smallConfig "next-after-invalid-plain" with Limits = tinyLimits } previous current
+            let! nextSession = create "next-after-invalid" (spec (encode previous)) (spec (encode current))
+            let! actual = readAll nextSession noHook
+            checkSameShape expected actual
+            let parts = actual.Pages |> Array.collect (fun page -> page.Parts)
+            Check.sequence previous (rebuild previous parts true) "The next session emits every previous line."
+            Check.sequence current (rebuild current parts false) "The next session emits every current line."
+            Check.true' (not invalidHolder.HoldsScratch) "The next request releases scratch held by the invalidated session."
+            do! invalidSession.Close()
+            do! nextSession.Close()
+            Check.equal 0 coordinator.Count "Closed sessions leave the coordinator."
         }
     ]
 

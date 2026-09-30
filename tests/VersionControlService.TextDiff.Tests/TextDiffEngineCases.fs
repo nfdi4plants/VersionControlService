@@ -629,6 +629,51 @@ module TextDiffEngineCases =
             Check.sequence [| 65_536.0 |] (run.Windows |> Array.map _.Start) "Only the final window waits for more bytes."
             return ()
         }
+        "observed common runs preserve evidence callbacks without retaining run windows", fun () -> async {
+            let data = Array.create 70_000 0x61uy
+            data[10] <- 0uy
+            for index = 100 to 799 do data[index] <- 0x01uy
+
+            let previous = ResizeArray<float * int * int * int * float * float>()
+            let current = ResizeArray<float * int * int * int * float * float>()
+            let observe (target: ResizeArray<float * int * int * int * float * float>) start bytes controls scalars firstControl firstNul =
+                target.Add((start, bytes, controls, scalars, firstControl, firstNul))
+
+            let run =
+                CommonRun.findObserved
+                    TextEncoding.Utf8
+                    0.0
+                    65_536.0
+                    false
+                    true
+                    0.0
+                    65_536.0
+                    (observe previous)
+                    (observe current)
+                    data
+                    0
+                    (Array.copy data)
+                    0
+                    data.Length
+
+            Check.sequence
+                [|
+                    0.0, 65_536, 700, 65_536, 100.0, 10.0
+                    65_536.0, 4_464, 0, 4_464, -1.0, -1.0
+                |]
+                (previous.ToArray())
+                "The previous side receives one observation for each window segment."
+            Check.sequence
+                [|
+                    65_536.0, 65_536, 700, 65_536, 65_636.0, 65_546.0
+                    131_072.0, 4_464, 0, 4_464, -1.0, -1.0
+                |]
+                (current.ToArray())
+                "The shared current side receives translated observation offsets."
+            Check.true' (Array.isEmpty run.Evidence) "The observed result does not retain per-run evidence."
+            Check.true' (Array.isEmpty run.Windows) "The observed result does not retain per-run windows."
+            return ()
+        }
         "a common run reports invalid UTF-8 inside equal bytes", fun () -> async {
             let data = Array.concat [ ascii "ok\nfine"; bytes [ 0xC0; 0xAF ]; ascii "\nrest" ]
             let run = commonRun TextEncoding.Utf8 500L false data (Array.copy data)

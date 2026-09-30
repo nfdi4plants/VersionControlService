@@ -767,7 +767,7 @@ module TextDiffSessionCases =
             do! session.Close()
             return ()
         }
-        "abandoned line reads release scratch and expire old continuations", fun () -> async {
+        "twelve suspended line reads continue after older reads are evicted", fun () -> async {
             let words count (format: int -> string) = String.Join(" ", Array.init count format)
             let previousLine = words 3_500 (fun index -> sprintf "w%06d" index)
             let currentLine = words 3_500 (fun index -> if index = 2_000 then sprintf "X%06d" index else sprintf "w%06d" index)
@@ -818,32 +818,24 @@ module TextDiffSessionCases =
             do! baselineSession.Close()
 
             let continuations = ResizeArray<string>()
-            for _ in 1 .. 16 do
+            for _ in 1 .. 12 do
                 let! result = session.ReadLine(DiffSide.Current, 1L, 8_192L, 8_192, None, fun () -> false)
                 match result with
                 | EngineResult.Ok(Resumable.Scanning(_, continuation, _)) -> continuations.Add continuation
-                | other -> failwith $"The abandoned line read returned {other}."
+                | other -> failwith $"The concurrent line read returned {other}."
                 Check.equal 0L (ledger.Used AllocationCategory.AlignmentScratch) "A suspended line read releases its pair-analysis reservation."
+            Check.equal 12 continuations.Count "Every line read returns a continuation."
 
-            let! expired = session.ReadLine(DiffSide.Current, 1L, 8_192L, 8_192, Some continuations[0], fun () -> false)
-            match expired with
-            | EngineResult.Failed("continuation_mismatch", _, _) -> ()
-            | other -> failwith $"The oldest line continuation returned {other}."
+            for continuation in continuations do
+                let! initial = session.ReadLine(DiffSide.Current, 1L, 8_192L, 8_192, Some continuation, fun () -> false)
+                let! line = resolveLine session DiffSide.Current 1L 8_192L 8_192 initial
+                Check.equal 8_192L line.Slice.OffsetUtf16 "A continued read keeps its requested offset."
+                Check.equal (currentLine.Substring(8_192, 8_192)) line.Slice.Text "A continued read returns the source slice."
+            Check.equal 0L (ledger.Used AllocationCategory.AlignmentScratch) "Completed line reads release pair-analysis scratch."
 
             let! freshInitial = session.ReadLine(DiffSide.Current, 1L, 0L, 8_192, None, fun () -> false)
-            let mutable freshResult = freshInitial
-            let mutable freshLine = None
-            let mutable freshRequests = 1
-            while freshLine.IsNone && freshRequests < 40 do
-                match freshResult with
-                | EngineResult.Ok(Resumable.Ready line) -> freshLine <- Some line
-                | EngineResult.Ok(Resumable.Scanning(_, continuation, _)) ->
-                    let! next = session.ReadLine(DiffSide.Current, 1L, 0L, 8_192, Some continuation, fun () -> false)
-                    freshResult <- next
-                    freshRequests <- freshRequests + 1
-                | other -> failwith $"The fresh line read returned {other}."
-            Check.true' freshLine.IsSome "A fresh line read finishes within its usual request budget."
-            Check.equal (Some(int64 currentLine.Length)) freshLine.Value.Slice.TotalUtf16 "The fresh line read keeps its total length."
+            let! freshLine = resolveLine session DiffSide.Current 1L 0L 8_192 freshInitial
+            Check.equal (Some(int64 currentLine.Length)) freshLine.Slice.TotalUtf16 "A fresh line read keeps its total length."
             Check.equal 0L (ledger.Used AllocationCategory.AlignmentScratch) "A completed line read releases pair-analysis scratch."
 
             let! pageSession = openPageSession "abandoned-read-page"
@@ -1828,6 +1820,55 @@ module TextDiffSessionCases =
             let! pages = readAll session (fun () -> false)
             checkOracle previous current pages
             do! session.Close()
+            return ()
+        }
+        "appended lines complete across small request budgets", fun () -> async {
+            let previous = Array.init 2_000 (fun index -> { Text = "line " + string index; Ending = LineEnding.LF })
+            let appended = Array.init 300 (fun index -> { Text = "added " + string index; Ending = LineEnding.LF })
+            let current = Array.append previous appended
+            for maxUnits in [| 10; 20; 40; 80; 160; 400 |] do
+                let limits = { Limits.defaults with MaxUnits = maxUnits; RequestMs = 1e15; QuantumMs = 1e15 }
+                let! session = openSession { defaultConfig () with Limits = limits } (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+                let! pages = readAll session (fun () -> false)
+                checkOracle previous current pages
+                do! session.Close()
+            return ()
+        }
+        "line slices past the read buffer keep their encoded text", fun () -> async {
+            let text = String.replicate 60_000 "中"
+            let makeSpec encoding bomLength (bytes: byte[]) = {
+                Source = Some(MemoryByteSource(bytes) :> IByteSource)
+                Encoding = encoding
+                BomLength = bomLength
+                ByteLength = int64 bytes.Length
+            }
+            let utf8 = Encoding.UTF8.GetBytes text
+            let utf16 = Array.zeroCreate<byte> (2 + text.Length * 2)
+            utf16[0] <- 0xFFuy
+            utf16[1] <- 0xFEuy
+            for index = 0 to text.Length - 1 do
+                let value = int text[index]
+                utf16[2 + index * 2] <- byte (value &&& 0xFF)
+                utf16[3 + index * 2] <- byte (value >>> 8)
+            let utf32 = Array.zeroCreate<byte> (4 + text.Length * 4)
+            utf32[0] <- 0xFFuy
+            utf32[1] <- 0xFEuy
+            for index = 0 to text.Length - 1 do
+                let value = int text[index]
+                utf32[4 + index * 4] <- byte (value &&& 0xFF)
+                utf32[5 + index * 4] <- byte (value >>> 8)
+            let sources = [|
+                "utf-8", makeSpec "utf-8" 0 utf8
+                "utf-16le", makeSpec "utf-16le" 2 utf16
+                "utf-32le", makeSpec "utf-32le" 4 utf32
+            |]
+            for encoding, current in sources do
+                let! session = openSession (defaultConfig ()) absentSpec current
+                let! initial = session.ReadLine(DiffSide.Current, 0L, 40_000L, 8_192, None, fun () -> false)
+                let! line = resolveLine session DiffSide.Current 0L 40_000L 8_192 initial
+                Check.equal 40_000L line.Slice.OffsetUtf16 $"The {encoding} slice starts at its requested offset."
+                Check.equal (text.Substring(40_000, 8_192)) line.Slice.Text $"The {encoding} slice matches the source."
+                do! session.Close()
             return ()
         }
         "start middle and end edits preserve lines across window edges", fun () -> async {

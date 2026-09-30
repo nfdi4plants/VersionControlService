@@ -287,6 +287,16 @@ module TextDiffStreamingCases =
             Check.equal 0.0 state.ValidatedBytes "Validated progress stops before the pending high surrogate."
             return ()
         }
+        "a due quantum still permits the first scanner segment", fun () -> async {
+            let clock = ManualClock 0.0
+            let meter = Meter.create (clock :> IClock) { MaxUnits = Int32.MaxValue; RequestMs = 1_000_000.0; QuantumMs = 0.0 }
+            let state = Scanner.create TextEncoding.Utf8 0L None
+            let input = Array.create 8_192 0x61uy
+            let result = Scanner.scanChunk state input 0 input.Length false meter (LineBatch()) ignore ignore
+            Check.equal 4_096 result.Consumed "The scanner makes one segment of progress."
+            Check.equal QuantumReached result.Status "The scanner suspends after the first segment."
+            return ()
+        }
         "the equal-byte phase resumes after a large insertion", fun () ->
             shiftedTailCase "stream-insertion-reentry" (fun previous ->
                 let inserted = makeLines 5_000 "inserted-"
@@ -357,6 +367,45 @@ module TextDiffStreamingCases =
             Check.sequence (rebuild current interruptedParts false) (rebuild current uninterruptedParts false) "Suspended work keeps the same current-side output."
             do! suspended.Close()
             do! uninterrupted.Close()
+            return ()
+        }
+        "a long replacement resumes its page search within request budgets", fun () -> async {
+            let unchanged = String('a', 160_000)
+            let changed = unchanged.Substring(0, 80_000) + "b" + unchanged.Substring(80_001)
+            let previous = [|
+                { Text = "head"; Ending = LineEnding.LF }
+                { Text = unchanged; Ending = LineEnding.LF }
+                { Text = "tail"; Ending = LineEnding.NoEnding }
+            |]
+            let current = [|
+                { Text = "head"; Ending = LineEnding.LF }
+                { Text = changed; Ending = LineEnding.LF }
+                { Text = "tail"; Ending = LineEnding.NoEnding }
+            |]
+            let previousSpec = sourceSpec (encodeLines previous)
+            let currentSpec = sourceSpec (encodeLines current)
+            let baselineLimits = { Limits.defaults with MaxUnits = Int32.MaxValue; RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 }
+            let tinyLimits = { baselineLimits with MaxUnits = 64 }
+            let! baseline = openSession (Ledger()) (config "stream-long-pair-baseline" 64 100_000 baselineLimits None) previousSpec currentSpec
+            let! baselinePages, _ = readAll baseline
+            let! limited = openSession (Ledger()) (config "stream-long-pair-limited" 64 100_000 tinyLimits None) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+            let! limitedPages, scans = readAll limited
+            Check.true' (scans > 1) "The long pair search returns more than one page request."
+            let replacedRow pages =
+                allParts pages
+                |> Array.collect (function
+                    | DiffPart.Hunk { Body = HunkBody.AlignedRows rows } -> rows
+                    | _ -> [||])
+                |> Array.find (fun (row: DiffRow) -> row.Kind = DiffRowKind.Replaced)
+            let lineShape (line: DiffLine) =
+                line.Number, line.Ending, line.Slice.OffsetUtf16, line.Slice.TotalUtf16, line.Slice.Text, line.Slice.Highlights
+            let rowShape (row: DiffRow) =
+                row.Kind,
+                row.Previous |> Option.map lineShape,
+                row.Current |> Option.map lineShape
+            Check.equal (rowShape (replacedRow baselinePages)) (rowShape (replacedRow limitedPages)) "The budgeted page has the same long pair slice and highlights."
+            do! baseline.Close()
+            do! limited.Close()
             return ()
         }
         "a work-limited gap becomes unaligned before a later edit", fun () -> async {

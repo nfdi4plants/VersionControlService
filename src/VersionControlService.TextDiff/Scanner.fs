@@ -893,9 +893,7 @@ module Scanner =
                 if Meter.overBudget meter then
                     status <- BudgetReached
                     stopped <- true
-                elif consumed > 0 && Meter.quantumDue meter then
-                    status <- QuantumReached
-                    stopped <- true
+                // A request with remaining work budget scans one segment before a due quantum suspends it.
             if not stopped then
                 let windowRemaining = WindowByteCount - state.CurrentWindow.Bytes
                 let segmentCount = min SegmentBytes (min (count - consumed) windowRemaining)
