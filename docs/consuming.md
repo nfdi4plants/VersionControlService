@@ -656,6 +656,14 @@ Keep a page's `PageId` if the caller may need the page again. `ReplayPage` retur
 as it was first read, except that `Pending` is `None`. A viewer can drop pages it no
 longer shows and read them again later.
 
+An `HunkBody.UnalignedSides` body holds lines whose alignment could not be established.
+This can happen when a gap exceeds the Myers step budget inside a window. It can also happen
+when a forward search reaches its configured limit, which defaults to 1,000,000 lines or
+256 MiB per side through `ResyncScanLines` and `ResyncScanBytes`. The search continues after
+it reaches a limit, from the same line offset between the sides. After an insertion or
+deletion larger than the limit, the rest of the file therefore shows as unaligned regions, like
+a rewrite, with every line present. A full rewrite also produces unaligned regions.
+
 ```fsharp
 let replayPage (service: TextDiffService) (handle: DiffHandle) (page: DiffPage) (context: OperationContext) = async {
     let! result = service.ReplayPage { Handle = handle; PageId = page.PageId } context
@@ -739,10 +747,11 @@ including HDF5 signatures. Content that turns out not to be text during later sc
 fails with `diff_content_not_text`, and `failure.DiffDetail` records the side and
 evidence. The evidence is a binary signature, a NUL byte, a control-character ratio
 above 1 percent in a window of the file, or a byte sequence that is invalid in the
-encoding. A recognized BOM selects its encoding. If the encoding remains ambiguous,
-`DiffBlocker.EncodingRequired` returns a `PreparationToken` and `EncodingCandidate` values.
-Ask the user to choose a candidate, then retry the same open request with that token and
-the chosen encoding on the reported side.
+encoding. A recognized BOM selects its encoding. Valid UTF-8 that contains multi-byte
+sequences is selected without asking. `DiffBlocker.EncodingRequired` appears when the bytes
+are not valid UTF-8 and more than one single-byte encoding fits. It returns a
+`PreparationToken` and `EncodingCandidate` values. Ask the user to choose a candidate, then
+retry the same open request with that token and the chosen encoding on the reported side.
 
 ```fsharp
 let chooseEncoding (request: OpenDiffRequest) (side: DiffSide) (token: PreparationToken) (encoding: string) =

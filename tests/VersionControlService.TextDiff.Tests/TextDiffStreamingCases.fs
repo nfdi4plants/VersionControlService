@@ -8,6 +8,26 @@ open VersionControlService.TextDiff
 module TextDiffStreamingCases =
     type private SourceLine = { Text: string; Ending: LineEnding }
 
+    type private GrowingByteSource(bytes: byte[], step: int, everyReads: int) =
+        let mutable available = 0
+        let mutable reads = 0
+
+        interface IByteSource with
+            member _.KnownLength = Some(int64 bytes.Length)
+            member _.AvailableLength() = int64 available
+            member _.IsComplete() = available >= bytes.Length
+            member _.ReadAt position buffer offset count = async {
+                reads <- reads + 1
+                if reads % everyReads = 0 then available <- min bytes.Length (available + step)
+                let start = int position
+                if start >= bytes.Length then return ReadOutcome.EndOfSource
+                elif start >= available then return ReadOutcome.NotYetAvailable
+                else
+                    let count = min count (available - start)
+                    Array.blit bytes start buffer offset count
+                    return ReadOutcome.Bytes count
+            }
+
     let private endingText = function
         | LineEnding.NoEnding -> ""
         | LineEnding.LF -> "\n"
@@ -26,6 +46,8 @@ module TextDiffStreamingCases =
         BomLength = 0
         ByteLength = int64 bytes.Length
     }
+
+    let private sourceSpecWith source bytes = { sourceSpec bytes with Source = Some source }
 
     let private config sessionId windowLines myersSteps limits hashMask = {
         SessionConfig.defaults sessionId with
@@ -90,6 +112,25 @@ module TextDiffStreamingCases =
     }
 
     let private allParts (pages: DiffPage array) = pages |> Array.collect (fun page -> page.Parts)
+
+    let private diffCounts pages =
+        let mutable added = 0
+        let mutable removed = 0
+        let mutable unalignedPrevious = 0
+        let mutable unalignedCurrent = 0
+        for part in allParts pages do
+            match part with
+            | DiffPart.Hunk fragment ->
+                match fragment.Body with
+                | HunkBody.AlignedRows rows ->
+                    for row in rows do
+                        if row.Kind = DiffRowKind.Added then added <- added + 1
+                        elif row.Kind = DiffRowKind.Removed then removed <- removed + 1
+                | HunkBody.UnalignedSides(previous, current) ->
+                    unalignedPrevious <- unalignedPrevious + previous.Length
+                    unalignedCurrent <- unalignedCurrent + current.Length
+            | _ -> ()
+        added, removed, unalignedPrevious, unalignedCurrent
 
     let private rebuild expected parts previousSide =
         let output = ResizeArray<SourceLine>()
@@ -304,6 +345,36 @@ module TextDiffStreamingCases =
         "the equal-byte phase resumes after a large deletion", fun () ->
             shiftedTailCase "stream-deletion-reentry" (fun previous ->
                 Array.concat [ previous[.. 99]; previous[5_100 ..] ])
+        "growing previous input preserves the complete insertion diff", fun () -> async {
+            let previous = makeLines 40_000 "line "
+            let inserted = makeLines 70_000 "new "
+            let current = Array.concat [ previous[.. 19_999]; inserted; previous[20_000 ..] ]
+            let previousBytes = encodeLines previous
+            let currentBytes = encodeLines current
+            let previousSource = sourceSpec previousBytes
+            let currentSource = sourceSpec currentBytes
+
+            let! complete = openSession (Ledger()) (SessionConfig.defaults "stream-growing-insertion-complete") previousSource currentSource
+            let! completePages, _ = readAll complete
+            checkOracle previous current completePages
+            let completeCounts = diffCounts completePages
+            Check.equal (70_000, 0, 0, 0) completeCounts "The complete input reports the full insertion without unaligned lines."
+            do! complete.Close()
+
+            for name, step, everyReads in [
+                "16k-2", 16_384, 2
+                "64k-3", 65_536, 3
+                "4k-1", 4_096, 1
+            ] do
+                let growing = GrowingByteSource(previousBytes, step, everyReads) :> IByteSource
+                let growingPrevious = sourceSpecWith growing previousBytes
+                let! session = openSession (Ledger()) (SessionConfig.defaults ("stream-growing-insertion-" + name)) growingPrevious currentSource
+                let! pages, _ = readAll session
+                checkOracle previous current pages
+                Check.equal completeCounts (diffCounts pages) $"Growth pattern {name} matches the complete input."
+                do! session.Close()
+            return ()
+        }
         "window storage stays within its configured line bound", fun () -> async {
             let previous = makeLines 50_000 "line-"
             let current = Array.copy previous

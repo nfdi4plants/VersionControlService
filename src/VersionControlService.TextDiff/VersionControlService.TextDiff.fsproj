@@ -28,6 +28,9 @@
     <Compile Include="TextDiffSession.fs" />
   </ItemGroup>
   <ItemGroup>
+    <InternalsVisibleTo Include="VersionControlService.TextDiff.Tests" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\VersionControlService.Abstractions\VersionControlService.Abstractions.fsproj" />
   </ItemGroup>
   <ItemGroup>

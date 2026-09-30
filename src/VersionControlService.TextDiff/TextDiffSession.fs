@@ -924,13 +924,6 @@ type TextDiffSession internal (
 
     // Window phase helpers.
 
-    let isCommittable (operation: DiffOperation) =
-        match operation.Kind with
-        | OperationKind.Equal
-        | OperationKind.EndingChanged
-        | OperationKind.Unaligned -> true
-        | _ -> false
-
     let beginFeeding () =
         windowState <- WindowState.Feeding
         opIndex <- 0
@@ -977,16 +970,26 @@ type TextDiffSession internal (
         let currentTable = currentSide.Table
         let bothFinished = previousSide.Finished && currentSide.Finished
         let emptyTable = previousTable.Count = 0 || currentTable.Count = 0
+        let canGrow = windowLimit < config.WindowMaxLines && not previousSide.ByteFull && not currentSide.ByteFull
         if partialAlign then
             // Growing sources stall before the window fills. Only settled operations are committed and the
             // window keeps its size so the next bytes extend the same lines.
             partialAlign <- false
             let mutable last = -1
             for index = 0 to ops.Length - 1 do
-                if isCommittable ops[index] then last <- index
+                if ops[index].Kind = OperationKind.Equal || ops[index].Kind = OperationKind.EndingChanged then last <- index
             if last >= 0 then
                 commitCount <- last + 1
                 beginFeeding ()
+            elif bothFinished then
+                if canGrow then
+                    windowLimit <- min config.WindowMaxLines (windowLimit * 2)
+                    previousSide.SetLimits(windowLimit, config.WindowMaxBytes)
+                    currentSide.SetLimits(windowLimit, config.WindowMaxBytes)
+                    ops <- Array.empty
+                    windowState <- WindowState.Loading
+                else
+                    startResync ()
             else
                 ops <- Array.empty
                 windowState <- WindowState.Loading
@@ -1001,7 +1004,6 @@ type TextDiffSession internal (
             for index = 0 to ops.Length - 1 do
                 if ops[index].Kind = OperationKind.Equal || ops[index].Kind = OperationKind.EndingChanged then last <- index
             let anchored = last >= 0
-            let canGrow = windowLimit < config.WindowMaxLines && not previousSide.ByteFull && not currentSide.ByteFull
             // A window without any matching line may hold an insertion or deletion that is larger than the
             // window, so it grows before it is given up. A largest window without a matching line continues
             // with the forward search.

@@ -3,9 +3,6 @@ namespace VersionControlService.TextDiff
 open System.Collections.Generic
 open VersionControlService.Abstractions
 
-[<assembly: System.Runtime.CompilerServices.InternalsVisibleTo("VersionControlService.TextDiff.Tests")>]
-do ()
-
 /// Position and size of one source line. Offsets and counts are floats so the transpiled code avoids 64-bit arithmetic.
 [<Struct>]
 type internal LineRef = {
