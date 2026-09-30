@@ -574,20 +574,21 @@ Vitest.describe (
                 let mutable resolveChild: (NodeProcess.ChildExit -> unit) option = None
                 let childClosed: JS.Promise<NodeProcess.ChildExit> =
                     JS.Constructors.Promise.Create(fun resolve _ -> resolveChild <- Some resolve)
-                let mutable releaseRead: (unit -> unit) option = None
-                let mutable firstRead = true
+                // The first two fills wait: the one of the pending ReadAt and the one the child exit starts on its own.
+                // Only the pending ReadAt can then bring the rest of the file in after the exit.
+                let heldReads = ResizeArray<unit -> unit>()
+                let mutable fills = 0
 
                 let readAt file buffer offset count position =
-                    if firstRead then
-                        firstRead <- false
+                    fills <- fills + 1
 
+                    if fills <= 2 then
                         JS.Constructors.Promise.Create(fun resolve reject ->
-                            releaseRead <-
-                                Some(fun () ->
-                                    NodeInterop.observePromise
-                                        (NodePositionalFile.readAt file buffer offset count position)
-                                        resolve
-                                        reject))
+                            heldReads.Add(fun () ->
+                                NodeInterop.observePromise
+                                    (NodePositionalFile.readAt file buffer offset count position)
+                                    resolve
+                                    reject))
                     else
                         NodePositionalFile.readAt file buffer offset count position
 
@@ -600,8 +601,9 @@ Vitest.describe (
                         readAt = readAt
                     )
 
-                let refresh = source.RefreshAvailableLength() |> Async.StartAsPromise
-                do! waitFor "the pending spool read" 5000.0 (fun () -> Promise.lift releaseRead.IsSome)
+                let target = [| 0uy |]
+                let pending = source.ReadAt 4L target 0 1 |> Async.StartAsPromise
+                do! waitFor "the pending spool read" 5000.0 (fun () -> Promise.lift (heldReads.Count = 1))
 
                 let finalBytes = Encoding.UTF8.GetBytes "abcdefghijklmnop"
                 let! _ = NodePositionalFile.writeAt writer finalBytes 0 finalBytes.Length 0L
@@ -612,31 +614,78 @@ Vitest.describe (
                     StderrTruncated = false
                     SpawnError = None
                 }
-                releaseRead.Value ()
+                do! waitFor "the fill started by the child exit" 5000.0 (fun () -> Promise.lift (heldReads.Count = 2))
+                heldReads[0] ()
 
-                let mutable readFailure = None
-
-                try
-                    let! _ = refresh
-                    ()
-                with error ->
-                    readFailure <- Some error
-
-                do! waitFor "the completed spool" 5000.0 (fun () -> Promise.lift(source.IsComplete() || source.Failure.IsSome))
-                Vitest.expect(readFailure.IsNone).toBe true
+                let! outcome = pending
+                Vitest.expect(outcome).toEqual(ReadOutcome.Bytes 1)
+                Vitest.expect(target[0]).toBe finalBytes[4]
                 Vitest.expect(source.Failure.IsNone).toBe true
                 Vitest.expect(source.IsComplete()).toBe true
+                heldReads[1] ()
 
                 for position = 0 to finalBytes.Length - 1 do
-                    let target = [| 0uy |]
-                    let! outcome = source.ReadAt(int64 position) target 0 1 |> Async.StartAsPromise
+                    let single = [| 0uy |]
+                    let! result = source.ReadAt(int64 position) single 0 1 |> Async.StartAsPromise
 
-                    match outcome with
-                    | ReadOutcome.Bytes 1 -> Vitest.expect(target[0]).toBe finalBytes[position]
+                    match result with
+                    | ReadOutcome.Bytes 1 -> Vitest.expect(single[0]).toBe finalBytes[position]
                     | other -> failwith $"Expected byte {position}, got %A{other}"
 
                 do! source.Dispose()
                 do! NodePositionalFile.close writer
+            }
+        )
+
+        Vitest.test (
+            "fails a retained spool read when the file returns no bytes inside the observed size",
+            TestOptions(timeout = 30000),
+            fun () -> promise {
+                let filePath = NodePath.join [| (currentFixture ()).Root; "shrinking-spool.blob" |]
+                do! writeText filePath "abcdefghijklmnop"
+
+                let childClosed: JS.Promise<NodeProcess.ChildExit> =
+                    Promise.lift {
+                        ExitCode = Some 0
+                        Signal = None
+                        Stderr = ""
+                        StderrTruncated = false
+                        SpawnError = None
+                    }
+
+                // The file keeps reporting 16 bytes, but only the first four can be read.
+                let mutable fills = 0
+
+                let readAt file buffer offset count position =
+                    fills <- fills + 1
+
+                    if fills = 1 then
+                        NodePositionalFile.readAt file buffer offset (min count 4) position
+                    else
+                        Promise.lift 0
+
+                let! source =
+                    TextDiffSources.SpoolSource.Open(
+                        filePath,
+                        16L,
+                        Some(Array.zeroCreate 16),
+                        childClosed,
+                        readAt = readAt
+                    )
+
+                do! waitFor "the spool to settle" 5000.0 (fun () -> Promise.lift (source.IsComplete() || source.Failure.IsSome))
+                let mutable failureCode = None
+                let mutable answer = None
+
+                try
+                    let! outcome = source.ReadAt 8L [| 0uy |] 0 1 |> Async.StartAsPromise
+                    answer <- Some outcome
+                with :? TextDiffSources.TextDiffSourceException as error ->
+                    failureCode <- Some error.Code
+
+                do! source.Dispose()
+                Vitest.expect(answer).toEqual None
+                Vitest.expect(failureCode).toEqual(Some TextDiffWorker.ReadFailedCode)
             }
         )
 

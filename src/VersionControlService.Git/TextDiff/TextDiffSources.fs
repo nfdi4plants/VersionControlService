@@ -433,7 +433,18 @@ type SpoolSource private (
                 readAt descriptor memory (int start) (int (min (limit - start) 262144L)) start
                 |> Async.AwaitPromise
 
-            if amount <= 0 then stalled <- true else cached <- max cached (start + int64 amount)
+            if amount <= 0 then
+                // The size already observed covers this offset, so an empty read means the file shrank underneath the spool.
+                // Without a failure the read would answer NotYetAvailable for bytes that never arrive.
+                stalled <- true
+
+                report (
+                    readFailure
+                        $"The Git blob for {path} could not be read. The spool file returned no bytes at offset {start} although {availableLength} bytes were visible."
+                )
+                |> ignore
+            else
+                cached <- max cached (start + int64 amount)
     }
 
     let refresh () = async {

@@ -341,68 +341,106 @@ let private waitUntil (condition: unit -> bool) = promise {
         failwith "The condition was not reached within five seconds."
 }
 
-let private verifyLateOpenCleanup (lateOpen: Resumable<OpenDiffResult>) (expectedCloseHandle: DiffHandle) =
-    let transport = ManualTransport()
-    let factory: TextDiffWorkerFactory = fun _ -> transport :> ITextDiffWorkerTransport
+let private initializeWorker (transport: ManualTransport) = promise {
+    do! waitUntil (fun () -> transport.Posted.Count > 0)
 
-    withPool 1 1 factory (fun pool -> promise {
+    match decodeMessage transport.Posted[0] with
+    | Ok(TextDiffMessage.Init(workerId, epoch, _)) -> transport.Inject(encode (TextDiffMessage.InitAck(workerId, epoch)))
+    | other -> failwith $"Expected init, got %A{other}"
+}
+
+let private openRequestsOf (transport: ManualTransport) =
+    transport.Posted
+    |> Seq.choose (fun message ->
+        match decodeMessage message with
+        | Ok(TextDiffMessage.Request(requestId, generation, RequestBody.Open _)) -> Some(requestId, generation)
+        | _ -> None)
+    |> Seq.toArray
+
+let private closeRequestsOf (transport: ManualTransport) =
+    transport.Posted
+    |> Seq.choose (fun message ->
+        match decodeMessage message with
+        | Ok(TextDiffMessage.Request(requestId, generation, RequestBody.Close handle)) -> Some(requestId, generation, handle)
+        | _ -> None)
+    |> Seq.toArray
+
+let private lastPostedIsClose (transport: ManualTransport) =
+    match decodeMessage transport.Posted[transport.Posted.Count - 1] with
+    | Ok(TextDiffMessage.Request(_, _, RequestBody.Close _)) -> true
+    | _ -> false
+
+/// Runs two workers with one session each. The first Open is canceled while it runs, so the next Open has to start the
+/// second worker, and a third Open waits until the canceled Open's slot is released by its late answer.
+let private verifyLateOpenCleanup (lateAnswer: string -> int -> TextDiffMessage) (expectedCloseHandle: DiffHandle option) =
+    let transports = System.Collections.Generic.Dictionary<int, ManualTransport>()
+
+    let factory: TextDiffWorkerFactory =
+        fun index ->
+            let transport = ManualTransport()
+            transports[index] <- transport
+            transport :> ITextDiffWorkerTransport
+
+    withPool 2 1 factory (fun pool -> promise {
         let service = pool.Service owner
         let source, cancellationContext = context ()
         let opening = Watched(service.Open openRequest cancellationContext |> run)
 
-        do! waitUntil (fun () -> transport.Posted.Count > 0)
-
-        let workerId, epoch =
-            match decodeMessage transport.Posted[0] with
-            | Ok(TextDiffMessage.Init(workerId, epoch, _)) -> workerId, epoch
-            | other -> failwith $"Expected init, got %A{other}"
-
-        transport.Inject(encode (TextDiffMessage.InitAck(workerId, epoch)))
-
-        let openRequests () =
-            transport.Posted
-            |> Seq.choose (fun message ->
-                match decodeMessage message with
-                | Ok(TextDiffMessage.Request(requestId, generation, RequestBody.Open _)) -> Some(requestId, generation)
-                | _ -> None)
-            |> Seq.toArray
-
-        let closeRequests () =
-            transport.Posted
-            |> Seq.choose (fun message ->
-                match decodeMessage message with
-                | Ok(TextDiffMessage.Request(requestId, generation, RequestBody.Close handle)) -> Some(requestId, generation, handle)
-                | _ -> None)
-            |> Seq.toArray
-
-        do! waitUntil (fun () -> (openRequests ()).Length = 1)
-        let firstRequestId, firstGeneration = (openRequests ())[0]
+        do! waitUntil (fun () -> transports.ContainsKey 0)
+        let first = transports[0]
+        do! initializeWorker first
+        do! waitUntil (fun () -> (openRequestsOf first).Length = 1)
+        let firstRequestId, firstGeneration = (openRequestsOf first)[0]
         source.Cancel()
         let! canceled = opening.Result
         Vitest.expect(failureCode canceled).toBe "operation_canceled"
 
-        // The only slot stays taken while the worker still runs the canceled Open.
-        let queued = Watched(service.Open openRequest (OperationContext.detached "queued-open") |> run)
+        // The first worker still runs the canceled Open, so its slot stays taken and the next Open starts the second worker.
+        // The pause gives a premature slot release time to happen before the next Open picks a worker.
+        do! delay 50
+        let second = Watched(service.Open openRequest (OperationContext.detached "second-open") |> run)
+        do! waitUntil (fun () -> transports.ContainsKey 1)
+        let other = transports[1]
+        do! initializeWorker other
+        do! waitUntil (fun () -> (openRequestsOf other).Length = 1)
+        Vitest.expect((openRequestsOf first).Length).toBe 1
+
+        let third = Watched(service.Open openRequest (OperationContext.detached "third-open") |> run)
         do! delay 20
-        Vitest.expect((openRequests ()).Length).toBe 1
-        Vitest.expect(queued.Settled).toBe false
+        Vitest.expect((openRequestsOf first).Length).toBe 1
+        Vitest.expect((openRequestsOf other).Length).toBe 1
+        Vitest.expect(third.Settled).toBe false
 
-        transport.Inject(encode (TextDiffMessage.Result(firstRequestId, firstGeneration, ResultPayload.Open lateOpen)))
-        do! waitUntil (fun () -> (closeRequests ()).Length = 1)
-        let closeRequestId, closeGeneration, closeHandle = (closeRequests ())[0]
-        Vitest.expect(closeHandle).toEqual expectedCloseHandle
-        Vitest.expect((openRequests ()).Length).toBe 1
-        Vitest.expect(queued.Settled).toBe false
+        first.Inject(encode (lateAnswer firstRequestId firstGeneration))
 
-        // The slot frees only after the worker answered the late Close.
-        transport.Inject(encode (TextDiffMessage.Result(closeRequestId, closeGeneration, ResultPayload.Close)))
-        do! waitUntil (fun () -> (openRequests ()).Length = 2)
-        let requestId, generation = (openRequests ())[1]
-        let handle = { DiffHandle.Id = "queued-worker-handle"; Version = "1" }
-        let opened = Resumable.Ready(OpenDiffResult.Opened(handle, sourceInfo, sourceInfo, Resumable.Ready page))
-        transport.Inject(encode (TextDiffMessage.Result(requestId, generation, ResultPayload.Open opened)))
-        let! queuedResult = queued.Result
-        openedHandle queuedResult |> ignore
+        match expectedCloseHandle with
+        | Some expected ->
+            // The worker gets the Close before anything else, and the slot frees only after the Close answer.
+            do! waitUntil (fun () -> (closeRequestsOf first).Length = 1)
+            let closeRequestId, closeGeneration, closeHandle = (closeRequestsOf first)[0]
+            Vitest.expect(closeHandle).toEqual expected
+            Vitest.expect(lastPostedIsClose first).toBe true
+            Vitest.expect((openRequestsOf first).Length).toBe 1
+            Vitest.expect(third.Settled).toBe false
+            first.Inject(encode (TextDiffMessage.Result(closeRequestId, closeGeneration, ResultPayload.Close)))
+        | None ->
+            // Nothing was opened on the worker, so no Close is posted and the slot frees at once.
+            ()
+
+        do! waitUntil (fun () -> (openRequestsOf first).Length = 2)
+        Vitest.expect((closeRequestsOf first).Length).toBe(if expectedCloseHandle.IsSome then 1 else 0)
+        let thirdRequestId, thirdGeneration = (openRequestsOf first)[1]
+        let secondRequestId, secondGeneration = (openRequestsOf other)[0]
+
+        let opened id =
+            Resumable.Ready(OpenDiffResult.Opened({ DiffHandle.Id = id; Version = "1" }, sourceInfo, sourceInfo, Resumable.Ready page))
+
+        first.Inject(encode (TextDiffMessage.Result(thirdRequestId, thirdGeneration, ResultPayload.Open(opened "third-worker-handle"))))
+        other.Inject(encode (TextDiffMessage.Result(secondRequestId, secondGeneration, ResultPayload.Open(opened "second-worker-handle"))))
+        let! thirdResult = third.Result
+        let! secondResult = second.Result
+        openedHandle thirdResult |> ignore
+        openedHandle secondResult |> ignore
     })
 
 let private inProcessFactory (control: Control) (created: ResizeArray<ITextDiffWorkerTransport>) : TextDiffWorkerFactory =
@@ -819,7 +857,9 @@ Vitest.describe (
             fun () ->
                 let workerHandle = { DiffHandle.Id = "late-worker-handle"; Version = "1" }
                 let lateOpen = Resumable.Ready(OpenDiffResult.Opened(workerHandle, sourceInfo, sourceInfo, Resumable.Ready page))
-                verifyLateOpenCleanup lateOpen workerHandle
+                verifyLateOpenCleanup
+                    (fun requestId generation -> TextDiffMessage.Result(requestId, generation, ResultPayload.Open lateOpen))
+                    (Some workerHandle)
         )
 
         Vitest.test (
@@ -828,7 +868,29 @@ Vitest.describe (
             fun () ->
                 let emptyHandle = { DiffHandle.Id = ""; Version = "" }
                 let lateOpen = Resumable.Scanning(page.Progress, "late-continuation", None)
-                verifyLateOpenCleanup lateOpen emptyHandle
+                verifyLateOpenCleanup
+                    (fun requestId generation -> TextDiffMessage.Result(requestId, generation, ResultPayload.Open lateOpen))
+                    (Some emptyHandle)
+        )
+
+        Vitest.test (
+            "releases a canceled running Open slot when the late answer is a cancellation",
+            TestOptions(timeout = 60000),
+            fun () ->
+                verifyLateOpenCleanup
+                    (fun requestId generation -> TextDiffMessage.Error(requestId, generation, canceledFailure ()))
+                    None
+        )
+
+        Vitest.test (
+            "releases a canceled running Open slot when the late answer is not diffable",
+            TestOptions(timeout = 60000),
+            fun () ->
+                let lateOpen = Resumable.Ready(OpenDiffResult.NotDiffable(DiffBlocker.NotRegularFile DiffSide.Current))
+
+                verifyLateOpenCleanup
+                    (fun requestId generation -> TextDiffMessage.Result(requestId, generation, ResultPayload.Open lateOpen))
+                    None
         )
 
         Vitest.test (
