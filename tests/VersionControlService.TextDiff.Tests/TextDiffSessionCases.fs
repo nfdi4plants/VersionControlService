@@ -2678,4 +2678,15 @@ module TextDiffSessionCases =
             Check.true' (int64 reads <= bytes / 8_192L) $"The sources served {reads} reads for {bytes} bytes."
             do! session.Close()
         }
+        "a window larger than the alignment scratch allows is rejected when the session opens", fun () -> async {
+            let withWindow lines = { config 3 1_000 1_024 lines Limits.defaults with SessionId = $"window-{lines}" }
+            let! accepted = openSession (withWindow SessionConfig.MaxWindowLines) absentSpec absentSpec
+            do! accepted.Close()
+            let mutable message = ""
+            try
+                let! rejected = openSession (withWindow (SessionConfig.MaxWindowLines + 1)) absentSpec absentSpec
+                do! rejected.Close()
+            with error -> message <- error.Message
+            Check.true' (message.Contains "WindowMaxLines") $"The oversize window is rejected with a message that names WindowMaxLines. Got: {message}"
+        }
     ]

@@ -463,8 +463,7 @@ let createCatalog (factories: ProviderFactory seq) =
 
 Most filled operations change nothing, return `Succeeded` and carry a
 `service_unavailable` warning. The synchronization service and the conflict session
-operations `Resolve`, `Finalize` and `Cancel` fail with that code. The text diff fallback
-has its own open and handle behavior.
+operations `Resolve`, `Finalize` and `Cancel` fail with that code.
 
 A fallback read returns a neutral value. `ListObjects` returns an empty array.
 `GetActiveSession` and `GetRepositoryWebUrl` return `None`. `GetSettings` returns no
@@ -760,8 +759,8 @@ one of two reasons. The worker closes a handle that stays idle for 15 minutes. T
 can also close an idle handle earlier when an `Open` needs its slot. It picks the least
 recently used idle handle. The default pool has three workers with one session each, so
 this happens when a fourth diff opens. Open a new diff when the error occurs.
-`source_changed` means a pinned
-source changed while the handle was open, so close it and open the current sources again.
+`source_changed` means a pinned source changed while the handle was open, so close it
+and open the current sources again.
 For `diff_content_not_text`, inspect `failure.DiffDetail` for the blocked side and evidence.
 For `preparation_mismatch`, discard the token and start `Open` again. A continuation is
 bound to its original request fields. On `continuation_mismatch`, retry with those fields
@@ -837,7 +836,7 @@ Call `Prewarm` during startup and await `disposeDiffPool` when the app quits. Th
 disposes its supervisor during shutdown.
 
 `TextDiffPoolOptions.create` makes a pool with three workers and one session per worker.
-A fourth open diff closes the least recently used idle one. Set `MaxWorkers` and
+A fourth `Open` closes the least recently used idle session, or waits when every session is busy. Set `MaxWorkers` and
 `SessionsPerWorker` on the options record to change that.
 
 An Electron app keeps the worker file outside the asar archive, because worker threads

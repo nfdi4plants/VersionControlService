@@ -4668,6 +4668,8 @@ module TextDiffSession =
                 || config.CheckpointResidentBytes < 0
             then
                 invalidArg (nameof config) "The session limits must be positive and the context count cannot be negative."
+            if config.WindowMaxLines > SessionConfig.MaxWindowLines then
+                invalidArg (nameof config) $"WindowMaxLines cannot exceed {SessionConfig.MaxWindowLines} lines, the largest window whose alignment fits the alignment scratch cap."
             for source in [| previous; current |] do
                 if source.BomLength < 0 || source.ByteLength < int64 source.BomLength then
                     invalidArg (nameof source) "The BOM length is outside the source."

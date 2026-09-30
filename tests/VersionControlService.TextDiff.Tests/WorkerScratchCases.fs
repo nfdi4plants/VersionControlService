@@ -185,6 +185,29 @@ module WorkerScratchCases =
             Check.sequence [| 0; 1 |] session.Output "Every session keeps its output when each request takes 2.1 seconds."
     }
 
+    /// Two viewers that poll at fixed, different periods. Each request that leaves a step in progress returns a page.
+    let private slowPollCase (periods: float[]) = async {
+        let clock = ManualClock 0.0
+        let coordinator = WorkerScratch()
+        let viewers = periods |> Array.map (fun _ -> createSession coordinator clock 6 3)
+        for viewer in viewers do
+            viewer.PagesMidStep <- true
+            viewer.Duration <- 50.0
+        let nextAt = periods |> Array.mapi (fun index period -> float index * period / 2.0)
+        let requests = Array.zeroCreate<int> viewers.Length
+        while viewers |> Array.exists (fun viewer -> not viewer.Finished) do
+            let mutable chosen = -1
+            for index in 0 .. viewers.Length - 1 do
+                if not viewers[index].Finished && (chosen < 0 || nextAt[index] < nextAt[chosen]) then chosen <- index
+            if nextAt[chosen] > (clock :> IClock).NowMs() then clock.Set nextAt[chosen]
+            requests[chosen] <- requests[chosen] + 1
+            if requests[chosen] > 200 then failwith $"Viewer {chosen} did not finish within 200 requests."
+            let! _ = viewers[chosen].Request()
+            nextAt[chosen] <- nextAt[chosen] + periods[chosen]
+        for viewer in viewers do
+            Check.sequence [| 0; 1; 2 |] viewer.Output "A viewer that polls several seconds apart keeps its output."
+    }
+
     let cases: (string * (unit -> Async<unit>)) list = [
         "an idle holder yields two seconds after its last request", starvationCase
         "bursts of three and four requests finish without reciprocal abandonment", fun () -> async {
@@ -198,4 +221,6 @@ module WorkerScratchCases =
             do! frozenProtectedCase true
         }
         "three sessions with 2.1 second requests all finish", slowRoundRobinCase
+        "two viewers that poll nine seconds apart finish with uninterrupted output", fun () -> slowPollCase [| 9_000.0; 9_000.0 |]
+        "viewers that poll nine and six seconds apart finish with uninterrupted output", fun () -> slowPollCase [| 9_000.0; 6_000.0 |]
     ]

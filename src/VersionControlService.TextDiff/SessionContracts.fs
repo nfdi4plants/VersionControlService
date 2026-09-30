@@ -22,6 +22,8 @@ type SessionConfig = {
     PageMaxRows: int
     PageMaxBytes: int
     PageMaxFragments: int
+    /// Lines per side that one alignment window may hold. A session accepts at most SessionConfig.MaxWindowLines,
+    /// because a larger window needs more alignment scratch than the worker ledger allows.
     WindowMaxLines: int
     WindowMaxBytes: int
     CommonChunkBytes: int
@@ -31,9 +33,12 @@ type SessionConfig = {
     ResyncSampleModulus: int
     /// Entries per side in the resync index.
     ResyncIndexCapacity: int
-    /// Lines per side that one resync region may scan.
+    /// Lines per side that one forward search may scan. A search that reaches the limit without a match turns
+    /// exactly the scanned range into an unaligned region, and the next search starts with a fresh count.
+    /// The default is 1,000,000 lines, so an insertion or deletion of up to about that size realigns.
     ResyncScanLines: int
-    /// Source bytes per side that one resync region may scan.
+    /// Source bytes per side that one forward search may scan, with the same effect as ResyncScanLines.
+    /// The default is 256 MiB.
     ResyncScanBytes: float
     /// Entries with the same hash that one index keeps.
     ResyncChainLimit: int
@@ -59,6 +64,11 @@ type EngineResult<'T> =
     | Canceled
 
 module SessionConfig =
+    /// The largest WindowMaxLines that a session accepts. The alignment of a window of this size still fits the
+    /// 8 MiB alignment scratch cap of the worker ledger.
+    [<Literal>]
+    let MaxWindowLines = 131_072
+
     let defaults sessionId = {
         SessionId = sessionId
         ContextLines = 3
@@ -72,8 +82,8 @@ module SessionConfig =
         HashMaskForTesting = None
         ResyncSampleModulus = 64
         ResyncIndexCapacity = 1_000_000
-        ResyncScanLines = 64_000_000
-        ResyncScanBytes = 17_179_869_184.0
+        ResyncScanLines = 1_000_000
+        ResyncScanBytes = 268_435_456.0
         ResyncChainLimit = 8
         ResyncProbeLimit = 32
         ResyncConfirmLines = 8

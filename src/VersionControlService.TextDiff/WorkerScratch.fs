@@ -25,6 +25,10 @@ module private ScratchTiming =
     [<Literal>]
     let ScratchProtectedIdleMs = 4_000.0
 
+    /// The longest idle time that a protected session survives, however far apart its requests are.
+    [<Literal>]
+    let ScratchProtectedMaxIdleMs = 60_000.0
+
 type private Registration(holder: IScratchHolder, clock: IClock) =
     member _.Holder = holder
     member _.Clock = clock
@@ -34,13 +38,17 @@ type private Registration(holder: IScratchHolder, clock: IClock) =
     member val Protected = false with get, set
     /// True once this session reported an unfinished step after it gained protection.
     member val KeptSinceProtected = false with get, set
+    /// The idle time that preceded the most recent request of this session.
+    member val LastGapMs = 0.0 with get, set
     member this.IdleMs = clock.NowMs() - this.LastActivityMs
 
 /// Coordinates scratch memory for the sessions of one worker. A session keeps unfinished work while it stays
 /// active. Once it has been idle for ScratchYieldIdleMs, measured from the end of its last request, another
 /// requester may ask it to yield. The requester that gains scratch through a yield is protected from every other
-/// requester. The protection ends when the session completes the step, returns a ready page, or has been idle
-/// for ScratchProtectedIdleMs. An admitted request spills other idle sessions whose scratch is safe to release.
+/// requester. The protection ends when the session finishes the step it was in the middle of. A ready page ends
+/// it only if no step is in progress. It also ends when the session has been idle for ScratchProtectedIdleMs, or
+/// for twice its last gap between requests when that is longer (at most ScratchProtectedMaxIdleMs). An admitted
+/// request spills other idle sessions whose scratch is safe to release.
 type WorkerScratch() =
     let registrations = List<Registration>()
 
@@ -68,7 +76,8 @@ type WorkerScratch() =
             elif registration.KeptSinceProtected then endProtection registration
 
     let isProtected (registration: Registration) =
-        if registration.Protected && registration.IdleMs >= ScratchTiming.ScratchProtectedIdleMs then endProtection registration
+        let limit = max ScratchTiming.ScratchProtectedIdleMs (min ScratchTiming.ScratchProtectedMaxIdleMs (2.0 * registration.LastGapMs))
+        if registration.Protected && registration.IdleMs >= limit then endProtection registration
         registration.Protected
 
     member _.Register(holder: IScratchHolder, clock: IClock) =
@@ -87,18 +96,20 @@ type WorkerScratch() =
         match find holder with
         | Some registration ->
             registration.LastActivityMs <- registration.Clock.NowMs()
-            if pageReady then endProtection registration else observeStep registration
+            if pageReady && not registration.Holder.MustKeepScratch then endProtection registration else observeStep registration
         | None -> ()
 
     /// Decides whether the requester may use the worker's scratch memory now. Returns false when the requester
     /// has to wait because another session is in the middle of a step. An idle holder yields unfinished work
     /// after ScratchYieldIdleMs, unless it is protected. A requester admitted after a yield is protected until
-    /// it finishes its step. An admitted requester first spills other idle sessions whose scratch is safe to release.
+    /// it is between steps again or its idle time passes its protection limit (see the type documentation).
+    /// An admitted requester first spills other idle sessions whose scratch is safe to release.
     member _.BeginRequest(requester: IScratchHolder) = async {
         let registration =
             match find requester with
             | Some existing -> existing
             | None -> invalidOp "The scratch holder must be registered before it begins a request."
+        registration.LastGapMs <- registration.IdleMs
         registration.LastActivityMs <- registration.Clock.NowMs()
         for current in registrations do observeStep current
         let mutable displaced = false

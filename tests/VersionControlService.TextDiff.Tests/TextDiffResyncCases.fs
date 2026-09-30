@@ -360,6 +360,33 @@ module TextDiffResyncCases =
         }
     ]
 
+    /// An insertion of the given size at line 100 that a deletion of the same size at line 500 cancels out, and an
+    /// edit near the end. Both sides scan the same number of lines from the start of each search, so the search
+    /// finds the shifted match only when the insertion is shorter than the scan limit.
+    let private shiftedBlock (size: int) =
+        let previous = lines "line-" 0 800
+        let current = Array.concat [ previous[.. 99]; lines "new-" 0 size; previous[100 .. 499]; previous[500 + size ..] ]
+        let edited = current.Length - 50
+        current[edited] <- { current[edited] with Text = "edited" }
+        previous, current
+
+    let private scanLimitCases: (string * (unit -> Async<unit>)) list = [
+        "an insertion below the forward scan limit realigns", fun () -> async {
+            let previous, current = shiftedBlock 80
+            let! shape = run { smallConfig "limit-below" with ResyncScanLines = 100 } previous current
+            Check.equal 0 (shape.UnalignedPrevious + shape.UnalignedCurrent) "The insertion is not unaligned."
+            Check.equal 80 shape.Added "Every inserted line is an added row."
+            Check.equal 80 shape.Removed "Every deleted line is a removed row."
+            Check.true' (hasAlignedRowWith shape "edited") "The later edit is an aligned row."
+        }
+        "an insertion above the forward scan limit becomes unaligned blocks and alignment resumes after them", fun () -> async {
+            let previous, current = shiftedBlock 150
+            let! shape = run { smallConfig "limit-above" with ResyncScanLines = 100 } previous current
+            Check.true' (shape.UnalignedPrevious > 0 && shape.UnalignedCurrent > 0) "The insertion shows as unaligned lines on both sides."
+            Check.true' (hasAlignedRowWith shape "edited") "The later edit is an aligned row, so the count restarted with each search."
+        }
+    ]
+
     let private tinyLimits = { tightLimits with MaxUnits = 32 }
 
     /// A session on a shared worker whose request budget is a few units, so one alignment step spans many requests.
@@ -791,4 +818,4 @@ module TextDiffResyncCases =
         }
     ]
 
-    let cases = phaseCases @ budgetCases @ seekCases @ extensionCases @ spillCases @ giantLineCases
+    let cases = phaseCases @ budgetCases @ scanLimitCases @ seekCases @ extensionCases @ spillCases @ giantLineCases
