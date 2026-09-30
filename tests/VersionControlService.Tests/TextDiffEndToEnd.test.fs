@@ -289,6 +289,78 @@ let private readAllPages service handle first operationName = promise {
     return pages.ToArray()
 }
 
+let private expandReady
+    (service: TextDiffService)
+    (handle: DiffHandle)
+    (gapId: string)
+    (fromStart: bool)
+    (count: int)
+    (operationName: string)
+    =
+    promise {
+        let mutable continuation = None
+        let mutable parts = None
+
+        while parts.IsNone do
+            let request = {
+                Handle = handle
+                GapId = gapId
+                FromStart = fromStart
+                Count = count
+                Continuation = continuation
+            }
+            let! result = service.Expand request (context operationName) |> Async.StartAsPromise
+
+            match operationValue "Expand" result with
+            | Resumable.Ready expanded -> parts <- Some expanded
+            | Resumable.Scanning(_, next, _) -> continuation <- Some next
+
+        return parts.Value
+    }
+
+let private readLineReady
+    (service: TextDiffService)
+    (handle: DiffHandle)
+    (side: DiffSide)
+    (line: int64)
+    (offsetUtf16: int64)
+    (maxUtf16: int)
+    (operationName: string)
+    =
+    promise {
+        let mutable continuation = None
+        let mutable value = None
+
+        while value.IsNone do
+            let request = {
+                Handle = handle
+                Side = side
+                Line = line
+                OffsetUtf16 = offsetUtf16
+                MaxUtf16 = maxUtf16
+                Continuation = continuation
+            }
+            let! result = service.ReadLine request (context operationName) |> Async.StartAsPromise
+
+            match operationValue "ReadLine" result with
+            | Resumable.Ready slice -> value <- Some slice
+            | Resumable.Scanning(_, next, _) -> continuation <- Some next
+
+        return value.Value
+    }
+
+let private hiddenGaps (parts: DiffPart[]) =
+    parts
+    |> Array.choose (function
+        | DiffPart.HiddenEqual gap -> Some gap
+        | _ -> None)
+
+let private expandedPreviousLines (parts: DiffPart[]) =
+    parts
+    |> Array.collect (function
+        | DiffPart.ExpandedContext(_, rows) -> rows |> Array.choose (fun row -> row.Previous)
+        | _ -> Array.empty)
+
 let private changedRow (row: DiffRow) =
     match row.Kind with
     | DiffRowKind.Context -> false
@@ -500,6 +572,182 @@ Vitest.describe (
                     Vitest.expect(pages |> Array.exists pageHasChange).toBe true
 
                     let! closeResult = service.Close handle (context "close-window-a") |> Async.StartAsPromise
+                    ignore (operationValue "Close" closeResult)
+                with error ->
+                    failure <- Some error
+
+                do! closeSession session failure
+            }
+        )
+
+        Vitest.test (
+            "expands a large equal gap from both ends and replays a replaced gap",
+            TestOptions(timeout = 180000),
+            fun () -> promise {
+                let! repository = newRepository ()
+                let previousLines = Array.init 1024 (fun index -> $"line-{index:D5}")
+                let currentLines = Array.copy previousLines
+                currentLines[8] <- "changed-near-start"
+                currentLines[1015] <- "changed-near-end"
+                let previous = String.concat "\n" previousLines + "\n"
+                let current = String.concat "\n" currentLines + "\n"
+                do! commitText repository "expanded.txt" previous
+                do! writeText (NodePath.join [| repository; "expanded.txt" |]) current
+                let session = createSession (currentFixture ()).Pool repository
+                let service = serviceFor session
+                let mutable failure = None
+
+                try
+                    let! handle, _, _, first =
+                        openedWithFirstPage service (openRequest "expanded.txt") "expand-gap-window-a"
+                    let! pages = readAllPages service handle first "expand-gap-pages-window-a"
+                    let allParts = pages |> Array.collect (fun page -> page.Parts)
+                    let gap =
+                        hiddenGaps allParts
+                        |> Array.filter (fun value -> value.PreviousRange.Count > 900L)
+                        |> Array.tryHead
+                        |> Option.defaultWith (fun () -> failwith "The fixture has no large equal gap.")
+                    let collected = ResizeArray<DiffLine>()
+
+                    let! fromStart = expandReady service handle gap.GapId true 5 "expand-gap-start-window-a"
+                    collected.AddRange(expandedPreviousLines fromStart)
+
+                    let! retried = expandReady service handle gap.GapId true 5 "expand-gap-retry-window-a"
+                    Vitest.expect(retried).toEqual fromStart
+
+                    let afterStart =
+                        hiddenGaps fromStart
+                        |> Array.tryHead
+                        |> Option.defaultWith (fun () -> failwith "The first expansion did not leave a hidden gap.")
+                    let! fromEnd = expandReady service handle afterStart.GapId false 5 "expand-gap-end-window-a"
+                    collected.AddRange(expandedPreviousLines fromEnd)
+
+                    let mutable remaining = hiddenGaps fromEnd |> Array.tryHead
+                    let mutable expansionIndex = 0
+
+                    while remaining.IsSome do
+                        let currentGap = remaining.Value
+                        let! expanded =
+                            expandReady
+                                service
+                                handle
+                                currentGap.GapId
+                                true
+                                (int currentGap.PreviousRange.Count)
+                                $"expand-gap-rest-{expansionIndex}-window-a"
+                        collected.AddRange(expandedPreviousLines expanded)
+                        remaining <- hiddenGaps expanded |> Array.tryHead
+                        expansionIndex <- expansionIndex + 1
+
+                    let expected =
+                        Array.init (int gap.PreviousRange.Count) (fun index ->
+                            previousLines[int gap.PreviousRange.Start + index])
+                    let orderedLines = collected.ToArray() |> Array.sortBy (fun line -> line.Number)
+                    let lineNumbers = orderedLines |> Array.map (fun line -> line.Number)
+                    let actual = orderedLines |> Array.map (fun line -> line.Slice.Text)
+
+                    Vitest.expect(actual.Length).toBe expected.Length
+                    Vitest.expect(lineNumbers |> Array.distinct |> Array.length).toBe expected.Length
+                    Vitest.expect(actual).toEqual expected
+
+                    let! closeResult = service.Close handle (context "close-expand-gap-window-a") |> Async.StartAsPromise
+                    ignore (operationValue "Close" closeResult)
+                with error ->
+                    failure <- Some error
+
+                do! closeSession session failure
+            }
+        )
+
+        Vitest.test (
+            "reads a long source line in UTF-16 slices",
+            TestOptions(timeout = 180000),
+            fun () -> promise {
+                let! repository = newRepository ()
+                let line = String.replicate 20_000 "x"
+                do! commitText repository "long-line.txt" "previous\n"
+                do! writeText (NodePath.join [| repository; "long-line.txt" |]) (line + "\n")
+                let session = createSession (currentFixture ()).Pool repository
+                let service = serviceFor session
+                let mutable failure = None
+
+                try
+                    let! handle, _, _, _ =
+                        openedWithFirstPage service (openRequest "long-line.txt") "read-line-window-a"
+                    let result = StringBuilder()
+                    let mutable offset = 0L
+                    let mutable sliceIndex = 0
+
+                    while offset < int64 line.Length do
+                        let! value =
+                            readLineReady
+                                service
+                                handle
+                                DiffSide.Current
+                                0L
+                                offset
+                                8192
+                                $"read-line-slice-{sliceIndex}-window-a"
+                        let expectedSliceLength = min 8192 (line.Length - int offset)
+                        Vitest.expect(value.Slice.Text.Length).toBe expectedSliceLength
+                        result.Append(value.Slice.Text) |> ignore
+                        offset <- offset + int64 value.Slice.Text.Length
+                        sliceIndex <- sliceIndex + 1
+
+                    Vitest.expect(sliceIndex).toBe 3
+                    Vitest.expect(result.ToString()).toBe line
+
+                    let! closeResult = service.Close handle (context "close-read-line-window-a") |> Async.StartAsPromise
+                    ignore (operationValue "Close" closeResult)
+                with error ->
+                    failure <- Some error
+
+                do! closeSession session failure
+            }
+        )
+
+        Vitest.test (
+            "reports source line counts after the scan completes",
+            TestOptions(timeout = 300000),
+            fun () -> promise {
+                let! repository = newRepository ()
+                let lineCount = 20_000
+                let previousLines = Array.init lineCount (fun index -> $"shared-line-{index:D5}")
+                let currentLines = Array.copy previousLines
+                currentLines[0] <- "changed-first-line"
+                currentLines[lineCount - 1] <- "changed-last-line"
+                let previous = String.concat "\n" previousLines + "\n"
+                let current = String.concat "\n" currentLines + "\n"
+                do! commitText repository "line-counts.txt" previous
+                do! writeText (NodePath.join [| repository; "line-counts.txt" |]) current
+                let session = createSession (currentFixture ()).Pool repository
+                let service = serviceFor session
+                let mutable failure = None
+
+                try
+                    let! handle, previousAtOpen, currentAtOpen, first =
+                        openedWithFirstPage service (openRequest "line-counts.txt") "line-count-window-a"
+                    let! beforeResult =
+                        service.GetSourceInfo { Handle = handle } (context "line-count-before-window-a")
+                        |> Async.StartAsPromise
+                    let beforePrevious, beforeCurrent = operationValue "GetSourceInfo" beforeResult
+
+                    Vitest.expect(beforePrevious.LineCount).toEqual None
+                    Vitest.expect(beforeCurrent.LineCount).toEqual None
+
+                    let! pages = readAllPages service handle first "line-count-pages-window-a"
+                    Vitest.expect(pages[pages.Length - 1].Progress.ScanComplete).toBe true
+
+                    let! afterResult =
+                        service.GetSourceInfo { Handle = handle } (context "line-count-after-window-a")
+                        |> Async.StartAsPromise
+                    let afterPrevious, afterCurrent = operationValue "GetSourceInfo" afterResult
+                    let expectedCount = Some(int64 lineCount)
+
+                    Vitest.expect(afterPrevious).toEqual { previousAtOpen with LineCount = expectedCount }
+                    Vitest.expect(afterCurrent).toEqual { currentAtOpen with LineCount = expectedCount }
+
+                    let! closeResult = service.Close handle (context "close-line-count-window-a") |> Async.StartAsPromise
                     ignore (operationValue "Close" closeResult)
                 with error ->
                     failure <- Some error

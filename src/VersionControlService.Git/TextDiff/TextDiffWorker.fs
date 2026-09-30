@@ -1182,18 +1182,37 @@ let private createHandler
 
         member _.Expand(host, request) =
             readingCall worker host request.Handle PageEnvelopeLimit ResultPayload.Expand (fun session ->
-                // The engine expands by gap id only, so FromStart, Count and Continuation are not forwarded.
-                session.Expand request.GapId)
+                session.Expand(
+                    request.GapId,
+                    request.FromStart,
+                    request.Count,
+                    request.Continuation,
+                    host.IsCanceled
+                ))
 
         member _.ReadLine(host, request) =
             readingCall worker host request.Handle LineEnvelopeLimit ResultPayload.ReadLine (fun session ->
-                session.ReadLine(request.Side, request.Line, request.OffsetUtf16, request.MaxUtf16))
+                session.ReadLine(
+                    request.Side,
+                    request.Line,
+                    request.OffsetUtf16,
+                    request.MaxUtf16,
+                    request.Continuation,
+                    host.IsCanceled
+                ))
 
         member _.GetSourceInfo(host, request) =
             callOn worker host request.Handle (fun slot -> async {
-                match slot.Infos with
-                | Some infos -> return Ok infos
-                | None -> return Error(closedFailure ())
+                match slot.Infos, slot.Session with
+                | Some(previousInfo, currentInfo), Some session ->
+                    let previousState, currentState = session.SourceInfo
+
+                    return
+                        Ok(
+                            { previousInfo with LineCount = previousState.LineCount },
+                            { currentInfo with LineCount = currentState.LineCount }
+                        )
+                | _ -> return Error(closedFailure ())
             })
 
         member _.Close(host, handle) =
