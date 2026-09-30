@@ -656,7 +656,7 @@ Keep a page's `PageId` if the caller may need the page again. `ReplayPage` retur
 as it was first read, except that `Pending` is `None`. A viewer can drop pages it no
 longer shows and read them again later.
 
-An `HunkBody.UnalignedSides` body holds lines whose alignment could not be established.
+A `HunkBody.UnalignedSides` body holds lines whose alignment could not be established.
 This can happen when a gap exceeds the Myers step budget inside a window. It can also happen
 when a forward search reaches its configured limit, which defaults to 1,000,000 lines or
 256 MiB per side through `ResyncScanLines` and `ResyncScanBytes`. The search continues after
