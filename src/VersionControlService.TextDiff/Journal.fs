@@ -111,6 +111,12 @@ type private JournalReader(bytes: byte[]) =
 
     member _.AtEnd = position = bytes.Length
 
+[<RequireQualifiedAccess>]
+type internal JournalValue =
+    | Page of Resumable<DiffPage>
+    | Expansion of Resumable<DiffPart[]>
+    | Line of Resumable<DiffLine>
+
 module private JournalCodec =
     let private writeRange (writer: JournalWriter) (value: LineRange) =
         writer.WriteInt64 value.Start
@@ -322,24 +328,46 @@ module private JournalCodec =
                 else None
             Some { Previous = previous; Current = current; Mismatch = mismatch }
 
-    let encode (value: Resumable<DiffPage>) =
+    let encode (value: JournalValue) =
         let writer = JournalWriter()
         writer.WriteByte 1
         match value with
-        | Resumable.Ready page ->
+        | JournalValue.Page result ->
             writer.WriteByte 0
-            writer.WriteString page.PageId
-            writer.WriteOptionString page.NextCursor
-            writer.WriteInt32 page.Parts.Length
-            for part in page.Parts do writePart writer part
-            writeProgress writer page.Progress
-            writer.WriteBool page.OutputComplete
-            writePending writer page.Pending
-        | Resumable.Scanning(progress, continuation, pending) ->
+            match result with
+            | Resumable.Ready page ->
+                writer.WriteByte 0
+                writer.WriteString page.PageId
+                writer.WriteOptionString page.NextCursor
+                writer.WriteInt32 page.Parts.Length
+                for part in page.Parts do writePart writer part
+                writeProgress writer page.Progress
+                writer.WriteBool page.OutputComplete
+                writePending writer None
+            | Resumable.Scanning(progress, continuation, _) ->
+                writer.WriteByte 1
+                writeProgress writer progress
+                writer.WriteString continuation
+                writePending writer None
+        | JournalValue.Expansion result ->
             writer.WriteByte 1
-            writeProgress writer progress
-            writer.WriteString continuation
-            writePending writer pending
+            match result with
+            | Resumable.Ready parts ->
+                writer.WriteByte 0
+                writer.WriteInt32 parts.Length
+                for part in parts do writePart writer part
+            | Resumable.Scanning(progress, continuation, _) ->
+                writer.WriteByte 1
+                writeProgress writer progress
+                writer.WriteString continuation
+        | JournalValue.Line result ->
+            writer.WriteByte 2
+            match result with
+            | Resumable.Ready line -> writer.WriteByte 0; writeLine writer line
+            | Resumable.Scanning(progress, continuation, _) ->
+                writer.WriteByte 1
+                writeProgress writer progress
+                writer.WriteString continuation
         writer.ToArray()
 
     let decode (bytes: byte[]) =
@@ -347,31 +375,50 @@ module private JournalCodec =
         if reader.ReadByte() <> 1 then invalidOp "The journal record version is unsupported."
         let value =
             match reader.ReadByte() with
-            | 1 -> Resumable.Scanning(readProgress reader, reader.ReadString(), readPending reader)
+            | 0 ->
+                let result =
+                    match reader.ReadByte() with
+                    | 1 -> Resumable.Scanning(readProgress reader, reader.ReadString(), readPending reader)
+                    | _ ->
+                        let pageId = reader.ReadString()
+                        let cursor = reader.ReadOptionString()
+                        let count = reader.ReadInt32()
+                        if count < 0 || count > 100_000 then invalidOp "The journal part count is invalid."
+                        let parts = Array.init count (fun _ -> readPart reader)
+                        let progress = readProgress reader
+                        let outputComplete = reader.ReadBool()
+                        let pending = readPending reader
+                        Resumable.Ready {
+                            PageId = pageId
+                            NextCursor = cursor
+                            Parts = parts
+                            Progress = progress
+                            OutputComplete = outputComplete
+                            Pending = pending
+                        }
+                JournalValue.Page result
+            | 1 ->
+                let result =
+                    match reader.ReadByte() with
+                    | 1 -> Resumable.Scanning(readProgress reader, reader.ReadString(), None)
+                    | _ ->
+                        let count = reader.ReadInt32()
+                        if count < 0 || count > 100_000 then invalidOp "The journal part count is invalid."
+                        Resumable.Ready(Array.init count (fun _ -> readPart reader))
+                JournalValue.Expansion result
             | _ ->
-                let pageId = reader.ReadString()
-                let cursor = reader.ReadOptionString()
-                let count = reader.ReadInt32()
-                if count < 0 || count > 100_000 then invalidOp "The journal part count is invalid."
-                let parts = Array.init count (fun _ -> readPart reader)
-                let progress = readProgress reader
-                let outputComplete = reader.ReadBool()
-                let pending = readPending reader
-                Resumable.Ready {
-                    PageId = pageId
-                    NextCursor = cursor
-                    Parts = parts
-                    Progress = progress
-                    OutputComplete = outputComplete
-                    Pending = pending
-                }
+                let result =
+                    match reader.ReadByte() with
+                    | 1 -> Resumable.Scanning(readProgress reader, reader.ReadString(), None)
+                    | _ -> Resumable.Ready(readLine reader)
+                JournalValue.Line result
         if not reader.AtEnd then invalidOp "The journal record has trailing data."
         value
 
 /// Frames an encoded value with its checksum. The byte loops live outside the async members because
 /// an async loop pays one scheduling step per iteration on the JavaScript runtime.
 module internal JournalRecord =
-    let encode (value: Resumable<DiffPage>) : byte[] =
+    let encode (value: JournalValue) : byte[] =
         let payload = JournalCodec.encode value
         let hash = Hash.create ()
         for byteIndex = 0 to payload.Length - 1 do Hash.addByte hash payload[byteIndex]
@@ -383,7 +430,7 @@ module internal JournalRecord =
         writer.WriteInt32(int hash.Hi)
         writer.ToArray()
 
-    let decode (record: byte[]) : Resumable<DiffPage> =
+    let decode (record: byte[]) : JournalValue =
         let reader = JournalReader record
         if reader.ReadByte() <> 0x54 then invalidOp "The journal record header is invalid."
         let payloadLength = reader.ReadInt32()
@@ -528,6 +575,14 @@ type private JournalCache(ledger: Ledger, capBytes: int) =
                 entries[sequence] <- { Record = record; Cost = cost; LastUse = tick }
                 used <- used + cost
 
+    member _.Remove(sequence: int64) =
+        match entries.TryGetValue sequence with
+        | true, entry ->
+            entries.Remove sequence |> ignore
+            used <- used - entry.Cost
+            ledger.Release(AllocationCategory.ResponseData, int64 entry.Cost)
+        | _ -> ()
+
     member _.Clear() =
         if used > 0 then ledger.Release(AllocationCategory.ResponseData, int64 used)
         used <- 0
@@ -607,7 +662,7 @@ type internal Journal(store: ITempStore, ledger: Ledger, cacheBytes: int) =
 
     /// Records a result. The whole commit runs to completion once it has started, and lookups wait for it,
     /// so an index relocation never interleaves with a lookup.
-    member _.Append(sequence: int64, value: Resumable<DiffPage>) =
+    member _.Append(sequence: int64, value: JournalValue) =
         gate.Run(
             async {
                 if sequence < 0L then invalidArg (nameof sequence) "The journal sequence cannot be negative."
@@ -638,6 +693,22 @@ type internal Journal(store: ITempStore, ledger: Ledger, cacheBytes: int) =
                         let value = JournalRecord.decode record
                         cache.Add(sequence, record)
                         return Some value
+            }
+        )
+
+    member _.Link(aliasSequence: int64, targetSequence: int64) =
+        gate.Run(
+            async {
+                if aliasSequence < 0L || targetSequence < 0L then invalidArg (nameof aliasSequence) "The journal key cannot be negative."
+                if not initialized then invalidOp "The journal has not been initialized."
+                do! growIndex aliasSequence
+                let! entry = readEntry targetSequence
+                match entry with
+                | Some(offset, length) ->
+                    do! writeEntry aliasSequence offset length
+                    count <- max count (aliasSequence + 1L)
+                    cache.Remove aliasSequence
+                | None -> invalidOp "The journal target does not exist."
             }
         )
 

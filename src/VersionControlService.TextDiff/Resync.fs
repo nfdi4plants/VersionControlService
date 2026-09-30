@@ -62,6 +62,7 @@ type internal ResyncEngine
         report: DiffSide -> string -> int64 -> unit,
         changed: unit -> unit,
         coverage: int -> float -> unit,
+        recordLineCount: int -> int64 -> unit,
         observe: int -> ScannerState -> float -> unit,
         startOffsets: float[],
         startLines: float[]
@@ -71,7 +72,7 @@ type internal ResyncEngine
 
     let makeSides () =
         Array.init 2 (fun side ->
-            let scan = ScanSide(specs[side], encodings[side], categories[side], sides[side], ledger, config.HashMaskForTesting, report)
+            let scan = ScanSide(specs[side], encodings[side], categories[side], sides[side], ledger, config.HashMaskForTesting, report, config.CheckpointIntervalBytes, recordLineCount side)
             scan.RecordPeaks <- false
             scan)
 
@@ -684,6 +685,7 @@ type internal ResyncEngine
     }
 
     member _.HoldsScratch = reserved || tableHeld disc[0] || tableHeld disc[1] || tableHeld aux[0] || tableHeld aux[1]
+    member _.PreviewSides = [| disc; aux |]
 
     /// Runs one bounded unit of work. The buffers are the session's chunk scratch.
     member _.Step(meter: Meter, bufferA: byte[], bufferB: byte[]) : Async<ResyncStep> = async {

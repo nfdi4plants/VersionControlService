@@ -1,6 +1,7 @@
 namespace VersionControlService.TextDiff
 
 open System
+open System.Collections.Generic
 open VersionControlService.Abstractions
 
 [<RequireQualifiedAccess>]
@@ -25,7 +26,80 @@ type private PageBuild =
 
 type private FragmentBuild = { Part: DiffPart; Taken: int; Size: int }
 
-/// Streams a diff of two byte sources. Phase one compares equal bytes with CommonRun and skips whole runs of
+type private SeekCursor = {
+    SideIndex: int
+    ByLine: bool
+    StartLine: float
+    EndLine: float
+    TargetOffset: float
+    State: ScannerState
+    Buffer: byte[]
+    mutable Batch: LineBatch
+    FoundLines: ResizeArray<ScannedLine>
+    mutable LineNumber: float
+    mutable Position: float
+    mutable Complete: bool
+    mutable Rebatch: bool
+    mutable Waiting: bool
+}
+
+type private PendingExpansion = {
+    Attempt: int64
+    GapSequence: int64
+    Gap: EqualGap
+    FromStart: bool
+    Count: int
+    TakeCount: int
+    mutable RequestSequence: int64
+    mutable Search: SeekCursor option
+    mutable PreviousLines: ScannedLine[] option
+    mutable CurrentLines: ScannedLine[] option
+}
+
+type private PendingLineRead = {
+    Attempt: int64
+    Side: DiffSide
+    Line: int64
+    OffsetUtf16: int64
+    MaxUtf16: int
+    TakeMaxUtf16: int
+    mutable RequestSequence: int64
+    mutable Search: SeekCursor option
+    mutable Scanned: ScannedLine option
+    mutable Decoder: DecoderState option
+    mutable BytePosition: float
+    Buffer: byte[]
+    Units: uint16[]
+    mutable UnitCount: int
+    mutable UnitPosition: float
+    mutable Waiting: bool
+}
+
+type private PendingLineView = {
+    SideIndex: int
+    Number: int64
+    StartOffset: float
+    ContentEnd: float
+    KnownEnd: float
+    KnownUtf16: int64 option
+    TotalUtf16: int64 option
+    Ending: LineEnding
+    Active: bool
+    EndOfFile: bool
+}
+
+type private TextReadCursor = {
+    Side: DiffSide
+    Spec: SourceSpec
+    Encoding: TextEncoding
+    ContentEnd: float
+    Buffer: byte[]
+    mutable Position: float
+    mutable Decoder: DecoderState
+    mutable PendingUnit: uint16 option
+}
+
+/// Streams a diff of two byte sources. The engine compares equal bytes with CommonRun and skips whole runs of
 /// equal lines. Around every difference, a window of line records per side is aligned, and the resulting
 /// operations feed a HunkBuilder that queues page content. Row text is read from the sources by offset when a
 /// page is built, so no line text is kept.
@@ -63,6 +137,16 @@ type TextDiffSession internal (
     let mutable busy = false
     let mutable requestSequence = 0L
     let mutable rowSequence = 0L
+    let mutable nextGapSequence = 0L
+    let mutable nextExpandRequest = 0L
+    let mutable nextExpandAttempt = 0L
+    let mutable nextLineRequest = 0L
+    let mutable nextLineAttempt = 0L
+    let mutable pairedMismatch: (int64 * int64 * int64 option) option = None
+    let mutable pendingPreviewBytes = 0L
+    let mutable lastPendingPreview: PendingPreview option = None
+    let pendingExpansions = Dictionary<int64, PendingExpansion>()
+    let pendingLineReads = Dictionary<int64, PendingLineRead>()
     let mutable mode = if canStartCommon then Mode.Common else Mode.Window
     let mutable windowState = WindowState.Loading
     let mutable waited = false
@@ -143,6 +227,18 @@ type TextDiffSession internal (
             fun () -> host.CreateTempStore(config.SessionId + ":checkpoints")
         )
 
+    let knownLineCounts = Array.create 2 None
+
+    let setKnownLineCount sideIndex count =
+        knownLineCounts[sideIndex] <-
+            match knownLineCounts[sideIndex] with
+            | Some previous -> Some(max previous count)
+            | None -> Some count
+
+    do
+        if previousSpec.Source.IsNone then knownLineCounts[0] <- Some 0L
+        if currentSpec.Source.IsNone then knownLineCounts[1] <- Some 0L
+
     let report (side: DiffSide) (kind: string) (offset: int64) =
         if invalidDetail.IsNone then
             let evidence =
@@ -151,14 +247,16 @@ type TextDiffSession internal (
             invalidDetail <- Some { Side = side; Evidence = evidence }
 
     let previousSide =
-        ScanSide(previousSpec, previousEncoding, AllocationCategory.PreviousWindows, DiffSide.Previous, ledger, config.HashMaskForTesting, report)
+        ScanSide(previousSpec, previousEncoding, AllocationCategory.PreviousWindows, DiffSide.Previous, ledger, config.HashMaskForTesting, report, config.CheckpointIntervalBytes, setKnownLineCount 0)
 
     let currentSide =
-        ScanSide(currentSpec, currentEncoding, AllocationCategory.CurrentWindows, DiffSide.Current, ledger, config.HashMaskForTesting, report)
+        ScanSide(currentSpec, currentEncoding, AllocationCategory.CurrentWindows, DiffSide.Current, ledger, config.HashMaskForTesting, report, config.CheckpointIntervalBytes, setKnownLineCount 1)
 
     do
         previousSide.Observer <- fun state line -> checkpoints.Observe(0, state, line)
         currentSide.Observer <- fun state line -> checkpoints.Observe(1, state, line)
+        previousSide.LineObserver <- fun offset line -> checkpoints.ObserveLine(0, offset, line)
+        currentSide.LineObserver <- fun offset line -> checkpoints.ObserveLine(1, offset, line)
         previousSide.BeginWindow(0L, windowLimit, config.WindowMaxBytes)
         currentSide.BeginWindow(0L, windowLimit, config.WindowMaxBytes)
 
@@ -185,6 +283,43 @@ type TextDiffSession internal (
         for character in prefix do
             Hash.addCodeUnit hash (int character)
         prefix + ":" + Hash.toString hash
+
+    let operationIdentifier (kind: string) (attempt: int64) (sequence: int64) (binding: string) =
+        let prefix = config.SessionId + ":" + kind + ":" + string attempt + ":" + string sequence + ":" + binding
+        let hash = Hash.create ()
+        for character in prefix do Hash.addCodeUnit hash (int character)
+        config.SessionId + ":" + kind + ":" + string attempt + ":" + string sequence + ":" + Hash.toString hash
+
+    let readOperationIdentifier (expectedKind: string) (binding: string) (value: string) =
+        if isNull value then None
+        else
+            let last = value.LastIndexOf ':'
+            if last <= 0 then None
+            else
+                let beforeChecksum = value.Substring(0, last)
+                let previousSeparator = beforeChecksum.LastIndexOf ':'
+                if previousSeparator <= 0 then None
+                else
+                    let sequenceText = beforeChecksum.Substring(previousSeparator + 1)
+                    let attemptSeparator = beforeChecksum.LastIndexOf(':', previousSeparator - 1)
+                    if attemptSeparator <= 0 then None
+                    else
+                        let attemptText = beforeChecksum.Substring(attemptSeparator + 1, previousSeparator - attemptSeparator - 1)
+                        let kindSeparator = beforeChecksum.LastIndexOf(':', attemptSeparator - 1)
+                        if kindSeparator <= 0 then None
+                        else
+                            let sessionId = beforeChecksum.Substring(0, kindSeparator)
+                            let kind = beforeChecksum.Substring(kindSeparator + 1, attemptSeparator - kindSeparator - 1)
+                            let mutable attempt = 0L
+                            let mutable sequence = 0L
+                            if sessionId <> config.SessionId
+                               || kind <> expectedKind
+                               || not (Int64.TryParse(attemptText, &attempt))
+                               || not (Int64.TryParse(sequenceText, &sequence))
+                               || operationIdentifier kind attempt sequence binding <> value then None
+                            else Some(attempt, sequence)
+
+    let journalKey (kind: int64) (sequence: int64) = sequence * 5L + kind
 
     let rowIdentifierPrefix = config.SessionId + ":r:"
     let rowIdentifierSeed =
@@ -318,6 +453,31 @@ type TextDiffSession internal (
                 | Some error -> report DiffSide.Previous ("invalid " + Decoders.name previousEncoding + " sequence: " + error.Reason) error.Offset
                 | None -> ()
 
+    let countUtf16Units (source: IByteSource) (encoding: TextEncoding) (startOffset: int64) (endOffset: int64) (meter: Meter) = async {
+        let buffer = Array.zeroCreate<byte> 65_536
+        let mutable state = Decoders.createAt encoding startOffset
+        let mutable position = float startOffset
+        let finish = float endOffset
+        let mutable units = 0.0
+        let mutable complete = true
+        while complete && position < finish && not (Meter.overBudget meter) do
+            let count = int (min (float buffer.Length) (finish - position))
+            let! outcome = source.ReadAt (int64 position) buffer 0 count
+            match outcome with
+            | ReadOutcome.Bytes actual when actual > 0 ->
+                let next, result = Decoders.decode state buffer 0 actual (fun _ _ _ -> units <- units + 1.0)
+                state <- next
+                position <- float next.AbsoluteOffset
+                Meter.chargeBytes meter actual
+                match result with
+                | Error error ->
+                    report DiffSide.Previous ("invalid " + Decoders.name encoding + " sequence: " + error.Reason) error.Offset
+                    complete <- false
+                | Ok _ -> ()
+            | _ -> complete <- false
+        if position <> finish then return None else return Some(int64 units)
+    }
+
     /// Restarts both scanners at a line start of the previous side and at the matching line start of the
     /// current side, then switches to window alignment.
     let handover (cursor: float) =
@@ -419,7 +579,13 @@ type TextDiffSession internal (
             else exitCommon ()
         else
             let remaining = min (previousLength - pos) (currentLength - pos - delta)
-            let want = int (min (float (min chunk chunkLimit)) (min remaining (float bufA.Length)))
+            let checkpointRoom offset =
+                let interval = config.CheckpointIntervalBytes
+                let boundary = (Math.Floor(offset / interval) + 1.0) * interval
+                let room = min (float bufA.Length) (max (float unitWidth) (boundary - offset))
+                max unitWidth (int room / unitWidth * unitWidth)
+            let checkpointBytes = min (checkpointRoom pos) (checkpointRoom (pos + delta))
+            let want = int (min (float (min chunk chunkLimit)) (min remaining (float (min bufA.Length checkpointBytes))))
             let! first = previousSpec.Source.Value.ReadAt (int64 pos) bufA 0 want
             let! second = currentSpec.Source.Value.ReadAt (int64 (pos + delta)) bufB 0 want
             match first, second with
@@ -451,7 +617,11 @@ type TextDiffSession internal (
                         previousSide.SetCoverage pos
                         currentSide.SetCoverage(pos + delta)
                     if invalidDetail.IsSome then ()
-                    elif run.Mismatch then exitCommon ()
+                    elif run.Mismatch then
+                        let differenceByte = run.DifferenceOffset |> Option.defaultValue run.Length
+                        let! mismatchUnits = countUtf16Units previousSpec.Source.Value previousEncoding (int64 lineStart) (int64 (pos + float differenceByte)) meter
+                        pairedMismatch <- Some(int64 (builder.NextPrevious + commonLines), int64 (builder.NextCurrent + commonLines), mismatchUnits)
+                        exitCommon ()
                     elif run.Length > 0 then chunk <- min chunkLimit (chunk * 2)
                     elif float want < remaining && chunk < chunkLimit then chunk <- min chunkLimit (chunk * 2)
                     else exitCommon ()
@@ -487,6 +657,7 @@ type TextDiffSession internal (
             report,
             sourceChanged,
             coverage,
+            (fun side count -> setKnownLineCount side count),
             (fun side state line -> checkpoints.Observe(side, state, line)),
             startOffsets,
             startLines
@@ -1257,6 +1428,542 @@ type TextDiffSession internal (
         if failed then return None else return Some decoded
     }
 
+    let activePreviewView sideIndex number (state: ScannerState) (table: LineTable) (byteLength: int64) =
+        let active =
+            not state.IsComplete
+            && (state.LineHasText || state.LineLengthUtf16 > 0.0 || state.PendingCR || state.PendingHigh <> 0 || state.PendingCount > 0)
+        if not active then None
+        else
+            let knownEnd = min (float byteLength) (float state.StartOffset + state.ValidatedBytes)
+            let width = float (Widths.unitBytes (if sideIndex = 0 then previousEncoding else currentEncoding))
+            let contentEnd = if state.PendingCR then min knownEnd (state.PendingCREnd - width) else knownEnd
+            Some {
+                SideIndex = sideIndex
+                Number = number
+                StartOffset = state.LineStart
+                ContentEnd = max state.LineStart contentEnd
+                KnownEnd = knownEnd
+                KnownUtf16 = Some(int64 state.LineLengthUtf16)
+                TotalUtf16 = None
+                Ending = LineEnding.NoEnding
+                Active = true
+                EndOfFile = false
+            }
+
+    let previewViewFromScan sideIndex (scan: ScanSide) =
+        let lineNumber = scan.Table.LineBase + int64 scan.Table.Count
+        activePreviewView sideIndex lineNumber scan.Scanner scan.Table scan.Spec.ByteLength
+
+    let completedPreviewView sideIndex number (scan: ScanSide) =
+        let table = scan.Table
+        if table.Count = 0 || table.LineBase + int64 table.Count - 1L <> number then None
+        else
+            let index = table.Count - 1
+            let endingCode = table.EndingCode index
+            let ending = LineEndingCode.toLineEnding endingCode
+            let encoding = if sideIndex = 0 then previousEncoding else currentEncoding
+            let finish = table.Finish index
+            let contentEnd = finish - Widths.endingWidth encoding endingCode
+            Some {
+                SideIndex = sideIndex
+                Number = number
+                StartOffset = table.Start index
+                ContentEnd = max (table.Start index) contentEnd
+                KnownEnd = finish
+                KnownUtf16 = Some(int64 (table.Length index))
+                TotalUtf16 = Some(int64 (table.Length index))
+                Ending = ending
+                Active = false
+                EndOfFile = scan.Finished && ending = LineEnding.NoEnding
+            }
+
+    let commonPreviewView sideIndex startOffset endOffset number =
+        let width = float (Widths.unitBytes (if sideIndex = 0 then previousEncoding else currentEncoding))
+        let contentEnd = if pendingCR then endOffset - width else endOffset
+        if endOffset <= startOffset && not pendingCR then None
+        else
+            Some {
+                SideIndex = sideIndex
+                Number = number
+                StartOffset = startOffset
+                ContentEnd = max startOffset contentEnd
+                KnownEnd = endOffset
+                KnownUtf16 = None
+                TotalUtf16 = None
+                Ending = LineEnding.NoEnding
+                Active = true
+                EndOfFile = false
+            }
+
+    let readPreviewSnippet (view: PendingLineView) (offset: int64) = async {
+        let spec = if view.SideIndex = 0 then previousSpec else currentSpec
+        let encoding = if view.SideIndex = 0 then previousEncoding else currentEncoding
+        let units = Array.zeroCreate<uint16> 2_048
+        let buffer = Array.zeroCreate<byte> 1_024
+        let mutable decoder = Decoders.createAt encoding (int64 view.StartOffset)
+        let mutable bytePosition = view.StartOffset
+        let mutable decodedUnits = 0.0
+        let mutable captured = 0
+        let mutable waiting = false
+        let mutable failed = false
+        let requestedOffset = float offset
+        let requestedEnd = requestedOffset + 2_048.0
+        while captured < 2_048 && decodedUnits < requestedEnd && bytePosition < view.ContentEnd && bytePosition < view.KnownEnd && not waiting && not failed do
+            let count = int (min (float buffer.Length) (min (view.ContentEnd - bytePosition) (view.KnownEnd - bytePosition)))
+            if count <= 0 then waiting <- true
+            else
+                match spec.Source with
+                | None -> waiting <- true
+                | Some source ->
+                    let! outcome = source.ReadAt (int64 bytePosition) buffer 0 count
+                    match outcome with
+                    | ReadOutcome.Bytes actual when actual > 0 ->
+                        let sink _ _ value =
+                            if decodedUnits >= requestedOffset && decodedUnits < requestedEnd && captured < units.Length then
+                                units[captured] <- uint16 value
+                                captured <- captured + 1
+                            decodedUnits <- decodedUnits + 1.0
+                        let next, result = Decoders.decode decoder buffer 0 actual sink
+                        decoder <- next
+                        bytePosition <- float next.AbsoluteOffset
+                        match result with
+                        | Error error ->
+                            report (if view.SideIndex = 0 then DiffSide.Previous else DiffSide.Current) ("invalid " + Decoders.name encoding + " sequence: " + error.Reason) error.Offset
+                            failed <- true
+                        | Ok _ -> ()
+                    | ReadOutcome.NotYetAvailable -> waiting <- true
+                    | ReadOutcome.EndOfSource -> sourceChanged (); failed <- true
+                    | ReadOutcome.Bytes _ -> waiting <- true
+        if captured > 0 && units[captured - 1] >= 0xD800us && units[captured - 1] <= 0xDBFFus then captured <- captured - 1
+        let text = Native.utf16Decode units captured
+        let endState =
+            match view.TotalUtf16 with
+            | Some total when offset + int64 captured < total -> SnippetEnd.Truncated
+            | Some _ -> if view.EndOfFile then SnippetEnd.EndOfFile else SnippetEnd.LineEnd
+            | None when decodedUnits > requestedOffset + float captured || bytePosition < min view.ContentEnd view.KnownEnd -> SnippetEnd.Truncated
+            | None -> SnippetEnd.MoreTextPending
+        return { Line = view.Number; OffsetUtf16 = offset; Text = text; End = endState }
+    }
+
+    let reservePendingPreview (value: PendingPreview option) =
+        if pendingPreviewBytes > 0L then ledger.Release(AllocationCategory.ResponseData, pendingPreviewBytes)
+        pendingPreviewBytes <- 0L
+        lastPendingPreview <- None
+        match value with
+        | None -> None
+        | Some preview ->
+            let stringCost =
+                [| preview.Previous; preview.Current |]
+                |> Array.sumBy (function PendingSide.Snippet snippet -> int64 snippet.Text.Length * 2L | _ -> 0L)
+            let cost = stringCost + 64L
+            if cost > 16L * 1024L || not (ledger.TryReserve(AllocationCategory.ResponseData, cost)) then None
+            else
+                pendingPreviewBytes <- cost
+                lastPendingPreview <- Some preview
+                lastPendingPreview
+
+    let makePendingPreview (active: PendingLineView option[]) (completed: (int64 -> PendingLineView option)[]) (exhausted: int64 option[]) mismatchLines = async {
+        let selected = Array.copy active
+        for sideIndex = 0 to 1 do
+            if selected[sideIndex].IsNone then
+                let other = 1 - sideIndex
+                match selected[other] with
+                | Some peer -> selected[sideIndex] <- completed[sideIndex] peer.Number
+                | None -> ()
+        if selected[0].IsNone && selected[1].IsNone then
+            return reservePendingPreview None
+        else
+            let mutable knownMismatch = None
+            let offsets = [| 0L; 0L |]
+            match mismatchLines, selected[0], selected[1] with
+            | Some(previousNumber, currentNumber, Some unitOffset), Some previousView, Some currentView
+                when previousView.Number = previousNumber
+                     && currentView.Number = currentNumber
+                     && (previousView.KnownUtf16 |> Option.exists (fun length -> length > unitOffset)
+                         || previousView.TotalUtf16 = Some unitOffset)
+                     && (currentView.KnownUtf16 |> Option.exists (fun length -> length > unitOffset)
+                         || currentView.TotalUtf16 = Some unitOffset) ->
+                knownMismatch <- Some unitOffset
+                offsets[0] <- max 0L (unitOffset - 256L)
+                offsets[1] <- max 0L (unitOffset - 256L)
+            | _ -> ()
+            let readOptionalSnippet sideIndex view = async {
+                match view with
+                | Some value ->
+                    let! snippet = readPreviewSnippet value offsets[sideIndex]
+                    return Some snippet
+                | None -> return None
+            }
+            let! previousSnippet = readOptionalSnippet 0 selected[0]
+            let! currentSnippet = readOptionalSnippet 1 selected[1]
+            let previousSide =
+                match previousSnippet, exhausted[0] with
+                | Some snippet, _ -> PendingSide.Snippet snippet
+                | None, Some count -> PendingSide.Exhausted count
+                | _ -> PendingSide.NoActiveLine
+            let currentSideValue =
+                match currentSnippet, exhausted[1] with
+                | Some snippet, _ -> PendingSide.Snippet snippet
+                | None, Some count -> PendingSide.Exhausted count
+                | _ -> PendingSide.NoActiveLine
+            let mutable mismatch = None
+            match mismatchLines, selected[0], selected[1], previousSnippet, currentSnippet with
+            | Some(previousNumber, currentNumber, Some unitOffset), Some previousView, Some currentView, Some previousText, Some currentText
+                when previousView.Number = previousNumber
+                     && currentView.Number = currentNumber
+                     && knownMismatch.IsSome
+                     && unitOffset >= previousText.OffsetUtf16
+                     && unitOffset <= previousText.OffsetUtf16 + int64 previousText.Text.Length
+                     && unitOffset >= currentText.OffsetUtf16
+                     && unitOffset <= currentText.OffsetUtf16 + int64 currentText.Text.Length ->
+                mismatch <- Some { PreviousOffsetUtf16 = unitOffset; CurrentOffsetUtf16 = unitOffset }
+            | _ -> ()
+            let preview = { Previous = previousSide; Current = currentSideValue; Mismatch = mismatch }
+            if invalidDetail.IsSome || failure.IsSome then return reservePendingPreview None
+            else return reservePendingPreview (Some preview)
+    }
+
+    let pagePreviewCandidates () =
+        match mode, resync with
+        | Mode.Resync, Some engine -> engine.PreviewSides
+        | Mode.Window, _ -> [| [| previousSide; currentSide |] |]
+        | _ -> [||]
+
+    let pendingPagePreview () = async {
+        let active = Array.create 2 None
+        let complete = Array.create 2 (fun _ -> None)
+        let ended = Array.create 2 None
+        if mode = Mode.Common then
+            let previousNumber = int64 (builder.NextPrevious + commonLines)
+            let currentNumber = int64 (builder.NextCurrent + commonLines)
+            active[0] <- commonPreviewView 0 lineStart pos previousNumber
+            active[1] <- commonPreviewView 1 (lineStart + delta) (pos + delta) currentNumber
+            if active[0].IsNone && previousSpec.Source.IsNone then ended[0] <- Some 0L
+            if active[1].IsNone && currentSpec.Source.IsNone then ended[1] <- Some 0L
+        else
+            let candidateSets = pagePreviewCandidates ()
+            for sideIndex = 0 to 1 do
+                let scans = candidateSets |> Array.collect (fun set -> set) |> Array.filter (fun scan -> (if sideIndex = 0 then scan.Side = DiffSide.Previous else scan.Side = DiffSide.Current))
+                let views = scans |> Array.choose (previewViewFromScan sideIndex)
+                if views.Length > 0 then
+                    active[sideIndex] <-
+                        Some(
+                            Array.minBy
+                                (fun view -> view.Number, view.StartOffset, -view.KnownEnd)
+                                views
+                        )
+                complete[sideIndex] <- fun number ->
+                    scans
+                    |> Array.choose (completedPreviewView sideIndex number)
+                    |> Array.tryHead
+                if scans |> Array.exists (fun scan -> scan.Spec.Source.IsNone) then ended[sideIndex] <- Some 0L
+                else
+                    let finished = scans |> Array.filter (fun scan -> scan.Finished)
+                    if finished.Length > 0 then ended[sideIndex] <- Some(finished |> Array.map (fun scan -> scan.Table.LineBase + int64 scan.Table.Count) |> Array.max)
+        return! makePendingPreview active complete ended pairedMismatch
+    }
+
+    let pendingSeekPreview (cursor: SeekCursor) = async {
+        let active = Array.create 2 None
+        let complete = Array.create 2 (fun _ -> None)
+        let ended = Array.create 2 None
+        let sideIndex = cursor.SideIndex
+        let scans = [| previousSide; currentSide |]
+        let scan = scans[sideIndex]
+        let spec = if sideIndex = 0 then previousSpec else currentSpec
+        active[sideIndex] <- activePreviewView sideIndex (int64 cursor.LineNumber) cursor.State scan.Table spec.ByteLength
+        for index = 0 to 1 do
+            if index <> sideIndex then
+                complete[index] <- fun number -> scans[index] |> completedPreviewView index number
+                active[index] <- previewViewFromScan index scans[index]
+                if scans[index].Finished then ended[index] <- Some(scans[index].Table.LineBase + int64 scans[index].Table.Count)
+                elif scans[index].Spec.Source.IsNone then ended[index] <- Some 0L
+        return! makePendingPreview active complete ended None
+    }
+
+    let presentPageResult result = async {
+        match result with
+        | EngineResult.Ok(Resumable.Scanning(progress, continuation, _)) ->
+            let! preview = pendingPagePreview ()
+            if invalidDetail.IsSome then return failContent ()
+            elif failure.IsSome then
+                let code, message = failure.Value
+                return EngineResult.Failed(code, message, None)
+            else return EngineResult.Ok(Resumable.Scanning(progress, continuation, preview))
+        | EngineResult.Ok(Resumable.Ready page) when page.NextCursor.IsSome ->
+            let! preview = pendingPagePreview ()
+            if invalidDetail.IsSome then return failContent ()
+            elif failure.IsSome then
+                let code, message = failure.Value
+                return EngineResult.Failed(code, message, None)
+            else
+                let previewBytes =
+                    match preview with
+                    | Some value ->
+                        [| value.Previous; value.Current |]
+                        |> Array.sumBy (function PendingSide.Snippet snippet -> snippet.Text.Length * 3 | _ -> 0)
+                    | None -> 0
+                let partBytes = page.Parts |> Array.sumBy (fun part -> max 0 (sizer part))
+                let pending = if partBytes + previewBytes + 512 <= config.PageMaxBytes then preview else None
+                return EngineResult.Ok(Resumable.Ready { page with Pending = pending })
+        | EngineResult.Ok(Resumable.Ready page) ->
+            reservePendingPreview None |> ignore
+            return EngineResult.Ok(Resumable.Ready { page with Pending = None })
+        | other -> return other
+    }
+
+    let readTailUnits (side: DiffSide) (spec: SourceSpec) (encoding: TextEncoding) (line: LineRef) (meter: Meter) (cancel: unit -> bool) = async {
+        let capacity = 8_192
+        let tail = Array.zeroCreate<uint16> capacity
+        let contentEnd = line.Start + lineContentBytes encoding line
+        let width = float (Widths.unitBytes encoding)
+        let roughStart = max line.Start (contentEnd - float (capacity * 4))
+        let relative = roughStart - line.Start
+        let mutable position = line.Start + Math.Floor(relative / width) * width
+        let buffer = Array.zeroCreate<byte> 4_096
+        let mutable waiting = false
+        let mutable failed = false
+        match encoding with
+        | TextEncoding.Utf8 ->
+            let mutable aligned = false
+            while not aligned && not waiting && not failed && position < contentEnd && not (cancel ()) && not (Meter.overBudget meter) do
+                match spec.Source with
+                | None -> failed <- true
+                | Some source ->
+                    let! outcome = source.ReadAt (int64 position) buffer 0 1
+                    match outcome with
+                    | ReadOutcome.Bytes actual when actual = 1 ->
+                        Meter.chargeBytes meter actual
+                        if (Native.readByte buffer 0 &&& 0xC0) <> 0x80 then aligned <- true
+                        else position <- position + 1.0
+                    | ReadOutcome.NotYetAvailable -> waiting <- true
+                    | _ -> failed <- true
+        | TextEncoding.Utf16LE
+        | TextEncoding.Utf16BE ->
+            if position + 2.0 <= contentEnd then
+                match spec.Source with
+                | None -> failed <- true
+                | Some source ->
+                    let! outcome = source.ReadAt (int64 position) buffer 0 2
+                    match outcome with
+                    | ReadOutcome.Bytes actual when actual = 2 ->
+                        Meter.chargeBytes meter actual
+                        let unit = Widths.unitAt encoding buffer 0
+                        if unit >= 0xDC00 && unit <= 0xDFFF then
+                            if position >= line.Start + 2.0 then position <- position - 2.0
+                            else failed <- true
+                    | ReadOutcome.NotYetAvailable -> waiting <- true
+                    | _ -> failed <- true
+        | _ -> ()
+        let mutable decoder = Decoders.createAt encoding (int64 position)
+        let mutable decodedUnits = 0
+        while not failed && not waiting && not (cancel ()) && not (Meter.overBudget meter) && float decoder.AbsoluteOffset < contentEnd do
+            let byteCount = int (min (float buffer.Length) (contentEnd - float decoder.AbsoluteOffset))
+            if byteCount <= 0 then waiting <- true
+            else
+                match spec.Source with
+                | None -> failed <- true
+                | Some source ->
+                    let! outcome = source.ReadAt decoder.AbsoluteOffset buffer 0 byteCount
+                    match outcome with
+                    | ReadOutcome.Bytes actual when actual > 0 ->
+                        let sink _ _ value =
+                            tail[decodedUnits % capacity] <- uint16 value
+                            decodedUnits <- decodedUnits + 1
+                        let next, result = Decoders.decode decoder buffer 0 actual sink
+                        decoder <- next
+                        Meter.chargeBytes meter actual
+                        match result with
+                        | Error error ->
+                            report side ("invalid " + Decoders.name encoding + " sequence: " + error.Reason) error.Offset
+                            failed <- true
+                        | Ok _ -> ()
+                    | ReadOutcome.NotYetAvailable -> waiting <- true
+                    | _ -> failed <- true
+        if failed || waiting || cancel () || Meter.overBudget meter || float decoder.AbsoluteOffset < contentEnd then return None
+        else
+            let count = min capacity decodedUnits
+            let start = if decodedUnits > capacity then decodedUnits % capacity else 0
+            let mutable first = 0
+            if count > 0 && tail[start] >= 0xDC00us && tail[start] <= 0xDFFFus then first <- 1
+            let result = Array.zeroCreate<uint16> (count - first)
+            for index = first to count - 1 do result[index - first] <- tail[(start + index) % capacity]
+            return Some result
+    }
+
+    let commonSuffixLength (previous: uint16[]) (current: uint16[]) =
+        let limit = min previous.Length current.Length
+        let mutable count = 0
+        while count < limit && previous[previous.Length - count - 1] = current[current.Length - count - 1] do
+            count <- count + 1
+        let previousStart = previous.Length - count
+        let currentStart = current.Length - count
+        if
+            count > 0
+            && previousStart > 0
+            && currentStart > 0
+            && previous[previousStart] >= 0xDC00us
+            && previous[previousStart] <= 0xDFFFus
+            && previous[previousStart - 1] >= 0xD800us
+            && previous[previousStart - 1] <= 0xDBFFus
+            && current[currentStart] >= 0xDC00us
+            && current[currentStart] <= 0xDFFFus
+            && current[currentStart - 1] >= 0xD800us
+            && current[currentStart - 1] <= 0xDBFFus
+        then count - 1
+        else count
+
+    let longLineSlices (meter: Meter) (cancel: unit -> bool) (previousRef: LineRef) (currentRef: LineRef) (previousLine: DiffLine) (currentLine: DiffLine) = async {
+        let reservation = 64L * 1024L
+        if Meter.overBudget meter || not (ledger.TryReserve(AllocationCategory.AlignmentScratch, reservation)) then
+            return None
+        else
+            try
+                let createCursor (side: DiffSide) (spec: SourceSpec) (encoding: TextEncoding) (line: LineRef) : TextReadCursor = {
+                    Side = side
+                    Spec = spec
+                    Encoding = encoding
+                    ContentEnd = line.Start + lineContentBytes encoding line
+                    Buffer = Array.zeroCreate<byte> 4_096
+                    Position = line.Start
+                    Decoder = Decoders.createAt encoding (int64 line.Start)
+                    PendingUnit = None
+                }
+                let previousCursor = createCursor DiffSide.Previous previousSpec previousEncoding previousRef
+                let currentCursor = createCursor DiffSide.Current currentSpec currentEncoding currentRef
+                let mutable canceled = false
+                let readBlock (cursor: TextReadCursor) wanted = async {
+                    let units = Array.zeroCreate<uint16> (wanted + 1)
+                    let mutable count = 0
+                    match cursor.PendingUnit with
+                    | Some value -> units[0] <- value; count <- 1; cursor.PendingUnit <- None
+                    | None -> ()
+                    let mutable failed = false
+                    while count < wanted && cursor.Position < cursor.ContentEnd && not failed && not canceled && not (Meter.overBudget meter) do
+                        if cancel () then canceled <- true
+                        else
+                            let byteCount = int (min (float (cursor.Buffer.Length)) (min (float (wanted - count)) (cursor.ContentEnd - cursor.Position)))
+                            if byteCount <= 0 then failed <- true
+                            else
+                                match cursor.Spec.Source with
+                                | None -> failed <- true
+                                | Some source ->
+                                    let! outcome = source.ReadAt (int64 cursor.Position) cursor.Buffer 0 byteCount
+                                    match outcome with
+                                    | ReadOutcome.Bytes actual when actual > 0 ->
+                                        let mutable overflow: uint16 option = None
+                                        let sink _ _ value =
+                                            if count < wanted then
+                                                units[count] <- uint16 value
+                                                count <- count + 1
+                                            elif overflow.IsNone then overflow <- Some(uint16 value)
+                                        let next, decoded = Decoders.decode cursor.Decoder cursor.Buffer 0 actual sink
+                                        cursor.Decoder <- next
+                                        cursor.Position <- float next.AbsoluteOffset
+                                        Meter.chargeBytes meter actual
+                                        match decoded with
+                                        | Error error ->
+                                            report cursor.Side ("invalid " + Decoders.name cursor.Encoding + " sequence: " + error.Reason) error.Offset
+                                            failed <- true
+                                        | Ok _ -> cursor.PendingUnit <- overflow
+                                    | ReadOutcome.NotYetAvailable -> failed <- true
+                                    | ReadOutcome.EndOfSource -> sourceChanged (); failed <- true
+                                    | ReadOutcome.Bytes _ -> failed <- true
+                    return Array.sub units 0 count, count, failed
+                }
+                let keepTail (history: uint16[]) (historyCount: int) (block: uint16[]) (blockCount: int) =
+                    let result = Array.zeroCreate<uint16> 128
+                    let take = min 128 blockCount
+                    if take = 128 then Array.blit block (blockCount - take) result 0 take
+                    else
+                        let fromHistory = min historyCount (128 - take)
+                        if fromHistory > 0 then Array.blit history (historyCount - fromHistory) result 0 fromHistory
+                        if take > 0 then Array.blit block 0 result fromHistory take
+                    result, min 128 (min historyCount 128 + blockCount)
+                let sliceAt (line: DiffLine) (values: uint16[]) valueCount baseOffset startOffset =
+                    let mutable first = max 0 (min valueCount (int (startOffset - baseOffset)))
+                    let mutable length = min 8_192 (valueCount - first)
+                    if first > 0 && first < valueCount
+                       && values[first - 1] >= 0xD800us && values[first - 1] <= 0xDBFFus
+                       && values[first] >= 0xDC00us && values[first] <= 0xDFFFus then
+                        first <- first - 1
+                        length <- min 8_192 (valueCount - first)
+                    elif first < valueCount && values[first] >= 0xDC00us && values[first] <= 0xDFFFus then
+                        first <- first + 1
+                        length <- min 8_192 (valueCount - first)
+                    if length > 0 && values[first + length - 1] >= 0xD800us && values[first + length - 1] <= 0xDBFFus then length <- length - 1
+                    let selected = Array.zeroCreate<uint16> length
+                    if length > 0 then Array.blit values first selected 0 length
+                    let text = Native.utf16Decode selected length
+                    { line with Slice = { line.Slice with OffsetUtf16 = int64 (baseOffset + float first); Text = text } }
+                let previousHistory = Array.zeroCreate<uint16> 128
+                let currentHistory = Array.zeroCreate<uint16> 128
+                let mutable historyCount = 0
+                let mutable unitOffset = 0.0
+                let mutable found: (DiffLine * DiffLine) option = None
+                let mutable failed = false
+                let mutable searching = true
+                while searching && found.IsNone && not failed && not canceled && not (Meter.overBudget meter) do
+                    let remainingPrevious = max 0.0 (previousRef.Length - unitOffset)
+                    let remainingCurrent = max 0.0 (currentRef.Length - unitOffset)
+                    let wanted = int (min 4_096.0 (max remainingPrevious remainingCurrent))
+                    if wanted = 0 then searching <- false
+                    else
+                        let expectedPrevious = int (min (float wanted) remainingPrevious)
+                        let expectedCurrent = int (min (float wanted) remainingCurrent)
+                        let! previousBlock, previousCount, previousFailed = readBlock previousCursor expectedPrevious
+                        let! currentBlock, currentCount, currentFailed = readBlock currentCursor expectedCurrent
+                        failed <- previousFailed || currentFailed || previousCount < expectedPrevious || currentCount < expectedCurrent
+                        if not failed then
+                            let shared = min previousCount currentCount
+                            let mutable difference = 0
+                            while difference < shared && previousBlock[difference] = currentBlock[difference] do difference <- difference + 1
+                            if difference < shared || previousCount <> currentCount then
+                                let leading = min historyCount 128
+                                let startOffset = max 0.0 (unitOffset + float difference - float leading)
+                                let previousValues = Array.zeroCreate<uint16> (leading + previousCount)
+                                let currentValues = Array.zeroCreate<uint16> (leading + currentCount)
+                                if leading > 0 then
+                                    Array.blit previousHistory (historyCount - leading) previousValues 0 leading
+                                    Array.blit currentHistory (historyCount - leading) currentValues 0 leading
+                                if previousCount > 0 then Array.blit previousBlock 0 previousValues leading previousCount
+                                if currentCount > 0 then Array.blit currentBlock 0 currentValues leading currentCount
+                                let baseOffset = unitOffset - float leading
+                                let previousSlice = sliceAt previousLine previousValues previousValues.Length baseOffset startOffset
+                                let currentSlice = sliceAt currentLine currentValues currentValues.Length baseOffset startOffset
+                                found <- Some(previousSlice, currentSlice)
+                            else
+                                let nextPrevious, nextPreviousCount = keepTail previousHistory historyCount previousBlock previousCount
+                                let nextCurrent, nextCurrentCount = keepTail currentHistory historyCount currentBlock currentCount
+                                Array.blit nextPrevious 0 previousHistory 0 nextPreviousCount
+                                Array.blit nextCurrent 0 currentHistory 0 nextCurrentCount
+                                historyCount <- min nextPreviousCount nextCurrentCount
+                                unitOffset <- unitOffset + float shared
+                                if shared = 0 then searching <- false
+                if canceled then return None
+                else
+                    match found with
+                    | None -> return None
+                    | Some(previousSlice, currentSlice) ->
+                        if Meter.overBudget meter then return Some(previousSlice, currentSlice)
+                        else
+                            let! previousTail = readTailUnits DiffSide.Previous previousSpec previousEncoding previousRef meter cancel
+                            match previousTail with
+                            | None -> return if cancel () then None else Some(previousSlice, currentSlice)
+                            | Some previousValues ->
+                                let! currentTail = readTailUnits DiffSide.Current currentSpec currentEncoding currentRef meter cancel
+                                match currentTail with
+                                | None -> return if cancel () then None else Some(previousSlice, currentSlice)
+                                | Some currentValues ->
+                                    let suffix = float (commonSuffixLength previousValues currentValues)
+                                    let changedEnd = min (previousRef.Length - suffix) (currentRef.Length - suffix)
+                                    if cancel () then return None
+                                    elif previousSlice.Slice.OffsetUtf16 > int64 changedEnd then return None
+                                    else return Some(previousSlice, currentSlice)
+            finally
+                ledger.Release(AllocationCategory.AlignmentScratch, reservation)
+    }
+
     let countSide (rows: RowRef[]) (first: int) (count: int) (previousSide: bool) =
         let mutable total = 0
         for index = first to first + count - 1 do
@@ -1304,7 +2011,7 @@ type TextDiffSession internal (
             | DiffRowKind.EndingChanged -> previousRefs[previousRefIndex] <- row.Previous; previousRefIndex <- previousRefIndex + 1
         previousRefs, currentRefs
 
-    let makeRows (item: QueueItem) (start: int) (count: int) (firstId: int64) (previousValues: DiffLine[]) (currentValues: DiffLine[]) =
+    let makeRows (item: QueueItem) (start: int) (count: int) (firstId: int64) (previousValues: DiffLine[]) (currentValues: DiffLine[]) (cancel: unit -> bool) (meter: Meter) = async {
         let fastIdStart =
             if firstId >= 0L && firstId + int64 (max 0 (count - 1)) <= int64 Int32.MaxValue then int firstId
             else -1
@@ -1340,18 +2047,42 @@ type TextDiffSession internal (
                 previousRefIndex <- previousRefIndex + 1
                 currentRefIndex <- currentRefIndex + 1
                 rows[index] <- { Id = id; Kind = row.Kind; Previous = Some previousLine; Current = Some currentLine }
-        rows
+        let mutable interrupted = false
+        for index = 0 to rows.Length - 1 do
+            if cancel () then interrupted <- true
+            elif rows[index].Kind = DiffRowKind.Replaced then
+                let source = item.Rows[start + index]
+                if source.Previous.Length > 8_192.0 || source.Current.Length > 8_192.0 then
+                    let! changed = longLineSlices meter cancel source.Previous source.Current rows[index].Previous.Value rows[index].Current.Value
+                    match changed with
+                    | Some(previousLine, currentLine) ->
+                        rows[index] <- { rows[index] with Previous = Some previousLine; Current = Some currentLine }
+                    | None when cancel () -> interrupted <- true
+                    | None -> ()
+                let previousLine = rows[index].Previous.Value
+                let currentLine = rows[index].Current.Value
+                let previousHighlights, currentHighlights = InlineHighlights.compute meter previousLine.Slice.Text currentLine.Slice.Text
+                rows[index] <- {
+                    rows[index] with
+                        Previous = Some { previousLine with Slice = { previousLine.Slice with Highlights = previousHighlights } }
+                        Current = Some { currentLine with Slice = { currentLine.Slice with Highlights = currentHighlights } }
+                }
+        if interrupted then return None else return Some rows
+    }
 
-    let buildRows (item: QueueItem) (start: int) (count: int) (firstId: int64) : Async<DiffRow[] option> = async {
-        let previousRefs, currentRefs = collectRowRefs item start count
-        let! previousLines = readLines previousSpec previousEncoding previousRefs
-        match previousLines with
-        | None -> return None
-        | Some previousValues ->
-            let! currentLines = readLines currentSpec currentEncoding currentRefs
-            match currentLines with
+    let buildRows (item: QueueItem) (start: int) (count: int) (firstId: int64) (cancel: unit -> bool) (meter: Meter) : Async<DiffRow[] option> = async {
+        if cancel () then return None
+        else
+            let previousRefs, currentRefs = collectRowRefs item start count
+            let! previousLines = readLines previousSpec previousEncoding previousRefs
+            match previousLines with
             | None -> return None
-            | Some currentValues -> return Some(makeRows item start count firstId previousValues currentValues)
+            | Some previousValues ->
+                let! currentLines = readLines currentSpec currentEncoding currentRefs
+                match currentLines with
+                | None -> return None
+                | Some currentValues ->
+                    return! makeRows item start count firstId previousValues currentValues cancel meter
     }
 
     let lanePart hunkId (item: QueueItem) (isPrevious: bool) (start: int) (built: DiffLine[]) =
@@ -1404,7 +2135,7 @@ type TextDiffSession internal (
                 size <- sizer part
             Some { Part = part; Taken = taken; Size = size }
 
-    let buildPage (sequence: int64) (cancel: unit -> bool) : Async<PageBuild> = async {
+    let buildPage (sequence: int64) (cancel: unit -> bool) (meter: Meter) : Async<PageBuild> = async {
         let items = Seq.toArray builder.Items
         let parts = ResizeArray<DiffPart>()
         let mutable usedBytes = 0
@@ -1424,9 +2155,11 @@ type TextDiffSession internal (
                 interrupted <- true
                 stop <- true
             elif item.Kind = ItemKind.Gap then
+                let gapId = identifier "g" nextGapSequence
+                nextGapSequence <- nextGapSequence + 1L
                 let part =
                     DiffPart.HiddenEqual {
-                        GapId = identifier "g" (int64 item.Sequence)
+                        GapId = gapId
                         PreviousRange = { Start = int64 item.PreviousStart; Count = int64 item.Count }
                         CurrentRange = { Start = int64 item.CurrentStart; Count = int64 item.Count }
                     }
@@ -1450,7 +2183,7 @@ type TextDiffSession internal (
                         let currentBefore = countSide item.Rows 0 start false
                         let firstId = nextRow
                         let hunkId = identifier "h" (int64 item.Sequence)
-                        let! built = buildRows item start available firstId
+                        let! built = buildRows item start available firstId cancel meter
                         match built with
                         | None -> return None
                         | Some rows ->
@@ -1514,13 +2247,13 @@ type TextDiffSession internal (
     let recordResult (sequence: int64) (result: Resumable<DiffPage>) =
         Shield.run (
             async {
-                do! journal.Append(sequence, result)
+                do! journal.Append(journalKey 0L sequence, JournalValue.Page result)
                 requestSequence <- sequence + 1L
             }
         )
 
-    let producePage (sequence: int64) (cancel: unit -> bool) : Async<EngineResult<Resumable<DiffPage>> option> = async {
-        let! built = buildPage sequence cancel
+    let producePage (sequence: int64) (cancel: unit -> bool) (meter: Meter) : Async<EngineResult<Resumable<DiffPage>> option> = async {
+        let! built = buildPage sequence cancel meter
         match built with
         | PageBuild.Interrupted -> return None
         | PageBuild.TooLarge -> return Some(failWorker "A diff row exceeds the configured page byte limit.")
@@ -1532,6 +2265,13 @@ type TextDiffSession internal (
                 Shield.run (
                     async {
                         do! recordResult sequence value
+                        for part in page.Parts do
+                            match part with
+                            | DiffPart.HiddenEqual gap ->
+                                match readIdentifier "g" gap.GapId with
+                                | Some gapSequence -> do! journal.Link(journalKey 3L gapSequence, journalKey 0L sequence)
+                                | None -> invalidOp "The generated gap id is invalid."
+                            | _ -> ()
                         builder.CommitPage(fullCount, partialConsumed, rowsRemoved, fragmentsRemoved)
                         rowSequence <- nextRow
                         firstPageReturned <- true
@@ -1551,7 +2291,7 @@ type TextDiffSession internal (
             // chunk scratch. The job suspends and the next request tries again.
             let value = Resumable.Scanning(progress (), identifier "c" (sequence + 1L), None)
             do! recordResult sequence value
-            return EngineResult.Ok value
+            return! presentPageResult (EngineResult.Ok value)
         else
             let meter = Meter.create host.Clock config.Limits
             let ranAfterRestore = freshlyRestored && not spilled
@@ -1569,14 +2309,14 @@ type TextDiffSession internal (
                     let doneTrigger = modeIsDone () && builder.Finished
                     let softTrigger = builder.CompletedHunks > 0 && not (modeIsDone ()) && not firstPageReturned
                     if hardTrigger || doneTrigger || softTrigger then
-                        let! produced = producePage sequence cancel
+                        let! produced = producePage sequence cancel meter
                         match produced with
                         | Some value -> result <- Some value
                         | None -> if failure.IsNone then result <- Some EngineResult.Canceled
                     elif not first && Meter.overBudget meter then
                         if builder.QueueCount > 0 || builder.HasOpenRows then
                             builder.FlushOpen()
-                            let! produced = producePage sequence cancel
+                            let! produced = producePage sequence cancel meter
                             match produced with
                             | Some value -> result <- Some value
                             | None -> if failure.IsNone then result <- Some EngineResult.Canceled
@@ -1596,52 +2336,149 @@ type TextDiffSession internal (
                             do! host.Yield()
                 first <- false
             if ranAfterRestore then freshlyRestored <- false
-            return result.Value
+            return! presentPageResult result.Value
     }
 
-    /// Finds the line that a line number or a byte offset names. The scan resumes from the nearest checkpoint at
-    /// or before the target and reads the source in 64 KiB pieces.
-    let seekScan (sideIndex: int) (byLine: bool) (target: float) : Async<ScannedLine option> = async {
-        let spec = if sideIndex = 0 then previousSpec else currentSpec
-        let encoding = if sideIndex = 0 then previousEncoding else currentEncoding
-        match spec.Source with
-        | None -> return None
-        | Some source ->
+    let specAt sideIndex = if sideIndex = 0 then previousSpec else currentSpec
+    let encodingAt sideIndex = if sideIndex = 0 then previousEncoding else currentEncoding
+    let scanSideAt sideIndex = if sideIndex = 0 then previousSide else currentSide
+
+    let beginSeek (sideIndex: int) (byLine: bool) (target: float) (startLine: float) (endLine: float) = async {
+        let spec = specAt sideIndex
+        if spec.Source.IsNone then return None
+        else
             let! hit = checkpoints.Find(sideIndex, byLine, target)
             let state, firstLine =
                 match hit with
                 | Some found -> found.State, found.Line
-                | None -> Scanner.create encoding (int64 spec.BomLength) None, 0.0
-            let buffer = Array.zeroCreate<byte> 65_536
+                | None -> Scanner.create (encodingAt sideIndex) (int64 spec.BomLength) None, 0.0
             let batch = LineBatch(256)
-            let meter = Meter.create host.Clock { config.Limits with MaxUnits = Int32.MaxValue; RequestMs = 1e15; QuantumMs = 1e15 }
-            let mutable line = firstLine
-            let mutable found: ScannedLine option = None
-            let mutable position = state.NextOffset
-            let mutable stop = false
-            let onLines (lines: LineBatch) =
-                for index = 0 to lines.Count - 1 do
-                    if found.IsNone then
+            return Some {
+                SideIndex = sideIndex
+                ByLine = byLine
+                StartLine = startLine
+                EndLine = endLine
+                TargetOffset = target
+                State = state
+                Buffer = Array.zeroCreate<byte> 65_536
+                Batch = batch
+                FoundLines = ResizeArray<ScannedLine>()
+                LineNumber = firstLine
+                Position = state.NextOffset
+                Complete = false
+                Rebatch = false
+                Waiting = false
+            }
+    }
+
+    let advanceSeek (cursor: SeekCursor) (meter: Meter) (cancel: unit -> bool) = async {
+        let spec = specAt cursor.SideIndex
+        match spec.Source with
+        | None -> cursor.Complete <- true
+        | Some source ->
+            cursor.Waiting <- false
+            cursor.Complete <- cursor.Complete || cursor.State.IsComplete
+            let mutable running = not cursor.Complete
+            let mutable iterations = 0
+            while running && not (Meter.overBudget meter) && not (cancel ()) do
+                iterations <- iterations + 1
+                if iterations > 10_000 then invalidOp "A seek request did not advance."
+                if cursor.Batch.Count = 0 then
+                    let remaining = max 1 (int (cursor.EndLine - cursor.LineNumber + 1.0))
+                    let lineBudget = max 1 (meter.MaxUnits - meter.Units)
+                    let capacity = if cursor.ByLine then min remaining lineBudget else 1
+                    if cursor.Rebatch || cursor.Batch.Capacity <> capacity then
+                        cursor.Batch <- LineBatch capacity
+                    cursor.Batch.StopAtFull <- true
+                    cursor.Rebatch <- false
+
+                let onLines (lines: LineBatch) =
+                    for index = 0 to lines.Count - 1 do
                         let scanned = lines.Line index
-                        if (byLine && line = target) || (not byLine && float scanned.EndOffset > target) then found <- Some scanned
-                        line <- line + 1.0
-            let ignoreEvidence (_: ScannerEvidence) = ()
-            while found.IsNone && not stop && not state.IsComplete do
-                if position >= float spec.ByteLength then
-                    let result = Scanner.scanChunk state buffer 0 0 true meter batch onLines ignoreEvidence
-                    stop <- result.Status <> EndOfInput
+                        let currentLine = cursor.LineNumber
+                        let selected =
+                            if cursor.ByLine then currentLine >= cursor.StartLine && currentLine <= cursor.EndLine
+                            else float scanned.EndOffset > cursor.TargetOffset
+                        if selected then cursor.FoundLines.Add scanned
+                        cursor.LineNumber <- currentLine + 1.0
+                        checkpoints.ObserveLine(cursor.SideIndex, float scanned.EndOffset, cursor.LineNumber)
+                        if (cursor.ByLine && currentLine >= cursor.EndLine) || (not cursor.ByLine && selected) then
+                            cursor.Complete <- true
+                            lines.StopRequested <- true
+                    if cursor.ByLine && not cursor.Complete && cursor.EndLine - cursor.LineNumber + 1.0 < float lines.Capacity then
+                        cursor.Rebatch <- true
+                        lines.StopRequested <- true
+
+                let sideState = scanSideAt cursor.SideIndex
+                let validatedBefore = sideState.Coverage
+                let evidence (item: ScannerEvidence) =
+                    let evidenceEnd =
+                        if item.Kind = "control ratio" then
+                            min (float spec.ByteLength) (float item.WindowStart + float Scanner.ObservationWindowBytes)
+                        else float item.Offset
+                    if evidenceEnd > validatedBefore then
+                        report (if cursor.SideIndex = 0 then DiffSide.Previous else DiffSide.Current) item.Kind item.Offset
+
+                if cursor.Position >= float spec.ByteLength then
+                    if source.IsComplete() then
+                        let result = Scanner.scanChunk cursor.State cursor.Buffer 0 0 true meter cursor.Batch onLines evidence
+                        cursor.Position <- cursor.State.NextOffset
+                        if result.Status = DecodeFailure then cursor.Complete <- true
+                        elif cursor.State.IsComplete && not cursor.Complete then cursor.Complete <- true
+                    else cursor.Waiting <- true
                 else
-                    let count = int (min 65_536.0 (float spec.ByteLength - position))
-                    let! outcome = source.ReadAt (int64 position) buffer 0 count
+                    let boundary = (Math.Floor(cursor.Position / config.CheckpointIntervalBytes) + 1.0) * config.CheckpointIntervalBytes
+                    let boundaryRoom = max 1.0 (boundary - cursor.Position)
+                    let count = int (min (float cursor.Buffer.Length) (min (float spec.ByteLength - cursor.Position) boundaryRoom))
+                    let! outcome = source.ReadAt (int64 cursor.Position) cursor.Buffer 0 count
                     match outcome with
                     | ReadOutcome.Bytes actual when actual > 0 ->
-                        meter.Units <- 0
-                        let atEnd = position + float actual >= float spec.ByteLength
-                        let result = Scanner.scanChunk state buffer 0 actual atEnd meter batch onLines ignoreEvidence
-                        position <- position + float result.Consumed
-                        if result.Status = DecodeFailure || result.Consumed < actual then stop <- true
-                    | _ -> stop <- true
-            return found
+                        cursor.Waiting <- false
+                        let atEnd = cursor.Position + float actual >= float spec.ByteLength && source.IsComplete()
+                        let result = Scanner.scanChunk cursor.State cursor.Buffer 0 actual atEnd meter cursor.Batch onLines evidence
+                        cursor.Position <- cursor.State.NextOffset
+                        sideState.SetCoverage(float cursor.State.StartOffset + cursor.State.ValidatedBytes)
+                        checkpoints.Observe(cursor.SideIndex, cursor.State, cursor.LineNumber)
+                        if result.Status = DecodeFailure then
+                            match result.Error with
+                            | Some error when float error.Offset >= validatedBefore ->
+                                report (if cursor.SideIndex = 0 then DiffSide.Previous else DiffSide.Current) ("invalid " + Decoders.name (encodingAt cursor.SideIndex) + " sequence: " + error.Reason) error.Offset
+                            | Some _ -> sourceChanged ()
+                            | None -> ()
+                            cursor.Complete <- true
+                        elif cursor.State.IsComplete && not cursor.Complete then cursor.Complete <- true
+                    | ReadOutcome.NotYetAvailable -> cursor.Waiting <- true
+                    | ReadOutcome.EndOfSource when source.IsComplete() -> sourceChanged (); cursor.Complete <- true
+                    | ReadOutcome.EndOfSource -> cursor.Waiting <- true
+                    | ReadOutcome.Bytes _ -> cursor.Waiting <- true
+                    if hdf5Due () then do! probeHdf5 ()
+                if cursor.State.IsComplete then
+                    cursor.Complete <- true
+                    if source.IsComplete() then setKnownLineCount cursor.SideIndex (int64 cursor.LineNumber)
+                if cursor.Complete || cursor.Waiting || Meter.overBudget meter then running <- false
+                if Meter.quantumDue meter && running then
+                    do! host.Yield()
+                    Meter.beginNextQuantum meter
+            if cursor.Complete && cursor.FoundLines.Count = 0 && cursor.EndLine < cursor.LineNumber then ()
+    }
+
+    /// Finds the line that a line number or a byte offset names. The scan resumes from the nearest checkpoint at
+    /// or before the target and checks any newly consumed content.
+    let seekScan (sideIndex: int) (byLine: bool) (target: float) : Async<ScannedLine option> = async {
+        let spec = specAt sideIndex
+        if spec.Source.IsNone then return None
+        else
+            let! started = beginSeek sideIndex byLine target target target
+            match started with
+            | None -> return None
+            | Some cursor ->
+                let meter = Meter.create host.Clock { config.Limits with MaxUnits = Int32.MaxValue; RequestMs = 1e15; QuantumMs = 1e15 }
+                let mutable waiting = false
+                while not cursor.Complete && not waiting && invalidDetail.IsNone && failure.IsNone do
+                    do! advanceSeek cursor meter (fun () -> false)
+                    waiting <- cursor.Waiting
+                if checkpoints.HasPending then do! checkpoints.Flush()
+                return if cursor.FoundLines.Count > 0 then Some cursor.FoundLines[0] else None
     }
 
     let seek (side: DiffSide) (byLine: bool) (target: float) : Async<EngineResult<ScannedLine option>> = async {
@@ -1650,9 +2487,414 @@ type TextDiffSession internal (
         else
             try
                 let! result = seekScan (if side = DiffSide.Previous then 0 else 1) byLine target
-                return EngineResult.Ok result
+                if invalidDetail.IsSome then return failContent ()
+                elif failure.IsSome then
+                    let code, message = failure.Value
+                    return EngineResult.Failed(code, message, None)
+                else return EngineResult.Ok result
             with error -> return failWorker error.Message
     }
+
+    let expansionBinding gapId fromStart count =
+        gapId + "|" + (if fromStart then "1" else "0") + "|" + string count
+
+    let lineReadBinding side line offset maxUtf16 =
+        (if side = DiffSide.Previous then "0" else "1")
+        + "|" + string line + "|" + string offset + "|" + string maxUtf16
+
+    let findGap gapId (parts: DiffPart[]) =
+        parts
+        |> Array.tryPick (function
+            | DiffPart.HiddenEqual gap when gap.GapId = gapId -> Some gap
+            | _ -> None)
+
+    let readGap gapSequence gapId = async {
+        let! result = journal.Read(journalKey 3L gapSequence)
+        match result with
+        | Some(JournalValue.Page(Resumable.Ready page)) -> return findGap gapId page.Parts
+        | Some(JournalValue.Expansion(Resumable.Ready parts)) -> return findGap gapId parts
+        | _ -> return None
+    }
+
+    let committedExpansion gapSequence = async {
+        let! result = journal.Read(journalKey 4L gapSequence)
+        match result with
+        | Some(JournalValue.Expansion(Resumable.Ready parts)) -> return Some parts
+        | _ -> return None
+    }
+
+    let lineRef (line: ScannedLine) = {
+        Number = 0.0
+        Start = float line.StartOffset
+        Finish = float line.EndOffset
+        Length = float line.Utf16Length
+        Ending =
+            match line.Ending with
+            | LineEnding.NoEnding -> LineEndingCode.NoEnding
+            | LineEnding.LF -> LineEndingCode.LF
+            | LineEnding.CRLF -> LineEndingCode.CRLF
+            | LineEnding.CR -> LineEndingCode.CR
+    }
+
+    let makeExpansion (pending: PendingExpansion) = async {
+        let previousScanned = pending.PreviousLines |> Option.defaultValue Array.empty
+        let currentScanned = pending.CurrentLines |> Option.defaultValue Array.empty
+        let previousRefs = previousScanned |> Array.map lineRef
+        let currentRefs = currentScanned |> Array.map lineRef
+        for index = 0 to previousRefs.Length - 1 do previousRefs[index] <- { previousRefs[index] with Number = float pending.Gap.PreviousRange.Start + float index + (if pending.FromStart then 0.0 else float (pending.Gap.PreviousRange.Count - int64 pending.TakeCount)) }
+        for index = 0 to currentRefs.Length - 1 do currentRefs[index] <- { currentRefs[index] with Number = float pending.Gap.CurrentRange.Start + float index + (if pending.FromStart then 0.0 else float (pending.Gap.CurrentRange.Count - int64 pending.TakeCount)) }
+        let! previousLines = readLines previousSpec previousEncoding previousRefs
+        match previousLines with
+        | None -> return None
+        | Some previousValues ->
+            let! currentLines = readLines currentSpec currentEncoding currentRefs
+            match currentLines with
+            | None -> return None
+            | Some currentValues ->
+                let rows = Array.zeroCreate<DiffRow> (min previousValues.Length currentValues.Length)
+                for index = 0 to rows.Length - 1 do
+                    let previous = previousValues[index]
+                    let current = {
+                        currentValues[index] with
+                            Number = int64 currentRefs[index].Number
+                    }
+                    rows[index] <- {
+                        Id = rowIdentifier (int rowSequence + index)
+                        Kind = DiffRowKind.Context
+                        Previous = Some previous
+                        Current = Some current
+                    }
+                let requestedRows = min rows.Length pending.TakeCount
+                let residualId = identifier "g" nextGapSequence
+                nextGapSequence <- nextGapSequence + 1L
+                let makeParts taken =
+                    let first = if pending.FromStart then 0 else rows.Length - taken
+                    let visible = if taken = 0 then Array.empty else Array.sub rows first taken
+                    let expanded = DiffPart.ExpandedContext(pending.Gap.GapId, visible)
+                    let remaining = pending.Gap.PreviousRange.Count - int64 taken
+                    let residual =
+                        if remaining <= 0L then None
+                        elif pending.FromStart then
+                            Some(DiffPart.HiddenEqual {
+                                GapId = residualId
+                                PreviousRange = { pending.Gap.PreviousRange with Start = pending.Gap.PreviousRange.Start + int64 taken; Count = remaining }
+                                CurrentRange = { pending.Gap.CurrentRange with Start = pending.Gap.CurrentRange.Start + int64 taken; Count = remaining }
+                            })
+                        else
+                            Some(DiffPart.HiddenEqual {
+                                GapId = residualId
+                                PreviousRange = { pending.Gap.PreviousRange with Count = remaining }
+                                CurrentRange = { pending.Gap.CurrentRange with Count = remaining }
+                            })
+                    match pending.FromStart, residual with
+                    | true, Some gap -> [| expanded; gap |]
+                    | false, Some gap -> [| gap; expanded |]
+                    | _ -> [| expanded |]
+                let mutable taken = requestedRows
+                let mutable parts = makeParts taken
+                let mutable size = parts |> Array.sumBy (fun part -> max 0 (sizer part))
+                while taken > 0 && size > config.PageMaxBytes do
+                    taken <- taken - 1
+                    parts <- makeParts taken
+                    size <- parts |> Array.sumBy (fun part -> max 0 (sizer part))
+                if size > config.PageMaxBytes then return None
+                else return Some(parts, taken)
+    }
+
+    let startExpansionSearch (pending: PendingExpansion) sideIndex = async {
+        if pending.TakeCount = 0 then
+            pending.PreviousLines <- Some Array.empty
+            pending.CurrentLines <- Some Array.empty
+            pending.Search <- None
+        else
+            let range = if sideIndex = 0 then pending.Gap.PreviousRange else pending.Gap.CurrentRange
+            let first = if pending.FromStart then range.Start else range.Start + range.Count - int64 pending.TakeCount
+            let last = first + int64 pending.TakeCount - 1L
+            let! cursor = beginSeek sideIndex true (float first) (float first) (float last)
+            pending.Search <- cursor
+    }
+
+    let advanceExpansion (pending: PendingExpansion) (meter: Meter) (cancel: unit -> bool) = async {
+        let mutable continueWork = not (cancel ())
+        let mutable iterations = 0
+        while continueWork && not (Meter.overBudget meter) do
+            iterations <- iterations + 1
+            if iterations > 1_000 then invalidOp "An expansion request did not advance."
+            match pending.Search with
+            | None -> continueWork <- false
+            | Some cursor ->
+                do! advanceSeek cursor meter cancel
+                if cursor.Complete then
+                    if cursor.FoundLines.Count <> pending.TakeCount then
+                        sourceChanged ()
+                        continueWork <- false
+                    elif pending.PreviousLines.IsNone then
+                        pending.PreviousLines <- Some(cursor.FoundLines.ToArray())
+                        do! startExpansionSearch pending 1
+                    else
+                        pending.CurrentLines <- Some(cursor.FoundLines.ToArray())
+                        pending.Search <- None
+                elif cursor.Waiting || cancel () || Meter.overBudget meter then continueWork <- false
+        return not continueWork || pending.Search.IsNone
+    }
+
+    let appendExpansion (pending: PendingExpansion) sequence parts usedRows =
+        Shield.run (
+            async {
+                let value = Resumable.Ready parts
+                let target = journalKey 1L sequence
+                do! journal.Append(target, JournalValue.Expansion value)
+                do! journal.Link(journalKey 4L pending.GapSequence, target)
+                for part in parts do
+                    match part with
+                    | DiffPart.HiddenEqual gap ->
+                        match readIdentifier "g" gap.GapId with
+                        | Some gapSequence -> do! journal.Link(journalKey 3L gapSequence, target)
+                        | None -> invalidOp "The generated gap id is invalid."
+                    | _ -> ()
+                rowSequence <- rowSequence + int64 usedRows
+                pendingExpansions.Remove pending.GapSequence |> ignore
+            }
+        )
+
+    let createLineRead side line offset maxUtf16 attempt sequence = async {
+        let index = if side = DiffSide.Previous then 0 else 1
+        let! search = beginSeek index true (float line) (float line) (float line)
+        return {
+            Attempt = attempt
+            Side = side
+            Line = line
+            OffsetUtf16 = offset
+            MaxUtf16 = maxUtf16
+            TakeMaxUtf16 = min 8_192 (max 0 maxUtf16)
+            RequestSequence = sequence
+            Search = search
+            Scanned = None
+            Decoder = None
+            BytePosition = 0.0
+            Buffer = Array.zeroCreate<byte> 65_536
+            Units = Array.zeroCreate<uint16> 8_192
+            UnitCount = 0
+            UnitPosition = 0.0
+            Waiting = false
+        }
+    }
+
+    let advanceLineRead (pending: PendingLineRead) (meter: Meter) (cancel: unit -> bool) = async {
+        pending.Waiting <- false
+        let mutable ready = false
+        let mutable failed = false
+        match pending.Search with
+        | Some cursor ->
+            do! advanceSeek cursor meter cancel
+            if cursor.Complete then
+                pending.Search <- None
+                if cursor.FoundLines.Count = 0 then failed <- true
+                else
+                    let scanned = cursor.FoundLines[0]
+                    pending.Scanned <- Some scanned
+                    pending.Decoder <- Some(Decoders.createAt (encodingAt cursor.SideIndex) scanned.StartOffset)
+                    pending.BytePosition <- float scanned.StartOffset
+        | None -> ()
+        if not failed && not (cancel ()) && not (Meter.overBudget meter) then
+            match pending.Scanned, pending.Decoder with
+            | Some scanned, Some decoder ->
+                let total = float scanned.Utf16Length
+                let requestedOffset = float (max 0L pending.OffsetUtf16)
+                let requestedEnd = min total (requestedOffset + float pending.TakeMaxUtf16)
+                let endingCode =
+                    match scanned.Ending with
+                    | LineEnding.NoEnding -> LineEndingCode.NoEnding
+                    | LineEnding.LF -> LineEndingCode.LF
+                    | LineEnding.CRLF -> LineEndingCode.CRLF
+                    | LineEnding.CR -> LineEndingCode.CR
+                let contentEnd = float scanned.EndOffset - Widths.endingWidth (encodingAt (if pending.Side = DiffSide.Previous then 0 else 1)) endingCode
+                if pending.TakeMaxUtf16 = 0 || requestedOffset >= total then ready <- true
+                else
+                    let mutable running = pending.UnitPosition < requestedEnd && pending.BytePosition < contentEnd
+                    while running && not (Meter.overBudget meter) && not (cancel ()) do
+                        let count = int (min (float pending.Buffer.Length) (contentEnd - pending.BytePosition))
+                        if count <= 0 then running <- false
+                        else
+                            let! outcome = (specAt (if pending.Side = DiffSide.Previous then 0 else 1)).Source.Value.ReadAt (int64 pending.BytePosition) pending.Buffer 0 count
+                            match outcome with
+                            | ReadOutcome.Bytes actual when actual > 0 ->
+                                let sink _ _ value =
+                                    let unitIndex = pending.UnitPosition
+                                    if unitIndex >= requestedOffset && unitIndex < requestedEnd && pending.UnitCount < pending.TakeMaxUtf16 then
+                                        pending.Units[pending.UnitCount] <- uint16 value
+                                        pending.UnitCount <- pending.UnitCount + 1
+                                    pending.UnitPosition <- unitIndex + 1.0
+                                let next, result = Decoders.decode decoder pending.Buffer 0 actual sink
+                                pending.Decoder <- Some next
+                                pending.BytePosition <- float next.AbsoluteOffset
+                                Meter.chargeBytes meter actual
+                                match result with
+                                | Error error -> report pending.Side ("invalid " + Decoders.name (encodingAt (if pending.Side = DiffSide.Previous then 0 else 1)) + " sequence: " + error.Reason) error.Offset; failed <- true; running <- false
+                                | Ok _ ->
+                                    if pending.UnitPosition >= requestedEnd then running <- false
+                            | ReadOutcome.NotYetAvailable -> pending.Waiting <- true; running <- false
+                            | ReadOutcome.EndOfSource -> sourceChanged (); failed <- true; running <- false
+                            | ReadOutcome.Bytes _ -> running <- false
+                    if pending.UnitPosition >= requestedEnd || pending.BytePosition >= contentEnd then ready <- true
+                    if not ready && not failed && Meter.overBudget meter then ()
+            | _ -> ()
+        if pending.Search.IsSome then ready <- false
+        return ready, failed, pending.Waiting || (pending.Search |> Option.exists (fun cursor -> cursor.Waiting))
+    }
+
+    let lineReadResult (pending: PendingLineRead) =
+        let scanned = pending.Scanned.Value
+        let mutable count = pending.UnitCount
+        if count > 0 && pending.Units[count - 1] >= 0xD800us && pending.Units[count - 1] <= 0xDBFFus then count <- count - 1
+        let text = Native.utf16Decode pending.Units count
+        let line = {
+            Number = pending.Line
+            Ending = scanned.Ending
+            Slice = {
+                OffsetUtf16 = max 0L pending.OffsetUtf16
+                TotalUtf16 = Some scanned.Utf16Length
+                Text = text
+                Highlights = Array.empty
+            }
+        }
+        line
+
+    let allocateExpandRequest () =
+        let sequence = nextExpandRequest
+        nextExpandRequest <- nextExpandRequest + 1L
+        sequence
+
+    let allocateExpandAttempt () =
+        let attempt = nextExpandAttempt
+        nextExpandAttempt <- nextExpandAttempt + 1L
+        attempt
+
+    let allocateLineRequest () =
+        let sequence = nextLineRequest
+        nextLineRequest <- nextLineRequest + 1L
+        sequence
+
+    let allocateLineAttempt () =
+        let attempt = nextLineAttempt
+        nextLineAttempt <- nextLineAttempt + 1L
+        attempt
+
+    let runExpansionRequest (pending: PendingExpansion) sequence (cancel: unit -> bool) = async {
+        let meter = Meter.create host.Clock config.Limits
+        let mutable finished = pending.Search.IsNone && pending.PreviousLines.IsSome && pending.CurrentLines.IsSome
+        let mutable waiting = false
+        let mutable stalled = false
+        let mutable iterations = 0
+        while not finished && not waiting && not (Meter.overBudget meter) && not (cancel ()) && invalidDetail.IsNone && failure.IsNone do
+            iterations <- iterations + 1
+            if iterations > 1_000 then
+                stalled <- true
+                finished <- true
+            else
+                let! _ = advanceExpansion pending meter cancel
+                finished <- pending.Search.IsNone && pending.PreviousLines.IsSome && pending.CurrentLines.IsSome
+                waiting <- pending.Search |> Option.exists (fun cursor -> cursor.Waiting)
+                if hdf5Due () then do! probeHdf5 ()
+                if Meter.quantumDue meter && not finished && not (Meter.overBudget meter) then
+                    do! host.Yield()
+                    Meter.beginNextQuantum meter
+        if stalled then return failWorker "An expansion request did not advance."
+        elif cancel () then return EngineResult.Canceled
+        elif invalidDetail.IsSome then return failContent ()
+        elif failure.IsSome then
+            let code, message = failure.Value
+            return EngineResult.Failed(code, message, None)
+        elif finished then
+            let! built = makeExpansion pending
+            match built with
+            | None -> return failWorker "The expansion result exceeds the configured response limit."
+            | Some(parts, usedRows) ->
+                do! appendExpansion pending sequence parts usedRows
+                return EngineResult.Ok(Resumable.Ready parts)
+        else
+            if checkpoints.HasPending then do! checkpoints.Flush()
+            let nextSequence = allocateExpandRequest ()
+            let continuation = operationIdentifier "x" pending.Attempt nextSequence (expansionBinding pending.Gap.GapId pending.FromStart pending.Count)
+            let! preview =
+                match pending.Search with
+                | Some cursor -> pendingSeekPreview cursor
+                | None -> async.Return None
+            if invalidDetail.IsSome then return failContent ()
+            elif failure.IsSome then
+                let code, message = failure.Value
+                return EngineResult.Failed(code, message, None)
+            else
+              let result = Resumable.Scanning(progress (), continuation, None)
+              do! journal.Append(journalKey 1L sequence, JournalValue.Expansion result)
+              pending.RequestSequence <- nextSequence
+              return EngineResult.Ok(Resumable.Scanning(progress (), continuation, preview))
+    }
+
+    let runLineReadRequest (pending: PendingLineRead) sequence (cancel: unit -> bool) = async {
+        let meter = Meter.create host.Clock config.Limits
+        let mutable finished = false
+        let mutable failed = false
+        let mutable waiting = false
+        while not finished && not failed && not waiting && not (Meter.overBudget meter) && not (cancel ()) && invalidDetail.IsNone && failure.IsNone do
+            let! ready, missing, isWaiting = advanceLineRead pending meter cancel
+            finished <- ready
+            failed <- missing
+            waiting <- isWaiting
+            if hdf5Due () then do! probeHdf5 ()
+            if Meter.quantumDue meter && not finished && not failed && not (Meter.overBudget meter) then
+                do! host.Yield()
+                Meter.beginNextQuantum meter
+        if cancel () then return EngineResult.Canceled
+        elif invalidDetail.IsSome then return failContent ()
+        elif failure.IsSome then
+            let code, message = failure.Value
+            return EngineResult.Failed(code, message, None)
+        elif failed then return failMismatch ()
+        elif finished then
+            let line = lineReadResult pending
+            let estimate = line.Slice.Text.Length * 3 + line.Slice.Highlights.Length * 24 + 512
+            if estimate > 64 * 1024 then return failWorker "A line slice exceeds the configured response limit."
+            else
+                let result = Resumable.Ready line
+                do! journal.Append(journalKey 2L sequence, JournalValue.Line result)
+                pendingLineReads.Remove pending.Attempt |> ignore
+                return EngineResult.Ok result
+        else
+            if checkpoints.HasPending then do! checkpoints.Flush()
+            let nextSequence = allocateLineRequest ()
+            let continuation = operationIdentifier "l" pending.Attempt nextSequence (lineReadBinding pending.Side pending.Line pending.OffsetUtf16 pending.MaxUtf16)
+            let! preview =
+                match pending.Search with
+                | Some cursor -> pendingSeekPreview cursor
+                | None -> async.Return None
+            if invalidDetail.IsSome then return failContent ()
+            elif failure.IsSome then
+                let code, message = failure.Value
+                return EngineResult.Failed(code, message, None)
+            else
+                let result = Resumable.Scanning(progress (), continuation, None)
+                do! journal.Append(journalKey 2L sequence, JournalValue.Line result)
+                pending.RequestSequence <- nextSequence
+                return EngineResult.Ok(Resumable.Scanning(progress (), continuation, preview))
+    }
+
+    let sourceInfo sideIndex =
+        let spec = specAt sideIndex
+        let side = scanSideAt sideIndex
+        let nextLine = if sideIndex = 0 then builder.NextPrevious else builder.NextCurrent
+        let lineCount =
+            match knownLineCounts[sideIndex] with
+            | Some count -> Some count
+            | None when modeIsDone () -> Some(int64 nextLine)
+            | None when side.Finished -> Some(int64 (max nextLine (float side.Table.LineBase + float side.Table.Count)))
+            | None -> None
+        {
+            ByteLength = spec.ByteLength
+            LineCount = lineCount
+            Encoding = Decoders.name (encodingAt sideIndex)
+            HasBom = spec.BomLength > 0
+        }
 
     let holdsScratch () =
         bufA.Length > 0
@@ -1702,6 +2944,8 @@ type TextDiffSession internal (
 
     member _.Progress = progress ()
 
+    member _.SourceInfo = sourceInfo 0, sourceInfo 1
+
     member _.InitializeJournal() = journal.Initialize()
 
     member this.FirstPage(cancel: unit -> bool) = async {
@@ -1715,9 +2959,10 @@ type TextDiffSession internal (
                     try
                         if cancel () then return EngineResult.Canceled
                         else
-                            let! recorded = journal.Read 0L
+                            let! recorded = journal.Read(journalKey 0L 0L)
                             match recorded with
-                            | Some value -> return EngineResult.Ok value
+                            | Some(JournalValue.Page value) -> return! presentPageResult (EngineResult.Ok value)
+                            | Some _ -> return failMismatch ()
                             | None when requestSequence <> 0L -> return failMismatch ()
                             | None -> return! advance 0L cancel
                     with error -> return failWorker error.Message
@@ -1738,9 +2983,10 @@ type TextDiffSession internal (
                             match readIdentifier "c" cursor with
                             | None -> return failMismatch ()
                             | Some sequence ->
-                                let! recorded = journal.Read sequence
+                                let! recorded = journal.Read(journalKey 0L sequence)
                                 match recorded with
-                                | Some value -> return EngineResult.Ok value
+                                | Some(JournalValue.Page value) -> return! presentPageResult (EngineResult.Ok value)
+                                | Some _ -> return failMismatch ()
                                 | None when sequence <> requestSequence -> return failMismatch ()
                                 | None -> return! advance sequence cancel
                     with error -> return failWorker error.Message
@@ -1755,19 +3001,128 @@ type TextDiffSession internal (
             | None -> return failMismatch ()
             | Some sequence ->
                 try
-                    let! recorded = journal.Read sequence
+                    let! recorded = journal.Read(journalKey 0L sequence)
                     match recorded with
-                    | Some(Resumable.Ready page) when page.PageId = pageId -> return EngineResult.Ok { page with Pending = None }
+                    | Some(JournalValue.Page(Resumable.Ready page)) when page.PageId = pageId -> return EngineResult.Ok { page with Pending = None }
                     | _ -> return failMismatch ()
                 with error -> return failWorker error.Message
     }
 
-    member _.Expand(_gapId: string) = async.Return(extensionResult "Gap expansion")
+    member _.Expand(gapId: string, fromStart: bool, count: int, continuation: string option, cancel: unit -> bool) = async {
+        if closed || closing then return failClosed ()
+        elif invalidDetail.IsSome then return failContent ()
+        else
+            let! acquired = acquire cancel
+            if not acquired then return EngineResult.Canceled
+            else
+                try
+                    try
+                        if cancel () then return EngineResult.Canceled
+                        else
+                            match readIdentifier "g" gapId with
+                            | None -> return failMismatch ()
+                            | Some gapSequence ->
+                                let binding = expansionBinding gapId fromStart count
+                                let parsed = continuation |> Option.map (readOperationIdentifier "x" binding)
+                                if parsed = Some None then return failMismatch ()
+                                else
+                                    let! committed = committedExpansion gapSequence
+                                    match committed with
+                                    | Some parts -> return EngineResult.Ok(Resumable.Ready parts)
+                                    | None ->
+                                      match continuation, parsed with
+                                      | Some _, Some(Some(attempt, sequence)) ->
+                                        match pendingExpansions.TryGetValue gapSequence with
+                                        | true, pending when attempt = pending.Attempt ->
+                                            let! recorded = journal.Read(journalKey 1L sequence)
+                                            match recorded with
+                                            | Some(JournalValue.Expansion(Resumable.Scanning(scanProgress, recordedContinuation, _))) ->
+                                                let! preview = pending.Search |> Option.map pendingSeekPreview |> Option.defaultValue (async.Return None)
+                                                if invalidDetail.IsSome then return failContent ()
+                                                else return EngineResult.Ok(Resumable.Scanning(scanProgress, recordedContinuation, preview))
+                                            | Some(JournalValue.Expansion result) -> return EngineResult.Ok result
+                                            | Some _ -> return failMismatch ()
+                                            | None when sequence <> pending.RequestSequence -> return failMismatch ()
+                                            | None -> return! runExpansionRequest pending sequence cancel
+                                        | _ -> return failMismatch ()
+                                      | None, _ ->
+                                        pendingExpansions.Remove gapSequence |> ignore
+                                        let! gap = readGap gapSequence gapId
+                                        match gap with
+                                        | None -> return failMismatch ()
+                                        | Some value ->
+                                            let take = min 100 (max 0 count |> min (int (min value.PreviousRange.Count 100L)))
+                                            let attempt = allocateExpandAttempt ()
+                                            let sequence = allocateExpandRequest ()
+                                            let pending = {
+                                                Attempt = attempt
+                                                GapSequence = gapSequence
+                                                Gap = value
+                                                FromStart = fromStart
+                                                Count = count
+                                                TakeCount = take
+                                                RequestSequence = sequence
+                                                Search = None
+                                                PreviousLines = None
+                                                CurrentLines = None
+                                            }
+                                            do! startExpansionSearch pending 0
+                                            pendingExpansions[gapSequence] <- pending
+                                            return! runExpansionRequest pending sequence cancel
+                                      | _ -> return failMismatch ()
+                    with error -> return failWorker error.Message
+                finally busy <- false
+    }
 
-    member _.ReadLine(_side: DiffSide, _line: int64, _offsetUtf16: int64, _maxUtf16: int) =
-        async.Return(extensionResult "Line slices")
+    member _.ReadLine(side: DiffSide, line: int64, offsetUtf16: int64, maxUtf16: int, continuation: string option, cancel: unit -> bool) = async {
+        if closed || closing then return failClosed ()
+        elif invalidDetail.IsSome then return failContent ()
+        elif line < 0L || offsetUtf16 < 0L then return failMismatch ()
+        else
+            let! acquired = acquire cancel
+            if not acquired then return EngineResult.Canceled
+            else
+                try
+                    try
+                        if cancel () then return EngineResult.Canceled
+                        else
+                            let binding = lineReadBinding side line offsetUtf16 maxUtf16
+                            match continuation with
+                            | Some token ->
+                                match readOperationIdentifier "l" binding token with
+                                | None -> return failMismatch ()
+                                | Some(attempt, sequence) ->
+                                    let! recorded = journal.Read(journalKey 2L sequence)
+                                    match recorded with
+                                    | Some(JournalValue.Line(Resumable.Scanning(scanProgress, recordedContinuation, _))) ->
+                                        match pendingLineReads.TryGetValue attempt with
+                                        | true, pending ->
+                                            let! preview = pending.Search |> Option.map pendingSeekPreview |> Option.defaultValue (async.Return None)
+                                            if invalidDetail.IsSome then return failContent ()
+                                            else return EngineResult.Ok(Resumable.Scanning(scanProgress, recordedContinuation, preview))
+                                        | _ -> return EngineResult.Ok(Resumable.Scanning(scanProgress, recordedContinuation, None))
+                                    | Some(JournalValue.Line result) -> return EngineResult.Ok result
+                                    | Some _ -> return failMismatch ()
+                                    | None ->
+                                        match pendingLineReads.TryGetValue attempt with
+                                        | true, pending when pending.Side = side && pending.Line = line && pending.OffsetUtf16 = offsetUtf16 && pending.MaxUtf16 = maxUtf16 && pending.RequestSequence = sequence ->
+                                            return! runLineReadRequest pending sequence cancel
+                                        | _ -> return failMismatch ()
+                            | None ->
+                                let attempt = allocateLineAttempt ()
+                                let sequence = allocateLineRequest ()
+                                let! pending = createLineRead side line offsetUtf16 maxUtf16 attempt sequence
+                                pendingLineReads[attempt] <- pending
+                                let! result = runLineReadRequest pending sequence cancel
+                                match result with
+                                | EngineResult.Canceled -> pendingLineReads.Remove attempt |> ignore
+                                | _ -> ()
+                                return result
+                    with error -> return failWorker error.Message
+                finally busy <- false
+    }
 
-    member _.PendingPreview() = extensionResult "Pending preview"
+    member _.PendingPreview() = EngineResult.Ok lastPendingPreview
 
     /// Writes the suspended step to the spill store and releases its scratch memory. The next request restores it.
     member _.Spill() = spillSession ()
@@ -1805,6 +3160,7 @@ type TextDiffSession internal (
                 previousSide.Dispose()
                 currentSide.Dispose()
                 releaseBuffers ()
+                reservePendingPreview None |> ignore
                 journal.Release()
                 do! checkpoints.Dispose()
                 do! store.Dispose()

@@ -9,6 +9,13 @@ type SourceSpec = {
     ByteLength: int64
 }
 
+type SessionSourceInfo = {
+    ByteLength: int64
+    LineCount: int64 option
+    Encoding: string
+    HasBom: bool
+}
+
 type SessionConfig = {
     SessionId: string
     ContextLines: int

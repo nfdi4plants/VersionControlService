@@ -70,6 +70,22 @@ type internal Checkpoints(ledger: Ledger, intervalBytes: float, residentBytes: i
                 if fits then residentUsed <- residentUsed + recordCost else pending.Add entry
                 entries[side].Add entry
 
+    member _.ObserveLine(side: int, offset: float, line: float) =
+        if offset >= nextDue[side] then
+            let state = Scanner.create encodings[side] (int64 offset) None
+            let fits = residentUsed + recordCost <= residentBytes && ledger.TryReserve(AllocationCategory.ResidentCheckpoints, int64 recordCost)
+            let entry = {
+                Offset = offset
+                Line = line
+                InLine = 0.0
+                State = Some state
+                Resident = fits
+                StoreOffset = -1.0
+            }
+            nextDue[side] <- (Math.Floor(offset / intervalBytes) + 1.0) * intervalBytes
+            if fits then residentUsed <- residentUsed + recordCost else pending.Add entry
+            entries[side].Add entry
+
     /// Writes the records that did not fit in memory.
     member _.Flush() = async {
         if pending.Count > 0 then

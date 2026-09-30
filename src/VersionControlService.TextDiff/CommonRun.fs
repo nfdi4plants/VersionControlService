@@ -9,6 +9,7 @@ type CommonRunResult = {
     /// line ending before the first differing byte. After a validation error it ends at the error.
     Length: int
     Mismatch: bool
+    DifferenceOffset: int option
     /// Lines that end inside the prefix, including a CR line carried in from the previous run.
     Lines: int
     /// Absolute offset after the last line ending inside the prefix, which is where the open line
@@ -277,6 +278,7 @@ module CommonRun =
             {
                 Length = 0
                 Mismatch = mismatch
+                DifferenceOffset = if mismatch then Some difference else None
                 Lines = 0
                 LastLineStart = position
                 PendingCR = pendingCR
@@ -348,6 +350,7 @@ module CommonRun =
             {
                 Length = length
                 Mismatch = mismatch
+                DifferenceOffset = if mismatch then Some difference else None
                 Lines = lines
                 LastLineStart = int64 (start + float lastStart)
                 PendingCR = pendingOut

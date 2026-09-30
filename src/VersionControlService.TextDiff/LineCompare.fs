@@ -65,7 +65,9 @@ type internal ScanSide(
     side: DiffSide,
     ledger: Ledger,
     hashMask: (uint32 * uint32) option,
-    reportEvidence: DiffSide -> string -> int64 -> unit
+    reportEvidence: DiffSide -> string -> int64 -> unit,
+    checkpointIntervalBytes: float,
+    recordLineCount: int64 -> unit
 ) =
     let table = LineTable(category, ledger, hashMask)
     let mutable scanner = Scanner.create encoding (int64 spec.BomLength) None
@@ -77,9 +79,11 @@ type internal ScanSide(
     let mutable windowAccountedBytes = 0.0
     let mutable recordPeaks = true
     let mutable observer: ScannerState -> float -> unit = fun _ _ -> ()
+    let mutable lineObserver: float -> float -> unit = fun _ _ -> ()
 
     member _.Spec = spec
     member _.Encoding = encoding
+    member _.Side = side
     member _.Table = table
     member _.Scanner = scanner
     member _.Finished = finished
@@ -143,7 +147,9 @@ type internal ScanSide(
                     let readLimit =
                         if consumedWindowBytes >= windowByteLimit && scanner.LineLengthUtf16 > 0.0 then maximum
                         else min maximum rawRoom
-                    let count = min buffer.Length (int (min (int64 readLimit) remaining))
+                    let boundary = (Math.Floor(scanner.NextOffset / checkpointIntervalBytes) + 1.0) * checkpointIntervalBytes
+                    let boundaryRoom = max 1.0 (boundary - scanner.NextOffset)
+                    let count = min buffer.Length (int (min boundaryRoom (min (float readLimit) (float remaining))))
                     let! outcome = source.ReadAt position buffer 0 count
                     match outcome with
                     | ReadOutcome.NotYetAvailable -> return ReadWaiting
@@ -163,13 +169,16 @@ type internal ScanSide(
         let result = Scanner.scanChunk scanner buffer 0 count endOfSource meter batch emitLineBatch emitEvidence
         for index = previousCount to table.Count - 1 do
             windowAccountedBytes <- windowAccountedBytes + table.Finish index - table.Start index + table.Length index * 2.0 + 40.0
+            lineObserver (table.Finish index) (float table.LineBase + float index + 1.0)
         if recordPeaks then ledger.RecordWindowLines(category, table.Count)
         observer scanner (float table.LineBase + float table.Count)
         coverage <- max coverage (float scanner.StartOffset + scanner.ValidatedBytes)
         match result.Error with
         | Some error -> reportEvidence side ("invalid " + Decoders.name encoding + " sequence: " + error.Reason) error.Offset
         | None -> ()
-        if result.Status = EndOfInput then finished <- true
+        if result.Status = EndOfInput then
+            finished <- true
+            recordLineCount (table.LineBase + int64 table.Count)
         result
 
     member _.SetCoverage(value: float) = coverage <- max coverage value
@@ -179,6 +188,8 @@ type internal ScanSide(
 
     /// Called after every consumed chunk with the scanner and the number of lines that ended before its position.
     member _.Observer with get () = observer and set value = observer <- value
+
+    member _.LineObserver with get () = lineObserver and set value = lineObserver <- value
 
     /// Writes the scan position and the window counters. The line arrays are written by the caller.
     member _.Export(header: HeaderBuilder) =
@@ -383,3 +394,192 @@ type internal DecodeCompare(previous: ScanSide, current: ScanSide, previousIndex
                 feedB.Consume n
                 return CompareStep.Continue
     }
+
+module internal InlineHighlights =
+    [<Literal>]
+    let private MaxTokens = 4_096
+
+    [<Literal>]
+    let private MaxTextUnits = 64 * 1024
+
+    type private TokenTable = {
+        Starts: int[]
+        Lengths: int[]
+        Count: int
+        Overflow: bool
+    }
+
+    let private isBoundary (value: char) = Char.IsWhiteSpace value || Char.IsPunctuation value
+
+    let private tokenCapacity (text: string) =
+        min MaxTokens (max 1 text.Length)
+
+    let private tokenize (text: string) =
+        let starts = Array.zeroCreate<int> (tokenCapacity text)
+        let lengths = Array.zeroCreate<int> starts.Length
+        let mutable count = 0
+        let mutable index = 0
+        let mutable overflow = false
+
+        let addToken start length =
+            if count = MaxTokens then
+                overflow <- true
+            else
+                starts[count] <- start
+                lengths[count] <- length
+                count <- count + 1
+
+        while index < text.Length && not overflow do
+            let start = index
+            let value = text[index]
+            if Char.IsWhiteSpace value then
+                index <- index + 1
+                while index < text.Length && Char.IsWhiteSpace text[index] do
+                    index <- index + 1
+                addToken start (index - start)
+            elif Char.IsPunctuation value then
+                index <- index + 1
+                addToken start 1
+            else
+                index <- index + 1
+                while index < text.Length && not (isBoundary text[index]) do
+                    index <- index + 1
+                addToken start (index - start)
+
+        { Starts = starts; Lengths = lengths; Count = count; Overflow = overflow }
+
+    let private tokenEqual (previous: string) (current: string) (previousTokens: TokenTable) previousIndex (currentTokens: TokenTable) currentIndex =
+        let leftStart = previousTokens.Starts[previousIndex]
+        let rightStart = currentTokens.Starts[currentIndex]
+        let leftLength = previousTokens.Lengths[previousIndex]
+        let rightLength = currentTokens.Lengths[currentIndex]
+        if leftLength <> rightLength then false
+        else
+            let mutable index = 0
+            let mutable equal = true
+            while equal && index < leftLength do
+                equal <- previous[leftStart + index] = current[rightStart + index]
+                index <- index + 1
+            equal
+
+    let private appendSpan (target: ResizeArray<Highlight>) start length kind =
+        if length > 0 then
+            if target.Count > 0 then
+                let previous = target[target.Count - 1]
+                if previous.Kind = kind && previous.Start + previous.Length = start then
+                    target[target.Count - 1] <- { previous with Length = previous.Length + length }
+                else
+                    target.Add { Start = start; Length = length; Kind = kind }
+            else
+                target.Add { Start = start; Length = length; Kind = kind }
+
+    let private appendTokenSpan (target: ResizeArray<Highlight>) (tokens: TokenTable) index kind =
+        appendSpan target tokens.Starts[index] tokens.Lengths[index] kind
+
+    let private commonPrefix (previous: string) (current: string) =
+        let limit = min previous.Length current.Length
+        let mutable count = 0
+        while count < limit && previous[count] = current[count] do
+            count <- count + 1
+        if count > 0 && count < previous.Length && Char.IsHighSurrogate previous[count - 1] && Char.IsLowSurrogate previous[count] then
+            count - 1
+        else
+            count
+
+    let private commonSuffix (previous: string) (current: string) prefix =
+        let limit = min previous.Length current.Length
+        let mutable count = 0
+        while count < limit - prefix && previous[previous.Length - count - 1] = current[current.Length - count - 1] do
+            count <- count + 1
+        let previousStart = previous.Length - count
+        let currentStart = current.Length - count
+        if
+            count > 0
+            && previousStart > prefix
+            && currentStart > prefix
+            && Char.IsLowSurrogate previous[previousStart]
+            && Char.IsHighSurrogate previous[previousStart - 1]
+            && Char.IsLowSurrogate current[currentStart]
+            && Char.IsHighSurrogate current[currentStart - 1]
+        then
+            count - 1
+        else
+            count
+
+    let private middleHighlights (previous: string) (current: string) =
+        let prefix = commonPrefix previous current
+        let suffix = commonSuffix previous current prefix
+        let previousChanged = previous.Length - prefix - suffix
+        let currentChanged = current.Length - prefix - suffix
+        let previousResult = ResizeArray<Highlight>(3)
+        let currentResult = ResizeArray<Highlight>(3)
+        appendSpan previousResult 0 prefix HighlightKind.UnchangedText
+        appendSpan currentResult 0 prefix HighlightKind.UnchangedText
+        appendSpan previousResult prefix previousChanged HighlightKind.ChangedText
+        appendSpan currentResult prefix currentChanged HighlightKind.ChangedText
+        appendSpan previousResult (prefix + previousChanged) suffix HighlightKind.UnchangedText
+        appendSpan currentResult (prefix + currentChanged) suffix HighlightKind.UnchangedText
+        previousResult.ToArray(), currentResult.ToArray()
+
+    let private tokenHighlights (previous: string) (current: string) (meter: Meter) (previousTokens: TokenTable) (currentTokens: TokenTable) =
+        let remaining = max 0 (meter.MaxUnits - meter.Units)
+        if remaining = 0 || Meter.overBudget meter then
+            None
+        else
+            let stepper =
+                MyersStepper(
+                    0,
+                    previousTokens.Count,
+                    0,
+                    currentTokens.Count,
+                    remaining,
+                    meter,
+                    fun previousIndex currentIndex -> tokenEqual previous current previousTokens previousIndex currentTokens currentIndex)
+            let mutable result = None
+            let mutable running = true
+            while running do
+                match stepper.Step() with
+                | MyersStepResult.Complete operations ->
+                    result <- Some operations
+                    running <- false
+                | MyersStepResult.StepLimitExceeded
+                | MyersStepResult.NeedComparison _ ->
+                    running <- false
+                | MyersStepResult.Running ->
+                    if Meter.overBudget meter then running <- false
+            result
+
+    let private highlightsFromOperations
+        (previous: string)
+        (current: string)
+        (previousTokens: TokenTable)
+        (currentTokens: TokenTable)
+        (operations: MyersOperation[])
+        =
+        let previousResult = ResizeArray<Highlight>()
+        let currentResult = ResizeArray<Highlight>()
+        for operation in operations do
+            match operation with
+            | MyersOperation.Equal(previousIndex, currentIndex) ->
+                appendTokenSpan previousResult previousTokens previousIndex HighlightKind.UnchangedText
+                appendTokenSpan currentResult currentTokens currentIndex HighlightKind.UnchangedText
+            | MyersOperation.Delete previousIndex ->
+                appendTokenSpan previousResult previousTokens previousIndex HighlightKind.ChangedText
+            | MyersOperation.Insert currentIndex ->
+                appendTokenSpan currentResult currentTokens currentIndex HighlightKind.ChangedText
+        previousResult.ToArray(), currentResult.ToArray()
+
+    let compute (meter: Meter) (previous: string) (current: string) : Highlight[] * Highlight[] =
+        if isNull previous then nullArg (nameof previous)
+        if isNull current then nullArg (nameof current)
+        elif previous.Length > MaxTextUnits || current.Length > MaxTextUnits || previous.Length + current.Length > MaxTextUnits then
+            middleHighlights previous current
+        else
+            let previousTokens = tokenize previous
+            let currentTokens = tokenize current
+            if previousTokens.Overflow || currentTokens.Overflow then
+                middleHighlights previous current
+            else
+                match tokenHighlights previous current meter previousTokens currentTokens with
+                | Some operations -> highlightsFromOperations previous current previousTokens currentTokens operations
+                | None -> middleHighlights previous current
