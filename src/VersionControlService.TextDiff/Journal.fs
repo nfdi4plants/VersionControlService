@@ -609,14 +609,14 @@ type internal Journal(store: ITempStore, ledger: Ledger, cacheBytes: int) =
             if actual < bytes.Length then return None
             else
                 let reader = JournalReader bytes
-                let offset = reader.ReadInt64()
+                let offset = dataStart + reader.ReadInt64()
                 let length = reader.ReadInt64()
                 if length <= 0L then return None else return Some(offset, length)
     }
 
     let writeEntry sequence offset length = async {
         let writer = JournalWriter()
-        writer.WriteInt64 offset
+        writer.WriteInt64(offset - dataStart)
         writer.WriteInt64 length
         let bytes = writer.ToArray()
         do! store.WriteAt (sequence * 16L) bytes 0 bytes.Length
@@ -639,14 +639,6 @@ type internal Journal(store: ITempStore, ledger: Ledger, cacheBytes: int) =
                 do! readFully source block amount
                 do! store.WriteAt (source + shift) block 0 amount
                 remaining <- remaining - int64 amount
-            for sequence = 0L to count - 1L do
-                let entry = Array.zeroCreate<byte> 16
-                let! actual = store.ReadAt (sequence * 16L) entry 0 entry.Length
-                if actual = entry.Length then
-                    let reader = JournalReader entry
-                    let offset = reader.ReadInt64()
-                    let length = reader.ReadInt64()
-                    if length > 0L then do! writeEntry sequence (offset + shift) length
             indexCapacity <- nextCapacity
             dataStart <- newStart
             let reserve = Array.zeroCreate<byte> 1

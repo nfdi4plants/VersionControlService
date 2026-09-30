@@ -79,7 +79,9 @@ type internal ScanSide(
     let mutable windowAccountedBytes = 0.0
     let mutable recordPeaks = true
     let mutable observer: ScannerState -> float -> unit = fun _ _ -> ()
-    let mutable lineObserver: float -> float -> unit = fun _ _ -> ()
+    let mutable lineObserver: float -> float -> float = fun _ _ -> checkpointIntervalBytes
+    let mutable hasLineObserver = false
+    let mutable lineCheckpointDue = checkpointIntervalBytes
 
     member _.Spec = spec
     member _.Encoding = encoding
@@ -169,7 +171,11 @@ type internal ScanSide(
         let result = Scanner.scanChunk scanner buffer 0 count endOfSource meter batch emitLineBatch emitEvidence
         for index = previousCount to table.Count - 1 do
             windowAccountedBytes <- windowAccountedBytes + table.Finish index - table.Start index + table.Length index * 2.0 + 40.0
-            lineObserver (table.Finish index) (float table.LineBase + float index + 1.0)
+        if hasLineObserver && table.Count > previousCount then
+            let last = table.Count - 1
+            let offset = table.Finish last
+            if offset >= lineCheckpointDue then
+                lineCheckpointDue <- lineObserver offset (float table.LineBase + float table.Count)
         if recordPeaks then ledger.RecordWindowLines(category, table.Count)
         observer scanner (float table.LineBase + float table.Count)
         coverage <- max coverage (float scanner.StartOffset + scanner.ValidatedBytes)
@@ -189,7 +195,7 @@ type internal ScanSide(
     /// Called after every consumed chunk with the scanner and the number of lines that ended before its position.
     member _.Observer with get () = observer and set value = observer <- value
 
-    member _.LineObserver with get () = lineObserver and set value = lineObserver <- value
+    member _.LineObserver with get () = lineObserver and set value = lineObserver <- value; hasLineObserver <- true
 
     /// Writes the scan position and the window counters. The line arrays are written by the caller.
     member _.Export(header: HeaderBuilder) =

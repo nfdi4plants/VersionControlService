@@ -85,6 +85,7 @@ type internal Checkpoints(ledger: Ledger, intervalBytes: float, residentBytes: i
             nextDue[side] <- (Math.Floor(offset / intervalBytes) + 1.0) * intervalBytes
             if fits then residentUsed <- residentUsed + recordCost else pending.Add entry
             entries[side].Add entry
+        nextDue[side]
 
     /// Writes the records that did not fit in memory.
     member _.Flush() = async {

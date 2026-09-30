@@ -2011,11 +2011,12 @@ type TextDiffSession internal (
             | DiffRowKind.EndingChanged -> previousRefs[previousRefIndex] <- row.Previous; previousRefIndex <- previousRefIndex + 1
         previousRefs, currentRefs
 
-    let makeRows (item: QueueItem) (start: int) (count: int) (firstId: int64) (previousValues: DiffLine[]) (currentValues: DiffLine[]) (cancel: unit -> bool) (meter: Meter) = async {
+    let makeRows (item: QueueItem) (start: int) (count: int) (firstId: int64) (previousValues: DiffLine[]) (currentValues: DiffLine[]) (cancel: unit -> bool) (meter: Meter) =
         let fastIdStart =
             if firstId >= 0L && firstId + int64 (max 0 (count - 1)) <= int64 Int32.MaxValue then int firstId
             else -1
         let rows = Array.zeroCreate<DiffRow> count
+        let longRows = ResizeArray<int>()
         let mutable previousRefIndex = 0
         let mutable currentRefIndex = 0
         for index = 0 to count - 1 do
@@ -2047,28 +2048,45 @@ type TextDiffSession internal (
                 previousRefIndex <- previousRefIndex + 1
                 currentRefIndex <- currentRefIndex + 1
                 rows[index] <- { Id = id; Kind = row.Kind; Previous = Some previousLine; Current = Some currentLine }
-        let mutable interrupted = false
-        for index = 0 to rows.Length - 1 do
-            if cancel () then interrupted <- true
-            elif rows[index].Kind = DiffRowKind.Replaced then
-                let source = item.Rows[start + index]
-                if source.Previous.Length > 8_192.0 || source.Current.Length > 8_192.0 then
-                    let! changed = longLineSlices meter cancel source.Previous source.Current rows[index].Previous.Value rows[index].Current.Value
-                    match changed with
-                    | Some(previousLine, currentLine) ->
-                        rows[index] <- { rows[index] with Previous = Some previousLine; Current = Some currentLine }
-                    | None when cancel () -> interrupted <- true
-                    | None -> ()
-                let previousLine = rows[index].Previous.Value
-                let currentLine = rows[index].Current.Value
-                let previousHighlights, currentHighlights = InlineHighlights.compute meter previousLine.Slice.Text currentLine.Slice.Text
-                rows[index] <- {
-                    rows[index] with
-                        Previous = Some { previousLine with Slice = { previousLine.Slice with Highlights = previousHighlights } }
-                        Current = Some { currentLine with Slice = { currentLine.Slice with Highlights = currentHighlights } }
-                }
-        if interrupted then return None else return Some rows
-    }
+                if row.Previous.Length > 8_192.0 || row.Current.Length > 8_192.0 then longRows.Add index
+        let applyHighlights index =
+            let previousLine = rows[index].Previous.Value
+            let currentLine = rows[index].Current.Value
+            let previousHighlights, currentHighlights = InlineHighlights.compute meter previousLine.Slice.Text currentLine.Slice.Text
+            rows[index] <- {
+                rows[index] with
+                    Previous = Some { previousLine with Slice = { previousLine.Slice with Highlights = previousHighlights } }
+                    Current = Some { currentLine with Slice = { currentLine.Slice with Highlights = currentHighlights } }
+            }
+        let processSyncRows first finish =
+            let mutable interrupted = false
+            for index = first to finish - 1 do
+                if cancel () then interrupted <- true
+                elif rows[index].Kind = DiffRowKind.Replaced then applyHighlights index
+            interrupted
+        if longRows.Count = 0 then
+            let interrupted = processSyncRows 0 rows.Length
+            async.Return(if interrupted then None else Some rows)
+        else
+            async {
+                let mutable interrupted = false
+                let mutable nextIndex = 0
+                for index in longRows do
+                    if processSyncRows nextIndex index then interrupted <- true
+                    if cancel () then interrupted <- true
+                    else
+                        let source = item.Rows[start + index]
+                        let! changed = longLineSlices meter cancel source.Previous source.Current rows[index].Previous.Value rows[index].Current.Value
+                        match changed with
+                        | Some(previousLine, currentLine) ->
+                            rows[index] <- { rows[index] with Previous = Some previousLine; Current = Some currentLine }
+                        | None when cancel () -> interrupted <- true
+                        | None -> ()
+                        applyHighlights index
+                    nextIndex <- index + 1
+                if processSyncRows nextIndex rows.Length then interrupted <- true
+                if interrupted then return None else return Some rows
+            }
 
     let buildRows (item: QueueItem) (start: int) (count: int) (firstId: int64) (cancel: unit -> bool) (meter: Meter) : Async<DiffRow[] option> = async {
         if cancel () then return None
@@ -2401,7 +2419,7 @@ type TextDiffSession internal (
                             else float scanned.EndOffset > cursor.TargetOffset
                         if selected then cursor.FoundLines.Add scanned
                         cursor.LineNumber <- currentLine + 1.0
-                        checkpoints.ObserveLine(cursor.SideIndex, float scanned.EndOffset, cursor.LineNumber)
+                        checkpoints.ObserveLine(cursor.SideIndex, float scanned.EndOffset, cursor.LineNumber) |> ignore
                         if (cursor.ByLine && currentLine >= cursor.EndLine) || (not cursor.ByLine && selected) then
                             cursor.Complete <- true
                             lines.StopRequested <- true
