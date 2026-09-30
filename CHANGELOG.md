@@ -18,20 +18,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `VersionControlService.TextDiff` adds a streaming diff engine for files of any size. It bounds memory use and work per request and targets .NET and Fable.
-- The Git provider can run text diffs in a worker pool supervised by `TextDiffSupervisor`. Hosts create a `TextDiffPool` with `TextDiffPoolOptions.create` and `TextDiffPool.create`, and use `TextDiffTransport.WorkerThreadTransport.create` to start the bundled worker script.
+-   `VersionControlService.TextDiff` adds a streaming diff engine for files of any size. It bounds memory use and work per request and targets .NET and Fable.
+-   The Git provider can run text diffs in a worker pool supervised by `TextDiffSupervisor`. Hosts create a `TextDiffPool` with `TextDiffPoolOptions.create` and `TextDiffPool.create`, and use `TextDiffTransport.WorkerThreadTransport.create` to start a worker thread from their own worker file.
+-   `DiffSide` and `DiffContentBlocked` describe which side of a diff could not be read as text and the evidence found. `OperationFailure.DiffDetail` carries a `DiffContentBlocked` for a `diff_content_not_text` failure.
 
 ### Changed
 
-- Version 0.2.0 replaces the whole-file text diff with `TextDiffService`. Its `Open`, `ReadPage`, `ReplayPage`, `Expand`, `ReadLine`, `GetSourceInfo` and `Close` operations return resumable work where needed. `DiffPart` represents hunk fragments or hidden equal gaps. `Expand` returns `ExpandedContext`. `ReplayPage` returns a page that was already read, by its `PageId`, so a caller can drop pages it no longer shows and read them again unchanged. Each `LineSlice` carries `Highlight` spans for changed or unchanged text.
-- The Git host bundles a worker script that calls `TextDiffWorker.bootstrap`, passes its pool through `GitSessionOptions.TextDiff`, calls `Prewarm` when the host starts and disposes the pool during shutdown. The default pool has two workers with four sessions per worker.
-- `Open` pins source identities and checks binary content, including HDF5 signatures. A recognized BOM selects the source encoding. An ambiguous encoding returns `DiffBlocker.EncodingRequired` with a `PreparationToken` and `EncodingCandidate` values. A non-text source found while scanning fails with `TextDiffFailureCodes.ContentNotText` and structured `OperationFailure.DiffDetail` when available.
-- Pages contain at most 1,000 rows and 32 fragments. Page responses, including the first page from `Open`, are limited to 512 KiB. `ReadLine` responses are limited to 64 KiB, and `ReadLineRequest.MaxUtf16` is clamped to 8,192 UTF-16 code units. `ExpandRequest.Count` is clamped to 100 lines.
-- The Git worker pool answers cancellation immediately. An idle diff session expires after 15 minutes with `diff_session_closed`. Callers open a new diff to continue.
+-   Version 0.2.0 replaces the whole-file contract of `TextDiffService`, which existed before, with resumable paged operations. Its `Open`, `ReadPage`, `ReplayPage`, `Expand`, `ReadLine`, `GetSourceInfo` and `Close` operations return resumable work where needed. `DiffPart` represents hunk fragments or hidden equal gaps. Each `LineSlice` can carry `Highlight` spans for changed or unchanged text.
+-   `Expand` returns an `ExpandedContext` part and, when lines of the gap remain hidden, a `HiddenEqual` part with a new gap id for the rest of the gap. `ReplayPage` returns a page that was already read, by its `PageId`. The replayed page is identical to the first one except that `Pending` is `None`, so a caller can drop pages it no longer shows and read them again later.
+-   The host writes its own worker file that calls `TextDiffWorker.bootstrap`, passes its pool through `GitSessionOptions.TextDiff`, calls `Prewarm` when it starts and disposes the pool when it shuts down. The package ships no worker script, and an Electron app keeps that file outside the asar archive.
+-   The Git factories and sessions created without options no longer supply a text diff service, so `session.TextDiff` is `None` for `createFactory`, the credential factories and the `createSession*` functions that take no `GitSessionOptions`. Only `createFactoryWithOptions` and `createSessionWithOptions` with a pool supply one.
+-   `TextDiffPoolOptions.create` makes a pool with three workers and one session per worker, so no two diffs share a worker's scratch memory. A fourth open diff closes the least recently used idle session.
+-   `Open` pins source identities and checks binary content, including HDF5 signatures. A recognized BOM selects the source encoding. An ambiguous encoding returns `DiffBlocker.EncodingRequired` with a `PreparationToken` and `EncodingCandidate` values. A source that is not text fails with `TextDiffFailureCodes.ContentNotText` and structured `OperationFailure.DiffDetail`. The evidence is a binary signature, a NUL byte, a control-character ratio above 1 percent in a window, or an invalid byte sequence.
+-   Pages contain at most 1,000 rows and 32 fragments. A page response, including the first page from `Open`, has a limit of 512 KiB, and a `ReadLine` response has a limit of 64 KiB. The service clamps `ReadLineRequest.MaxUtf16` to 8,192 UTF-16 code units and `ExpandRequest.Count` to 100 lines.
+-   The Git worker pool answers cancellation immediately. The worker closes an idle diff session after 15 minutes, and the pool closes an idle session earlier when an `Open` needs its slot. Both cases fail later requests with `diff_session_closed`, and the caller opens a new diff to continue.
+-   `OperationFailure` has a new `DiffDetail` field, so code that builds the record has to set it. `OperationFailure.create` sets it to `None`.
+-   The text diff fallback of `WorkspaceSession.withFallbackServices` used to return `UnsupportedContent` from its three reads. It now returns `NotDiffable ProviderUnsupported` from `Open`. `ReadPage`, `ReplayPage`, `Expand`, `ReadLine` and `GetSourceInfo` fail with `service_unavailable`, and `Close` succeeds with that warning.
 
 ### Removed
 
-- `TextDiffService.GetDiff` and `TextDiffService.GetWordDiff` are removed with the whole-file contract. `TextDiffService.GetBaseContent` is also removed. Consumers use `TextDiffService` pages, replay, gap expansion and line slices instead.
+-   `ContentView` and its `TextContent` and `UnsupportedContent` cases no longer exist. They belonged to the whole-file contract.
+-   Version 0.2.0 removes `TextDiffService.GetDiff`, `TextDiffService.GetWordDiff` and `TextDiffService.GetBaseContent`. Consumers use `TextDiffService` pages, replay, gap expansion and line slices instead.
 
 ## 0.1.2 - 2026-09-28
 

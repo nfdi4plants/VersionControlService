@@ -32,12 +32,13 @@ type TextDiffPoolOptions = {
 
 module TextDiffPoolOptions =
 
-    /// Options with two workers and four sessions per worker.
+    /// Options with three workers and one session per worker. No two diffs share a worker's scratch memory,
+    /// and a fourth open diff closes the least recently used idle session to take its slot.
     let create (factory: TextDiffWorkerFactory) (supervisor: Supervisor.TextDiffSupervisor) = {
         Factory = factory
         Supervisor = supervisor
-        MaxWorkers = 2
-        SessionsPerWorker = 4
+        MaxWorkers = 3
+        SessionsPerWorker = 1
         InitTimeoutMs = 15000
         NowMilliseconds = fun () -> float DateTime.UtcNow.Ticks / 10000.0
     }

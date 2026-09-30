@@ -10,7 +10,7 @@ The packages are on nuget.org:
 dotnet add package VersionControlService
 ```
 
-The umbrella package is dependency-only and carries the public abstractions, the Node runtime, the Git provider, and the lakeFS provider at one coordinated version. An external provider that does not need the built-in implementations can reference `VersionControlService.Abstractions` alone.
+The umbrella package is dependency-only and carries the public abstractions, the text diff engine, the Node runtime, the Git provider, and the lakeFS provider at one coordinated version. An external provider that does not need the built-in implementations can reference `VersionControlService.Abstractions` alone.
 
 The Git and lakeFS providers run on Fable and Node. They need the `simple-git` npm package, and the Git provider needs git 2.38 or newer on the path. Git LFS is optional and only the large-object services use it. lakeFS needs no local tool. [Consuming the library](docs/consuming.md) lists what to install.
 
@@ -212,7 +212,7 @@ The host persists `WorkspaceBinding` values. An explicit binding wins over probi
 
 Every opened session has `CoreVersionControl`. On a session the provider built, optional services are present only when the provider supports them, so feature discovery is an `Option.isSome` check. A consumer that fills the gaps gives that up, as the next paragraph describes. Operations return `Succeeded`, `PartiallySucceeded`, or `Failed` with structured state-change, recovery, affected-path, and revision evidence.
 
-A consumer that wants one code path for every provider fills the gaps itself. `WorkspaceSession.withFallbackServices` returns a session with every service present, and `ProviderFactory.withFallbackServices` wraps a factory so that every session it opens is complete. A composition root wraps its factories before `ProviderResolver.tryCreateCatalog`. Most fallback operations succeed as no-ops with a `service_unavailable` warning. Synchronization operations and conflict mutations fail with that code. The text diff fallback returns `NotDiffable ProviderUnsupported` from `Open`. Calls that read a diff handle fail with `service_unavailable`. `Close` succeeds as a no-op with that warning. `ListObjects` returns an empty array. `GetActiveSession` and `GetRepositoryWebUrl` return `None`. `GetSettings` returns no threshold with `MaterializeLargeObjects = true`. `Prune` and `Deduplicate` return the reason as their report. `WorkspaceSession.availability` reports which services the provider really supplies. Read it before filling, because a filled session reports every service as present. A wrapped factory never yields an unfilled session, so a host that needs the report keeps the unwrapped factory, or applies `WorkspaceSession.withFallbackServices` itself after reading the availability.
+A consumer that wants one code path for every provider fills the gaps itself. `WorkspaceSession.withFallbackServices` returns a session with every service present, and `ProviderFactory.withFallbackServices` wraps a factory so that every session it opens is complete. A composition root wraps its factories before `ProviderResolver.tryCreateCatalog`. Most fallback operations succeed as no-ops with a `service_unavailable` warning. Synchronization operations and the conflict session operations `Resolve`, `Finalize` and `Cancel` fail with that code. The text diff fallback returns `NotDiffable ProviderUnsupported` from `Open`. Calls that read a diff handle fail with `service_unavailable`. `Close` succeeds as a no-op with that warning. `ListObjects` returns an empty array. `GetActiveSession` and `GetRepositoryWebUrl` return `None`. `GetSettings` returns no threshold with `MaterializeLargeObjects = true`. `Prune` and `Deduplicate` return the reason as their report. `WorkspaceSession.availability` reports which services the provider really supplies. Read it before filling, because a filled session reports every service as present. A wrapped factory never yields an unfilled session, so a host that needs the report keeps the unwrapped factory, or applies `WorkspaceSession.withFallbackServices` itself after reading the availability.
 
 Everything outside an opened session (`Probe`, `VerifyLocation`, `Initialize`, `Clone`, `Adopt`, `Bind`, `CheckDependencies`, `InstallDependency`), repository locations and credentials stay provider-specific at the composition root. A consumer that prefers to see an absent service as absent does not apply the fallback, so two consumers may behave differently against the same provider by design.
 
@@ -253,7 +253,7 @@ Run `.\build.cmd` without a target to list every target, including the focused t
 
 ## Pack a local feed
 
-Contributors who want to try unreleased changes in a host can pack the five coordinated packages into a local feed. Run this from the repository root:
+Contributors who want to try unreleased changes in a host can pack the six coordinated packages into a local feed. Run this from the repository root:
 
 ```console
 dotnet restore VersionControlService.slnx

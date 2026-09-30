@@ -461,17 +461,20 @@ let createCatalog (factories: ProviderFactory seq) =
     |> Resolver.tryCreateCatalog
 ```
 
-Most filled operations succeed as a no-op with a `service_unavailable` warning. The
-synchronization service and conflict mutations fail with that code. The text diff fallback
+Most filled operations change nothing, return `Succeeded` and carry a
+`service_unavailable` warning. The synchronization service and the conflict session
+operations `Resolve`, `Finalize` and `Cancel` fail with that code. The text diff fallback
 has its own open and handle behavior.
 
-A fallback read hands back an empty answer. `ListObjects` returns an empty array.
+A fallback read returns a neutral value. `ListObjects` returns an empty array.
 `GetActiveSession` and `GetRepositoryWebUrl` return `None`. `GetSettings` returns no
 threshold with `MaterializeLargeObjects = true`. `Prune` and `Deduplicate` return the
-reason as their report. The text diff fallback returns `NotDiffable ProviderUnsupported`
-from `Open`. Its `ReadPage`, `ReplayPage`, `Expand`, `ReadLine` and `GetSourceInfo` calls
-fail with `service_unavailable`. `Close` succeeds as a no-op with that warning. lakeFS has
-no text diff service, so it gets this fallback.
+reason as their report.
+
+The text diff fallback returns `NotDiffable ProviderUnsupported` from `Open`. Its
+`ReadPage`, `ReplayPage`, `Expand`, `ReadLine` and `GetSourceInfo` calls fail with
+`service_unavailable`. `Close` does nothing and returns `Succeeded` with that warning.
+lakeFS has no text diff service, so it gets this fallback.
 
 A fallback write also succeeds and changes nothing. `Materialize`, `Dematerialize`,
 `SetPathPolicy` and `SetSettings` return `Succeeded` with the same warning. Read the
@@ -552,6 +555,15 @@ opposite choices against the same provider, which is the intent.
 `TextDiff` is an optional service on `WorkspaceSession`. Read it from `session.TextDiff`
 before opening a diff. The Git provider compares a working file with its version at HEAD
 when `PreviousPath` is `None`. `Open` pins the source identities for the returned handle.
+
+The Git provider supplies a working service only when the host passes a worker pool. The
+functions that take no `GitSessionOptions` (`GitWorkspaceSession.createFactory`,
+`createFactoryWithCredentials`, `createSession`, `createSessionWithCredentials` and the
+other credential variants) leave `session.TextDiff` as `None`. Only
+`createFactoryWithOptions` and `createSessionWithOptions` with a `TextDiffPool` in
+`GitSessionOptions.TextDiff` create a session with a working text diff. Options without a
+pool produce a service whose `Open` fails with `diff_worker_failed`. See
+[hosting in Node or Electron](#hosting-in-node-or-electron).
 
 The examples use `valueOf` to keep result handling short. A real caller should match
 `Failed` and retain the `OperationFailure` fields it needs.
@@ -636,11 +648,14 @@ let readNextPage (service: TextDiffService) (handle: DiffHandle) (page: DiffPage
 ```
 
 Each `DiffPage` has a `PageId` for replay and an optional `NextCursor`. Its `DiffPart`
-values are hunk fragments or hidden equal gaps. `Expand` returns `ExpandedContext` rows.
-A `PendingPreview` shows text of the unfinished scan. It is advisory and holds no diff rows.
+values are hunk fragments or hidden equal gaps. `Expand` returns an `ExpandedContext` part
+with the rows it revealed. When rows of the gap remain hidden, it also returns a
+`HiddenEqual` part with a new gap id for the rest, so the next `Expand` request uses that
+id. A `PendingPreview` shows text of the unfinished scan. It is advisory and holds no
+diff rows.
 Keep a page's `PageId` if the caller may need the page again. `ReplayPage` returns the page
-exactly as it was first read, so a viewer can drop pages it no longer shows and read them
-again later.
+as it was first read, except that `Pending` is `None`. A viewer can drop pages it no
+longer shows and read them again later.
 
 ```fsharp
 let replayPage (service: TextDiffService) (handle: DiffHandle) (page: DiffPage) (context: OperationContext) = async {
@@ -690,7 +705,7 @@ let expandGap (service: TextDiffService) (handle: DiffHandle) (gap: EqualGap) (f
 For a long line, `ReadLineRequest.OffsetUtf16` selects a slice. `Line` is the zero-based
 `DiffLine.Number`. The service clamps `MaxUtf16` to 8,192 UTF-16 code units. Advance the
 next offset by the returned text length. Stop when `TotalUtf16` is present and the offset
-reaches that total. `LineSlice.Highlights` returns UTF-16 spans marked as changed or
+reaches that total. `LineSlice.Highlights` holds UTF-16 spans marked as changed or
 unchanged text.
 
 ```fsharp
@@ -720,10 +735,12 @@ let readFirstLineSlice (service: TextDiffService) (handle: DiffHandle) (context:
 }
 ```
 
-`Open` can return `NotDiffable` when initial classification recognizes binary content.
-The classifier recognizes HDF5 signatures too. A binary signature found during later
-scanning fails with `diff_content_not_text`, and `failure.DiffDetail` records the side and
-evidence. A recognized BOM selects its encoding. If the encoding remains ambiguous,
+`Open` can return `NotDiffable` when initial classification recognizes binary content,
+including HDF5 signatures. Content that turns out not to be text during later scanning
+fails with `diff_content_not_text`, and `failure.DiffDetail` records the side and
+evidence. The evidence is a binary signature, a NUL byte, a control-character ratio
+above 1 percent in a window of the file, or a byte sequence that is invalid in the
+encoding. A recognized BOM selects its encoding. If the encoding remains ambiguous,
 `DiffBlocker.EncodingRequired` returns a `PreparationToken` and `EncodingCandidate` values.
 Ask the user to choose a candidate, then retry the same open request with that token and
 the chosen encoding on the reported side.
@@ -738,8 +755,12 @@ let chooseEncoding (request: OpenDiffRequest) (side: DiffSide) (token: Preparati
             if side = DiffSide.Current then Some encoding else request.CurrentEncoding }
 ```
 
-The Git worker keeps an idle handle for 15 minutes. An expired or closed handle returns
-`diff_session_closed`. Open a new diff when that happens. `source_changed` means a pinned
+A closed handle returns `diff_session_closed`, and so does a handle the pool closed for
+one of two reasons. The worker closes a handle that stays idle for 15 minutes. The pool
+can also close an idle handle earlier when an `Open` needs its slot. It picks the least
+recently used idle handle. The default pool has three workers with one session each, so
+this happens when a fourth diff opens. Open a new diff when the error occurs.
+`source_changed` means a pinned
 source changed while the handle was open, so close it and open the current sources again.
 For `diff_content_not_text`, inspect `failure.DiffDetail` for the blocked side and evidence.
 For `preparation_mismatch`, discard the token and start `Open` again. A continuation is
@@ -753,8 +774,9 @@ The Git provider caps a page at 1,000 rows and 32 fragments. `Open`, `ReadPage`,
 
 ### Hosting in Node or Electron
 
-Bundle an absolute-path worker file for `TextDiffWorker.bootstrap`. The worker receives
-`NodeWorkerThreads.parentPort` and passes it to that entry point.
+The package ships no worker script. The host writes its own worker file, bundles it and
+refers to it by absolute path. The file passes `NodeWorkerThreads.parentPort` to
+`TextDiffWorker.bootstrap`.
 
 ```fsharp
 module TextDiffWorkerEntry
@@ -813,6 +835,28 @@ let disposeDiffPool (pool: DiffPool.TextDiffPool) =
 
 Call `Prewarm` during startup and await `disposeDiffPool` when the app quits. The pool
 disposes its supervisor during shutdown.
+
+`TextDiffPoolOptions.create` makes a pool with three workers and one session per worker.
+A fourth open diff closes the least recently used idle one. Set `MaxWorkers` and
+`SessionsPerWorker` on the options record to change that.
+
+An Electron app keeps the worker file outside the asar archive, because worker threads
+cannot load scripts from inside it. Unpack the file in the packager settings, using the
+bare file name. This Electron Forge example unpacks a worker file named
+`text-diff-worker.js`:
+
+```js
+module.exports = {
+  packagerConfig: {
+    asar: {
+      unpack: "text-diff-worker.js",
+    },
+  },
+};
+```
+
+Point `workerScriptPath` at the unpacked copy, which sits in the `app.asar.unpacked`
+folder next to `app.asar`.
 
 ## Saving work
 
@@ -1177,7 +1221,7 @@ The packages are on nuget.org:
 dotnet add package VersionControlService
 ```
 
-The umbrella package depends on the other four at that exact version, so referencing it is
+The umbrella package depends on the other five at that exact version, so referencing it is
 enough. A host that only defines or consumes contracts references
 `VersionControlService.Abstractions` alone and needs nothing else. To build the packages
 from a clone instead, follow "Pack a local feed" in the README.

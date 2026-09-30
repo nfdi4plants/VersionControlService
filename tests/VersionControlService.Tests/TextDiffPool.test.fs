@@ -245,9 +245,7 @@ type private ManualTransport() =
 let private createTempDirectory () : JS.Promise<string> =
     mkdtemp (NodePath.join [| systemTempDirectory (); "vcs-text-diff-pool-" |])
 
-let private withPoolConfigured
-    (maxWorkers: int)
-    (sessionsPerWorker: int)
+let private withPoolOptions
     (factory: TextDiffWorkerFactory)
     (configure: TextDiffPool.TextDiffPoolOptions -> TextDiffPool.TextDiffPoolOptions)
     (body: TextDiffPool.TextDiffPool -> JS.Promise<unit>)
@@ -262,13 +260,7 @@ let private withPoolConfigured
             }
 
         let pool =
-            TextDiffPool.create (
-                configure {
-                    (TextDiffPool.TextDiffPoolOptions.create factory supervisor) with
-                        MaxWorkers = maxWorkers
-                        SessionsPerWorker = sessionsPerWorker
-                }
-            )
+            TextDiffPool.create (configure (TextDiffPool.TextDiffPoolOptions.create factory supervisor))
 
         let mutable failure = None
 
@@ -287,6 +279,23 @@ let private withPoolConfigured
         | Some error -> return raise error
         | None -> ()
     }
+
+let private withPoolConfigured
+    (maxWorkers: int)
+    (sessionsPerWorker: int)
+    (factory: TextDiffWorkerFactory)
+    (configure: TextDiffPool.TextDiffPoolOptions -> TextDiffPool.TextDiffPoolOptions)
+    (body: TextDiffPool.TextDiffPool -> JS.Promise<unit>)
+    : JS.Promise<unit> =
+    withPoolOptions
+        factory
+        (fun options ->
+            configure {
+                options with
+                    MaxWorkers = maxWorkers
+                    SessionsPerWorker = sessionsPerWorker
+            })
+        body
 
 let private withPool
     (maxWorkers: int)
@@ -500,6 +509,38 @@ Vitest.describe (
 
                     let! current = readPage service secondHandle "c" (OperationContext.detached "read")
                     Vitest.expect(current.IsSucceeded).toBe true
+                })
+        )
+
+        Vitest.test (
+            "closes the least recently used idle session when a fourth diff opens with the default options",
+            TestOptions(timeout = 60000),
+            fun () ->
+                let control = Control()
+
+                withPoolOptions (inProcessFactory control (ResizeArray())) id (fun pool -> promise {
+                    let service = pool.Service owner
+                    let! first = service.Open openRequest (OperationContext.detached "open-1") |> run
+                    let firstHandle = openedHandle first
+                    let! second = service.Open openRequest (OperationContext.detached "open-2") |> run
+                    let secondHandle = openedHandle second
+                    let! third = service.Open openRequest (OperationContext.detached "open-3") |> run
+                    let thirdHandle = openedHandle third
+                    Vitest.expect(control.Closed.Count).toBe 0
+
+                    let! touched = readPage service firstHandle "c" (OperationContext.detached "read")
+                    Vitest.expect(touched.IsSucceeded).toBe true
+
+                    let! fourth = service.Open openRequest (OperationContext.detached "open-4") |> run
+                    let fourthHandle = openedHandle fourth
+                    Vitest.expect(control.Closed.Count).toBe 1
+
+                    let! evicted = readPage service secondHandle "c" (OperationContext.detached "read")
+                    Vitest.expect(failureCode evicted).toBe TextDiffFailureCodes.SessionClosed
+
+                    for handle in [ firstHandle; thirdHandle; fourthHandle ] do
+                        let! current = readPage service handle "c" (OperationContext.detached "read")
+                        Vitest.expect(current.IsSucceeded).toBe true
                 })
         )
 
