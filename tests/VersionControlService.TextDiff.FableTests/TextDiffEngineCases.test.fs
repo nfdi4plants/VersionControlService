@@ -8,6 +8,9 @@ open VersionControlService.TextDiff.Tests
 module TextDiffEngineCasesTests =
     let private benchmarkSize = 64 * 1024 * 1024
 
+    [<Emit("$0[$1] = $2")>]
+    let private writeBenchmarkByte (data: byte[]) (index: int) (value: int) : unit = jsNative
+
     let private createMeter () =
         let clock = ManualClock 0.0
         Meter.create
@@ -52,7 +55,7 @@ module TextDiffEngineCasesTests =
         let mutable lineEnd = 39
 
         while lineEnd < size do
-            data[lineEnd] <- 0x0Auy
+            writeBenchmarkByte data lineEnd 0x0A
             lineEnd <- lineEnd + 40
 
         data
@@ -173,15 +176,22 @@ module TextDiffEngineCasesTests =
         ByteLength = int64 data.Length
     }
 
+    let private startRequest work = work |> Async.StartAsPromise |> Async.AwaitPromise
+
     let rec private finishFirstPage (session: TextDiffSession) (result: EngineResult<Resumable<DiffPage>>) = async {
         match result with
         | EngineResult.Ok(Resumable.Ready page) -> return page
         | EngineResult.Ok(Resumable.Scanning(_, continuation, _)) ->
-            let! next = session.ReadPage continuation (fun () -> false)
-            return! finishFirstPage session next
+            let! next = startRequest (session.ReadPage continuation (fun () -> false))
+            return! startRequest (finishFirstPage session next)
         | EngineResult.Failed(code, message, detail) ->
             return failwith $"The measured session failed with {code}: {message}. Detail: {detail}."
         | EngineResult.Canceled -> return failwith "The measured session was canceled."
+    }
+
+    let private readNextPage (session: TextDiffSession) cursor = async {
+        let! result = session.ReadPage cursor (fun () -> false)
+        return! startRequest (finishFirstPage session result)
     }
 
     let rec private finishSessionOutput (session: TextDiffSession) (page: DiffPage) = async {
@@ -189,11 +199,41 @@ module TextDiffEngineCasesTests =
         else
             match page.NextCursor with
             | Some cursor ->
-                let! result = session.ReadPage cursor (fun () -> false)
-                let! nextPage = finishFirstPage session result
+                let! nextPage = readNextPage session cursor |> Async.StartAsPromise |> Async.AwaitPromise
                 return! finishSessionOutput session nextPage
             | None -> return failwith "The measured scan stopped before output was complete."
     }
+
+    [<Emit("Promise.resolve($0)")>]
+    let private promiseResolve (value: 'T) : JS.Promise<'T> = jsNative
+
+    [<Emit("Promise.resolve(undefined)")>]
+    let private promiseResolveUnit () : JS.Promise<unit> = jsNative
+
+    [<Emit("Promise.reject(new Error($0))")>]
+    let private promiseReject<'T> (message: string) : JS.Promise<'T> = jsNative
+
+    [<Emit("$0.then($1)")>]
+    let private promiseThen (source: JS.Promise<'T>) (continuation: 'T -> JS.Promise<'U>) : JS.Promise<'U> = jsNative
+
+    let rec private finishFirstPagePromise (session: TextDiffSession) (result: EngineResult<Resumable<DiffPage>>) : JS.Promise<DiffPage> =
+        match result with
+        | EngineResult.Ok(Resumable.Ready page) -> promiseResolve page
+        | EngineResult.Ok(Resumable.Scanning(_, continuation, _)) ->
+            promiseThen (Async.StartAsPromise(session.ReadPage continuation (fun () -> false))) (finishFirstPagePromise session)
+        | EngineResult.Failed(code, message, detail) -> promiseReject $"The measured session failed with {code}: {message}. Detail: {detail}."
+        | EngineResult.Canceled -> promiseReject "The measured session was canceled."
+
+    let rec private finishSessionOutputPromise (session: TextDiffSession) (page: DiffPage) : JS.Promise<unit> =
+        if page.OutputComplete then promiseResolveUnit ()
+        else
+            match page.NextCursor with
+            | Some cursor ->
+                promiseThen
+                    (Async.StartAsPromise(session.ReadPage cursor (fun () -> false)))
+                    (fun result ->
+                        promiseThen (finishFirstPagePromise session result) (fun nextPage -> finishSessionOutputPromise session nextPage))
+            | None -> promiseReject "The measured scan stopped before output was complete."
 
     /// Builds lines of a fixed width that start with a marker letter and an eight digit counter, so every line differs.
     let private numberedLines (marker: byte) (lineBytes: int) (count: int) =
@@ -201,21 +241,21 @@ module TextDiffEngineCasesTests =
 
         for line = 0 to count - 1 do
             let start = line * lineBytes
-            data[start] <- marker
+            writeBenchmarkByte data start (int marker)
             let mutable value = line
 
             for digit = 8 downto 1 do
-                data[start + digit] <- byte (0x30 + value % 10)
+                writeBenchmarkByte data (start + digit) (0x30 + value % 10)
                 value <- value / 10
 
-            data[start + lineBytes - 1] <- 0x0Auy
+            writeBenchmarkByte data (start + lineBytes - 1) 0x0A
 
         data
 
     let private createBenchmarkSession config previous current : Async<TextDiffSession> = async {
         let clock = ManualClock 0.0
         let host = Host.createInMemory (clock :> IClock)
-        return! TextDiffSession.create host (Ledger()) config (fun _ -> 1) previous current
+        return! startRequest (TextDiffSession.create host (Ledger()) config (fun _ -> 1) previous current)
     }
 
     Vitest.describe (
@@ -270,8 +310,8 @@ module TextDiffEngineCasesTests =
             let config = benchmarkSessionConfig "benchmark-identical" 3 1_000 (8 * 1024 * 1024)
             let started = BrowserClock.nowMs()
             let! session = createBenchmarkSession config source source
-            let! first = session.FirstPage(fun () -> false)
-            let! page = finishFirstPage session first
+            let! first = startRequest (session.FirstPage(fun () -> false))
+            let! page = startRequest (finishFirstPage session first)
             let elapsed = max 1.0 (BrowserClock.nowMs() - started)
             if not page.OutputComplete then failwith "The identical scan did not complete on its first page."
             let rate = 2.0 * float size / 1_000_000.0 * 1_000.0 / elapsed
@@ -291,8 +331,8 @@ module TextDiffEngineCasesTests =
             let config = benchmarkSessionConfig "benchmark-first-page" 3 1_000 (8 * 1024 * 1024)
             let started = BrowserClock.nowMs()
             let! session = createBenchmarkSession config (benchmarkSource previous) (benchmarkSource current)
-            let! first = session.FirstPage(fun () -> false)
-            let! page = finishFirstPage session first
+            let! first = startRequest (session.FirstPage(fun () -> false))
+            let! page = startRequest (finishFirstPage session first)
             let elapsed = max 0.0 (BrowserClock.nowMs() - started)
             if page.Parts.Length = 0 then failwith "The first page has no edit rows."
             Vitest.log ($"1 MiB file with three edits, first page: {elapsed:F1} ms")
@@ -311,8 +351,8 @@ module TextDiffEngineCasesTests =
             let config = benchmarkSessionConfig "benchmark-early-edits-64m" 3 1_000 (8 * 1024 * 1024)
             let started = BrowserClock.nowMs()
             let! session = createBenchmarkSession config (benchmarkSource previous) (benchmarkSource current)
-            let! first = session.FirstPage(fun () -> false)
-            let! page = finishFirstPage session first
+            let! first = startRequest (session.FirstPage(fun () -> false))
+            let! page = startRequest (finishFirstPage session first)
             if page.Parts.Length = 0 then failwith "The first page has no edit rows."
             do! finishSessionOutput session page
             let elapsed = max 1.0 (BrowserClock.nowMs() - started)
@@ -330,13 +370,17 @@ module TextDiffEngineCasesTests =
             let previous = numberedLines 0x70uy lineBytes lineCount
             let cutLine = 1_000
             let insertion = numberedLines 0x69uy 256 (8 * 1024 * 1024 / 256)
-            let current = Array.concat [ previous[.. cutLine * lineBytes - 1]; insertion; previous[cutLine * lineBytes ..] ]
+            let cutByte = cutLine * lineBytes
+            let current = Array.zeroCreate<byte> (previous.Length + insertion.Length)
+            Array.blit previous 0 current 0 cutByte
+            Array.blit insertion 0 current cutByte insertion.Length
+            Array.blit previous cutByte current (cutByte + insertion.Length) (previous.Length - cutByte)
             let ledger = Ledger()
             let config = benchmarkSessionConfig "benchmark-insertion-64m" 3 1_000 (8 * 1024 * 1024)
             let started = BrowserClock.nowMs()
-            let! session = TextDiffSession.create (Host.createInMemory (ManualClock 0.0 :> IClock)) ledger config (fun _ -> 1) (benchmarkSource previous) (benchmarkSource current)
-            let! first = session.FirstPage(fun () -> false)
-            let! page = finishFirstPage session first
+            let! session = startRequest (TextDiffSession.create (Host.createInMemory (ManualClock 0.0 :> IClock)) ledger config (fun _ -> 1) (benchmarkSource previous) (benchmarkSource current))
+            let! first = startRequest (session.FirstPage(fun () -> false))
+            let! page = startRequest (finishFirstPage session first)
             if page.Parts.Length = 0 then failwith "The first page has no edit rows."
             do! finishSessionOutput session page
             let elapsed = max 1.0 (BrowserClock.nowMs() - started)
@@ -351,21 +395,25 @@ module TextDiffEngineCasesTests =
 
     /// Measures a whole session with the default budgets and logs the time to the first page and the total time.
     let private reportSessionRun label sessionId (previous: byte[]) (current: byte[]) (checkLedger: Ledger -> unit) =
-        Async.StartAsPromise(async {
-            let ledger = Ledger()
-            let config = { SessionConfig.defaults sessionId with Limits = { Limits.defaults with MaxUnits = 2_147_483_647; RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 } }
-            let started = BrowserClock.nowMs()
-            let! session = TextDiffSession.create (Host.createInMemory (ManualClock 0.0 :> IClock)) ledger config (fun _ -> 1) (benchmarkSource previous) (benchmarkSource current)
-            let! first = session.FirstPage(fun () -> false)
-            let! page = finishFirstPage session first
-            let firstPageMs = BrowserClock.nowMs() - started
-            if page.Parts.Length = 0 then failwith "The first page has no edit rows."
-            do! finishSessionOutput session page
-            let elapsed = max 1.0 (BrowserClock.nowMs() - started)
-            checkLedger ledger
-            Vitest.log ($"{label}: first page {firstPageMs:F1} ms, total {elapsed:F1} ms")
-            do! session.Close()
-        })
+        let ledger = Ledger()
+        let config = { SessionConfig.defaults sessionId with Limits = { Limits.defaults with MaxUnits = 2_147_483_647; RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 } }
+        let started = BrowserClock.nowMs()
+        let create = TextDiffSession.create (Host.createInMemory (ManualClock 0.0 :> IClock)) ledger config (fun _ -> 1) (benchmarkSource previous) (benchmarkSource current)
+        promiseThen (Async.StartAsPromise create) (fun session ->
+            promiseThen (Async.StartAsPromise(session.FirstPage(fun () -> false))) (fun result ->
+                promiseThen (finishFirstPagePromise session result) (fun page ->
+                    let firstPageMs = BrowserClock.nowMs() - started
+                    if page.Parts.Length = 0 then promiseReject "The first page has no edit rows."
+                    else
+                        promiseThen (finishSessionOutputPromise session page) (fun () ->
+                            let elapsed = max 1.0 (BrowserClock.nowMs() - started)
+                            checkLedger ledger
+                            Vitest.log ($"{label}: first page {firstPageMs:F1} ms, total {elapsed:F1} ms")
+                            promiseThen (Async.StartAsPromise(session.Close())) (fun () -> promiseResolveUnit ())
+                        )
+                )
+            )
+        )
 
     let private measureMiddleInsertion () =
         let lineBytes = 40
@@ -373,7 +421,11 @@ module TextDiffEngineCasesTests =
         let previous = numberedLines 0x70uy lineBytes lineCount
         let cutLine = lineCount / 2
         let insertion = numberedLines 0x69uy lineBytes (8 * 1024 * 1024 / lineBytes)
-        let current = Array.concat [ previous[.. cutLine * lineBytes - 1]; insertion; previous[cutLine * lineBytes ..] ]
+        let cutByte = cutLine * lineBytes
+        let current = Array.zeroCreate<byte> (previous.Length + insertion.Length)
+        Array.blit previous 0 current 0 cutByte
+        Array.blit insertion 0 current cutByte insertion.Length
+        Array.blit previous cutByte current (cutByte + insertion.Length) (previous.Length - cutByte)
         let check (ledger: Ledger) =
             let equalAfterInsertion = float (previous.Length - cutLine * lineBytes)
             if ledger.CommonRunBytes < 0.9 * equalAfterInsertion then

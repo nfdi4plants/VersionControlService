@@ -61,6 +61,12 @@ module Hash =
 
     let addCodeUnit (hash: Hash64) (scalar: int) = addScalar hash scalar
 
+#if FABLE_COMPILER
+    [<Fable.Core.Emit("($0 >>> 0).toString(16).padStart(8, '0') + ($1 >>> 0).toString(16).padStart(8, '0')")>]
+    let private formatWords (high: uint32) (low: uint32) : string = Fable.Core.Util.jsNative
+
+    let toString (hash: Hash64) = formatWords hash.Hi hash.Lo
+#else
     let toString (hash: Hash64) =
         let chars = Array.zeroCreate<char> 16
         let digits = "0123456789abcdef"
@@ -71,3 +77,4 @@ module Hash =
         writeWord hash.Hi 0
         writeWord hash.Lo 8
         String(chars)
+#endif

@@ -23,6 +23,12 @@ module Native =
     [<Emit("$0[$1] = $2")>]
     let writeByte (bytes: byte[]) (index: int) (value: int) : unit = jsNative
 
+    [<Emit("$2.set($0.subarray($1, $1 + $4), $3)")>]
+    let copyBytes (source: byte[]) (sourceOffset: int) (target: byte[]) (targetOffset: int) (count: int) : unit = jsNative
+
+    [<Emit("(($buffer, $offset, $value) => { const number = Number($value); if (!Number.isSafeInteger(number) || number < 0) return false; $buffer[$offset] = number % 256; $buffer[$offset + 1] = Math.floor(number / 256) % 256; $buffer[$offset + 2] = Math.floor(number / 65536) % 256; $buffer[$offset + 3] = Math.floor(number / 16777216) % 256; $buffer[$offset + 4] = Math.floor(number / 4294967296) % 256; $buffer[$offset + 5] = Math.floor(number / 1099511627776) % 256; $buffer[$offset + 6] = Math.floor(number / 281474976710656) % 256; $buffer[$offset + 7] = Math.floor(number / 72057594037927936) % 256; return true; })($0, $1, $2)")>]
+    let writeNonnegativeSafeInt64 (bytes: byte[]) (index: int) (value: int64) : bool = jsNative
+
     [<Emit("$0[$1]")>]
     let readInt (values: int[]) (index: int) : int = jsNative
 
@@ -84,15 +90,36 @@ module Native =
     [<Emit("new TextDecoder('utf-16le', { ignoreBOM: true })")>]
     let private createUtf16Decoder () : obj = jsNative
 
+    [<Emit("new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })")>]
+    let private createUtf8Decoder () : obj = jsNative
+
+    [<Emit("new TextEncoder()")>]
+    let private createUtf8Encoder () : obj = jsNative
+
     // ignoreBOM keeps a leading U+FEFF in the text. The default decoder would drop it.
     let private utf16Decoder = createUtf16Decoder ()
+    let private utf8Decoder = createUtf8Decoder ()
+    let private utf8Encoder = createUtf8Encoder ()
 
     [<Emit("$0.decode($1.subarray(0, $2))")>]
     let private decodeUnits (decoder: obj) (units: uint16[]) (count: int) : string = jsNative
 
+    [<Emit("$0.decode($1.subarray($2, $2 + $3))")>]
+    let private decodeUtf8 (decoder: obj) (bytes: byte[]) (offset: int) (count: int) : string = jsNative
+
+    [<Emit("$0.encodeInto($1, $2.subarray($3)).written")>]
+    let private encodeUtf8Into (encoder: obj) (value: string) (bytes: byte[]) (offset: int) : int = jsNative
+
     /// Builds a string from the first `count` UTF-16 code units.
     let utf16Decode (units: uint16[]) (count: int) =
         if count = 0 then "" else decodeUnits utf16Decoder units count
+
+    /// Decodes one validated UTF-8 byte range while preserving a leading BOM.
+    let utf8Decode (bytes: byte[]) (offset: int) (count: int) =
+        if count = 0 then "" else decodeUtf8 utf8Decoder bytes offset count
+
+    let utf8EncodeInto (value: string) (bytes: byte[]) (offset: int) =
+        if value.Length = 0 then 0 else encodeUtf8Into utf8Encoder value bytes offset
 #else
     let inline imul (left: int) (right: int) = left * right
 
@@ -102,6 +129,9 @@ module Native =
     let inline readByte (bytes: byte[]) (index: int) = int bytes[index]
 
     let inline writeByte (bytes: byte[]) (index: int) (value: int) = bytes[index] <- byte value
+
+    let inline copyBytes (source: byte[]) (sourceOffset: int) (target: byte[]) (targetOffset: int) (count: int) =
+        Array.Copy(source, sourceOffset, target, targetOffset, count)
 
     let inline readInt (values: int[]) (index: int) = values[index]
 
@@ -134,4 +164,10 @@ module Native =
     /// Builds a string from the first `count` UTF-16 code units.
     let utf16Decode (units: uint16[]) (count: int) =
         String(MemoryMarshal.Cast<uint16, char>(ReadOnlySpan<uint16>(units, 0, count)))
+
+    let utf8Decode (bytes: byte[]) (offset: int) (count: int) =
+        System.Text.Encoding.UTF8.GetString(bytes, offset, count)
+
+    let utf8EncodeInto (value: string) (bytes: byte[]) (offset: int) =
+        System.Text.Encoding.UTF8.GetBytes(value, 0, value.Length, bytes, offset)
 #endif

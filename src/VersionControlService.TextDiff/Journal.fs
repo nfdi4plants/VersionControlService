@@ -11,32 +11,58 @@ type private JournalWriter() =
     let mutable bytes = Array.zeroCreate<byte> 256
     let mutable count = 0
 
+    let ensure additional =
+        let required = count + additional
+        if required > bytes.Length then
+            let mutable capacity = bytes.Length
+            while capacity < required do capacity <- max (capacity * 2) required
+            let grown = Array.zeroCreate<byte> capacity
+            Native.copyBytes bytes 0 grown 0 count
+            bytes <- grown
+
     member _.Position = count
 
     member _.WriteByte(value: int) =
-        if count = bytes.Length then
-            let grown = Array.zeroCreate<byte> (bytes.Length * 2)
-            for index = 0 to count - 1 do
-                Native.writeByte grown index (Native.readByte bytes index)
-            bytes <- grown
+        ensure 1
         Native.writeByte bytes count value
         count <- count + 1
 
     member this.WriteBool(value: bool) = this.WriteByte(if value then 1 else 0)
 
     member this.WriteInt32(value: int) =
-        for index = 0 to 3 do
-            this.WriteByte((value >>> (index * 8)) &&& 0xFF)
+        ensure 4
+        Native.writeByte bytes count (value &&& 0xFF)
+        Native.writeByte bytes (count + 1) ((value >>> 8) &&& 0xFF)
+        Native.writeByte bytes (count + 2) ((value >>> 16) &&& 0xFF)
+        Native.writeByte bytes (count + 3) ((value >>> 24) &&& 0xFF)
+        count <- count + 4
 
     member this.WriteInt64(value: int64) =
+        ensure 8
+#if FABLE_COMPILER
+        if Native.writeNonnegativeSafeInt64 bytes count value then count <- count + 8
+        else
+            let bits = uint64 value
+            for index = 0 to 7 do
+                Native.writeByte bytes (count + index) (int ((bits >>> (index * 8)) &&& 0xFFUL))
+            count <- count + 8
+#else
         let bits = uint64 value
         for index = 0 to 7 do
-            this.WriteByte(int ((bits >>> (index * 8)) &&& 0xFFUL))
+            Native.writeByte bytes (count + index) (int ((bits >>> (index * 8)) &&& 0xFFUL))
+        count <- count + 8
+#endif
+
+    member _.WriteBytes(value: byte[]) =
+        ensure value.Length
+        Native.copyBytes value 0 bytes count value.Length
+        count <- count + value.Length
 
     member this.WriteString(value: string) =
-        let encoded = Encoding.UTF8.GetBytes(value)
-        this.WriteInt32 encoded.Length
-        for item in encoded do this.WriteByte(int item)
+        ensure (4 + value.Length * 3)
+        let written = Native.utf8EncodeInto value bytes (count + 4)
+        this.WriteInt32 written
+        count <- count + written
 
     member this.WriteOptionString(value: string option) =
         match value with
@@ -45,8 +71,7 @@ type private JournalWriter() =
 
     member _.ToArray() =
         let result = Array.zeroCreate<byte> count
-        for index = 0 to count - 1 do
-            Native.writeByte result index (Native.readByte bytes index)
+        Native.copyBytes bytes 0 result 0 count
         result
 
 type private JournalReader(bytes: byte[]) =
@@ -353,7 +378,7 @@ module internal JournalRecord =
         let writer = JournalWriter()
         writer.WriteByte 0x54
         writer.WriteInt32 payload.Length
-        for byteValue in payload do writer.WriteByte(int byteValue)
+        writer.WriteBytes payload
         writer.WriteInt32(int hash.Lo)
         writer.WriteInt32(int hash.Hi)
         writer.ToArray()

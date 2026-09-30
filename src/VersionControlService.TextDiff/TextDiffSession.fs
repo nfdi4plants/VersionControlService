@@ -162,10 +162,21 @@ type TextDiffSession internal (
         previousSide.BeginWindow(0L, windowLimit, config.WindowMaxBytes)
         currentSide.BeginWindow(0L, windowLimit, config.WindowMaxBytes)
 
+    let modeIsDone () =
+        match mode with
+        | Mode.Done -> true
+        | _ -> false
+
+    let modeIsWindowOrResync () =
+        match mode with
+        | Mode.Window
+        | Mode.Resync -> true
+        | _ -> false
+
     let progress () = {
         ValidatedBytes = int64 (min (float totalBytes) (previousSide.Coverage + currentSide.Coverage))
         TotalBytes = totalBytes
-        ScanComplete = mode = Mode.Done
+        ScanComplete = modeIsDone ()
     }
 
     let identifier (kind: string) (sequence: int64) =
@@ -174,6 +185,20 @@ type TextDiffSession internal (
         for character in prefix do
             Hash.addCodeUnit hash (int character)
         prefix + ":" + Hash.toString hash
+
+    let rowIdentifierPrefix = config.SessionId + ":r:"
+    let rowIdentifierSeed =
+        let hash = Hash.create ()
+        for character in rowIdentifierPrefix do
+            Hash.addCodeUnit hash (int character)
+        hash
+
+    let rowIdentifier (sequence: int) =
+        let sequenceText = string sequence
+        let hash = { Lo = rowIdentifierSeed.Lo; Hi = rowIdentifierSeed.Hi }
+        for character in sequenceText do
+            Hash.addCodeUnit hash (int character)
+        rowIdentifierPrefix + sequenceText + ":" + Hash.toString hash
 
     let readIdentifier (expectedKind: string) (value: string) =
         if isNull value then None
@@ -836,9 +861,17 @@ type TextDiffSession internal (
         let! target = ensureSpillStore ()
         let writer = SnapshotWriter target
         let header = HeaderBuilder()
-        let inResync = mode = Mode.Resync
+        let inResync =
+            match mode with
+            | Mode.Resync -> true
+            | _ -> false
         header.Bool inResync
-        header.Bool(windowState = WindowState.Aligning || windowState = WindowState.Comparing)
+        header.Bool(
+            match windowState with
+            | WindowState.Aligning
+            | WindowState.Comparing -> true
+            | _ -> false
+        )
         header.Int(
             match windowState with
             | WindowState.Loading -> 0
@@ -907,7 +940,7 @@ type TextDiffSession internal (
         if spilled then
             releaseWindows ()
             dropRestore ()
-        elif mode = Mode.Window || mode = Mode.Resync then
+        elif modeIsWindowOrResync () then
             do! writeSnapshot ()
             releaseWindows ()
             match aligner with
@@ -1019,7 +1052,11 @@ type TextDiffSession internal (
             match mode with
             | Mode.Common -> false
             | Mode.Resync -> false
-            | Mode.Window -> windowState = WindowState.Aligning || windowState = WindowState.Feeding
+            | Mode.Window ->
+                match windowState with
+                | WindowState.Aligning
+                | WindowState.Feeding -> true
+                | _ -> false
             | Mode.Done -> true
 
     let synchronousMicrostep (meter: Meter) =
@@ -1042,8 +1079,8 @@ type TextDiffSession internal (
                 && invalidDetail.IsNone
                 && builder.QueuedRows < config.PageMaxRows
                 && builder.QueuedFragments < config.PageMaxFragments
-                && not (mode = Mode.Done && builder.Finished)
-                && not (builder.CompletedHunks > 0 && mode <> Mode.Done && not firstPageReturned)
+                && not (modeIsDone () && builder.Finished)
+                && not (builder.CompletedHunks > 0 && not (modeIsDone ()) && not firstPageReturned)
                 && not (Meter.overBudget meter)
                 && not (Meter.quantumDue meter)
 
@@ -1115,6 +1152,28 @@ type TextDiffSession internal (
     // the page and removes the consumed queue content.
 
     let rowBuffer = Array.zeroCreate<byte> 32_768
+    let pageReadBuffer = Array.zeroCreate<byte> (1024 * 1024)
+
+    let makeDiffLine (line: LineRef) text = {
+        Number = int64 line.Number
+        Ending = LineEndingCode.toLineEnding line.Ending
+        Slice = { OffsetUtf16 = 0L; TotalUtf16 = Some(int64 line.Length); Text = text; Highlights = Array.empty }
+    }
+
+    let decodeLine (encoding: TextEncoding) (line: LineRef) (bytes: byte[]) offset want =
+        textCount <- 0
+        if want > 0 then
+            let state = Decoders.createAt encoding (int64 line.Start)
+            Decoders.decode state bytes offset want (fun _ _ value ->
+                if textCount < textUnits.Length then textUnits[textCount] <- uint16 value
+                textCount <- textCount + 1)
+            |> ignore
+        let mutable count = min textCount textUnits.Length
+        if count > 0 && textUnits[count - 1] >= 0xD800us && textUnits[count - 1] <= 0xDBFFus then count <- count - 1
+        makeDiffLine line (Native.utf16Decode textUnits count)
+
+    let lineContentBytes encoding (line: LineRef) =
+        max 0.0 (line.Finish - line.Start - float (Widths.endingWidth encoding line.Ending))
 
     let readLine (spec: SourceSpec) (encoding: TextEncoding) (line: LineRef) : Async<DiffLine option> = async {
         let contentBytes = line.Finish - line.Start - Widths.endingWidth encoding line.Ending
@@ -1124,65 +1183,93 @@ type TextDiffSession internal (
             sourceChanged ()
             return None
         else
-            textCount <- 0
-            if want > 0 then
-                let state = Decoders.createAt encoding (int64 line.Start)
-                Decoders.decode state rowBuffer 0 want (fun _ _ value ->
-                    if textCount < textUnits.Length then textUnits[textCount] <- uint16 value
-                    textCount <- textCount + 1)
-                |> ignore
-            let mutable count = min textCount textUnits.Length
-            if count > 0 && textUnits[count - 1] >= 0xD800us && textUnits[count - 1] <= 0xDBFFus then count <- count - 1
-            let text = Native.utf16Decode textUnits count
-            return
-                Some {
-                    Number = int64 line.Number
-                    Ending = LineEndingCode.toLineEnding line.Ending
-                    Slice = { OffsetUtf16 = 0L; TotalUtf16 = Some(int64 line.Length); Text = text; Highlights = Array.empty }
-                }
+            return Some(decodeLine encoding line rowBuffer 0 want)
     }
 
-    let buildRow (id: string) (row: RowRef) : Async<DiffRow option> = async {
-        match row.Kind with
-        | DiffRowKind.Context
-        | DiffRowKind.EndingChanged ->
-            let! previous = readLine previousSpec previousEncoding row.Previous
-            match previous with
-            | None -> return None
-            | Some previousLine ->
-                let currentLine = {
-                    previousLine with
-                        Number = int64 row.Current.Number
-                        Ending = LineEndingCode.toLineEnding row.Current.Ending
-                        Slice = { previousLine.Slice with TotalUtf16 = Some(int64 row.Current.Length) }
-                }
-                return Some { Id = id; Kind = row.Kind; Previous = Some previousLine; Current = Some currentLine }
-        | DiffRowKind.Removed ->
-            let! previous = readLine previousSpec previousEncoding row.Previous
-            return previous |> Option.map (fun line -> { Id = id; Kind = row.Kind; Previous = Some line; Current = None })
-        | DiffRowKind.Added ->
-            let! current = readLine currentSpec currentEncoding row.Current
-            return current |> Option.map (fun line -> { Id = id; Kind = row.Kind; Previous = None; Current = Some line })
-        | DiffRowKind.Replaced ->
-            let! previous = readLine previousSpec previousEncoding row.Previous
-            let! current = readLine currentSpec currentEncoding row.Current
-            match previous, current with
-            | Some previousLine, Some currentLine ->
-                return Some { Id = id; Kind = row.Kind; Previous = Some previousLine; Current = Some currentLine }
-            | _ -> return None
+    let decodeUtf8BatchLines (lines: LineRef[]) firstIndex finishIndex (decoded: DiffLine[]) (text: string) =
+        let mutable textOffset = 0
+        for lineIndex = firstIndex to finishIndex - 1 do
+            let line = lines[lineIndex]
+            let lineLength = int line.Length
+            let available = max 0 (min lineLength (text.Length - textOffset))
+            let mutable count = min textUnits.Length available
+            if count > 0 && Char.IsHighSurrogate(text[textOffset + count - 1]) then count <- count - 1
+            let lineText = if count = 0 then "" else text.Substring(textOffset, count)
+            decoded[lineIndex] <- makeDiffLine line lineText
+            textOffset <- textOffset + lineLength + (if line.Ending = LineEndingCode.CRLF then 2 else if line.Ending = LineEndingCode.NoEnding then 0 else 1)
+
+    let decodeBatchLines (encoding: TextEncoding) (lines: LineRef[]) firstIndex finishIndex (decoded: DiffLine[]) (batchStart: float) =
+        for lineIndex = firstIndex to finishIndex - 1 do
+            let line = lines[lineIndex]
+            let offset = int (line.Start - batchStart)
+            let want = int (min 32_768.0 (lineContentBytes encoding line))
+            decoded[lineIndex] <- decodeLine encoding line pageReadBuffer offset want
+
+    let findBatchEnd (encoding: TextEncoding) (lines: LineRef[]) index batchStart initialFinish =
+        let mutable batchFinish = initialFinish
+        let mutable stop = false
+        let mutable finishIndex = index + 1
+        while finishIndex < lines.Length && not stop do
+            let next = lines[finishIndex]
+            if next.Start = batchFinish
+               && lineContentBytes encoding next <= 32_768.0
+               && next.Finish - batchStart <= float pageReadBuffer.Length then
+                batchFinish <- next.Finish
+                finishIndex <- finishIndex + 1
+            else stop <- true
+        finishIndex, batchFinish
+
+    let readLines (spec: SourceSpec) (encoding: TextEncoding) (lines: LineRef[]) : Async<DiffLine[] option> = async {
+        let decoded = Array.zeroCreate<DiffLine> lines.Length
+        let mutable index = 0
+        let mutable failed = false
+        let readIndividually () = async {
+            let! line = readLine spec encoding lines[index]
+            match line with
+            | Some value -> decoded[index] <- value; index <- index + 1
+            | None -> failed <- true
+        }
+        while index < lines.Length && not failed do
+            let first = lines[index]
+            let firstContentBytes = lineContentBytes encoding first
+            let firstSpan = first.Finish - first.Start
+            if firstContentBytes > 32_768.0 || firstSpan > float pageReadBuffer.Length then
+                do! readIndividually ()
+            else
+                let batchStart = first.Start
+                let finishIndex, batchFinish = findBatchEnd encoding lines index batchStart first.Finish
+                let byteCount = int (batchFinish - batchStart)
+                let! status = if byteCount = 0 then async.Return 1 else readFully spec.Source.Value batchStart pageReadBuffer byteCount
+                if status <> 1 then
+                    sourceChanged ()
+                    failed <- true
+                else
+                    let validUtf8 =
+                        match encoding with
+                        | TextEncoding.Utf8 -> Native.isUtf8 pageReadBuffer 0 byteCount
+                        | _ -> false
+                    if validUtf8 then
+                        let text = Native.utf8Decode pageReadBuffer 0 byteCount
+                        decodeUtf8BatchLines lines index finishIndex decoded text
+                    else
+                        decodeBatchLines encoding lines index finishIndex decoded batchStart
+                    index <- finishIndex
+        if failed then return None else return Some decoded
     }
 
     let countSide (rows: RowRef[]) (first: int) (count: int) (previousSide: bool) =
         let mutable total = 0
         for index = first to first + count - 1 do
-            let kind = rows[index].Kind
-            if (if previousSide then LineRefs.hasPrevious kind else LineRefs.hasCurrent kind) then total <- total + 1
+            match rows[index].Kind with
+            | DiffRowKind.Added when previousSide -> ()
+            | DiffRowKind.Removed when not previousSide -> ()
+            | _ -> total <- total + 1
         total
 
-    let rowsPart (item: QueueItem) (start: int) (previousBefore: int) (currentBefore: int) (built: DiffRow[]) =
+    let rowsPart hunkId (item: QueueItem) (start: int) (previousBefore: int) (currentBefore: int) (built: DiffRow[]) =
         let taken = built.Length
         DiffPart.Hunk {
-            HunkId = identifier "h" (int64 item.Sequence)
+            HunkId = hunkId
             PreviousRange = {
                 Start = int64 item.PreviousStart + int64 previousBefore
                 Count = int64 (countSide item.Rows start taken true)
@@ -1196,12 +1283,83 @@ type TextDiffSession internal (
             Body = HunkBody.AlignedRows built
         }
 
-    let lanePart (item: QueueItem) (isPrevious: bool) (start: int) (built: DiffLine[]) =
+    let collectRowRefs (item: QueueItem) (start: int) (count: int) =
+        let previousCount = countSide item.Rows start count true
+        let currentCount = countSide item.Rows start count false
+        let previousRefs = Array.zeroCreate<LineRef> previousCount
+        let currentRefs = Array.zeroCreate<LineRef> currentCount
+        let mutable previousRefIndex = 0
+        let mutable currentRefIndex = 0
+        for index = start to start + count - 1 do
+            let row = item.Rows[index]
+            match row.Kind with
+            | DiffRowKind.Added -> currentRefs[currentRefIndex] <- row.Current; currentRefIndex <- currentRefIndex + 1
+            | DiffRowKind.Removed -> previousRefs[previousRefIndex] <- row.Previous; previousRefIndex <- previousRefIndex + 1
+            | DiffRowKind.Replaced ->
+                previousRefs[previousRefIndex] <- row.Previous
+                currentRefs[currentRefIndex] <- row.Current
+                previousRefIndex <- previousRefIndex + 1
+                currentRefIndex <- currentRefIndex + 1
+            | DiffRowKind.Context
+            | DiffRowKind.EndingChanged -> previousRefs[previousRefIndex] <- row.Previous; previousRefIndex <- previousRefIndex + 1
+        previousRefs, currentRefs
+
+    let makeRows (item: QueueItem) (start: int) (count: int) (firstId: int64) (previousValues: DiffLine[]) (currentValues: DiffLine[]) =
+        let fastIdStart =
+            if firstId >= 0L && firstId + int64 (max 0 (count - 1)) <= int64 Int32.MaxValue then int firstId
+            else -1
+        let rows = Array.zeroCreate<DiffRow> count
+        let mutable previousRefIndex = 0
+        let mutable currentRefIndex = 0
+        for index = 0 to count - 1 do
+            let row = item.Rows[start + index]
+            let id = if fastIdStart >= 0 then rowIdentifier (fastIdStart + index) else identifier "r" (firstId + int64 index)
+            match row.Kind with
+            | DiffRowKind.Context
+            | DiffRowKind.EndingChanged ->
+                let previousLine = previousValues[previousRefIndex]
+                previousRefIndex <- previousRefIndex + 1
+                let currentLine = {
+                    previousLine with
+                        Number = int64 row.Current.Number
+                        Ending = LineEndingCode.toLineEnding row.Current.Ending
+                        Slice = { previousLine.Slice with TotalUtf16 = Some(int64 row.Current.Length) }
+                }
+                rows[index] <- { Id = id; Kind = row.Kind; Previous = Some previousLine; Current = Some currentLine }
+            | DiffRowKind.Removed ->
+                let previousLine = previousValues[previousRefIndex]
+                previousRefIndex <- previousRefIndex + 1
+                rows[index] <- { Id = id; Kind = row.Kind; Previous = Some previousLine; Current = None }
+            | DiffRowKind.Added ->
+                let currentLine = currentValues[currentRefIndex]
+                currentRefIndex <- currentRefIndex + 1
+                rows[index] <- { Id = id; Kind = row.Kind; Previous = None; Current = Some currentLine }
+            | DiffRowKind.Replaced ->
+                let previousLine = previousValues[previousRefIndex]
+                let currentLine = currentValues[currentRefIndex]
+                previousRefIndex <- previousRefIndex + 1
+                currentRefIndex <- currentRefIndex + 1
+                rows[index] <- { Id = id; Kind = row.Kind; Previous = Some previousLine; Current = Some currentLine }
+        rows
+
+    let buildRows (item: QueueItem) (start: int) (count: int) (firstId: int64) : Async<DiffRow[] option> = async {
+        let previousRefs, currentRefs = collectRowRefs item start count
+        let! previousLines = readLines previousSpec previousEncoding previousRefs
+        match previousLines with
+        | None -> return None
+        | Some previousValues ->
+            let! currentLines = readLines currentSpec currentEncoding currentRefs
+            match currentLines with
+            | None -> return None
+            | Some currentValues -> return Some(makeRows item start count firstId previousValues currentValues)
+    }
+
+    let lanePart hunkId (item: QueueItem) (isPrevious: bool) (start: int) (built: DiffLine[]) =
         let lines = if isPrevious then item.PreviousLines else item.CurrentLines
         let own = { Start = int64 lines[start].Number; Count = int64 built.Length }
         let other = { Start = int64 (if isPrevious then item.CurrentStart else item.PreviousStart); Count = 0L }
         DiffPart.Hunk {
-            HunkId = identifier "h" (int64 item.Sequence)
+            HunkId = hunkId
             PreviousRange = if isPrevious then own else other
             CurrentRange = if isPrevious then other else own
             StartsHunk = item.StartsHunk && start = 0
@@ -1209,51 +1367,42 @@ type TextDiffSession internal (
             Body = if isPrevious then HunkBody.UnalignedSides(built, Array.empty) else HunkBody.UnalignedSides(Array.empty, built)
         }
 
-    /// Reads up to available entries and keeps as many as fit in byteRoom. Sizes are estimated from a one entry
-    /// fragment per entry and verified against the sizer for the whole fragment.
-    let takeFragment
+    let takeBuiltFragment
         (available: int)
         (byteRoom: int)
         (cancel: unit -> bool)
-        (readEntry: int -> Async<obj option>)
-        (makePart: obj[] -> DiffPart)
-        : Async<FragmentBuild option> =
-        async {
-            let built = ResizeArray<obj>()
-            let baseSize = sizer (makePart Array.empty)
-            let mutable estimate = baseSize
-            let mutable index = 0
-            let mutable stop = false
-            let mutable interrupted = false
-            while not stop && index < available do
-                if index &&& 255 = 255 && cancel () then
-                    interrupted <- true
-                    stop <- true
-                else
-                    let! entry = readEntry index
-                    match entry with
-                    | None ->
-                        interrupted <- true
-                        stop <- true
-                    | Some value ->
-                        let cost = max 0 (sizer (makePart [| value |]) - baseSize) + 1
-                        if estimate + cost > byteRoom then stop <- true
-                        else
-                            built.Add value
-                            estimate <- estimate + cost
-                            index <- index + 1
-            if interrupted then return None
+        (values: 'T[])
+        (makePart: 'T[] -> DiffPart)
+        =
+        let empty = Array.empty<'T>
+        let one = Array.zeroCreate<'T> 1
+        let baseSize = sizer (makePart empty)
+        let mutable estimate = baseSize
+        let mutable index = 0
+        let mutable stop = false
+        let mutable interrupted = false
+        while not stop && index < available do
+            if index &&& 255 = 255 && cancel () then
+                interrupted <- true
+                stop <- true
             else
-                let all = built.ToArray()
-                let mutable taken = all.Length
-                let mutable part = makePart all
-                let mutable size = sizer part
-                while size > byteRoom && taken > 0 do
-                    taken <- taken - 1
-                    part <- makePart (Array.sub all 0 taken)
-                    size <- sizer part
-                return Some { Part = part; Taken = taken; Size = size }
-        }
+                one[0] <- values[index]
+                let cost = max 0 (sizer (makePart one) - baseSize) + 1
+                if estimate + cost > byteRoom then stop <- true
+                else
+                    estimate <- estimate + cost
+                    index <- index + 1
+        if interrupted then None
+        else
+            let all = if index = values.Length then values else Array.sub values 0 index
+            let mutable taken = all.Length
+            let mutable part = makePart all
+            let mutable size = sizer part
+            while size > byteRoom && taken > 0 do
+                taken <- taken - 1
+                part <- makePart (Array.sub all 0 taken)
+                size <- sizer part
+            Some { Part = part; Taken = taken; Size = size }
 
     let buildPage (sequence: int64) (cancel: unit -> bool) : Async<PageBuild> = async {
         let items = Seq.toArray builder.Items
@@ -1296,39 +1445,34 @@ type TextDiffSession internal (
                 let available = min item.Remaining (config.PageMaxRows - rowsUsed)
                 let byteRoom = config.PageMaxBytes - usedBytes
                 let! fragment =
-                    if item.Kind = ItemKind.Rows then
+                    if item.Kind = ItemKind.Rows then async {
                         let previousBefore = countSide item.Rows 0 start true
                         let currentBefore = countSide item.Rows 0 start false
                         let firstId = nextRow
-                        takeFragment
-                            available
-                            byteRoom
-                            cancel
-                            (fun offset -> async {
-                                let! row = buildRow (identifier "r" (firstId + int64 offset)) item.Rows[start + offset]
-                                return row |> Option.map box
-                            })
-                            (fun built -> rowsPart item start previousBefore currentBefore (Array.map unbox<DiffRow> built))
-                    elif item.PreviousLines.Length > 0 then
-                        takeFragment
-                            available
-                            byteRoom
-                            cancel
-                            (fun offset -> async {
-                                let! line = readLine previousSpec previousEncoding item.PreviousLines[start + offset]
-                                return line |> Option.map box
-                            })
-                            (fun built -> lanePart item true start (Array.map unbox<DiffLine> built))
+                        let hunkId = identifier "h" (int64 item.Sequence)
+                        let! built = buildRows item start available firstId
+                        match built with
+                        | None -> return None
+                        | Some rows ->
+                            return takeBuiltFragment available byteRoom cancel rows (fun values -> rowsPart hunkId item start previousBefore currentBefore values)
+                    }
+                    elif item.PreviousLines.Length > 0 then async {
+                        let lines = Array.sub item.PreviousLines start available
+                        let hunkId = identifier "h" (int64 item.Sequence)
+                        let! decoded = readLines previousSpec previousEncoding lines
+                        match decoded with
+                        | None -> return None
+                        | Some values -> return takeBuiltFragment available byteRoom cancel values (lanePart hunkId item true start)
+                    }
                     else
-                        takeFragment
-                            available
-                            byteRoom
-                            cancel
-                            (fun offset -> async {
-                                let! line = readLine currentSpec currentEncoding item.CurrentLines[start + offset]
-                                return line |> Option.map box
-                            })
-                            (fun built -> lanePart item false start (Array.map unbox<DiffLine> built))
+                        async {
+                            let lines = Array.sub item.CurrentLines start available
+                            let hunkId = identifier "h" (int64 item.Sequence)
+                            let! decoded = readLines currentSpec currentEncoding lines
+                            match decoded with
+                            | None -> return None
+                            | Some values -> return takeBuiltFragment available byteRoom cancel values (lanePart hunkId item false start)
+                        }
                 match fragment with
                 | None ->
                     interrupted <- true
@@ -1422,8 +1566,8 @@ type TextDiffSession internal (
                     result <- Some(EngineResult.Failed(code, message, None))
                 else
                     let hardTrigger = builder.QueuedRows >= config.PageMaxRows || builder.QueuedFragments >= config.PageMaxFragments
-                    let doneTrigger = mode = Mode.Done && builder.Finished
-                    let softTrigger = builder.CompletedHunks > 0 && mode <> Mode.Done && not firstPageReturned
+                    let doneTrigger = modeIsDone () && builder.Finished
+                    let softTrigger = builder.CompletedHunks > 0 && not (modeIsDone ()) && not firstPageReturned
                     if hardTrigger || doneTrigger || softTrigger then
                         let! produced = producePage sequence cancel
                         match produced with

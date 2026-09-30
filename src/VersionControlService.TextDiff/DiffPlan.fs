@@ -155,7 +155,11 @@ module internal DiffOperations =
             if last >= 0 then
                 let tail = operations[last]
                 let merged =
-                    tail.Kind = operation.Kind
+                    (match tail.Kind, operation.Kind with
+                     | OperationKind.Equal, OperationKind.Equal
+                     | OperationKind.Removed, OperationKind.Removed
+                     | OperationKind.Added, OperationKind.Added -> true
+                     | _ -> false)
                     && (match operation.Kind with
                         | OperationKind.Equal ->
                             tail.PreviousIndex + tail.PreviousCount = operation.PreviousIndex

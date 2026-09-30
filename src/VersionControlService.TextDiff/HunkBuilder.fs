@@ -61,8 +61,13 @@ module internal LineRefs =
         Ending = int (table.EndingCode index)
     }
 
-    let hasPrevious kind = kind <> DiffRowKind.Added
-    let hasCurrent kind = kind <> DiffRowKind.Removed
+    let hasPrevious = function
+        | DiffRowKind.Added -> false
+        | _ -> true
+
+    let hasCurrent = function
+        | DiffRowKind.Removed -> false
+        | _ -> true
 
 /// Groups a stream of aligned lines into gaps, hunks and unaligned regions. It stores line positions and never
 /// line text. Hunks carry ContextLines lines of context on each side, merge when the equal lines between them

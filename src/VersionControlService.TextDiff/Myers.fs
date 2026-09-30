@@ -28,7 +28,7 @@ type private MyersTask =
     | WriteInserts of currentStart: int * count: int
 
 [<RequireQualifiedAccess>]
-type private RangeStage =
+type internal RangeStage =
     | Prefix
     | Suffix
     | Prepare
@@ -39,7 +39,7 @@ type private RangeStage =
     | ReverseSnake
     | Fallback
 
-type private MyersRange(previousStart: int, previousEnd: int, currentStart: int, currentEnd: int) =
+type internal MyersRange(previousStart: int, previousEnd: int, currentStart: int, currentEnd: int) =
     member val PreviousStart = previousStart with get, set
     member val PreviousEnd = previousEnd with get
     member val CurrentStart = currentStart with get, set
@@ -59,12 +59,18 @@ type private MyersRange(previousStart: int, previousEnd: int, currentStart: int,
     member val OddDelta = false with get, set
     member val Forward = Array.empty<int> with get, set
     member val Reverse = Array.empty<int> with get, set
-    member val ForwardSet = Array.empty<bool> with get, set
-    member val ReverseSet = Array.empty<bool> with get, set
+    member val ForwardSet = Array.empty<byte> with get, set
+    member val ReverseSet = Array.empty<byte> with get, set
     member val D = 0 with get, set
     member val K = 0 with get, set
     member val X = 0 with get, set
     member val Y = 0 with get, set
+
+module private MyersFrontier =
+    let inline intAt (values: int[]) index = Native.readInt values index
+    let inline isSet (values: byte[]) index = Native.readByte values index <> 0
+    let inline writeInt (values: int[]) index value = Native.writeInt values index value
+    let inline markSet (values: byte[]) index = Native.writeByte values index 1
 
 type MyersStepper(
     previousStart: int,
@@ -141,12 +147,12 @@ type MyersStepper(
         let length = 2 * maxD + 3
         let forward = Array.zeroCreate<int> length
         let reverse = Array.zeroCreate<int> length
-        let forwardSet = Array.zeroCreate<bool> length
-        let reverseSet = Array.zeroCreate<bool> length
-        forward[offset + 1] <- 0
-        forwardSet[offset + 1] <- true
-        reverse[offset + 1] <- 0
-        reverseSet[offset + 1] <- true
+        let forwardSet = Array.zeroCreate<byte> length
+        let reverseSet = Array.zeroCreate<byte> length
+        Native.writeInt forward (offset + 1) 0
+        Native.writeByte forwardSet (offset + 1) 1
+        Native.writeInt reverse (offset + 1) 0
+        Native.writeByte reverseSet (offset + 1) 1
         range.N <- n
         range.M <- m
         range.MaxD <- maxD
@@ -371,14 +377,16 @@ type MyersStepper(
                             range.K <- -range.D
                         else
                             let index = range.Offset + range.K
+                            let forward = range.Forward
+                            let forwardSet = range.ForwardSet
                             let x =
                                 if range.K = -range.D
                                    || (range.K <> range.D
-                                       && (not range.ForwardSet[index - 1]
-                                           || range.Forward[index - 1] < range.Forward[index + 1])) then
-                                    if range.ForwardSet[index + 1] then range.Forward[index + 1] else 0
+                                       && (not (MyersFrontier.isSet forwardSet (index - 1))
+                                           || MyersFrontier.intAt forward (index - 1) < MyersFrontier.intAt forward (index + 1))) then
+                                    if MyersFrontier.isSet forwardSet (index + 1) then MyersFrontier.intAt forward (index + 1) else 0
                                 else
-                                    (if range.ForwardSet[index - 1] then range.Forward[index - 1] else 0) + 1
+                                    (if MyersFrontier.isSet forwardSet (index - 1) then MyersFrontier.intAt forward (index - 1) else 0) + 1
                             range.X <- x
                             range.Y <- x - range.K
                             range.Stage <- RangeStage.ForwardSnake
@@ -394,15 +402,19 @@ type MyersStepper(
                                     range.Y <- range.Y + 1
                                 else
                                     let index = range.Offset + range.K
-                                    range.Forward[index] <- range.X
-                                    range.ForwardSet[index] <- true
+                                    let forward = range.Forward
+                                    let forwardSet = range.ForwardSet
+                                    let reverse = range.Reverse
+                                    let reverseSet = range.ReverseSet
+                                    MyersFrontier.writeInt forward index range.X
+                                    MyersFrontier.markSet forwardSet index
                                     if range.OddDelta then
                                         let reverseDiagonal = range.Delta - range.K
                                         let reverseIndex = range.Offset + reverseDiagonal
                                         if reverseIndex >= 0
-                                           && reverseIndex < range.Reverse.Length
-                                           && range.ReverseSet[reverseIndex]
-                                           && range.X >= range.N - range.Reverse[reverseIndex] then
+                                           && reverseIndex < reverse.Length
+                                           && MyersFrontier.isSet reverseSet reverseIndex
+                                           && range.X >= range.N - MyersFrontier.intAt reverse reverseIndex then
                                             range.Stage <- RangeStage.Fallback
                                             let splitPrevious = range.PreviousStart + range.X
                                             let splitCurrent = range.CurrentStart + range.Y
@@ -419,15 +431,19 @@ type MyersStepper(
                             | ComparisonStep.LimitExceeded -> markLimitExceeded ()
                         else
                             let index = range.Offset + range.K
-                            range.Forward[index] <- range.X
-                            range.ForwardSet[index] <- true
+                            let forward = range.Forward
+                            let forwardSet = range.ForwardSet
+                            let reverse = range.Reverse
+                            let reverseSet = range.ReverseSet
+                            MyersFrontier.writeInt forward index range.X
+                            MyersFrontier.markSet forwardSet index
                             if range.OddDelta then
                                 let reverseDiagonal = range.Delta - range.K
                                 let reverseIndex = range.Offset + reverseDiagonal
                                 if reverseIndex >= 0
-                                   && reverseIndex < range.Reverse.Length
-                                   && range.ReverseSet[reverseIndex]
-                                   && range.X >= range.N - range.Reverse[reverseIndex] then
+                                   && reverseIndex < reverse.Length
+                                   && MyersFrontier.isSet reverseSet reverseIndex
+                                   && range.X >= range.N - MyersFrontier.intAt reverse reverseIndex then
                                     let splitPrevious = range.PreviousStart + range.X
                                     let splitCurrent = range.CurrentStart + range.Y
                                     pushSuffix range
@@ -451,14 +467,16 @@ type MyersStepper(
                                 range.Stage <- RangeStage.ForwardFrontier
                         else
                             let index = range.Offset + range.K
+                            let reverse = range.Reverse
+                            let reverseSet = range.ReverseSet
                             let x =
                                 if range.K = -range.D
                                    || (range.K <> range.D
-                                       && (not range.ReverseSet[index - 1]
-                                           || range.Reverse[index - 1] < range.Reverse[index + 1])) then
-                                    if range.ReverseSet[index + 1] then range.Reverse[index + 1] else 0
+                                       && (not (MyersFrontier.isSet reverseSet (index - 1))
+                                           || MyersFrontier.intAt reverse (index - 1) < MyersFrontier.intAt reverse (index + 1))) then
+                                    if MyersFrontier.isSet reverseSet (index + 1) then MyersFrontier.intAt reverse (index + 1) else 0
                                 else
-                                    (if range.ReverseSet[index - 1] then range.Reverse[index - 1] else 0) + 1
+                                    (if MyersFrontier.isSet reverseSet (index - 1) then MyersFrontier.intAt reverse (index - 1) else 0) + 1
                             range.X <- x
                             range.Y <- x - range.K
                             range.Stage <- RangeStage.ReverseSnake
@@ -474,16 +492,20 @@ type MyersStepper(
                                     range.Y <- range.Y + 1
                                 else
                                     let index = range.Offset + range.K
-                                    range.Reverse[index] <- range.X
-                                    range.ReverseSet[index] <- true
+                                    let reverse = range.Reverse
+                                    let reverseSet = range.ReverseSet
+                                    let forward = range.Forward
+                                    let forwardSet = range.ForwardSet
+                                    MyersFrontier.writeInt reverse index range.X
+                                    MyersFrontier.markSet reverseSet index
                                     if not range.OddDelta then
                                         let forwardDiagonal = range.Delta - range.K
                                         let forwardIndex = range.Offset + forwardDiagonal
                                         if forwardIndex >= 0
-                                           && forwardIndex < range.Forward.Length
-                                           && range.ForwardSet[forwardIndex]
-                                           && range.Forward[forwardIndex] >= range.N - range.X then
-                                            let x = range.Forward[forwardIndex]
+                                           && forwardIndex < forward.Length
+                                           && MyersFrontier.isSet forwardSet forwardIndex
+                                           && MyersFrontier.intAt forward forwardIndex >= range.N - range.X then
+                                            let x = MyersFrontier.intAt forward forwardIndex
                                             let y = x - forwardDiagonal
                                             let splitPrevious = range.PreviousStart + x
                                             let splitCurrent = range.CurrentStart + y
@@ -500,16 +522,20 @@ type MyersStepper(
                             | ComparisonStep.LimitExceeded -> markLimitExceeded ()
                         else
                             let index = range.Offset + range.K
-                            range.Reverse[index] <- range.X
-                            range.ReverseSet[index] <- true
+                            let reverse = range.Reverse
+                            let reverseSet = range.ReverseSet
+                            let forward = range.Forward
+                            let forwardSet = range.ForwardSet
+                            MyersFrontier.writeInt reverse index range.X
+                            MyersFrontier.markSet reverseSet index
                             if not range.OddDelta then
                                 let forwardDiagonal = range.Delta - range.K
                                 let forwardIndex = range.Offset + forwardDiagonal
                                 if forwardIndex >= 0
-                                   && forwardIndex < range.Forward.Length
-                                   && range.ForwardSet[forwardIndex]
-                                   && range.Forward[forwardIndex] >= range.N - range.X then
-                                    let x = range.Forward[forwardIndex]
+                                   && forwardIndex < forward.Length
+                                   && MyersFrontier.isSet forwardSet forwardIndex
+                                   && MyersFrontier.intAt forward forwardIndex >= range.N - range.X then
+                                    let x = MyersFrontier.intAt forward forwardIndex
                                     let y = x - forwardDiagonal
                                     let splitPrevious = range.PreviousStart + x
                                     let splitCurrent = range.CurrentStart + y
