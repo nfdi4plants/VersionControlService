@@ -27,6 +27,18 @@ module TextDiffSessionCases =
                 return outcome
             }
 
+    type private DelayedByteSource(bytes: byte[], clock: ManualClock, delayMs: float) =
+        let inner = MemoryByteSource(bytes) :> IByteSource
+
+        interface IByteSource with
+            member _.KnownLength = inner.KnownLength
+            member _.AvailableLength() = inner.AvailableLength()
+            member _.IsComplete() = inner.IsComplete()
+            member _.ReadAt position buffer offset count = async {
+                clock.Advance delayMs
+                return! inner.ReadAt position buffer offset count
+            }
+
     let private endingText = function
         | LineEnding.NoEnding -> ""
         | LineEnding.LF -> "\n"
@@ -112,6 +124,30 @@ module TextDiffSessionCases =
             return failwith $"The session failed with {code}: {message}. Detail: {detail}."
         | EngineResult.Canceled -> return failwith "The session canceled an uncanceled request."
     }
+
+    let private faultHost sessionId =
+        let pairWrites = ref false
+        let indexWrites = ref false
+        let indexWriteCount = ref 0
+        let plain = Host.createInMemory (ManualClock 0.0 :> IClock)
+        let createStore name = async {
+            let! inner = plain.CreateTempStore name
+            return
+                { new ITempStore with
+                    member _.Append buffer offset count = inner.Append buffer offset count
+                    member _.WriteAt position buffer offset count = async {
+                        if name = sessionId + ":pairs" && pairWrites.Value then
+                            failwith "injected pair store write failure"
+                        if name = sessionId + ":journal-index" && indexWrites.Value then
+                            indexWriteCount.Value <- indexWriteCount.Value + 1
+                            if indexWriteCount.Value = 2 then failwith "injected journal link failure"
+                        return! inner.WriteAt position buffer offset count
+                    }
+                    member _.ReadAt position buffer offset count = inner.ReadAt position buffer offset count
+                    member _.Length() = inner.Length()
+                    member _.Dispose() = inner.Dispose() }
+        }
+        { plain with CreateTempStore = createStore }, pairWrites, indexWrites
 
     let private sourceSpecWith (source: IByteSource) (encoding: string) (bomLength: int) (byteLength: int64) = {
         Source = Some source
@@ -592,6 +628,93 @@ module TextDiffSessionCases =
             let! secondInitial = session.ReadLine(DiffSide.Previous, 0L, int64 first.Slice.Text.Length, 128, None, fun () -> false)
             let! second = resolveLine session DiffSide.Previous 0L (int64 first.Slice.Text.Length) 128 secondInitial
             Check.true' (second.Slice.Text.StartsWith("😀", StringComparison.Ordinal)) "The next slice starts with the complete surrogate pair."
+            do! session.Close()
+            return ()
+        }
+        "abandoned line reads release scratch and expire old continuations", fun () -> async {
+            let words count (format: int -> string) = String.Join(" ", Array.init count format)
+            let previousLine = words 3_500 (fun index -> sprintf "w%06d" index)
+            let currentLine = words 3_500 (fun index -> if index = 2_000 then sprintf "X%06d" index else sprintf "w%06d" index)
+            let previous = [|
+                { Text = "head"; Ending = LineEnding.LF }
+                { Text = previousLine; Ending = LineEnding.LF }
+                { Text = "tail"; Ending = LineEnding.LF }
+            |]
+            let current = [|
+                { Text = "head"; Ending = LineEnding.LF }
+                { Text = currentLine; Ending = LineEnding.LF }
+                { Text = "tail"; Ending = LineEnding.LF }
+            |]
+            let limits = { Limits.defaults with MaxUnits = 12; RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 }
+            let lineConfig = { defaultConfig () with Limits = limits }
+            let clock = ManualClock 0.0
+            let host = Host.createInMemory (clock :> IClock)
+            let ledger = Ledger()
+            let! session = TextDiffSession.create host ledger lineConfig (fun _ -> 100) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+            let! pages = readAll session (fun () -> false)
+            let changed = rows (allParts pages) |> Array.find (fun row -> row.Kind = DiffRowKind.Replaced)
+            Check.equal 1L changed.Current.Value.Number "The long changed line is available for line reads."
+
+            let pagePrevious = Array.init 2_001 (fun index -> { Text = "row " + string index; Ending = LineEnding.LF })
+            let pageCurrent = Array.init 2_001 (fun index -> { Text = (if index % 7 = 3 then "edit " + string index else "row " + string index); Ending = LineEnding.LF })
+            let pageConfig = { config 3 1_000 1_024 4 limits with PageMaxFragments = 1 }
+            let resolveFirstPageWithCount (value: TextDiffSession) = async {
+                let! first = value.FirstPage(fun () -> false)
+                let mutable result = first
+                let mutable page = None
+                let mutable requests = 1
+                while page.IsNone && requests < 100 do
+                    match result with
+                    | EngineResult.Ok(Resumable.Ready ready) -> page <- Some ready
+                    | EngineResult.Ok(Resumable.Scanning(_, continuation, _)) ->
+                        let! next = value.ReadPage continuation (fun () -> false)
+                        result <- next
+                        requests <- requests + 1
+                    | other -> failwith $"The page read returned {other}."
+                match page with
+                | Some ready -> return ready, requests
+                | None -> return failwith "The page read did not finish within its request budget."
+            }
+            let openPageSession sessionId =
+                TextDiffSession.create host ledger { pageConfig with SessionId = sessionId } (fun _ -> 100) (sourceSpec (encodeLines pagePrevious)) (sourceSpec (encodeLines pageCurrent))
+            let! baselineSession = openPageSession "abandoned-read-baseline"
+            let! _, baselineRequests = resolveFirstPageWithCount baselineSession
+            do! baselineSession.Close()
+
+            let continuations = ResizeArray<string>()
+            for _ in 1 .. 16 do
+                let! result = session.ReadLine(DiffSide.Current, 1L, 8_192L, 8_192, None, fun () -> false)
+                match result with
+                | EngineResult.Ok(Resumable.Scanning(_, continuation, _)) -> continuations.Add continuation
+                | other -> failwith $"The abandoned line read returned {other}."
+                Check.equal 0L (ledger.Used AllocationCategory.AlignmentScratch) "A suspended line read releases its pair-analysis reservation."
+
+            let! expired = session.ReadLine(DiffSide.Current, 1L, 8_192L, 8_192, Some continuations[0], fun () -> false)
+            match expired with
+            | EngineResult.Failed("continuation_mismatch", _, _) -> ()
+            | other -> failwith $"The oldest line continuation returned {other}."
+
+            let! freshInitial = session.ReadLine(DiffSide.Current, 1L, 0L, 8_192, None, fun () -> false)
+            let mutable freshResult = freshInitial
+            let mutable freshLine = None
+            let mutable freshRequests = 1
+            while freshLine.IsNone && freshRequests < 40 do
+                match freshResult with
+                | EngineResult.Ok(Resumable.Ready line) -> freshLine <- Some line
+                | EngineResult.Ok(Resumable.Scanning(_, continuation, _)) ->
+                    let! next = session.ReadLine(DiffSide.Current, 1L, 0L, 8_192, Some continuation, fun () -> false)
+                    freshResult <- next
+                    freshRequests <- freshRequests + 1
+                | other -> failwith $"The fresh line read returned {other}."
+            Check.true' freshLine.IsSome "A fresh line read finishes within its usual request budget."
+            Check.equal (Some(int64 currentLine.Length)) freshLine.Value.Slice.TotalUtf16 "The fresh line read keeps its total length."
+            Check.equal 0L (ledger.Used AllocationCategory.AlignmentScratch) "A completed line read releases pair-analysis scratch."
+
+            let! pageSession = openPageSession "abandoned-read-page"
+            let! page, pageRequests = resolveFirstPageWithCount pageSession
+            Check.true' (page.Parts.Length > 0) "A new page is available after the abandoned reads."
+            Check.true' (pageRequests <= baselineRequests + 1) "The page takes its usual number of requests after the abandoned reads."
+            do! pageSession.Close()
             do! session.Close()
             return ()
         }
@@ -1582,6 +1705,314 @@ module TextDiffSessionCases =
                 checkOracle previous current pages
                 do! session.Close()
 
+            return ()
+        }
+        "journal entries stay readable after many page and gap keys", fun () -> async {
+            let lines changed =
+                Array.init 400 (fun index ->
+                    let text =
+                        if changed && index % 10 = 5 then "changed line " + string index + " with some words"
+                        else "line " + string index + " with some words"
+                    { Text = text; Ending = LineEnding.LF })
+            let sessionConfig = { defaultConfig () with PageMaxFragments = 1 }
+            let! session = openSession sessionConfig (sourceSpec (encodeLines (lines false))) (sourceSpec (encodeLines (lines true)))
+            let! pages = readAll session (fun () -> false)
+            Check.true' (pages.Length > 13) "The session records more than thirteen pages."
+            let gaps = allParts pages |> Array.choose (function DiffPart.HiddenEqual gap -> Some gap | _ -> None)
+            Check.true' (gaps.Length > 12) "The session records gap keys above sequence twelve."
+            for gap in gaps do
+                let! initial = session.Expand(gap.GapId, true, 100, None, fun () -> false)
+                let! _ = resolveExpansion session gap.GapId true 100 initial
+                ()
+            do! session.Close()
+            return ()
+        }
+        "line reads do not corrupt later page records", fun () -> async {
+            let lines changed =
+                Array.init 400 (fun index ->
+                    let text =
+                        if changed && index % 10 = 5 then "changed line " + string index + " with some words"
+                        else "line " + string index + " with some words"
+                    { Text = text; Ending = LineEnding.LF })
+            let sessionConfig = { defaultConfig () with PageMaxFragments = 1 }
+            let! session = openSession sessionConfig (sourceSpec (encodeLines (lines false))) (sourceSpec (encodeLines (lines true)))
+            let! initial = session.FirstPage(fun () -> false)
+            let! first = resolvePage session (fun () -> false) initial
+            let mutable page = first
+            for line in 0L .. 39L do
+                let! result = session.ReadLine(DiffSide.Current, line, 0L, 128, None, fun () -> false)
+                let! _ = resolveLine session DiffSide.Current line 0L 128 result
+                ()
+            let mutable pages = 1
+            while page.NextCursor.IsSome do
+                let! next = session.ReadPage page.NextCursor.Value (fun () -> false)
+                let! ready = resolvePage session (fun () -> false) next
+                page <- ready
+                pages <- pages + 1
+            Check.true' (pages > 13) "The page sequence remains readable through the end."
+            do! session.Close()
+            return ()
+        }
+        "slow source reads still advance scanner chunks", fun () -> async {
+            let previousLines = Array.init 180 (fun index -> { Text = "line " + string index; Ending = LineEnding.LF })
+            let currentLines = Array.copy previousLines
+            currentLines[90] <- { currentLines[90] with Text = "changed line ninety" }
+            let previousBytes = encodeLines previousLines
+            let currentBytes = encodeLines currentLines
+            let normalConfig = { defaultConfig () with Limits = { Limits.defaults with RequestMs = 1e12; QuantumMs = 1_000_000.0 } }
+            let! normal = openSession normalConfig (sourceSpec previousBytes) (sourceSpec currentBytes)
+            let! normalPages = readAll normal (fun () -> false)
+            let rowShape pages =
+                allParts pages
+                |> Array.collect (function
+                    | DiffPart.Hunk { Body = HunkBody.AlignedRows values } -> values |> Array.map (fun row -> row.Kind, row.Previous |> Option.map (fun line -> line.Slice.Text), row.Current |> Option.map (fun line -> line.Slice.Text))
+                    | _ -> Array.empty)
+            let normalRows = rowShape normalPages
+            do! normal.Close()
+            for delay in [| 11.0; 50.0 |] do
+                let clock = ManualClock 0.0
+                let host = Host.createInMemory (clock :> IClock)
+                let sessionConfig = { defaultConfig () with Limits = { Limits.defaults with RequestMs = 1e12; QuantumMs = 10.0 } }
+                let previous = { sourceSpec previousBytes with Source = Some(DelayedByteSource(previousBytes, clock, delay) :> IByteSource) }
+                let current = { sourceSpec currentBytes with Source = Some(DelayedByteSource(currentBytes, clock, delay) :> IByteSource) }
+                let! session = TextDiffSession.create host (Ledger()) sessionConfig (fun _ -> 1) previous current
+                let! pages = readAll session (fun () -> false)
+                Check.sequence normalRows (rowShape pages) "Slow reads preserve the normal diff rows."
+                do! session.Close()
+            return ()
+        }
+        "control evidence follows complete windows on both sides", fun () -> async {
+            let buildControlText tag addEsc =
+                let builder = StringBuilder()
+                for index in 0 .. 999 do builder.Append(sprintf "common line %04d with some padding text\n" index) |> ignore
+                for index in 0 .. 519 do
+                    builder.Append(sprintf "%s%s line %05d padding padding padding pad\n" (if addEsc then "\u001b" else " ") tag index) |> ignore
+                for index in 0 .. 299 do builder.Append(sprintf "tail line %04d plain text here\n" index) |> ignore
+                Encoding.UTF8.GetBytes(builder.ToString())
+            let previous = buildControlText "old" false
+            let current = buildControlText "new" true
+            let! session = openSession (defaultConfig ()) (sourceSpec previous) (sourceSpec current)
+            let! pages = readAll session (fun () -> false)
+            Check.true' (pages.Length > 0) "Sparse control characters pass through the session."
+            do! session.Close()
+
+            let plain prefix index = (sprintf "%s %06d plain text line padding........" prefix index).Substring(0, 39) + "\n"
+            let text = StringBuilder()
+            let mutable number = 0
+            while text.Length < 131_072 - 650 do text.Append(plain "p" number) |> ignore; number <- number + 1
+            while text.Length < 131_072 + 650 do text.Append(String('\u0001', 49) + "\n") |> ignore
+            while text.Length < 220_000 do text.Append(plain "q" number) |> ignore; number <- number + 1
+            let previousText = text.ToString()
+            let inserted = String.concat "" [ for index in 0 .. 818 -> plain "ins" index ]
+            let currentText = inserted + previousText
+            let! deltaSession = openSession (defaultConfig ()) (sourceSpec (Encoding.UTF8.GetBytes previousText)) (sourceSpec (Encoding.UTF8.GetBytes currentText))
+            let rec findFailure (session: TextDiffSession) result = async {
+                match result with
+                | EngineResult.Failed(code, _, detail) -> return Some(code, detail)
+                | EngineResult.Ok(Resumable.Scanning(_, continuation, _)) ->
+                    let! next = session.ReadPage continuation (fun () -> false)
+                    return! findFailure session next
+                | EngineResult.Ok(Resumable.Ready page) ->
+                    match page.NextCursor with
+                    | Some cursor ->
+                        let! next = session.ReadPage cursor (fun () -> false)
+                        return! findFailure session next
+                    | None -> return None
+                | EngineResult.Canceled -> return None
+            }
+            let! deltaStart = deltaSession.FirstPage(fun () -> false)
+            let! deltaFailure = findFailure deltaSession deltaStart
+            match deltaFailure with
+            | Some(TextDiffFailureCodes.ContentNotText, Some detail) ->
+                Check.equal DiffSide.Current detail.Side "The shifted current side reports its evidence."
+                let marker = detail.Evidence.LastIndexOf("byte ", StringComparison.Ordinal)
+                let offset = Int64.Parse(detail.Evidence.Substring(marker + 5))
+                Check.true' (offset >= 131_072L && offset < 196_608L) "The current side reports the window that contains its controls."
+            | other -> failwith $"The shifted control window did not fail on the current side: {other}."
+            do! deltaSession.Close()
+
+            let wholeHasEvidence (bytes: byte[]) =
+                let state = Scanner.create TextEncoding.Utf8 0L None
+                let evidence = ResizeArray<ScannerEvidence>()
+                let meter = Meter.create (ManualClock 0.0 :> IClock) { Limits.defaults with MaxUnits = Int32.MaxValue; RequestMs = 1e15; QuantumMs = 1e15 }
+                Scanner.scanChunk state bytes 0 bytes.Length true meter (LineBatch(4)) ignore evidence.Add |> ignore
+                evidence |> Seq.exists (fun item -> item.Kind = "control ratio")
+            for perMille in [| 0; 5; 12; 25 |] do
+                let random = RandomState(uint32 (100 + perMille))
+                let bytes = Array.init 131_072 (fun _ -> if random.Next(1_000) < perMille then 1uy else 0x61uy)
+                let expected = wholeHasEvidence bytes
+                let! densitySession = openSession (defaultConfig ()) (sourceSpec bytes) (sourceSpec bytes)
+                let! first = densitySession.FirstPage(fun () -> false)
+                let! failure = findFailure densitySession first
+                Check.equal expected failure.IsSome $"Density {perMille} agrees with the whole-file scan."
+                do! densitySession.Close()
+            return ()
+        }
+        "a short final window joins the previous control window", fun () -> async {
+            let body first =
+                let builder = StringBuilder(first + "\n")
+                let mutable index = 0
+                while builder.Length < 65_575 do
+                    builder.Append(sprintf "line %05d of plain text in a text file\n" index) |> ignore
+                    index <- index + 1
+                Array.append (Encoding.UTF8.GetBytes(builder.ToString().Substring(0, 65_575))) [| 0x1Auy |]
+            let previous = body "first line A"
+            let current = body "first line B"
+            let! same = openSession (defaultConfig ()) (sourceSpec previous) (sourceSpec previous)
+            let! samePages = readAll same (fun () -> false)
+            Check.true' (samePages.Length > 0) "An identical file with a short tail is accepted."
+            do! same.Close()
+            let! changed = openSession (defaultConfig ()) (sourceSpec previous) (sourceSpec current)
+            let! pages = readAll changed (fun () -> false)
+            let changedRows =
+                allParts pages
+                |> Array.collect (function
+                    | DiffPart.Hunk { Body = HunkBody.AlignedRows values } -> values |> Array.filter (fun row -> row.Kind <> DiffRowKind.Context)
+                    | _ -> Array.empty)
+            Check.true' (changedRows.Length > 0) "A one-line change with the same short tail is accepted."
+            do! changed.Close()
+            return ()
+        }
+        "a page commit failure poisons later requests", fun () -> async {
+            let previous = Array.init 40 (fun index -> { Text = "line " + string index; Ending = LineEnding.LF })
+            let current = Array.copy previous
+            current[20] <- { current[20] with Text = "changed line twenty" }
+            let sessionConfig = { defaultConfig () with PageMaxFragments = 1 }
+            let host, pairWrites, _ = faultHost sessionConfig.SessionId
+            pairWrites.Value <- true
+            let! session = TextDiffSession.create host (Ledger()) sessionConfig (fun _ -> 1) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+            let! initial = session.FirstPage(fun () -> false)
+            let rec resolveResult result = async {
+                match result with
+                | EngineResult.Ok(Resumable.Scanning(_, continuation, _)) ->
+                    let! next = session.ReadPage continuation (fun () -> false)
+                    return! resolveResult next
+                | other -> return other
+            }
+            let! failed = resolveResult initial
+            match failed with
+            | EngineResult.Failed(code, _, _) -> Check.equal TextDiffFailureCodes.WorkerFailed code "The failed page commit returns worker_failed."
+            | other -> failwith $"The injected page write did not fail: {other}."
+            let! later = session.FirstPage(fun () -> false)
+            match later with
+            | EngineResult.Failed(code, _, _) -> Check.equal TextDiffFailureCodes.WorkerFailed code "A later page request sees the failed session."
+            | other -> failwith $"The failed session accepted another page request: {other}."
+            do! session.Close()
+            return ()
+        }
+        "an expansion commit failure poisons later requests", fun () -> async {
+            let previous = Array.init 80 (fun index -> { Text = "line " + string index; Ending = LineEnding.LF })
+            let current = Array.copy previous
+            current[40] <- { current[40] with Text = "changed line forty" }
+            let sessionConfig = { defaultConfig () with PageMaxFragments = 1 }
+            let host, _, indexWrites = faultHost sessionConfig.SessionId
+            let! session = TextDiffSession.create host (Ledger()) sessionConfig (fun _ -> 1) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+            let! initial = session.FirstPage(fun () -> false)
+            let! page = resolvePage session (fun () -> false) initial
+            let gap = page.Parts |> Array.pick (function DiffPart.HiddenEqual value -> Some value | _ -> None)
+            indexWrites.Value <- true
+            let! expansion = session.Expand(gap.GapId, true, 2, None, fun () -> false)
+            match expansion with
+            | EngineResult.Failed(code, _, _) -> Check.equal TextDiffFailureCodes.WorkerFailed code "The failed expansion commit returns worker_failed."
+            | other -> failwith $"The injected expansion link did not fail: {other}."
+            let! later = session.FirstPage(fun () -> false)
+            match later with
+            | EngineResult.Failed(code, _, _) -> Check.equal TextDiffFailureCodes.WorkerFailed code "A later request sees the failed expansion session."
+            | other -> failwith $"The failed session accepted another request: {other}."
+            do! session.Close()
+            return ()
+        }
+        "trimmed from-end expansions assign distinct row identifiers", fun () -> async {
+            let previous = Array.init 60 (fun index -> { Text = String('a', 8_000) + string index; Ending = LineEnding.LF })
+            let current = Array.copy previous
+            current[30] <- { current[30] with Text = String('b', 8_000) + "30" }
+            let sessionConfig = {
+                defaultConfig () with
+                    ContextLines = 0
+                    PageMaxBytes = 40_000
+                    PageMaxRows = 1_000
+                    Limits = { Limits.defaults with MaxUnits = Int32.MaxValue; RequestMs = 1e12; QuantumMs = 1e12 }
+            }
+            let rowSize (row: DiffRow) =
+                let lineSize = function Some line -> line.Slice.Text.Length + 64 | None -> 0
+                lineSize row.Previous + lineSize row.Current + 64
+            let size (part: DiffPart) =
+                match part with
+                | DiffPart.ExpandedContext(_, values) -> 64 + (values |> Array.sumBy rowSize)
+                | DiffPart.Hunk fragment ->
+                    match fragment.Body with
+                    | HunkBody.AlignedRows values -> 128 + (values |> Array.sumBy rowSize)
+                    | HunkBody.UnalignedSides(previousLines, currentLines) -> 128 + (Array.append previousLines currentLines |> Array.sumBy (fun line -> line.Slice.Text.Length + 64))
+                | _ -> 128
+            let host = Host.createInMemory (ManualClock 0.0 :> IClock)
+            let! session = TextDiffSession.create host (Ledger()) sessionConfig size (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+            let! pages = readAll session (fun () -> false)
+            let ids = ResizeArray<string>()
+            let collect parts =
+                for part in parts do
+                    match part with
+                    | DiffPart.ExpandedContext(_, values) -> for row in values do ids.Add row.Id
+                    | DiffPart.Hunk { Body = HunkBody.AlignedRows values } -> for row in values do ids.Add row.Id
+                    | _ -> ()
+            for page in pages do collect page.Parts
+            let mutable gap =
+                allParts pages
+                |> Array.pick (function DiffPart.HiddenEqual value when value.PreviousRange.Count > 10L -> Some value | _ -> None)
+                |> Some
+            let mutable expansions = 0
+            while gap.IsSome && expansions < 6 do
+                let value = gap.Value
+                let! initial = session.Expand(value.GapId, false, 10, None, fun () -> false)
+                let! parts = resolveExpansion session value.GapId false 10 initial
+                collect parts
+                gap <- parts |> Array.tryPick (function DiffPart.HiddenEqual residual -> Some residual | _ -> None)
+                expansions <- expansions + 1
+            let duplicates = ids |> Seq.countBy id |> Seq.filter (fun (_, count) -> count > 1) |> Seq.toArray
+            Check.equal 0 duplicates.Length "Rows from trimmed expansions keep unique identifiers."
+            do! session.Close()
+            return ()
+        }
+        "pending mismatch offsets stay on the differing character", fun () -> async {
+            let prefix = String.replicate 10 "a\n"
+            let body = String('x', 20_000_000)
+            let previous = Encoding.UTF8.GetBytes(prefix + body.Substring(0, 50) + "P" + body.Substring(51) + "\nend\n")
+            let current = Encoding.UTF8.GetBytes(prefix + body.Substring(0, 50) + "C" + body.Substring(51) + "\nend\n")
+            let limits = { Limits.defaults with MaxUnits = 500; RequestMs = 1e12; QuantumMs = 1e12 }
+            let sessionConfig = { defaultConfig () with ContextLines = 0; Limits = limits }
+            let! session = openSession sessionConfig (sourceSpec previous) (sourceSpec current)
+            let! first = session.FirstPage(fun () -> false)
+            let! previewValue, _ = findPendingPreview session (fun value -> value.Mismatch.IsSome) first
+            let preview = previewValue.Value
+            let mismatch = preview.Mismatch.Value
+            Check.equal 50L mismatch.PreviousOffsetUtf16 "The previous marker names the differing character."
+            Check.equal 50L mismatch.CurrentOffsetUtf16 "The current marker names the differing character."
+            do! session.Close()
+            return ()
+        }
+        "pending previews keep paired line numbers after an insertion", fun () -> async {
+            let prefix = String.replicate 5 "a\n"
+            let between = String.replicate 5 "a\n"
+            let body = String('x', 20_000_000)
+            let previous = Encoding.UTF8.GetBytes(prefix + between + body.Substring(0, 50) + "P" + body.Substring(51) + "\nend\n")
+            let current = Encoding.UTF8.GetBytes(prefix + "inserted\n" + between + body.Substring(0, 50) + "C" + body.Substring(51) + "\nend\n")
+            let limits = { Limits.defaults with MaxUnits = 500; RequestMs = 1e12; QuantumMs = 1e12 }
+            let sessionConfig = { defaultConfig () with ContextLines = 0; PageMaxRows = 1; PageMaxFragments = 1; Limits = limits }
+            let! session = openSession sessionConfig (sourceSpec previous) (sourceSpec current)
+            let! first = session.FirstPage(fun () -> false)
+            let! previewValue, _ =
+                findPendingPreview session
+                    (fun value ->
+                        match value.Previous, value.Current with
+                        | PendingSide.Snippet oldLine, PendingSide.Snippet newLine -> oldLine.Line = 10L && newLine.Line = 11L
+                        | _ -> false)
+                    first
+            let preview = previewValue.Value
+            match preview.Previous, preview.Current with
+            | PendingSide.Snippet oldLine, PendingSide.Snippet newLine ->
+                Check.equal 10L oldLine.Line "The preview keeps the previous line number."
+                Check.equal 11L newLine.Line "The preview maps the inserted current line."
+            | other -> failwith $"The mismatch preview omitted a paired line: {other}."
+            do! session.Close()
             return ()
         }
     ]

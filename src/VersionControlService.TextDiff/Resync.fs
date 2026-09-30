@@ -56,6 +56,7 @@ type internal ResyncEngine
     (
         config: SessionConfig,
         ledger: Ledger,
+        evidenceTallies: ControlRatioTally[],
         builder: HunkBuilder,
         specs: SourceSpec[],
         encodings: TextEncoding[],
@@ -72,7 +73,7 @@ type internal ResyncEngine
 
     let makeSides () =
         Array.init 2 (fun side ->
-            let scan = ScanSide(specs[side], encodings[side], categories[side], sides[side], ledger, config.HashMaskForTesting, report, config.CheckpointIntervalBytes, recordLineCount side)
+            let scan = ScanSide(specs[side], encodings[side], categories[side], sides[side], ledger, evidenceTallies[side], config.HashMaskForTesting, report, config.CheckpointIntervalBytes, recordLineCount side)
             scan.RecordPeaks <- false
             scan)
 
@@ -492,7 +493,11 @@ type internal ResyncEngine
             let availableP = aux[0].Table.Count - rowP
             let availableC = aux[1].Table.Count - rowC
             let confirm = config.ResyncConfirmLines
-            let enough = availableP >= confirm && availableC >= confirm || availableP = availableC
+            let enough =
+                availableP >= confirm && availableC >= confirm
+                || availableP = availableC
+                || (availableP < confirm && availableP <= availableC && aux[0].Finished)
+                || (availableC < confirm && availableC <= availableP && aux[1].Finished)
             forwardCount <- min confirm (min availableP availableC)
             let mutable equal = enough && forwardCount >= 1
             let mutable index = 0

@@ -168,6 +168,16 @@ module TextDiffResyncCases =
             Check.equal 400 shape.UnalignedPrevious "Every previous line is unaligned."
             Check.equal 400 shape.UnalignedCurrent "Every current line is unaligned."
         }
+        "a matching EOF tail confirms a rewrite with extra current lines", fun () -> async {
+            for extra in [ 0; 1; 20 ] do
+                let previous = Array.append (lines "old-" 0 3_000) (lines "trailer-" 0 3)
+                let current = Array.concat [ lines "new-" 0 3_000; lines "trailer-" 0 3; lines "tail-" 0 extra ]
+                let! shape = run (smallConfig $"resync-eof-{extra}") previous current
+                Check.equal 3_000 shape.UnalignedPrevious "The rewritten previous lines form an unaligned region."
+                Check.equal 3_000 shape.UnalignedCurrent "The rewritten current lines form an unaligned region."
+                Check.equal extra shape.Added "Every extra current line is added."
+                Check.equal 0 shape.Removed "No previous line is removed."
+        }
         "a sync candidate that fails its confirmation is rejected", fun () -> async {
             let previous = lines "line-" 0 500
             let inserted = lines "other-" 0 300

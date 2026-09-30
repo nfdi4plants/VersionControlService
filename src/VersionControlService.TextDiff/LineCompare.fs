@@ -64,6 +64,7 @@ type internal ScanSide(
     category: AllocationCategory,
     side: DiffSide,
     ledger: Ledger,
+    evidenceTally: ControlRatioTally,
     hashMask: (uint32 * uint32) option,
     reportEvidence: DiffSide -> string -> int64 -> unit,
     checkpointIntervalBytes: float,
@@ -82,6 +83,12 @@ type internal ScanSide(
     let mutable lineObserver: float -> float -> float = fun _ _ -> checkpointIntervalBytes
     let mutable hasLineObserver = false
     let mutable lineCheckpointDue = checkpointIntervalBytes
+
+    let attachScalarObserver (state: ScannerState) =
+        state.ScalarObserver <- Some(fun value start -> evidenceTally.ObserveScalar(value, start))
+        state.ScalarRunObserver <- Some(fun start count width -> evidenceTally.ObserveAsciiRun(start, count, width))
+
+    do attachScalarObserver scanner
 
     member _.Spec = spec
     member _.Encoding = encoding
@@ -121,6 +128,7 @@ type internal ScanSide(
     member _.SetCursor(offset: float, firstLine: int64, maxLines: int, maxBytes: int) =
         table.ReleaseWindow()
         scanner <- Scanner.create encoding (int64 offset) None
+        attachScalarObserver scanner
         finished <- spec.Source.IsNone
         windowLineLimit <- max 1 maxLines
         windowByteLimit <- max 1 maxBytes
@@ -163,7 +171,9 @@ type internal ScanSide(
 
     member _.Consume(buffer: byte[], count: int, endOfSource: bool, meter: Meter) =
         let emitLineBatch batch = table.AppendBatch batch
-        let emitEvidence (evidence: ScannerEvidence) = reportEvidence side evidence.Kind evidence.Offset
+        let emitEvidence (evidence: ScannerEvidence) =
+            if evidence.Kind <> "control ratio" && evidence.Kind <> "nul" then
+                reportEvidence side evidence.Kind evidence.Offset
         let remainingLines = max 1 (windowLineLimit - table.Count)
         let batch = LineBatch(max 1 (min 4_096 remainingLines))
         batch.StopAtFull <- true
@@ -179,15 +189,23 @@ type internal ScanSide(
         if recordPeaks then ledger.RecordWindowLines(category, table.Count)
         observer scanner (float table.LineBase + float table.Count)
         coverage <- max coverage (float scanner.StartOffset + scanner.ValidatedBytes)
+        evidenceTally.AdvanceThrough(float scanner.StartOffset + scanner.ValidatedBytes)
         match result.Error with
         | Some error -> reportEvidence side ("invalid " + Decoders.name encoding + " sequence: " + error.Reason) error.Offset
         | None -> ()
         if result.Status = EndOfInput then
             finished <- true
+            evidenceTally.Finish()
             recordLineCount (table.LineBase + int64 table.Count)
         result
 
-    member _.SetCoverage(value: float) = coverage <- max coverage value
+    member _.SetCoverage(value: float) =
+        coverage <- max coverage value
+        evidenceTally.AdvanceThrough value
+        if value >= float spec.ByteLength && (spec.Source |> Option.forall (fun source -> source.IsComplete())) then
+            evidenceTally.Finish()
+
+    member _.AttachState(state: ScannerState) = attachScalarObserver state
 
     /// False for helper sides whose window sizes do not count toward the session peaks.
     member _.RecordPeaks with get () = recordPeaks and set value = recordPeaks <- value
@@ -220,6 +238,7 @@ type internal ScanSide(
         let firstLine = header.Number()
         let lines = header.Int()
         scanner <- ScannerStateCodec.read encoding header
+        attachScalarObserver scanner
         struct (int64 firstLine, lines)
 
     member _.Dispose() = table.Dispose()

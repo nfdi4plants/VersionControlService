@@ -33,7 +33,7 @@ type private SeekCursor = {
     EndLine: float
     TargetOffset: float
     State: ScannerState
-    Buffer: byte[]
+    mutable Buffer: byte[]
     mutable Batch: LineBatch
     FoundLines: ResizeArray<ScannedLine>
     mutable LineNumber: float
@@ -61,7 +61,7 @@ type private TextReadCursor = {
     Spec: SourceSpec
     Encoding: TextEncoding
     ContentEnd: float
-    Buffer: byte[]
+    mutable Buffer: byte[]
     mutable Position: float
     mutable Decoder: DecoderState
     mutable PendingUnit: uint16 option
@@ -73,7 +73,7 @@ type private ReverseTextCursor = {
     Encoding: TextEncoding
     StartByte: float
     mutable EndByte: float
-    Buffer: byte[]
+    mutable Buffer: byte[]
     Units: uint16[]
     mutable BlockCount: int
     mutable BlockPosition: int
@@ -110,8 +110,9 @@ type private PendingLineRead = {
     mutable PairHighlights: PairHighlightResult option
     mutable Decoder: DecoderState option
     mutable BytePosition: float
-    Buffer: byte[]
-    Units: uint16[]
+    mutable Buffer: byte[]
+    mutable Units: uint16[]
+    mutable SavedUnits: string
     mutable UnitCount: int
     mutable UnitPosition: float
     mutable PreviousUnit: uint16 option
@@ -147,6 +148,7 @@ and private PairLineAnalysis = {
     mutable HasLastPrefixUnit: bool
     mutable Failed: bool
     Reservation: int64
+    mutable Reserved: bool
     mutable Released: bool
 }
 
@@ -389,7 +391,6 @@ type TextDiffSession internal (
     let mutable commonLines = 0.0
     let mutable pendingCR = false
     let mutable chunk = min 4_096 chunkLimit
-    let mutable pendingWindow: ObservationWindow option = None
     let mutable backActive = false
     let mutable backEnd = 0.0
     let mutable backFound = 0
@@ -442,7 +443,7 @@ type TextDiffSession internal (
     let mutable textCount = 0
 
     let builder = HunkBuilder(config.ContextLines, config.PageMaxRows)
-    let journal = Journal(store, ledger, config.JournalCacheBytes)
+    let journal = Journal(store, ledger, config.JournalCacheBytes, fun () -> host.CreateTempStore(config.SessionId + ":journal-index"))
     let pairings = PairingIndex(ledger, fun () -> host.CreateTempStore(config.SessionId + ":pairs"))
 
     let checkpoints =
@@ -473,11 +474,14 @@ type TextDiffSession internal (
                 else kind + " at byte " + string offset
             invalidDetail <- Some { Side = side; Evidence = evidence }
 
+    let previousEvidence = ControlRatioTally(DiffSide.Previous, previousSpec.BomLength, previousSpec.ByteLength, report)
+    let currentEvidence = ControlRatioTally(DiffSide.Current, currentSpec.BomLength, currentSpec.ByteLength, report)
+
     let previousSide =
-        ScanSide(previousSpec, previousEncoding, AllocationCategory.PreviousWindows, DiffSide.Previous, ledger, config.HashMaskForTesting, report, config.CheckpointIntervalBytes, setKnownLineCount 0)
+        ScanSide(previousSpec, previousEncoding, AllocationCategory.PreviousWindows, DiffSide.Previous, ledger, previousEvidence, config.HashMaskForTesting, report, config.CheckpointIntervalBytes, setKnownLineCount 0)
 
     let currentSide =
-        ScanSide(currentSpec, currentEncoding, AllocationCategory.CurrentWindows, DiffSide.Current, ledger, config.HashMaskForTesting, report, config.CheckpointIntervalBytes, setKnownLineCount 1)
+        ScanSide(currentSpec, currentEncoding, AllocationCategory.CurrentWindows, DiffSide.Current, ledger, currentEvidence, config.HashMaskForTesting, report, config.CheckpointIntervalBytes, setKnownLineCount 1)
 
     do
         previousSide.Observer <- fun state line -> checkpoints.Observe(0, state, line)
@@ -595,16 +599,20 @@ type TextDiffSession internal (
 
     let failWorker message = EngineResult.Failed(TextDiffFailureCodes.WorkerFailed, message, None)
 
-    let failNotImplemented (operation: string) = EngineResult.Failed("not_implemented", operation + " is not implemented.", None)
-
-    let extensionResult operation =
-        if closed || closing then failClosed ()
-        elif invalidDetail.IsSome then failContent ()
-        else failNotImplemented operation
-
     let sourceChanged () =
         if failure.IsNone then
             failure <- Some(TextDiffFailureCodes.SourceChanged, "A source changed while the diff was being computed.")
+
+    let failCommit (error: exn) =
+        failure <- Some(TextDiffFailureCodes.WorkerFailed, error.Message)
+
+    let reportDecodeError sideIndex (error: DecodeError) =
+        let sideState = if sideIndex = 0 then previousSide else currentSide
+        if float error.Offset < sideState.Coverage then sourceChanged ()
+        else
+            let side = if sideIndex = 0 then DiffSide.Previous else DiffSide.Current
+            let encoding = if sideIndex = 0 then previousEncoding else currentEncoding
+            report side ("invalid " + Decoders.name encoding + " sequence: " + error.Reason) error.Offset
 
     let ensureBuffers () =
         if bufA.Length = 0 then
@@ -647,38 +655,11 @@ type TextDiffSession internal (
 
     // Equal-byte phase helpers.
 
-    let setPendingEvidence (evidence: ScannerEvidence) =
-        report DiffSide.Previous evidence.Kind evidence.Offset
-
-    let finalizePending () =
-        match pendingWindow with
-        | Some window ->
-            Scanner.finalizeWindow window setPendingEvidence
-            pendingWindow <- None
-        | None -> ()
-
-    let mergeWindows (run: CommonRunResult) =
-        for window in run.Windows do
-            match pendingWindow with
-            | Some previous when previous.Start = window.Start ->
-                previous.Bytes <- previous.Bytes + window.Bytes
-                previous.Scalars <- previous.Scalars + window.Scalars
-                previous.Controls <- previous.Controls + window.Controls
-                if previous.FirstControl < 0 then previous.FirstControl <- window.FirstControl
-            | Some previous ->
-                if previous.Bytes >= Scanner.SmallFinalWindowBytes then Scanner.finalizeWindow previous setPendingEvidence
-                pendingWindow <- Some window
-            | None -> pendingWindow <- Some window
-
     let reportRun (run: CommonRunResult) =
         if invalidDetail.IsNone then
-            if run.Evidence.Length > 0 then
-                let evidence = run.Evidence[0]
-                report DiffSide.Previous evidence.Kind evidence.Offset
-            else
-                match run.Error with
-                | Some error -> report DiffSide.Previous ("invalid " + Decoders.name previousEncoding + " sequence: " + error.Reason) error.Offset
-                | None -> ()
+            match run.Error with
+            | Some error -> reportDecodeError 0 error
+            | None -> ()
 
     let countUtf16Units (source: IByteSource) (encoding: TextEncoding) (startOffset: int64) (endOffset: int64) (meter: Meter) = async {
         let buffer = Array.zeroCreate<byte> 65_536
@@ -698,7 +679,7 @@ type TextDiffSession internal (
                 Meter.chargeBytes meter actual
                 match result with
                 | Error error ->
-                    report DiffSide.Previous ("invalid " + Decoders.name encoding + " sequence: " + error.Reason) error.Offset
+                    reportDecodeError 0 error
                     complete <- false
                 | Ok _ -> ()
             | _ -> complete <- false
@@ -708,8 +689,6 @@ type TextDiffSession internal (
     /// Restarts both scanners at a line start of the previous side and at the matching line start of the
     /// current side, then switches to window alignment.
     let handover (cursor: float) =
-        let carried = pendingWindow
-        pendingWindow <- None
         mode <- Mode.Window
         windowState <- WindowState.Loading
         windowLimit <- initialWindowLines
@@ -719,12 +698,6 @@ type TextDiffSession internal (
         currentSide.SetCursor(cursor + delta, int64 builder.NextCurrent, windowLimit, config.WindowMaxBytes)
         pBase <- cursor
         cBase <- cursor + delta
-        match carried with
-        | Some window ->
-            let start = Scanner.windowStartOf cursor
-            if window.Start = start then previousSide.Scanner.CurrentWindow <- { window with Bytes = int (cursor - start) }
-            elif window.Start < start then Scanner.finalizeWindow window setPendingEvidence
-        | None -> ()
 
     let exitCommon () =
         let lines = commonLines
@@ -739,7 +712,6 @@ type TextDiffSession internal (
             backTarget <- lineStart
 
     let finishEqual () =
-        finalizePending ()
         let trailing = if lineStart < float previousSpec.ByteLength then 1.0 else 0.0
         builder.EqualSkip(commonLines + trailing)
         builder.Finish()
@@ -828,8 +800,22 @@ type TextDiffSession internal (
                     waited <- true
                     Meter.charge meter 1
                 else
-                    let run = CommonRun.find previousEncoding (int64 pos) pendingCR bufA 0 bufB 0 got
-                    mergeWindows run
+                    let oldPos = pos
+                    let run =
+                        CommonRun.findObserved
+                            previousEncoding
+                            oldPos
+                            (oldPos + delta)
+                            pendingCR
+                            (fun value offset -> previousEvidence.ObserveScalar(value, offset))
+                            (fun value offset -> currentEvidence.ObserveScalar(value, offset))
+                            (fun start count width -> previousEvidence.ObserveAsciiRun(start, count, width))
+                            (fun start count width -> currentEvidence.ObserveAsciiRun(start, count, width))
+                            bufA
+                            0
+                            bufB
+                            0
+                            got
                     reportRun run
                     Meter.charge meter 1
                     if run.Length > 0 then
@@ -846,7 +832,7 @@ type TextDiffSession internal (
                     if invalidDetail.IsSome then ()
                     elif run.Mismatch then
                         let differenceByte = run.DifferenceOffset |> Option.defaultValue run.Length
-                        let! mismatchUnits = countUtf16Units previousSpec.Source.Value previousEncoding (int64 lineStart) (int64 (pos + float differenceByte)) meter
+                        let! mismatchUnits = countUtf16Units previousSpec.Source.Value previousEncoding (int64 lineStart) (int64 (oldPos + float differenceByte)) meter
                         pairedMismatch <- Some(int64 (builder.NextPrevious + commonLines), int64 (builder.NextCurrent + commonLines), mismatchUnits)
                         exitCommon ()
                     elif run.Length > 0 then chunk <- min chunkLimit (chunk * 2)
@@ -878,6 +864,7 @@ type TextDiffSession internal (
         ResyncEngine(
             config,
             ledger,
+            [| previousEvidence; currentEvidence |],
             builder,
             [| previousSpec; currentSpec |],
             [| previousEncoding; currentEncoding |],
@@ -1062,7 +1049,6 @@ type TextDiffSession internal (
         commonLines <- 0.0
         pendingCR <- false
         chunk <- min 4_096 chunkLimit
-        pendingWindow <- None
         backActive <- false
         releaseWindows ()
 
@@ -1755,7 +1741,7 @@ type TextDiffSession internal (
                         bytePosition <- float next.AbsoluteOffset
                         match result with
                         | Error error ->
-                            report (if view.SideIndex = 0 then DiffSide.Previous else DiffSide.Current) ("invalid " + Decoders.name encoding + " sequence: " + error.Reason) error.Offset
+                            reportDecodeError view.SideIndex error
                             failed <- true
                         | Ok _ -> ()
                     | ReadOutcome.NotYetAvailable -> waiting <- true
@@ -1789,13 +1775,19 @@ type TextDiffSession internal (
                 lastPendingPreview <- Some preview
                 lastPendingPreview
 
-    let makePendingPreview (active: PendingLineView option[]) (completed: (int64 -> PendingLineView option)[]) (exhausted: int64 option[]) mismatchLines = async {
+    let makePendingPreview (active: PendingLineView option[]) (completed: (int64 -> PendingLineView option)[]) (exhausted: int64 option[]) (mismatchLines: (int64 * int64 * int64 option) option) = async {
         let selected = Array.copy active
         for sideIndex = 0 to 1 do
             if selected[sideIndex].IsNone then
                 let other = 1 - sideIndex
                 match selected[other] with
-                | Some peer -> selected[sideIndex] <- completed[sideIndex] peer.Number
+                | Some peer ->
+                    let! pairedNumber =
+                        match mismatchLines with
+                        | Some(previousNumber, currentNumber, _) when sideIndex = 0 && peer.Number = currentNumber -> async.Return(Some previousNumber)
+                        | Some(previousNumber, currentNumber, _) when sideIndex = 1 && peer.Number = previousNumber -> async.Return(Some currentNumber)
+                        | _ -> async.Return(Some peer.Number)
+                    pairedNumber |> Option.iter (fun number -> selected[sideIndex] <- completed[sideIndex] number)
                 | None -> ()
         if selected[0].IsNone && selected[1].IsNone then
             return reservePendingPreview None
@@ -1905,7 +1897,7 @@ type TextDiffSession internal (
                 active[index] <- previewViewFromScan index scans[index]
                 if scans[index].Finished then ended[index] <- Some(scans[index].Table.LineBase + int64 scans[index].Table.Count)
                 elif scans[index].Spec.Source.IsNone then ended[index] <- Some 0L
-        return! makePendingPreview active complete ended None
+        return! makePendingPreview active complete ended pairedMismatch
     }
 
     let presentPageResult result = async {
@@ -2002,7 +1994,7 @@ type TextDiffSession internal (
                         Meter.chargeBytes meter actual
                         match result with
                         | Error error ->
-                            report side ("invalid " + Decoders.name encoding + " sequence: " + error.Reason) error.Offset
+                            reportDecodeError (if side = DiffSide.Previous then 0 else 1) error
                             failed <- true
                         | Ok _ -> ()
                     | ReadOutcome.NotYetAvailable -> waiting <- true
@@ -2090,7 +2082,7 @@ type TextDiffSession internal (
                                         Meter.chargeBytes meter actual
                                         match decoded with
                                         | Error error ->
-                                            report cursor.Side ("invalid " + Decoders.name cursor.Encoding + " sequence: " + error.Reason) error.Offset
+                                            reportDecodeError (if cursor.Side = DiffSide.Previous then 0 else 1) error
                                             failed <- true
                                         | Ok _ -> cursor.PendingUnit <- overflow
                                     | ReadOutcome.NotYetAvailable -> failed <- true
@@ -2226,7 +2218,7 @@ type TextDiffSession internal (
                                         decoder <- next
                                         Meter.chargeBytes meter actual
                                         match decoded with
-                                        | Error error -> report side ("invalid " + Decoders.name encoding + " sequence: " + error.Reason) error.Offset; failed <- true
+                                        | Error error -> reportDecodeError (if side = DiffSide.Previous then 0 else 1) error; failed <- true
                                         | Ok _ -> ()
                                     | ReadOutcome.NotYetAvailable -> waiting <- true
                                     | ReadOutcome.EndOfSource -> sourceChanged (); failed <- true
@@ -2605,27 +2597,33 @@ type TextDiffSession internal (
             let value = Resumable.Ready page
             // The record and the consumption of the queued rows commit together. A cancellation that arrives
             // meanwhile takes effect after both are done.
-            do!
-                Shield.run (
-                    async {
-                        do! recordResult sequence value
-                        match value with
-                        | Resumable.Ready readyPage -> do! rememberPagePairs sequence readyPage
-                        | Resumable.Scanning _ -> ()
-                        for part in page.Parts do
-                            match part with
-                            | DiffPart.HiddenEqual gap ->
-                                match readIdentifier "g" gap.GapId with
-                                | Some gapSequence -> do! journal.Link(journalKey 3L gapSequence, journalKey 0L sequence)
-                                | None -> invalidOp "The generated gap id is invalid."
-                            | _ -> ()
-                        builder.CommitPage(fullCount, partialConsumed, rowsRemoved, fragmentsRemoved)
-                        rowSequence <- nextRow
-                        firstPageReturned <- true
-                        if page.OutputComplete then releaseBuffers ()
-                    }
-                )
-            return Some(EngineResult.Ok value)
+            let mutable commitStarted = false
+            try
+                do!
+                    Shield.run (
+                        async {
+                            commitStarted <- true
+                            do! recordResult sequence value
+                            match value with
+                            | Resumable.Ready readyPage -> do! rememberPagePairs sequence readyPage
+                            | Resumable.Scanning _ -> ()
+                            for part in page.Parts do
+                                match part with
+                                | DiffPart.HiddenEqual gap ->
+                                    match readIdentifier "g" gap.GapId with
+                                    | Some gapSequence -> do! journal.Link(journalKey 3L gapSequence, journalKey 0L sequence)
+                                    | None -> invalidOp "The generated gap id is invalid."
+                                | _ -> ()
+                            builder.CommitPage(fullCount, partialConsumed, rowsRemoved, fragmentsRemoved)
+                            rowSequence <- nextRow
+                            firstPageReturned <- true
+                            if page.OutputComplete then releaseBuffers ()
+                        }
+                    )
+                return Some(EngineResult.Ok value)
+            with error ->
+                if commitStarted then failCommit error
+                return Some(failWorker error.Message)
     }
 
     let advance (sequence: int64) (cancel: unit -> bool) : Async<EngineResult<Resumable<DiffPage>>> = async {
@@ -2699,6 +2697,7 @@ type TextDiffSession internal (
                 match hit with
                 | Some found -> found.State, found.Line
                 | None -> Scanner.create (encodingAt sideIndex) (int64 spec.BomLength) None, 0.0
+            (scanSideAt sideIndex).AttachState state
             let batch = LineBatch(256)
             return Some {
                 SideIndex = sideIndex
@@ -2758,13 +2757,7 @@ type TextDiffSession internal (
 
                 let sideState = scanSideAt cursor.SideIndex
                 let validatedBefore = sideState.Coverage
-                let evidence (item: ScannerEvidence) =
-                    let evidenceEnd =
-                        if item.Kind = "control ratio" then
-                            min (float spec.ByteLength) (float item.WindowStart + float Scanner.ObservationWindowBytes)
-                        else float item.Offset
-                    if evidenceEnd > validatedBefore then
-                        report (if cursor.SideIndex = 0 then DiffSide.Previous else DiffSide.Current) item.Kind item.Offset
+                let evidence (_: ScannerEvidence) = ()
 
                 if cursor.Position >= float spec.ByteLength then
                     if source.IsComplete() then
@@ -2913,10 +2906,13 @@ type TextDiffSession internal (
                     }
                 let requestedRows = min rows.Length pending.TakeCount
                 let residualId = identifier "g" nextGapSequence
-                nextGapSequence <- nextGapSequence + 1L
                 let makeParts taken =
                     let first = if pending.FromStart then 0 else rows.Length - taken
-                    let visible = if taken = 0 then Array.empty else Array.sub rows first taken
+                    let visible =
+                        if taken = 0 then Array.empty
+                        else
+                            Array.sub rows first taken
+                            |> Array.mapi (fun index row -> { row with Id = rowIdentifier (int rowSequence + index) })
                     let expanded = DiffPart.ExpandedContext(pending.Gap.GapId, visible)
                     let remaining = pending.Gap.PreviousRange.Count - int64 taken
                     let residual =
@@ -2986,23 +2982,33 @@ type TextDiffSession internal (
     }
 
     let appendExpansion (pending: PendingExpansion) sequence parts usedRows =
-        Shield.run (
-            async {
-                let value = Resumable.Ready parts
-                let target = journalKey 1L sequence
-                do! journal.Append(target, JournalValue.Expansion value)
-                do! journal.Link(journalKey 4L pending.GapSequence, target)
-                for part in parts do
-                    match part with
-                    | DiffPart.HiddenEqual gap ->
-                        match readIdentifier "g" gap.GapId with
-                        | Some gapSequence -> do! journal.Link(journalKey 3L gapSequence, target)
-                        | None -> invalidOp "The generated gap id is invalid."
-                    | _ -> ()
-                rowSequence <- rowSequence + int64 usedRows
-                pendingExpansions.Remove pending.GapSequence |> ignore
-            }
-        )
+        async {
+            let mutable commitStarted = false
+            try
+                do!
+                    Shield.run (
+                        async {
+                            let value = Resumable.Ready parts
+                            let target = journalKey 1L sequence
+                            commitStarted <- true
+                            do! journal.Append(target, JournalValue.Expansion value)
+                            do! journal.Link(journalKey 4L pending.GapSequence, target)
+                            for part in parts do
+                                match part with
+                                | DiffPart.HiddenEqual gap ->
+                                    match readIdentifier "g" gap.GapId with
+                                    | Some gapSequence -> do! journal.Link(journalKey 3L gapSequence, target)
+                                    | None -> invalidOp "The generated gap id is invalid."
+                                | _ -> ()
+                            nextGapSequence <- nextGapSequence + 1L
+                            rowSequence <- rowSequence + int64 usedRows
+                            pendingExpansions.Remove pending.GapSequence |> ignore
+                        }
+                    )
+            with error ->
+                if commitStarted then failCommit error
+                return raise error
+        }
 
     let createLineRead side line offset maxUtf16 attempt sequence pairedLine = async {
         let index = if side = DiffSide.Previous then 0 else 1
@@ -3033,6 +3039,7 @@ type TextDiffSession internal (
             BytePosition = 0.0
             Buffer = Array.zeroCreate<byte> 65_536
             Units = Array.zeroCreate<uint16> 8_192
+            SavedUnits = ""
             UnitCount = 0
             UnitPosition = 0.0
             PreviousUnit = None
@@ -3126,6 +3133,7 @@ type TextDiffSession internal (
                     HasLastPrefixUnit = false
                     Failed = false
                     Reservation = reservation
+                    Reserved = true
                     Released = false
                 }
             with error ->
@@ -3213,7 +3221,7 @@ type TextDiffSession internal (
                         cursor.ReadPosition <- float next.AbsoluteOffset
                         Meter.chargeBytes meter actual
                         match result with
-                        | Error error -> report cursor.Side ("invalid " + Decoders.name cursor.Encoding + " sequence: " + error.Reason) error.Offset; failed <- true
+                        | Error error -> reportDecodeError (if cursor.Side = DiffSide.Previous then 0 else 1) error; failed <- true
                         | Ok _ -> ()
                     | ReadOutcome.NotYetAvailable -> waiting <- true
                     | ReadOutcome.EndOfSource -> sourceChanged (); failed <- true
@@ -3231,10 +3239,23 @@ type TextDiffSession internal (
             else return false, false, true
     }
 
+    let releasePairAnalysisReservation (analysis: PairLineAnalysis) =
+        if analysis.Reserved then
+            ledger.Release(AllocationCategory.AlignmentScratch, analysis.Reservation)
+            analysis.Reserved <- false
+
+    let reservePairAnalysis (analysis: PairLineAnalysis) =
+        if analysis.Released then false
+        elif analysis.Reserved then true
+        elif ledger.TryReserve(AllocationCategory.AlignmentScratch, analysis.Reservation) then
+            analysis.Reserved <- true
+            true
+        else false
+
     let releasePairAnalysis (analysis: PairLineAnalysis) =
         if not analysis.Released then
+            releasePairAnalysisReservation analysis
             analysis.Released <- true
-            ledger.Release(AllocationCategory.AlignmentScratch, analysis.Reservation)
 
     let releasePendingLineRead (pending: PendingLineRead) =
         match pending.PairAnalysis with
@@ -3242,6 +3263,52 @@ type TextDiffSession internal (
             releasePairAnalysis analysis
             pending.PairAnalysis <- None
         | None -> ()
+        for cursor in [| pending.Search; pending.PairSearch |] do
+            match cursor with
+            | Some value -> value.Buffer <- Array.empty; value.Batch <- LineBatch(1)
+            | None -> ()
+        pending.Buffer <- Array.empty
+        pending.Units <- Array.empty
+        pending.SavedUnits <- ""
+
+    let releasePendingLineRequest (pending: PendingLineRead) =
+        match pending.PairAnalysis with
+        | Some analysis ->
+            releasePairAnalysisReservation analysis
+            analysis.PreviousCursor.Buffer <- Array.empty
+            analysis.CurrentCursor.Buffer <- Array.empty
+            analysis.PreviousReverse.Buffer <- Array.empty
+            analysis.CurrentReverse.Buffer <- Array.empty
+        | None -> ()
+        if pending.Units.Length > 0 then
+            pending.SavedUnits <- Native.utf16Decode pending.Units pending.UnitCount
+        for cursor in [| pending.Search; pending.PairSearch |] do
+            match cursor with
+            | Some value -> value.Buffer <- Array.empty; value.Batch <- LineBatch(1)
+            | None -> ()
+        pending.Buffer <- Array.empty
+        pending.Units <- Array.empty
+
+    let restorePendingLineRequest (pending: PendingLineRead) =
+        if pending.Buffer.Length = 0 then pending.Buffer <- Array.zeroCreate<byte> 65_536
+        if pending.Units.Length = 0 then
+            pending.Units <- Array.zeroCreate<uint16> (max 0 pending.TakeMaxUtf16)
+            let count = min pending.UnitCount pending.SavedUnits.Length
+            for index = 0 to count - 1 do pending.Units[index] <- uint16 pending.SavedUnits[index]
+            pending.SavedUnits <- ""
+        for cursor in [| pending.Search; pending.PairSearch |] do
+            match cursor with
+            | Some value when value.Buffer.Length = 0 ->
+                value.Buffer <- Array.zeroCreate<byte> 65_536
+                value.Batch <- LineBatch(256)
+            | _ -> ()
+        match pending.PairAnalysis with
+        | Some analysis when reservePairAnalysis analysis ->
+            if analysis.PreviousCursor.Buffer.Length = 0 then analysis.PreviousCursor.Buffer <- Array.zeroCreate<byte> 4_100
+            if analysis.CurrentCursor.Buffer.Length = 0 then analysis.CurrentCursor.Buffer <- Array.zeroCreate<byte> 4_100
+            if analysis.PreviousReverse.Buffer.Length = 0 then analysis.PreviousReverse.Buffer <- Array.zeroCreate<byte> 4_096
+            if analysis.CurrentReverse.Buffer.Length = 0 then analysis.CurrentReverse.Buffer <- Array.zeroCreate<byte> 4_096
+        | _ -> ()
 
     let readPairBlock (cursor: TextReadCursor) (target: uint16[]) (meter: Meter) (cancel: unit -> bool) = async {
         if cancel () || Meter.overBudget meter then return 0, false, true, false
@@ -3267,7 +3334,7 @@ type TextDiffSession internal (
                     Meter.chargeBytes meter actual
                     match result with
                     | Error error ->
-                        report cursor.Side ("invalid " + Decoders.name cursor.Encoding + " sequence: " + error.Reason) error.Offset
+                        reportDecodeError (if cursor.Side = DiffSide.Previous then 0 else 1) error
                         return count, true, false, false
                     | Ok _ -> return count, failed, false, cursor.Position >= cursor.ContentEnd
                 | ReadOutcome.NotYetAvailable -> return 0, false, true, false
@@ -3304,6 +3371,7 @@ type TextDiffSession internal (
             match pending.PairAnalysis with
             | None -> return false, failed, waiting
             | Some analysis when failed || waiting -> return false, failed, waiting
+            | Some analysis when not (reservePairAnalysis analysis) -> return false, false, true
             | Some analysis ->
                 let mutable progress = true
                 let fillPrevious () = async {
@@ -3495,7 +3563,7 @@ type TextDiffSession internal (
                                 pending.BytePosition <- float next.AbsoluteOffset
                                 Meter.chargeBytes meter actual
                                 match result with
-                                | Error error -> report pending.Side ("invalid " + Decoders.name (encodingAt (if pending.Side = DiffSide.Previous then 0 else 1)) + " sequence: " + error.Reason) error.Offset; failed <- true; running <- false
+                                | Error error -> reportDecodeError (if pending.Side = DiffSide.Previous then 0 else 1) error; failed <- true; running <- false
                                 | Ok _ ->
                                     if pending.UnitPosition >= requestedEnd then running <- false
                             | ReadOutcome.NotYetAvailable -> pending.Waiting <- true; running <- false
@@ -3605,7 +3673,7 @@ type TextDiffSession internal (
               return EngineResult.Ok(Resumable.Scanning(progress (), continuation, preview))
     }
 
-    let runLineReadRequest (pending: PendingLineRead) sequence (cancel: unit -> bool) = async {
+    let runLineReadRequestCore (pending: PendingLineRead) sequence (cancel: unit -> bool) = async {
         let meter = Meter.create host.Clock config.Limits
         let mutable finished = false
         let mutable failed = false
@@ -3662,6 +3730,14 @@ type TextDiffSession internal (
                 return EngineResult.Ok(Resumable.Scanning(progress (), continuation, preview))
     }
 
+    let runLineReadRequest (pending: PendingLineRead) sequence (cancel: unit -> bool) = async {
+        restorePendingLineRequest pending
+        try
+            return! runLineReadRequestCore pending sequence cancel
+        finally
+            releasePendingLineRequest pending
+    }
+
     let sourceInfo sideIndex =
         let spec = specAt sideIndex
         let side = scanSideAt sideIndex
@@ -3700,6 +3776,9 @@ type TextDiffSession internal (
     /// in the middle of a step keeps it until the step completes.
     let spillSession () : Async<EngineResult<unit>> = async {
         if closed || closing then return failClosed ()
+        elif failure.IsSome then
+            let code, message = failure.Value
+            return EngineResult.Failed(code, message, None)
         elif invalidDetail.IsSome then return failContent ()
         elif busy || midStep () then return EngineResult.Ok()
         else
@@ -3733,6 +3812,9 @@ type TextDiffSession internal (
 
     member this.FirstPage(cancel: unit -> bool) = async {
         if closed then return failClosed ()
+        elif failure.IsSome then
+            let code, message = failure.Value
+            return EngineResult.Failed(code, message, None)
         elif invalidDetail.IsSome then return failContent ()
         else
             let! acquired = acquire cancel
@@ -3757,6 +3839,9 @@ type TextDiffSession internal (
 
     member this.ReadPage (cursor: string) (cancel: unit -> bool) = async {
         if closed then return failClosed ()
+        elif failure.IsSome then
+            let code, message = failure.Value
+            return EngineResult.Failed(code, message, None)
         elif invalidDetail.IsSome then return failContent ()
         else
             let! acquired = acquire cancel
@@ -3784,6 +3869,9 @@ type TextDiffSession internal (
 
     member _.ReplayPage(pageId: string) = async {
         if closed then return failClosed ()
+        elif failure.IsSome then
+            let code, message = failure.Value
+            return EngineResult.Failed(code, message, None)
         elif invalidDetail.IsSome then return failContent ()
         else
             match readIdentifier "p" pageId with
@@ -3801,6 +3889,9 @@ type TextDiffSession internal (
 
     member _.Expand(gapId: string, fromStart: bool, count: int, continuation: string option, cancel: unit -> bool) = async {
         if closed || closing then return failClosed ()
+        elif failure.IsSome then
+            let code, message = failure.Value
+            return EngineResult.Failed(code, message, None)
         elif invalidDetail.IsSome then return failContent ()
         else
             let! acquired = acquire cancel
@@ -3867,6 +3958,9 @@ type TextDiffSession internal (
 
     member _.ReadLine(side: DiffSide, line: int64, offsetUtf16: int64, maxUtf16: int, continuation: string option, cancel: unit -> bool) = async {
         if closed || closing then return failClosed ()
+        elif failure.IsSome then
+            let code, message = failure.Value
+            return EngineResult.Failed(code, message, None)
         elif invalidDetail.IsSome then return failContent ()
         elif line < 0L || offsetUtf16 < 0L then return failMismatch ()
         else
@@ -3891,7 +3985,7 @@ type TextDiffSession internal (
                                             let! preview = pending.Search |> Option.map pendingSeekPreview |> Option.defaultValue (async.Return None)
                                             if invalidDetail.IsSome then return failContent ()
                                             else return EngineResult.Ok(Resumable.Scanning(scanProgress, recordedContinuation, preview))
-                                        | _ -> return EngineResult.Ok(Resumable.Scanning(scanProgress, recordedContinuation, None))
+                                        | _ -> return failMismatch ()
                                     | Some(JournalValue.Line result) -> return EngineResult.Ok result
                                     | Some _ -> return failMismatch ()
                                     | None ->
@@ -3905,6 +3999,11 @@ type TextDiffSession internal (
                                 let! pairedLine = pairings.Find(side, line)
                                 let! pending = createLineRead side line offsetUtf16 maxUtf16 attempt sequence pairedLine
                                 pendingLineReads[attempt] <- pending
+                                while pendingLineReads.Count > 8 do
+                                    let oldest = pendingLineReads.Keys |> Seq.min
+                                    let expired = pendingLineReads[oldest]
+                                    releasePendingLineRead expired
+                                    pendingLineReads.Remove oldest |> ignore
                                 let! result = runLineReadRequest pending sequence cancel
                                 match result with
                                 | EngineResult.Canceled
@@ -3915,7 +4014,10 @@ type TextDiffSession internal (
                 finally busy <- false
     }
 
-    member _.PendingPreview() = EngineResult.Ok lastPendingPreview
+    member _.PendingPreview() =
+        match failure with
+        | Some(code, message) -> EngineResult.Failed(code, message, None)
+        | None -> EngineResult.Ok lastPendingPreview
 
     /// Writes the suspended step to the spill store and releases its scratch memory. The next request restores it.
     member _.Spill() = spillSession ()
@@ -3958,6 +4060,7 @@ type TextDiffSession internal (
                 reservePendingPreview None |> ignore
                 do! pairings.Dispose()
                 journal.Release()
+                do! journal.Dispose()
                 do! checkpoints.Dispose()
                 do! store.Dispose()
                 match spillStore with

@@ -210,16 +210,46 @@ module CommonRun =
         windows.ToArray()
 
     /// Counts controls in bytes [first, last) of a byte encoding with a table lookup behind a range test.
-    let private countByteControls (data: byte[]) (first: int) (last: int) (windowOrigin: int) (window: ObservationWindow) =
+    let private countByteControls
+        (encoding: TextEncoding)
+        (position: float)
+        (currentPosition: float)
+        (observePrevious: int -> float -> unit)
+        (observeCurrent: int -> float -> unit)
+        (observePreviousRun: float -> int -> int -> unit)
+        (observeCurrentRun: float -> int -> int -> unit)
+        (data: byte[])
+        (first: int)
+        (last: int)
+        (windowOrigin: int)
+        (window: ObservationWindow)
+        =
         let flags = Scanner.controlFlags
         let mutable controls = 0
         let mutable firstControl = window.FirstControl
-        for index in first .. last - 1 do
+        let mutable index = first
+        while index < last do
             let value = Native.readByte data index
-            if value < 0x20 || value = 0x7F then
-                if Native.readByte flags value <> 0 then
-                    controls <- controls + 1
-                    if firstControl < 0 then firstControl <- index - windowOrigin
+            if value >= 0x20 && value < 0x7F then
+                let runStart = index
+                index <- index + 1
+                let mutable running = true
+                while running && index < last do
+                    let current = Native.readByte data index
+                    if current >= 0x20 && current < 0x7F then index <- index + 1
+                    else running <- false
+                let runLength = index - runStart
+                observePreviousRun (position + float runStart) runLength 1
+                observeCurrentRun (currentPosition + float runStart) runLength 1
+            else
+                if encoding = TextEncoding.Windows1252 || not (Decoders.isUtf8Continuation value) then
+                    observePrevious value (position + float index)
+                    observeCurrent value (currentPosition + float index)
+                if value < 0x20 || value = 0x7F then
+                    if Native.readByte flags value <> 0 then
+                        controls <- controls + 1
+                        if firstControl < 0 then firstControl <- index - windowOrigin
+                index <- index + 1
         window.Controls <- window.Controls + controls
         window.FirstControl <- firstControl
 
@@ -229,13 +259,16 @@ module CommonRun =
             if not (Decoders.isUtf8Continuation (Native.readByte data index)) then scalars <- scalars + 1
         scalars
 
-    /// Compares left[leftOffset ..] with right[rightOffset ..] over at most `count` bytes, capped at
-    /// MaxRunBytes. `position` is the absolute offset of both starts and `pendingCR` is the flag that
-    /// the previous run or the scanner left open.
-    let find
+    /// Compares equal bytes up to a mismatch or invalid scalar and reports every observed scalar at each side's offset.
+    let findObserved
         (encoding: TextEncoding)
-        (position: int64)
+        (position: float)
+        (currentPosition: float)
         (pendingCR: bool)
+        (observePrevious: int -> float -> unit)
+        (observeCurrent: int -> float -> unit)
+        (observePreviousRun: float -> int -> int -> unit)
+        (observeCurrentRun: float -> int -> int -> unit)
         (left: byte[])
         (leftOffset: int)
         (right: byte[])
@@ -244,13 +277,13 @@ module CommonRun =
         : CommonRunResult =
         if isNull left then nullArg (nameof left)
         if isNull right then nullArg (nameof right)
-        if position < 0L then invalidArg (nameof position) "The position cannot be negative."
+        if position < 0.0 || currentPosition < 0.0 then invalidArg (nameof position) "The position cannot be negative."
         if count < 0 || leftOffset < 0 || leftOffset > left.Length - count then
             invalidArg (nameof leftOffset) "The left byte range is outside its buffer."
         if rightOffset < 0 || rightOffset > right.Length - count then
             invalidArg (nameof rightOffset) "The right byte range is outside its buffer."
 
-        let start = float position
+        let start = position
         let limit = min count MaxRunBytes
         let difference = firstDifference left leftOffset right rightOffset limit
         let mismatch = difference < limit
@@ -261,7 +294,7 @@ module CommonRun =
             if isValid encoding data candidate then
                 candidate, None
             else
-                match firstError encoding position data candidate with
+                match firstError encoding (int64 position) data candidate with
                 | Some decodeError -> int (float decodeError.Offset - start), Some decodeError
                 | None -> candidate, None
 
@@ -280,7 +313,7 @@ module CommonRun =
                 Mismatch = mismatch
                 DifferenceOffset = if mismatch then Some difference else None
                 Lines = 0
-                LastLineStart = position
+                LastLineStart = int64 position
                 PendingCR = pendingCR
                 Evidence = Array.empty
                 Windows = Array.empty
@@ -305,7 +338,7 @@ module CommonRun =
                     let windowOrigin = int (window.Start - start)
                     let first = max 0 windowOrigin
                     let last = first + window.Bytes
-                    countByteControls data first last windowOrigin window
+                    countByteControls encoding start currentPosition observePrevious observeCurrent observePreviousRun observeCurrentRun data first last windowOrigin window
                     if encoding = TextEncoding.Windows1252 then
                         window.Scalars <- window.Bytes
                     elif keep[windowIndex] || window.Controls > 0 then
@@ -321,6 +354,8 @@ module CommonRun =
                         windowIndex <- windowIndex + 1
                     let window = windows[windowIndex]
                     let value = readCodeUnit size littleEndian data index
+                    observePrevious value (start + float index)
+                    observeCurrent value (currentPosition + float index)
                     window.Scalars <- window.Scalars + 1
                     if value < 0x80 then
                         if Native.readByte Scanner.controlFlags value <> 0 then
@@ -358,3 +393,17 @@ module CommonRun =
                 Windows = kept.ToArray()
                 Error = error
             }
+
+    /// Compares left[leftOffset ..] with right[rightOffset ..] over at most `count` bytes, capped at
+    /// MaxRunBytes. Both inputs start at the same absolute offset.
+    let find
+        (encoding: TextEncoding)
+        (position: int64)
+        (pendingCR: bool)
+        (left: byte[])
+        (leftOffset: int)
+        (right: byte[])
+        (rightOffset: int)
+        (count: int)
+        : CommonRunResult =
+        findObserved encoding (float position) (float position) pendingCR (fun _ _ -> ()) (fun _ _ -> ()) (fun _ _ _ -> ()) (fun _ _ _ -> ()) left leftOffset right rightOffset count

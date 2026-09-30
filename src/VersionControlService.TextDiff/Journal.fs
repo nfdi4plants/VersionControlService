@@ -588,72 +588,81 @@ type private JournalCache(ledger: Ledger, capBytes: int) =
         used <- 0
         entries.Clear()
 
-type internal Journal(store: ITempStore, ledger: Ledger, cacheBytes: int) =
+type internal Journal(store: ITempStore, ledger: Ledger, cacheBytes: int, createIndexStore: unit -> Async<ITempStore>) =
     let cache = JournalCache(ledger, cacheBytes)
     let gate = AsyncGate()
-    let mutable indexCapacity = 64L
-    let mutable dataStart = indexCapacity * 16L
+    let mutable indexStore: ITempStore option = None
+    let indexEntryBytes = 24L
     let mutable count = 0L
     let mutable initialized = false
 
+    let getIndexStore () = async {
+        match indexStore with
+        | Some value -> return value
+        | None ->
+            let! created = createIndexStore ()
+            indexStore <- Some created
+            return created
+    }
+
     let readFully position buffer count = async {
         let! actual = store.ReadAt position buffer 0 count
-        if actual <> count then invalidOp "The journal index or record is truncated."
+        if actual <> count then invalidOp "The journal record is truncated."
     }
 
     let readEntry sequence = async {
+        let! index = getIndexStore ()
+        let indexCapacity = index.Length() / indexEntryBytes
         if sequence < 0L || sequence >= count || sequence >= indexCapacity then return None
         else
-            let bytes = Array.zeroCreate<byte> 16
-            let! actual = store.ReadAt (sequence * 16L) bytes 0 bytes.Length
+            let bytes = Array.zeroCreate<byte> (int indexEntryBytes)
+            let! actual = index.ReadAt (sequence * indexEntryBytes) bytes 0 bytes.Length
             if actual < bytes.Length then return None
             else
                 let reader = JournalReader bytes
-                let offset = dataStart + reader.ReadInt64()
+                let key = reader.ReadInt64()
+                let offset = reader.ReadInt64()
                 let length = reader.ReadInt64()
-                if length <= 0L then return None else return Some(offset, length)
+                if key <> sequence || length <= 0L then return None else return Some(offset, length)
     }
 
     let writeEntry sequence offset length = async {
+        let! index = getIndexStore ()
         let writer = JournalWriter()
-        writer.WriteInt64(offset - dataStart)
+        writer.WriteInt64 sequence
+        writer.WriteInt64 offset
         writer.WriteInt64 length
         let bytes = writer.ToArray()
-        do! store.WriteAt (sequence * 16L) bytes 0 bytes.Length
+        do! index.WriteAt (sequence * indexEntryBytes) bytes 0 bytes.Length
+    }
+
+    let appendZeroSlots slotCount = async {
+        let! index = getIndexStore ()
+        let slotsPerChunk = 2_730
+        let zeroSlots = Array.zeroCreate<byte> (slotsPerChunk * int indexEntryBytes)
+        let mutable remaining = slotCount
+        while remaining > 0L do
+            let slots = int (min (int64 slotsPerChunk) remaining)
+            let! _ = index.Append zeroSlots 0 (slots * int indexEntryBytes)
+            remaining <- remaining - int64 slots
     }
 
     let growIndex neededSequence = async {
-        if neededSequence >= indexCapacity then
-            let oldCapacity = indexCapacity
-            let mutable nextCapacity = oldCapacity
+        let! index = getIndexStore ()
+        let currentCapacity = index.Length() / indexEntryBytes
+        if neededSequence >= currentCapacity then
+            let mutable nextCapacity = max 64L currentCapacity
             while neededSequence >= nextCapacity do nextCapacity <- nextCapacity * 2L
-            let oldStart = dataStart
-            let newStart = nextCapacity * 16L
-            let shift = newStart - oldStart
-            let oldEnd = store.Length()
-            let block = Array.zeroCreate<byte> 65_536
-            let mutable remaining = oldEnd - oldStart
-            while remaining > 0L do
-                let amount = int (min (int64 block.Length) remaining)
-                let source = oldStart + remaining - int64 amount
-                do! readFully source block amount
-                do! store.WriteAt (source + shift) block 0 amount
-                remaining <- remaining - int64 amount
-            indexCapacity <- nextCapacity
-            dataStart <- newStart
-            let reserve = Array.zeroCreate<byte> 1
-            do! store.WriteAt (dataStart - 1L) reserve 0 1
+            do! appendZeroSlots (nextCapacity - currentCapacity)
     }
 
     member _.Initialize() = async {
         if not initialized then
-            let reservation = Array.zeroCreate<byte> 1
-            do! store.WriteAt (dataStart - 1L) reservation 0 1
+            do! growIndex 0L
             initialized <- true
     }
 
-    /// Records a result. The whole commit runs to completion once it has started, and lookups wait for it,
-    /// so an index relocation never interleaves with a lookup.
+    /// Records a result. The gate keeps readers from observing an entry while its record is being written.
     member _.Append(sequence: int64, value: JournalValue) =
         gate.Run(
             async {
@@ -709,3 +718,11 @@ type internal Journal(store: ITempStore, ledger: Ledger, cacheBytes: int) =
 
     /// Drops the cached records and returns their bytes to the ledger.
     member _.Release() = cache.Clear()
+
+    member _.Dispose() = async {
+        match indexStore with
+        | Some value ->
+            do! value.Dispose()
+            indexStore <- None
+        | None -> ()
+    }

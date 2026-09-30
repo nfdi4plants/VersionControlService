@@ -109,27 +109,8 @@ type MyersStepper(
         let currentRangeStart = range.CurrentStart
         let previousRangeCount = range.CorePreviousEnd - previousRangeStart
         let currentRangeCount = range.CoreCurrentEnd - currentRangeStart
-        let mutable ordered = ResizeArray<MyersTask>()
-        if range.SingleMatch < 0 then
-            ordered.Add(WriteDeletes(previousRangeStart, previousRangeCount))
-            ordered.Add(WriteInserts(currentRangeStart, currentRangeCount))
-        elif range.SinglePrevious then
-            let matchCurrent = range.SingleMatch
-            ordered.Add(WriteInserts(currentRangeStart, matchCurrent - currentRangeStart))
-            ordered.Add(WriteEqual(previousRangeStart, matchCurrent, 1))
-            ordered.Add(WriteInserts(matchCurrent + 1, range.CurrentEnd - matchCurrent - 1))
-        else
-            let matchPrevious = range.SingleMatch
-            ordered.Add(WriteDeletes(previousRangeStart, matchPrevious - previousRangeStart))
-            ordered.Add(WriteEqual(matchPrevious, currentRangeStart, 1))
-            ordered.Add(WriteDeletes(matchPrevious + 1, range.PreviousEnd - matchPrevious - 1))
         pushSuffix range
-        for index = ordered.Count - 1 downto 0 do
-            match ordered[index] with
-            | WriteDeletes(_, count)
-            | WriteInserts(_, count)
-            | WriteEqual(_, _, count) when count = 0 -> ()
-            | task -> tasks.Push task
+        pushDeleteInsert previousRangeStart previousRangeCount currentRangeStart currentRangeCount
         active <- None
 
     let pushFallback (range: MyersRange) =
