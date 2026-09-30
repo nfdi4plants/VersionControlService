@@ -159,8 +159,6 @@ type ScannerState = {
     mutable CurrentWindow: ObservationWindow
     mutable PreviousWindow: ObservationWindow option
     mutable IsComplete: bool
-    mutable ScalarObserver: (int -> float -> unit) option
-    mutable ScalarRunObserver: (float -> int -> int -> unit) option
 }
 
 module Scanner =
@@ -236,8 +234,6 @@ module Scanner =
             CurrentWindow = newWindow windowStart (int (start - windowStart))
             PreviousWindow = None
             IsComplete = false
-            ScalarObserver = None
-            ScalarRunObserver = None
         }
 
     let private copyWindow window = {
@@ -382,9 +378,6 @@ module Scanner =
             else
                 state.CurrentWindow
         window.Scalars <- window.Scalars + 1
-        match state.ScalarObserver with
-        | Some observe -> observe scalar start
-        | None -> ()
         if scalar < 0x80 then
             if Native.readByte controlFlags scalar <> 0 then
                 window.Controls <- window.Controls + 1
@@ -486,9 +479,6 @@ module Scanner =
                     current <- if index < stop then Native.readByte data index else 0
                 let length = index - runStart
                 scalars <- scalars + length
-                match state.ScalarRunObserver with
-                | Some observe -> observe (origin + float runStart) length 1
-                | None -> ()
                 state.LineHasText <- true
                 state.LineLengthUtf16 <- state.LineLengthUtf16 + float length
                 if limit >= 0 then retainAscii state limit data runStart length 1
@@ -576,9 +566,6 @@ module Scanner =
                     current <- if index < stop then Native.readByte data index else 0
                 let length = index - runStart
                 scalars <- scalars + length
-                match state.ScalarRunObserver with
-                | Some observe -> observe (origin + float runStart) length 1
-                | None -> ()
                 state.LineHasText <- true
                 state.LineLengthUtf16 <- state.LineLengthUtf16 + float length
                 if limit >= 0 then retainAscii state limit data runStart length 1
@@ -648,9 +635,6 @@ module Scanner =
                         else (Native.readByte data index <<< 8) ||| Native.readByte data (index + 1)
                 let length = (index - runStart) >>> 1
                 scalars <- scalars + length
-                match state.ScalarRunObserver with
-                | Some observe -> observe (origin + float runStart) length 2
-                | None -> ()
                 state.LineHasText <- true
                 state.LineLengthUtf16 <- state.LineLengthUtf16 + float length
                 if limit >= 0 then retainAscii state limit data (runStart + lowByte) length 2
@@ -983,6 +967,20 @@ type internal ControlRatioTally(side: DiffSide, startOffset: int, sourceLength: 
 
     member _.HighWater = highWater
 
+    member this.ObserveCounts(start: float, byteCount: int, controls: int, scalars: int, firstControl: float, firstNul: float) =
+        if not finished && byteCount > 0 && start >= highWater then
+            this.AdvanceThrough start
+            let window =
+                match previous with
+                | Some earlier when start < earlier.Start + 65_536.0 -> earlier
+                | _ -> current
+            window.Scalars <- window.Scalars + scalars
+            window.Controls <- window.Controls + controls
+            if firstControl >= start && window.FirstControl < 0 then
+                window.FirstControl <- int (firstControl - window.Start)
+            if firstNul >= start then report side "nul" (int64 firstNul)
+            this.AdvanceThrough (start + float byteCount)
+
     member _.AdvanceThrough(offset: float) =
         let target = min (float sourceLength) (max highWater offset)
         while highWater < target do
@@ -995,39 +993,6 @@ type internal ControlRatioTally(side: DiffSide, startOffset: int, sourceLength: 
                 current <- Scanner.newWindow (current.Start + 65_536.0) 0
             elif current.Bytes >= Scanner.SmallFinalWindowBytes then
                 settlePrevious ()
-
-    member this.ObserveScalar(value: int, start: float) =
-        if not finished && start >= highWater && start < float sourceLength then
-            this.AdvanceThrough start
-            let window =
-                match previous with
-                | Some previousWindow when start < previousWindow.Start + 65_536.0 -> previousWindow
-                | _ -> current
-            window.Scalars <- window.Scalars + 1
-            if value < 0x80 then
-                if Native.readByte Scanner.controlFlags value <> 0 then
-                    window.Controls <- window.Controls + 1
-                    if window.FirstControl < 0 then window.FirstControl <- int (start - window.Start)
-                elif value = 0 then
-                    report side "nul" (int64 start)
-
-    member this.ObserveAsciiRun(start: float, count: int, bytesPerScalar: int) =
-        if not finished && count > 0 && bytesPerScalar > 0 then
-            let skip = if highWater <= start then 0 else int (Math.Ceiling((highWater - start) / float bytesPerScalar))
-            let mutable remaining = count - skip
-            let mutable position = start + float (skip * bytesPerScalar)
-            while remaining > 0 do
-                this.AdvanceThrough position
-                let window =
-                    match previous with
-                    | Some earlier when position < earlier.Start + 65_536.0 -> earlier
-                    | _ -> current
-                let bytesToBoundary = int (window.Start + 65_536.0 - position)
-                let taken = min remaining (max 1 (bytesToBoundary / bytesPerScalar))
-                window.Scalars <- window.Scalars + taken
-                position <- position + float (taken * bytesPerScalar)
-                remaining <- remaining - taken
-                this.AdvanceThrough position
 
     member this.Finish() =
         if not finished then

@@ -84,12 +84,6 @@ type internal ScanSide(
     let mutable hasLineObserver = false
     let mutable lineCheckpointDue = checkpointIntervalBytes
 
-    let attachScalarObserver (state: ScannerState) =
-        state.ScalarObserver <- Some(fun value start -> evidenceTally.ObserveScalar(value, start))
-        state.ScalarRunObserver <- Some(fun start count width -> evidenceTally.ObserveAsciiRun(start, count, width))
-
-    do attachScalarObserver scanner
-
     member _.Spec = spec
     member _.Encoding = encoding
     member _.Side = side
@@ -128,7 +122,6 @@ type internal ScanSide(
     member _.SetCursor(offset: float, firstLine: int64, maxLines: int, maxBytes: int) =
         table.ReleaseWindow()
         scanner <- Scanner.create encoding (int64 offset) None
-        attachScalarObserver scanner
         finished <- spec.Source.IsNone
         windowLineLimit <- max 1 maxLines
         windowByteLimit <- max 1 maxBytes
@@ -174,11 +167,33 @@ type internal ScanSide(
         let emitEvidence (evidence: ScannerEvidence) =
             if evidence.Kind <> "control ratio" && evidence.Kind <> "nul" then
                 reportEvidence side evidence.Kind evidence.Offset
+        let bufferPosition = scanner.NextOffset
+        let pendingValue = scanner.PendingValue
+        let pendingCount = scanner.PendingCount
+        let expectedCount = scanner.ExpectedCount
+        let pendingStart = scanner.PendingStart
+        let pendingHigh = scanner.PendingHigh
+        let pendingHighStart = scanner.PendingHighStart
         let remainingLines = max 1 (windowLineLimit - table.Count)
         let batch = LineBatch(max 1 (min 4_096 remainingLines))
         batch.StopAtFull <- true
         let previousCount = table.Count
         let result = Scanner.scanChunk scanner buffer 0 count endOfSource meter batch emitLineBatch emitEvidence
+        let validatedEnd = float scanner.StartOffset + scanner.ValidatedBytes
+        CommonRun.observeScannerRange
+            encoding
+            buffer
+            0
+            bufferPosition
+            validatedEnd
+            evidenceTally.HighWater
+            pendingValue
+            pendingCount
+            expectedCount
+            pendingStart
+            pendingHigh
+            pendingHighStart
+            (fun start bytes controls scalars firstControl firstNul -> evidenceTally.ObserveCounts(start, bytes, controls, scalars, firstControl, firstNul))
         for index = previousCount to table.Count - 1 do
             windowAccountedBytes <- windowAccountedBytes + table.Finish index - table.Start index + table.Length index * 2.0 + 40.0
         if hasLineObserver && table.Count > previousCount then
@@ -204,8 +219,6 @@ type internal ScanSide(
         evidenceTally.AdvanceThrough value
         if value >= float spec.ByteLength && (spec.Source |> Option.forall (fun source -> source.IsComplete())) then
             evidenceTally.Finish()
-
-    member _.AttachState(state: ScannerState) = attachScalarObserver state
 
     /// False for helper sides whose window sizes do not count toward the session peaks.
     member _.RecordPeaks with get () = recordPeaks and set value = recordPeaks <- value
@@ -238,7 +251,6 @@ type internal ScanSide(
         let firstLine = header.Number()
         let lines = header.Int()
         scanner <- ScannerStateCodec.read encoding header
-        attachScalarObserver scanner
         struct (int64 firstLine, lines)
 
     member _.Dispose() = table.Dispose()

@@ -807,10 +807,11 @@ type TextDiffSession internal (
                             oldPos
                             (oldPos + delta)
                             pendingCR
-                            (fun value offset -> previousEvidence.ObserveScalar(value, offset))
-                            (fun value offset -> currentEvidence.ObserveScalar(value, offset))
-                            (fun start count width -> previousEvidence.ObserveAsciiRun(start, count, width))
-                            (fun start count width -> currentEvidence.ObserveAsciiRun(start, count, width))
+                            true
+                            previousEvidence.HighWater
+                            currentEvidence.HighWater
+                            (fun start bytes controls scalars firstControl firstNul -> previousEvidence.ObserveCounts(start, bytes, controls, scalars, firstControl, firstNul))
+                            (fun start bytes controls scalars firstControl firstNul -> currentEvidence.ObserveCounts(start, bytes, controls, scalars, firstControl, firstNul))
                             bufA
                             0
                             bufB
@@ -2697,7 +2698,6 @@ type TextDiffSession internal (
                 match hit with
                 | Some found -> found.State, found.Line
                 | None -> Scanner.create (encodingAt sideIndex) (int64 spec.BomLength) None, 0.0
-            (scanSideAt sideIndex).AttachState state
             let batch = LineBatch(256)
             return Some {
                 SideIndex = sideIndex
