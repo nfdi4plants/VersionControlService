@@ -179,6 +179,20 @@ module TextDiffResyncCases =
             Check.equal 0 shape.Removed "No line is removed."
             Check.equal 0 (shape.UnalignedPrevious + shape.UnalignedCurrent) "A pure insertion is not unaligned."
         }
+        "an insertion larger than a window resyncs when the alignment step budget ends the window", fun () -> async {
+            // The window alignment gives up on a gap of unmatched lines after its step budget. The window is then
+            // one unaligned region, which must not hide the place where the sources line up again.
+            let pad (value: int) = (string value).PadLeft(7, '0')
+            let generated index = { Text = $"row {pad index},value {pad ((index * 7) % 10_000_000)},sample S{pad index}"; Ending = LineEnding.LF }
+            let previous = Array.init 600 (fun index -> generated (index + 1))
+            let inserted = Array.init 300 (fun index -> { Text = $"inserted {pad (index + 1)} in the middle of the file"; Ending = LineEnding.LF })
+            let current = Array.concat [ previous[.. 99]; inserted; previous[100 ..] ]
+            let sessionConfig = { smallConfig "resync-step-budget" with MyersStepsPerGap = 1_000; ResyncSampleModulus = 4 }
+            let! shape = run sessionConfig previous current
+            Check.equal 300 shape.Added "Every inserted line is an added row."
+            Check.equal 0 shape.Removed "No line is removed."
+            Check.equal 0 (shape.UnalignedPrevious + shape.UnalignedCurrent) "A pure insertion is not unaligned."
+        }
         "a deletion larger than a window resyncs at the unchanged side", fun () -> async {
             let previous = lines "line-" 0 500
             let current = Array.append previous[.. 99] previous[400 ..]

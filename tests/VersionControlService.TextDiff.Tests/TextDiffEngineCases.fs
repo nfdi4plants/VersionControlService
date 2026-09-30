@@ -449,12 +449,14 @@ module TextDiffEngineCases =
             expectClassified (classify (ascii "plain ascii")) TextEncoding.Utf8 false 0
             return ()
         }
-        "valid UTF-8 and Windows-1252 can require a choice", fun () -> async {
-            match classify (bytes [ 0xC3; 0xA9 ]) with
-            | Candidates values ->
-                Check.sequence [| "utf-8"; "windows-1252" |] (values |> Array.map _.Encoding) "Both materially different candidates are returned."
-                Check.true' (values |> Array.forall (fun item -> item.Preview.Length <= 2048)) "Candidate previews stay bounded."
-            | result -> failwith $"Expected encoding candidates, got {result}."
+        "valid UTF-8 with a multi-byte sequence is chosen without a choice", fun () -> async {
+            expectClassified (classify (bytes [ 0xC3; 0xA9 ])) TextEncoding.Utf8 false 0
+            expectClassified (classify (Encoding.UTF8.GetBytes "Käse und Übung\n")) TextEncoding.Utf8 false 0
+            return ()
+        }
+        "bytes that are not valid UTF-8 are classified as Windows-1252", fun () -> async {
+            expectClassified (classify (bytes [ 0x63; 0x61; 0x66; 0xE9; 0x0A ])) TextEncoding.Windows1252 false 0
+            expectClassified (classify (bytes [ 0x4B; 0xE4; 0x73; 0x65; 0x0A ])) TextEncoding.Windows1252 false 0
             return ()
         }
         "artificial sample cuts are skipped and a real EOF cut is an error", fun () -> async {

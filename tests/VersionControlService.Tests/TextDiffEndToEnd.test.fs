@@ -837,6 +837,70 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "reads a page with a one-line edit and a line ending change between context rows",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! repository = newRepository ()
+                let lines = [| for index in 0 .. 11 -> $"line-{index}" |]
+                let previous = String.concat "" [| for line in lines -> line + "\n" |]
+
+                let current =
+                    String.concat "" [|
+                        for index in 0 .. 11 ->
+                            if index = 3 then "line-3 edited\n"
+                            elif index = 8 then "line-8\r\n"
+                            else lines[index] + "\n"
+                    |]
+
+                do! commitText repository "small.txt" previous
+                do! writeText (NodePath.join [| repository; "small.txt" |]) current
+                let session = createSession (currentFixture ()).Pool repository
+                let service = serviceFor session
+                let mutable failure = None
+
+                try
+                    let! handle, _, _, first = openedWithFirstPage service (openRequest "small.txt") "small-edit-window-a"
+                    let! pages = readAllPages service handle first "small-edit-read-window-a"
+
+                    let rows =
+                        pages
+                        |> Array.collect (fun page -> page.Parts)
+                        |> Array.collect (function
+                            | DiffPart.Hunk { Body = HunkBody.AlignedRows rows } -> rows
+                            | _ -> Array.empty)
+
+                    Vitest.expect(rows.Length).toBe 12
+
+                    for index in 0 .. rows.Length - 1 do
+                        let row = rows[index]
+                        let previousLine = row.Previous.Value
+                        let currentLine = row.Current.Value
+                        Vitest.expect(previousLine.Slice.Text).toBe lines[index]
+                        Vitest.expect(previousLine.Number).toEqual (int64 index)
+                        Vitest.expect(currentLine.Number).toEqual (int64 index)
+
+                        match index with
+                        | 3 ->
+                            Vitest.expect(row.Kind).toEqual DiffRowKind.Replaced
+                            Vitest.expect(currentLine.Slice.Text).toBe "line-3 edited"
+                        | 8 ->
+                            Vitest.expect(row.Kind).toEqual DiffRowKind.EndingChanged
+                            Vitest.expect(currentLine.Slice.Text).toBe lines[index]
+                            Vitest.expect(currentLine.Ending).toEqual LineEnding.CRLF
+                        | _ ->
+                            Vitest.expect(row.Kind).toEqual DiffRowKind.Context
+                            Vitest.expect(currentLine.Slice.Text).toBe lines[index]
+
+                    let! closeResult = service.Close handle (context "small-edit-close-window-a") |> Async.StartAsPromise
+                    ignore (operationValue "Close" closeResult)
+                with error ->
+                    failure <- Some error
+
+                do! closeSession session failure
+            }
+        )
+
+        Vitest.test (
             "expands a large equal gap from both ends and replays a replaced gap",
             TestOptions(timeout = 180000),
             fun () -> promise {
@@ -1144,37 +1208,39 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "reopens an ambiguous file after choosing UTF-8",
+            "opens a UTF-8 file with umlauts without an encoding choice",
             TestOptions(timeout = 120000),
             fun () -> promise {
                 let! repository = newRepository ()
-                do! commitBytes repository "ambiguous.txt" [| 0xC3; 0xA9; 0x0A |]
-                do! writeBytes (NodePath.join [| repository; "ambiguous.txt" |]) [| 0xC3; 0xA8; 0x0A |]
+                do! commitBytes repository "umlauts.txt" [| 0x4B; 0xC3; 0xA4; 0x73; 0x65; 0x0A |]
+                do! writeBytes (NodePath.join [| repository; "umlauts.txt" |]) [| 0x4B; 0xC3; 0xA4; 0x73; 0x65; 0x21; 0x0A |]
                 let session = createSession (currentFixture ()).Pool repository
                 let service = serviceFor session
-                let firstRequest = openRequest "ambiguous.txt"
-                let! first = openUntilReady service firstRequest "ambiguous-window-a"
-                let token, candidates =
-                    match first with
-                    | OpenDiffResult.NotDiffable(DiffBlocker.EncodingRequired(_, token, candidates)) -> token, candidates
-                    | other -> failwith $"Expected an encoding choice, got %A{other}."
-
-                Vitest.expect(candidates |> Array.exists (fun candidate -> candidate.Encoding = "utf-8")).toBe true
-                Vitest.expect(candidates |> Array.exists (fun candidate -> candidate.Encoding = "windows-1252")).toBe true
-
-                let selected =
-                    {
-                        firstRequest with
-                            Preparation = Some token
-                            PreviousEncoding = Some "utf-8"
-                            CurrentEncoding = Some "utf-8"
-                    }
-                let! opened = openedWithFirstPage service selected "ambiguous-window-a-reopen"
+                let! opened = openedWithFirstPage service (openRequest "umlauts.txt") "umlauts-window-a"
                 let handle, _, currentInfo, firstPage = opened
                 Vitest.expect(currentInfo.Encoding).toEqual(Some "utf-8")
-                Vitest.expect(currentInfo.EncodingWasChosen).toBe true
+                Vitest.expect(currentInfo.EncodingWasChosen).toBe false
                 Vitest.expect(pageHasChange firstPage).toBe true
-                let! closeResult = service.Close handle (context "close-ambiguous-window-a") |> Async.StartAsPromise
+                let! closeResult = service.Close handle (context "close-umlauts-window-a") |> Async.StartAsPromise
+                ignore (operationValue "Close" closeResult)
+                do! session.Close() |> Async.StartAsPromise
+            }
+        )
+
+        Vitest.test (
+            "opens a file with bytes that are invalid as UTF-8 as Windows-1252",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! repository = newRepository ()
+                do! commitBytes repository "legacy.txt" [| 0x63; 0x61; 0x66; 0xE9; 0x0A |]
+                do! writeBytes (NodePath.join [| repository; "legacy.txt" |]) [| 0x63; 0x61; 0x66; 0xE8; 0x0A |]
+                let session = createSession (currentFixture ()).Pool repository
+                let service = serviceFor session
+                let! opened = openedWithFirstPage service (openRequest "legacy.txt") "legacy-window-a"
+                let handle, _, currentInfo, firstPage = opened
+                Vitest.expect(currentInfo.Encoding).toEqual(Some "windows-1252")
+                Vitest.expect(pageHasChange firstPage).toBe true
+                let! closeResult = service.Close handle (context "close-legacy-window-a") |> Async.StartAsPromise
                 ignore (operationValue "Close" closeResult)
                 do! session.Close() |> Async.StartAsPromise
             }

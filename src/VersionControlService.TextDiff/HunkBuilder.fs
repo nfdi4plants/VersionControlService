@@ -3,6 +3,9 @@ namespace VersionControlService.TextDiff
 open System.Collections.Generic
 open VersionControlService.Abstractions
 
+[<assembly: System.Runtime.CompilerServices.InternalsVisibleTo("VersionControlService.TextDiff.Tests")>]
+do ()
+
 /// Position and size of one source line. Offsets and counts are floats so the transpiled code avoids 64-bit arithmetic.
 [<Struct>]
 type internal LineRef = {
@@ -68,6 +71,44 @@ module internal LineRefs =
     let hasCurrent = function
         | DiffRowKind.Removed -> false
         | _ -> true
+
+/// The compact per-side line arrays that a window of rows reads. A row takes a slot on a side only when it reads
+/// a line from that side. Context and ending-only rows read their line from the previous side and build the
+/// current line from it, so they take no slot on the current side.
+module internal RowLines =
+    let count (rows: RowRef[]) (first: int) (rowCount: int) (previousSide: bool) =
+        let mutable total = 0
+        for index = first to first + rowCount - 1 do
+            match rows[index].Kind with
+            | DiffRowKind.Replaced -> total <- total + 1
+            | DiffRowKind.Added -> if not previousSide then total <- total + 1
+            | _ -> if previousSide then total <- total + 1
+        total
+
+    /// The slot of a row in the arrays that collect builds for one side.
+    let slotBefore (rows: RowRef[]) (first: int) (rowIndex: int) (previousSide: bool) =
+        count rows first (rowIndex - first) previousSide
+
+    let collect (rows: RowRef[]) (first: int) (rowCount: int) =
+        let previousRefs = Array.zeroCreate<LineRef> (count rows first rowCount true)
+        let currentRefs = Array.zeroCreate<LineRef> (count rows first rowCount false)
+        let mutable previousIndex = 0
+        let mutable currentIndex = 0
+        for index = first to first + rowCount - 1 do
+            let row = rows[index]
+            match row.Kind with
+            | DiffRowKind.Added ->
+                currentRefs[currentIndex] <- row.Current
+                currentIndex <- currentIndex + 1
+            | DiffRowKind.Replaced ->
+                previousRefs[previousIndex] <- row.Previous
+                currentRefs[currentIndex] <- row.Current
+                previousIndex <- previousIndex + 1
+                currentIndex <- currentIndex + 1
+            | _ ->
+                previousRefs[previousIndex] <- row.Previous
+                previousIndex <- previousIndex + 1
+        previousRefs, currentRefs
 
 /// Groups a stream of aligned lines into gaps, hunks and unaligned regions. It stores line positions and never
 /// line text. Hunks carry ContextLines lines of context on each side, merge when the equal lines between them

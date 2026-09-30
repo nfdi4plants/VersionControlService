@@ -473,6 +473,22 @@ module Classification =
                         if (((baseOdd + i) &&& 1) = 1) = oddOffsets then parityZeros <- parityZeros + 1
         total > 0 && zeros * 10 >= total && parityZeros * 10 >= zeros * 9
 
+    /// True when a sampled range holds a lead byte of a multi-byte UTF-8 sequence. The caller has already
+    /// checked that the ranges are valid UTF-8, so a byte from 0xC0 up starts a sequence.
+    let private hasMultiByteSequence sourceLength samples =
+        let ordered = orderedSamples samples
+        let mutable found = false
+        let mutable sampleIndex = 0
+        while not found && sampleIndex < ordered.Length do
+            let start, stop = sampleRange sourceLength TextEncoding.Utf8 0 ordered[sampleIndex]
+            let bytes = ordered[sampleIndex].Bytes
+            let mutable index = start
+            while not found && index < stop do
+                if Native.readByte bytes index >= 0xC0 then found <- true
+                index <- index + 1
+            sampleIndex <- sampleIndex + 1
+        found
+
     let classifyWithChoice sourceLength samples encoding =
         match detectBom samples with
         | Some bom ->
@@ -514,6 +530,9 @@ module Classification =
                     | _, _, Some error, _ -> BinaryEvidence error
                     | _ -> BinaryEvidence "no supported text encoding"
                 elif accepted.Count = 1 then Classified(accepted[0].Encoding, false, 0)
+                elif utf8.Error.IsNone && utf8.ControlEvidence.IsNone && hasMultiByteSequence sourceLength samples then
+                    // Text in another single-byte encoding is almost never valid UTF-8 with multi-byte sequences.
+                    Classified(TextEncoding.Utf8, false, 0)
                 else
                     let distinct = ResizeArray<Evaluation>()
                     let texts = ResizeArray<DecodedText>()

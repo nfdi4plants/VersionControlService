@@ -669,6 +669,51 @@ module TextDiffSessionCases =
     }
 
     let cases: (string * (unit -> Async<unit>)) list = [
+        "a small edit between context rows keeps every line on both sides", fun () -> async {
+            let build edited =
+                Array.init 12 (fun index ->
+                    let text = if index = 5 && edited then "line-5 edited" else "line-" + string index
+                    { Text = text; Ending = LineEnding.LF })
+            let! session = openSession (defaultConfig ()) (sourceSpec (encodeLines (build false))) (sourceSpec (encodeLines (build true)))
+            let! pages = readAll session (fun () -> false)
+            let shown = allParts pages |> rows
+            Check.equal 7 shown.Length "The hunk holds three context rows on each side of the edit."
+            for index = 0 to shown.Length - 1 do
+                let row = shown[index]
+                let number = int64 (index + 2)
+                let previous = row.Previous.Value
+                let current = row.Current.Value
+                Check.equal number previous.Number "A row shows the previous line number."
+                Check.equal number current.Number "A row shows the current line number."
+                Check.equal ("line-" + string number) previous.Slice.Text "A row shows the previous text."
+                if index = 3 then
+                    Check.equal DiffRowKind.Replaced row.Kind "The edited line is a replaced row."
+                    Check.equal "line-5 edited" current.Slice.Text "The replaced row shows the edited text."
+                else
+                    Check.equal DiffRowKind.Context row.Kind "An unchanged line is a context row."
+                    Check.equal previous.Slice.Text current.Slice.Text "A context row shows the same text on both sides."
+        }
+        "a line ending change between context rows is one ending-only row", fun () -> async {
+            let build crlf =
+                Array.init 12 (fun index ->
+                    { Text = "line-" + string index; Ending = if index = 5 && crlf then LineEnding.CRLF else LineEnding.LF })
+            let! session = openSession (defaultConfig ()) (sourceSpec (encodeLines (build false))) (sourceSpec (encodeLines (build true)))
+            let! pages = readAll session (fun () -> false)
+            let shown = allParts pages |> rows
+            Check.equal 7 shown.Length "The hunk holds three context rows on each side of the ending change."
+            for index = 0 to shown.Length - 1 do
+                let row = shown[index]
+                let previous = row.Previous.Value
+                let current = row.Current.Value
+                Check.equal previous.Slice.Text current.Slice.Text "Both sides show the same text."
+                Check.equal previous.Number current.Number "Both sides show the same line number."
+                if index = 3 then
+                    Check.equal DiffRowKind.EndingChanged row.Kind "The ending change is an ending-only row."
+                    Check.equal LineEnding.LF previous.Ending "The previous side keeps its ending."
+                    Check.equal LineEnding.CRLF current.Ending "The current side shows its own ending."
+                else
+                    Check.equal DiffRowKind.Context row.Kind "An unchanged line is a context row."
+        }
         "gap expansion reads both ends and returns the recorded replacement", fun () -> async {
             let expected = Array.init 12 (fun index -> { Text = "line-" + string index; Ending = LineEnding.LF })
             let source = sourceSpec (encodeLines expected)

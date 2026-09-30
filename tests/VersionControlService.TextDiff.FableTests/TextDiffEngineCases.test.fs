@@ -241,7 +241,8 @@ module TextDiffEngineCasesTests =
         | EngineResult.Failed(code, message, detail) -> promiseReject $"The measured session failed with {code}: {message}. Detail: {detail}."
         | EngineResult.Canceled -> promiseReject "The measured session was canceled."
 
-    let rec private finishSessionOutputPromise (session: TextDiffSession) (page: DiffPage) : JS.Promise<unit> =
+    let rec private finishSessionOutputPromise (observe: DiffPage -> unit) (session: TextDiffSession) (page: DiffPage) : JS.Promise<unit> =
+        observe page
         if page.OutputComplete then promiseResolveUnit ()
         else
             match page.NextCursor with
@@ -249,7 +250,7 @@ module TextDiffEngineCasesTests =
                 promiseThen
                     (Async.StartAsPromise(session.ReadPage cursor (fun () -> false)))
                     (fun result ->
-                        promiseThen (finishFirstPagePromise session result) (fun nextPage -> finishSessionOutputPromise session nextPage))
+                        promiseThen (finishFirstPagePromise session result) (fun nextPage -> finishSessionOutputPromise observe session nextPage))
             | None -> promiseReject "The measured scan stopped before output was complete."
 
     /// Builds lines of a fixed width that start with a marker letter and an eight digit counter, so every line differs.
@@ -433,7 +434,7 @@ module TextDiffEngineCasesTests =
     )
 
     /// Measures a whole session with the default budgets and logs the time to the first page and the total time.
-    let private reportSessionRun label sessionId (previous: byte[]) (current: byte[]) (checkLedger: Ledger -> unit) =
+    let private reportSessionRun label sessionId (previous: byte[]) (current: byte[]) (observe: DiffPage -> unit) (checkLedger: Ledger -> unit) =
         let ledger = Ledger()
         let config = { SessionConfig.defaults sessionId with Limits = { Limits.defaults with MaxUnits = 2_147_483_647; RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 } }
         let started = BrowserClock.nowMs()
@@ -444,7 +445,7 @@ module TextDiffEngineCasesTests =
                     let firstPageMs = BrowserClock.nowMs() - started
                     if page.Parts.Length = 0 then promiseReject "The first page has no edit rows."
                     else
-                        promiseThen (finishSessionOutputPromise session page) (fun () ->
+                        promiseThen (finishSessionOutputPromise observe session page) (fun () ->
                             let elapsed = max 1.0 (BrowserClock.nowMs() - started)
                             checkLedger ledger
                             Vitest.log ($"{label}: first page {firstPageMs:F1} ms, total {elapsed:F1} ms")
@@ -454,29 +455,47 @@ module TextDiffEngineCasesTests =
             )
         )
 
+    /// Adds the rows of a page to a tally of added rows, removed rows and lines in unaligned regions.
+    let private tallyPage (tally: int[]) (page: DiffPage) =
+        for part in page.Parts do
+            match part with
+            | DiffPart.Hunk fragment ->
+                match fragment.Body with
+                | HunkBody.AlignedRows rows ->
+                    for row in rows do
+                        if row.Kind = DiffRowKind.Added then tally[0] <- tally[0] + 1
+                        elif row.Kind = DiffRowKind.Removed then tally[1] <- tally[1] + 1
+                | HunkBody.UnalignedSides(previous, current) -> tally[2] <- tally[2] + previous.Length + current.Length
+            | _ -> ()
+
     let private measureMiddleInsertion () =
         let lineBytes = 40
         let lineCount = benchmarkSize / lineBytes
         let previous = numberedLines 0x70uy lineBytes lineCount
         let cutLine = lineCount / 2
-        let insertion = numberedLines 0x69uy lineBytes (8 * 1024 * 1024 / lineBytes)
+        let insertedLines = 8 * 1024 * 1024 / lineBytes
+        let insertion = numberedLines 0x69uy lineBytes insertedLines
         let cutByte = cutLine * lineBytes
         let current = Array.zeroCreate<byte> (previous.Length + insertion.Length)
         Array.blit previous 0 current 0 cutByte
         Array.blit insertion 0 current cutByte insertion.Length
         Array.blit previous cutByte current (cutByte + insertion.Length) (previous.Length - cutByte)
+        // The insertion is larger than one alignment window, so the search has to find the unchanged lines after it.
+        let tally = Array.zeroCreate<int> 3
         let check (ledger: Ledger) =
             let equalAfterInsertion = float (previous.Length - cutLine * lineBytes)
             if ledger.CommonRunBytes < 0.9 * equalAfterInsertion then
                 failwith $"The equal-byte phase consumed {ledger.CommonRunBytes} of {equalAfterInsertion} equal bytes after the insertion."
-        reportSessionRun "64 MiB file with an 8 MiB insertion in the middle" "benchmark-insertion-middle" previous current check
+            if tally[0] <> insertedLines || tally[1] <> 0 || tally[2] <> 0 then
+                failwith $"The insertion shows {tally[0]} added rows, {tally[1]} removed rows and {tally[2]} unaligned lines, expected {insertedLines} added rows and nothing else."
+        reportSessionRun "64 MiB file with an 8 MiB insertion in the middle" "benchmark-insertion-middle" previous current (tallyPage tally) check
 
     let private measureFullRewrite () =
         let lineBytes = 40
         let lineCount = benchmarkSize / lineBytes
         let previous = numberedLines 0x70uy lineBytes lineCount
         let current = numberedLines 0x71uy lineBytes lineCount
-        reportSessionRun "64 MiB full rewrite" "benchmark-rewrite" previous current ignore
+        reportSessionRun "64 MiB full rewrite" "benchmark-rewrite" previous current ignore ignore
 
     Vitest.itWithTimeout("measures a 64 MiB file with an 8 MiB insertion of 40-byte lines in the middle", measureMiddleInsertion, 1_800_000)
 

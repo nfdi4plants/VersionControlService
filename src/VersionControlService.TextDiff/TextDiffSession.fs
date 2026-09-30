@@ -994,15 +994,18 @@ type TextDiffSession internal (
             commitCount <- ops.Length
             beginFeeding ()
         else
+            // The window commits up to its last matching line. The operations after it stay unsettled, and so
+            // does a trailing unaligned region: the alignment of a gap stops at its step budget and reports the
+            // whole gap as unaligned, which says nothing about where the sources line up again.
             let mutable last = -1
-            let mutable anchored = false
             for index = 0 to ops.Length - 1 do
-                if isCommittable ops[index] then last <- index
-                if ops[index].Kind = OperationKind.Equal || ops[index].Kind = OperationKind.EndingChanged then anchored <- true
+                if ops[index].Kind = OperationKind.Equal || ops[index].Kind = OperationKind.EndingChanged then last <- index
+            let anchored = last >= 0
             let canGrow = windowLimit < config.WindowMaxLines && not previousSide.ByteFull && not currentSide.ByteFull
             // A window without any matching line may hold an insertion or deletion that is larger than the
-            // window, so it grows before its unaligned lines are committed.
-            if last >= 0 && (anchored || not canGrow) then
+            // window, so it grows before it is given up. A largest window without a matching line continues
+            // with the forward search.
+            if anchored then
                 commitCount <- last + 1
                 beginFeeding ()
             elif canGrow then
@@ -2683,27 +2686,6 @@ type TextDiffSession internal (
 
     let rememberPagePairs sequence (page: DiffPage) = pairings.AppendPage(sequence, pairRanges page.Parts)
 
-    let collectRowRefs (item: QueueItem) (start: int) (count: int) =
-        let previousCount = countSide item.Rows start count true
-        let currentCount = countSide item.Rows start count false
-        let previousRefs = Array.zeroCreate<LineRef> previousCount
-        let currentRefs = Array.zeroCreate<LineRef> currentCount
-        let mutable previousRefIndex = 0
-        let mutable currentRefIndex = 0
-        for index = start to start + count - 1 do
-            let row = item.Rows[index]
-            match row.Kind with
-            | DiffRowKind.Added -> currentRefs[currentRefIndex] <- row.Current; currentRefIndex <- currentRefIndex + 1
-            | DiffRowKind.Removed -> previousRefs[previousRefIndex] <- row.Previous; previousRefIndex <- previousRefIndex + 1
-            | DiffRowKind.Replaced ->
-                previousRefs[previousRefIndex] <- row.Previous
-                currentRefs[currentRefIndex] <- row.Current
-                previousRefIndex <- previousRefIndex + 1
-                currentRefIndex <- currentRefIndex + 1
-            | DiffRowKind.Context
-            | DiffRowKind.EndingChanged -> previousRefs[previousRefIndex] <- row.Previous; previousRefIndex <- previousRefIndex + 1
-        previousRefs, currentRefs
-
     let makeRows (item: QueueItem) (start: int) (count: int) (firstId: int64) (previousValues: DiffLine[]) (currentValues: DiffLine[]) (cancel: unit -> bool) (meter: Meter) (pairWorkStarted: bool ref) =
         let fastIdStart =
             if firstId >= 0L && firstId + int64 (max 0 (count - 1)) <= int64 Int32.MaxValue then int firstId
@@ -2824,21 +2806,10 @@ type TextDiffSession internal (
             && pending.RowIndex < start + rowCount
         | None -> false
 
-    /// The slot of a row in the compact line array that collectRowRefs builds for one side. Only the rows that
-    /// read a line from that side take a slot.
-    let sideSlotBefore (item: QueueItem) (start: int) (rowIndex: int) (previousSide: bool) =
-        let mutable total = 0
-        for index = start to rowIndex - 1 do
-            match item.Rows[index].Kind with
-            | DiffRowKind.Added -> if not previousSide then total <- total + 1
-            | DiffRowKind.Replaced -> total <- total + 1
-            | _ -> if previousSide then total <- total + 1
-        total
-
-    let readPageLines isPrevious spec encoding item start rowCount (lines: LineRef[]) cancel = async {
+    let readPageLines isPrevious spec encoding (item: QueueItem) start rowCount (lines: LineRef[]) cancel = async {
         match pendingLongPair with
         | Some pending when hasPageLongPair item start rowCount ->
-            let index = sideSlotBefore item start pending.RowIndex isPrevious
+            let index = RowLines.slotBefore item.Rows start pending.RowIndex isPrevious
             let beforeRefs = if index = 0 then Array.empty else Array.sub lines 0 index
             let afterRefs = if index + 1 = lines.Length then Array.empty else Array.sub lines (index + 1) (lines.Length - index - 1)
             let! before = readLines spec encoding beforeRefs cancel
@@ -2860,7 +2831,7 @@ type TextDiffSession internal (
     let buildRows (item: QueueItem) (start: int) (count: int) (firstId: int64) (cancel: unit -> bool) (meter: Meter) (pairWorkStarted: bool ref) : Async<DiffRow[] option> = async {
         if cancel () then return None
         else
-            let previousRefs, currentRefs = collectRowRefs item start count
+            let previousRefs, currentRefs = RowLines.collect item.Rows start count
             let! previousLines =
                 if hasPageLongPair item start count then
                     readPageLines true previousSpec previousEncoding item start count previousRefs cancel
