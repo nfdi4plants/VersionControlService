@@ -158,13 +158,13 @@ module WorkspaceSession =
     /// consumer that wants one code path for every provider. Present services are kept.
     ///
     /// Each successful fallback does nothing and carries a service_unavailable warning.
-    /// Opening a paged diff reports an unsupported provider, and later text diff requests
-    /// fail because no diff handle exists.
+    /// Opening a paged diff reports an unsupported provider. The text diff requests that read
+    /// a handle fail because no diff handle exists, and Close succeeds with the warning.
     /// ListObjects returns an empty array, and GetSettings returns no threshold with
     /// MaterializeLargeObjects = true. GetActiveSession and GetRepositoryWebUrl return None.
     /// Prune and Deduplicate return the reason as their report.
-    /// Synchronization operations and conflict mutations fail as Unsupported with the
-    /// service_unavailable code.
+    /// Synchronization operations and the conflict session operations Resolve, Finalize and
+    /// Cancel fail as Unsupported with the service_unavailable code.
     let withFallbackServices (session: WorkspaceSession) : WorkspaceSession = {
         // Naming every field makes a newly added optional service fail compilation until this fallback handles it.
         Descriptor = session.Descriptor
