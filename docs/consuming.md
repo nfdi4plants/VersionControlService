@@ -461,13 +461,17 @@ let createCatalog (factories: ProviderFactory seq) =
     |> Resolver.tryCreateCatalog
 ```
 
-Every filled operation succeeds as a no-op carrying a `service_unavailable` warning,
-apart from the two groups named further down. A fallback read hands back an empty answer:
-`ListObjects` an empty array, `GetActiveSession` and `GetRepositoryWebUrl` `None`,
-`GetSettings` no threshold with `MaterializeLargeObjects = true`, and `Prune` and
-`Deduplicate` the reason as their report. The text diff fallback answers `Open` with
-`NotDiffable ProviderUnsupported`, and its other calls fail because no diff handle can exist.
-lakeFS has no text diff service, so it gets this fallback.
+Most filled operations succeed as a no-op with a `service_unavailable` warning. The
+synchronization service and conflict mutations fail with that code. The text diff fallback
+has its own open and handle behavior.
+
+A fallback read hands back an empty answer. `ListObjects` returns an empty array.
+`GetActiveSession` and `GetRepositoryWebUrl` return `None`. `GetSettings` returns no
+threshold with `MaterializeLargeObjects = true`. `Prune` and `Deduplicate` return the
+reason as their report. The text diff fallback returns `NotDiffable ProviderUnsupported`
+from `Open`. Its `ReadPage`, `ReplayPage`, `Expand`, `ReadLine` and `GetSourceInfo` calls
+fail with `service_unavailable`. `Close` succeeds as a no-op with that warning. lakeFS has
+no text diff service, so it gets this fallback.
 
 A fallback write also succeeds and changes nothing. `Materialize`, `Dematerialize`,
 `SetPathPolicy` and `SetSettings` return `Succeeded` with the same warning. Read the
@@ -542,6 +546,273 @@ Fill the gaps when the host is generic over providers and a missing feature shou
 degrade quietly. Keep them absent when the interface changes shape per provider, or when
 a host must never offer an action the provider cannot carry out. Two hosts can make
 opposite choices against the same provider, which is the intent.
+
+## Paged text diffs
+
+`TextDiff` is an optional service on `WorkspaceSession`. Read it from `session.TextDiff`
+before opening a diff. The Git provider compares a working file with its version at HEAD
+when `PreviousPath` is `None`. `Open` pins the source identities for the returned handle.
+
+The examples use `valueOf` to keep result handling short. A real caller should match
+`Failed` and retain the `OperationFailure` fields it needs.
+
+```fsharp
+module PagedTextDiffExample
+
+open VersionControlService.Abstractions
+
+let private valueOf (result: OperationResult<'T>) : 'T =
+    match result with
+    | Succeeded outcome -> outcome.Value
+    | PartiallySucceeded(outcome, _) -> outcome.Value
+    | Failed failure -> failwith failure.Message
+
+let rec private openReady
+    (service: TextDiffService)
+    (request: OpenDiffRequest)
+    (context: OperationContext)
+    : Async<OpenDiffResult> = async {
+    let! result = service.Open request context
+
+    match valueOf result with
+    | Resumable.Ready opened -> return opened
+    | Resumable.Scanning(_, continuation, _) ->
+        return! openReady service { request with Continuation = Some continuation } context
+}
+
+let rec private readPageReady
+    (service: TextDiffService)
+    (handle: DiffHandle)
+    (cursor: string)
+    (context: OperationContext)
+    : Async<DiffPage> = async {
+    let! result = service.ReadPage { Handle = handle; Cursor = cursor } context
+
+    match valueOf result with
+    | Resumable.Ready page -> return page
+    | Resumable.Scanning(_, continuation, _) ->
+        return! readPageReady service handle continuation context
+}
+```
+
+Resume an `Open` scan by sending its continuation in `OpenDiffRequest.Continuation`.
+`Open` can then return an opened handle with a first page that is still scanning. Pass that
+page continuation as the `ReadPage` cursor. Later `ReadPage` continuations also replace the
+cursor.
+
+```fsharp
+let openDiff (service: TextDiffService) (path: RepositoryPath) (context: OperationContext) = async {
+    let request: OpenDiffRequest = {
+        Path = path
+        PreviousPath = None
+        Preparation = None
+        PreviousEncoding = None
+        CurrentEncoding = None
+        ContextLines = 3
+        Continuation = None
+    }
+
+    let! opened = openReady service request context
+
+    match opened with
+    | OpenDiffResult.NotDiffable blocker -> return Error blocker
+    | OpenDiffResult.Opened(handle, previous, current, first) ->
+        let! firstPage =
+            match first with
+            | Resumable.Ready page -> async.Return page
+            | Resumable.Scanning(_, continuation, _) ->
+                readPageReady service handle continuation context
+
+        return Ok(handle, previous, current, firstPage)
+}
+
+let readNextPage (service: TextDiffService) (handle: DiffHandle) (page: DiffPage) (context: OperationContext) = async {
+    match page.NextCursor with
+    | None -> return None
+    | Some cursor ->
+        let! next = readPageReady service handle cursor context
+        return Some next
+}
+```
+
+Each `DiffPage` has a `PageId` for replay and an optional `NextCursor`. Its `DiffPart`
+values are hunk fragments or hidden equal gaps. `Expand` returns `ExpandedContext` rows.
+A `PendingPreview` shows text of the unfinished scan. It is advisory and holds no diff rows.
+Keep a page's `PageId` if the caller may need the page again. `ReplayPage` returns the page
+exactly as it was first read, so a viewer can drop pages it no longer shows and read them
+again later.
+
+```fsharp
+let replayPage (service: TextDiffService) (handle: DiffHandle) (page: DiffPage) (context: OperationContext) = async {
+    let! result = service.ReplayPage { Handle = handle; PageId = page.PageId } context
+    return valueOf result
+}
+
+let sourceInfoAndClose (service: TextDiffService) (handle: DiffHandle) (context: OperationContext) = async {
+    let! sourceResult = service.GetSourceInfo { Handle = handle } context
+    let sources = valueOf sourceResult
+    let! closeResult = service.Close handle context
+    valueOf closeResult
+    return sources
+}
+```
+
+`GetSourceInfo` returns both `DiffSourceInfo` records. Each record reports `ByteLength`,
+`Encoding`, `EncodingWasChosen` and `HasBom`. `LineCount` can stay `None` until the scan
+reaches the end. Call `Close` when the view no longer needs the handle.
+
+`ExpandRequest.FromStart = true` expands from the start of a hidden equal gap. Set it to
+`false` to expand from the end. The service clamps `Count` to 100 lines. If an expansion is
+still scanning, repeat the same request fields and set `Continuation` to the returned token.
+
+```fsharp
+let rec private expandReady (service: TextDiffService) (request: ExpandRequest) (context: OperationContext) = async {
+    let! result = service.Expand request context
+
+    match valueOf result with
+    | Resumable.Ready parts -> return parts
+    | Resumable.Scanning(_, continuation, _) ->
+        return! expandReady service { request with Continuation = Some continuation } context
+}
+
+let expandGap (service: TextDiffService) (handle: DiffHandle) (gap: EqualGap) (fromStart: bool) (context: OperationContext) =
+    let request: ExpandRequest = {
+        Handle = handle
+        GapId = gap.GapId
+        FromStart = fromStart
+        Count = 50
+        Continuation = None
+    }
+
+    expandReady service request context
+```
+
+For a long line, `ReadLineRequest.OffsetUtf16` selects a slice. `Line` is the zero-based
+`DiffLine.Number`. The service clamps `MaxUtf16` to 8,192 UTF-16 code units. Advance the
+next offset by the returned text length. Stop when `TotalUtf16` is present and the offset
+reaches that total. `LineSlice.Highlights` returns UTF-16 spans marked as changed or
+unchanged text.
+
+```fsharp
+let rec private readLineReady (service: TextDiffService) (request: ReadLineRequest) (context: OperationContext) = async {
+    let! result = service.ReadLine request context
+
+    match valueOf result with
+    | Resumable.Ready line -> return line
+    | Resumable.Scanning(_, continuation, _) ->
+        return! readLineReady service { request with Continuation = Some continuation } context
+}
+
+let readFirstLineSlice (service: TextDiffService) (handle: DiffHandle) (context: OperationContext) = async {
+    let request: ReadLineRequest = {
+        Handle = handle
+        Side = DiffSide.Current
+        Line = 0L
+        OffsetUtf16 = 0L
+        MaxUtf16 = 8192
+        Continuation = None
+    }
+
+    let! line = readLineReady service request context
+    let slice = line.Slice
+    let nextOffset = slice.OffsetUtf16 + int64 slice.Text.Length
+    return slice, nextOffset
+}
+```
+
+`Open` can return `NotDiffable` when initial classification recognizes binary content.
+The classifier recognizes HDF5 signatures too. A binary signature found during later
+scanning fails with `diff_content_not_text`, and `failure.DiffDetail` records the side and
+evidence. A recognized BOM selects its encoding. If the encoding remains ambiguous,
+`DiffBlocker.EncodingRequired` returns a `PreparationToken` and `EncodingCandidate` values.
+Ask the user to choose a candidate, then retry the same open request with that token and
+the chosen encoding on the reported side.
+
+```fsharp
+let chooseEncoding (request: OpenDiffRequest) (side: DiffSide) (token: PreparationToken) (encoding: string) =
+    { request with
+        Preparation = Some token
+        PreviousEncoding =
+            if side = DiffSide.Previous then Some encoding else request.PreviousEncoding
+        CurrentEncoding =
+            if side = DiffSide.Current then Some encoding else request.CurrentEncoding }
+```
+
+The Git worker keeps an idle handle for 15 minutes. An expired or closed handle returns
+`diff_session_closed`. Open a new diff when that happens. `source_changed` means a pinned
+source changed while the handle was open, so close it and open the current sources again.
+For `diff_content_not_text`, inspect `failure.DiffDetail` for the blocked side and evidence.
+For `preparation_mismatch`, discard the token and start `Open` again. A continuation is
+bound to its original request fields. On `continuation_mismatch`, retry with those fields
+or start a new request without that continuation. A `diff_worker_failed` result means the
+Git host could not complete the worker request. Check that it supplied a working pool.
+
+The Git provider caps a page at 1,000 rows and 32 fragments. `Open`, `ReadPage`,
+`ReplayPage` and `Expand` responses each have a 512 KiB limit. `ReadLine` responses have a
+64 KiB limit. The byte limits include the serialized response envelope.
+
+### Hosting in Node or Electron
+
+Bundle an absolute-path worker file for `TextDiffWorker.bootstrap`. The worker receives
+`NodeWorkerThreads.parentPort` and passes it to that entry point.
+
+```fsharp
+module TextDiffWorkerEntry
+
+module NodeWorkerThreads = VersionControlService.Runtime.Node.WorkerThreads
+module TextDiffWorker = VersionControlService.Git.TextDiff.TextDiffWorker
+
+match NodeWorkerThreads.parentPort with
+| Some port -> TextDiffWorker.bootstrap port
+| None -> invalidOp "This file must run in a worker thread."
+```
+
+Create the supervisor and pool in the Node host. Pass the pool through `GitSessionOptions`
+when creating the Git factory. `WindowOwnerOf` should return a stable id for the window
+that owns each call.
+
+```fsharp
+module GitDiffHost
+
+open Fable.Core
+
+module DiffSupervisor = VersionControlService.Git.TextDiff.TextDiffSupervisor
+module DiffPool = VersionControlService.Git.TextDiff.TextDiffPool
+module DiffTransport = VersionControlService.Git.TextDiff.TextDiffTransport
+module GitDiffService = VersionControlService.Git.TextDiff.GitTextDiffService
+module GitSessions = VersionControlService.Git.GitWorkspaceSession
+
+let createGitFactory workerScriptPath credentials revisionIdentity revisionPolicy = async {
+    let! supervisor =
+        DiffSupervisor.create DiffSupervisor.TextDiffSupervisorOptions.defaults
+        |> Async.AwaitPromise
+
+    let poolOptions =
+        DiffPool.TextDiffPoolOptions.create
+            (fun _ -> DiffTransport.WorkerThreadTransport.create workerScriptPath)
+            supervisor
+    let pool = DiffPool.create poolOptions
+    pool.Prewarm()
+
+    let textDiffOptions: GitDiffService.GitTextDiffOptions = {
+        Pool = pool
+        WindowOwnerOf = fun _ -> "main"
+    }
+    let options: GitSessions.GitSessionOptions = {
+        Hooks = GitSessions.GitSessionHooks.none
+        TextDiff = Some textDiffOptions
+    }
+
+    let factory = GitSessions.createFactoryWithOptions options credentials revisionIdentity revisionPolicy
+    return pool, factory
+}
+
+let disposeDiffPool (pool: DiffPool.TextDiffPool) =
+    pool.Dispose() |> Async.AwaitPromise
+```
+
+Call `Prewarm` during startup and await `disposeDiffPool` when the app quits. The pool
+disposes its supervisor during shutdown.
 
 ## Saving work
 

@@ -64,7 +64,7 @@ Optional services advertise real capability:
 | Service | Purpose |
 |---|---|
 | `Synchronization` | refresh, preview update, update, publish, and synchronize |
-| `TextDiff` | paged diffs of a working file against HEAD |
+| `TextDiff` | resumable pages for a working file against its version at HEAD |
 | `ConflictResolution` | provider-owned conflict sessions and stale-handle checks |
 | `ObjectMaterialization` | list, hydrate, and dematerialize large or lazy objects |
 | `StoragePolicy` | literal-path policy and host-facing settings |
@@ -73,7 +73,14 @@ Optional services advertise real capability:
 
 Providers leave an unsupported service as `None`. Do not add a service whose methods are required stubs that always return `Unsupported`.
 
-Consumers choose whether to fill absent services. `WorkspaceSession.withFallbackServices` returns a session with every service present, and `ProviderFactory.withFallbackServices` wraps a factory so `Open` returns such sessions. Every fallback operation succeeds as a no-op that carries a `service_unavailable` warning, except the synchronization service and the conflict mutations `Resolve`, `Finalize` and `Cancel`, which fail with that code. `WorkspaceSession.availability` reports what the provider really supplies and has to be read before the fallback is applied, because a filled session reports every service as present and a wrapped factory never yields an unfilled session. A host that needs the report keeps the unwrapped factory, or applies `WorkspaceSession.withFallbackServices` itself after reading the availability.
+A `TextDiff` provider returns `Resumable` while it scans and binds each continuation to the
+same request fields. It journals produced pages so `ReplayPage` can return a page after its
+in-memory representation is evicted. `Open` pins both source identities for the handle
+lifetime. The provider binds each handle and continuation to the owner that opened it, then
+checks that owner before serving a request. A provider reports `source_changed` when either
+pinned source changes.
+
+Consumers choose whether to fill absent services. `WorkspaceSession.withFallbackServices` returns a session with every service present, and `ProviderFactory.withFallbackServices` wraps a factory so `Open` returns such sessions. Most fallback methods succeed as no-ops with a `service_unavailable` warning. Synchronization operations and conflict mutations fail with that code. The text diff fallback returns `NotDiffable ProviderUnsupported` from `Open`. Its handle-reading methods fail with `service_unavailable`. `Close` succeeds as a no-op with a warning. `WorkspaceSession.availability` reports what the provider really supplies and has to be read before the fallback is applied, because a filled session reports every service as present and a wrapped factory never yields an unfilled session. A host that needs the report keeps the unwrapped factory, or applies `WorkspaceSession.withFallbackServices` itself after reading the availability.
 
 Everything outside an opened session (`Probe`, `VerifyLocation`, `Initialize`, `Clone`, `Adopt`, `Bind`, `CheckDependencies`, `InstallDependency`), repository locations and credentials stay provider-specific at the composition root. A consumer that prefers to see an absent service as absent does not apply the fallback. `operation_not_supported` remains the provider's own code for an operation it implements but cannot perform for the given input.
 

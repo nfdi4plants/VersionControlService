@@ -16,6 +16,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `VersionControlService.TextDiff` adds a streaming diff engine for files of any size. It bounds memory use and work per request and targets .NET and Fable.
+- The Git provider can run text diffs in a worker pool supervised by `TextDiffSupervisor`. Hosts create a `TextDiffPool` with `TextDiffPoolOptions.create` and `TextDiffPool.create`, and use `TextDiffTransport.WorkerThreadTransport.create` to start the bundled worker script.
+
+### Changed
+
+- Version 0.2.0 replaces the whole-file text diff with `TextDiffService`. Its `Open`, `ReadPage`, `ReplayPage`, `Expand`, `ReadLine`, `GetSourceInfo` and `Close` operations return resumable work where needed. `DiffPart` represents hunk fragments or hidden equal gaps. `Expand` returns `ExpandedContext`. `ReplayPage` returns a page that was already read, by its `PageId`, so a caller can drop pages it no longer shows and read them again unchanged. Each `LineSlice` carries `Highlight` spans for changed or unchanged text.
+- The Git host bundles a worker script that calls `TextDiffWorker.bootstrap`, passes its pool through `GitSessionOptions.TextDiff`, calls `Prewarm` when the host starts and disposes the pool during shutdown. The default pool has two workers with four sessions per worker.
+- `Open` pins source identities and checks binary content, including HDF5 signatures. A recognized BOM selects the source encoding. An ambiguous encoding returns `DiffBlocker.EncodingRequired` with a `PreparationToken` and `EncodingCandidate` values. A non-text source found while scanning fails with `TextDiffFailureCodes.ContentNotText` and structured `OperationFailure.DiffDetail` when available.
+- Pages contain at most 1,000 rows and 32 fragments. Page responses, including the first page from `Open`, are limited to 512 KiB. `ReadLine` responses are limited to 64 KiB, and `ReadLineRequest.MaxUtf16` is clamped to 8,192 UTF-16 code units. `ExpandRequest.Count` is clamped to 100 lines.
+- The Git worker pool answers cancellation immediately. An idle diff session expires after 15 minutes with `diff_session_closed`. Callers open a new diff to continue.
+
+### Removed
+
+- `TextDiffService.GetDiff` and `TextDiffService.GetWordDiff` are removed with the whole-file contract. `TextDiffService.GetBaseContent` is also removed. Consumers use `TextDiffService` pages, replay, gap expansion and line slices instead.
+
 ## 0.1.2 - 2026-09-28
 
 ### Fixed
