@@ -8,6 +8,12 @@ open VersionControlService.TextDiff.Tests
 module TextDiffEngineCasesTests =
     let private benchmarkSize = 64 * 1024 * 1024
 
+    [<Import("setImmediate", "node:timers")>]
+    let private setImmediate (callback: unit -> unit) : unit = jsNative
+
+    let private trampolineYield () =
+        Async.FromContinuations(fun (success, _, _) -> setImmediate success)
+
     [<Emit("$0[$1] = $2")>]
     let private writeBenchmarkByte (data: byte[]) (index: int) (value: int) : unit = jsNative
 
@@ -84,6 +90,17 @@ module TextDiffEngineCasesTests =
             offset <- offset + copied
 
         data
+
+    let private singleLongLineData size =
+        let firstLine = [| 0x66uy; 0x69uy; 0x72uy; 0x73uy; 0x74uy; 0x2Duy; 0x6Cuy; 0x69uy; 0x6Euy; 0x65uy; 0x0Auy |]
+        let pattern = [| 0x77uy; 0x6Fuy; 0x72uy; 0x64uy; 0x20uy |]
+        let previous = Array.zeroCreate<byte> (firstLine.Length + size)
+        Array.blit firstLine 0 previous 0 firstLine.Length
+        Array.blit (repeatBytes size pattern) 0 previous firstLine.Length size
+        let current = Array.copy previous
+        let changedWord = (size / pattern.Length - 1) * pattern.Length
+        current[firstLine.Length + changedWord] <- 0x62uy
+        previous, current
 
     let private utf8Data () =
         let cycle =
@@ -320,6 +337,26 @@ module TextDiffEngineCasesTests =
         })
     )
 
+    let private measureSingleLongLine size =
+        Async.StartAsPromise(async {
+            let previous, current = singleLongLineData size
+            let config = SessionConfig.defaults $"benchmark-single-line-{size}"
+            let clock = { new IClock with member _.NowMs() = BrowserClock.nowMs() }
+            let baseHost = Host.createInMemory clock
+            let host = { baseHost with Yield = trampolineYield }
+            let started = BrowserClock.nowMs()
+            let! session = startRequest (TextDiffSession.create host (Ledger()) config (fun _ -> 1) (benchmarkSource previous) (benchmarkSource current))
+            let! first = startRequest (session.FirstPage(fun () -> false))
+            let! page = startRequest (finishFirstPage session first)
+            let firstPageMs = max 0.0 (BrowserClock.nowMs() - started)
+            if page.Parts.Length = 0 then failwith "The single-line change produced an empty first page."
+            do! finishSessionOutput session page
+            let elapsed = max 1.0 (BrowserClock.nowMs() - started)
+            let mebibytes = size / (1024 * 1024)
+            Vitest.log ($"{mebibytes} MiB single-line change: first page {firstPageMs:F1} ms, total {elapsed:F1} ms")
+            do! session.Close()
+        })
+
     Vitest.it (
         "measures time to the first page for three edits in a 1 MiB file",
         fun () -> Async.StartAsPromise(async {
@@ -476,3 +513,7 @@ module TextDiffEngineCasesTests =
 
             reportClassification "Classification of UTF-16 LE text" pattern
     )
+
+    Vitest.itWithTimeout("measures a 1 MiB single line change", (fun () -> measureSingleLongLine (1024 * 1024)), 600_000)
+    Vitest.itWithTimeout("measures a 4 MiB single line change", (fun () -> measureSingleLongLine (4 * 1024 * 1024)), 600_000)
+    Vitest.itWithTimeout("measures a 16 MiB single line change", (fun () -> measureSingleLongLine (16 * 1024 * 1024)), 600_000)

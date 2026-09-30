@@ -332,9 +332,7 @@ type internal RunCompare(previous: ScanSide, current: ScanSide, previousIndex: i
                             doneBytes <- doneBytes + float got
                             return CompareStep.Continue
                         else
-                            let mutable index = 0
-                            while Native.readByte bufferA index = Native.readByte bufferB index do
-                                index <- index + 1
+                            let index = Native.equalBytePrefix bufferA 0 bufferB 0 got
                             let mismatchAt = doneBytes + float index
                             if not wholeGroup then return CompareStep.Finished pair
                             else
@@ -364,7 +362,8 @@ type internal DecodeFeed(side: ScanSide, buffer: byte[]) =
 
     member _.Available = filled - head
     member _.Exhausted = position >= finish
-    member _.Peek(offset: int) = units[head + offset]
+    member _.Units = units
+    member _.Head = head
     member _.Consume(count: int) = head <- head + count
 
     /// Reads and decodes the next chunk. It returns 1 after decoding data, 0 when the source has no data yet
@@ -421,9 +420,7 @@ type internal DecodeCompare(previous: ScanSide, current: ScanSide, previousIndex
         elif feedA.Available = 0 || feedB.Available = 0 then return CompareStep.Finished pair
         else
             let n = min feedA.Available feedB.Available
-            let mutable index = 0
-            while index < n && feedA.Peek index = feedB.Peek index do
-                index <- index + 1
+            let index = Native.equalIntPrefix feedA.Units feedA.Head feedB.Units feedB.Head n
             Meter.charge meter (index / 256)
             if index < n then return CompareStep.Finished pair
             else

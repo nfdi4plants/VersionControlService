@@ -211,6 +211,20 @@ type private PendingLineView = {
     EndOfFile: bool
 }
 
+type private PendingPreviewCursor = {
+    SideIndex: int
+    Number: int64
+    StartOffset: float
+    Offset: int64
+    mutable Decoder: DecoderState
+    mutable BytePosition: float
+    mutable DecodedUnits: float
+    mutable Captured: int
+    Units: uint16[]
+    Buffer: byte[]
+    Reservation: int64
+}
+
 module private LongLine =
     let sliceAt (line: DiffLine) (values: uint16[]) valueCount baseOffset startOffset =
         let mutable first = max 0 (min valueCount (int (startOffset - baseOffset)))
@@ -438,6 +452,7 @@ type TextDiffSession internal (
     let mutable pairedMismatch: (int64 * int64 * int64 option) option = None
     let mutable pendingPreviewBytes = 0L
     let mutable lastPendingPreview: PendingPreview option = None
+    let pendingPreviewCursors: PendingPreviewCursor option[] = Array.create 2 None
     let pendingExpansions = Dictionary<int64, PendingExpansion>()
     let pendingLineReads = Dictionary<int64, PendingLineRead>()
     let mutable pendingLongPair: PendingLongPair option = None
@@ -1898,37 +1913,69 @@ type TextDiffSession internal (
                 EndOfFile = false
             }
 
+    let releasePendingPreviewCursor sideIndex =
+        match pendingPreviewCursors[sideIndex] with
+        | Some cursor ->
+            if cursor.Reservation > 0L then ledger.Release(AllocationCategory.ResponseData, cursor.Reservation)
+            pendingPreviewCursors[sideIndex] <- None
+        | None -> ()
+
     let readPreviewSnippet (view: PendingLineView) (offset: int64) = async {
         let spec = if view.SideIndex = 0 then previousSpec else currentSpec
         let encoding = if view.SideIndex = 0 then previousEncoding else currentEncoding
-        let units = Array.zeroCreate<uint16> 2_048
-        let buffer = Array.zeroCreate<byte> 1_024
-        let mutable decoder = Decoders.createAt encoding (int64 view.StartOffset)
-        let mutable bytePosition = view.StartOffset
-        let mutable decodedUnits = 0.0
-        let mutable captured = 0
+        let cursor =
+            match pendingPreviewCursors[view.SideIndex] with
+            | Some current when offset <> 0L
+                                && current.Number = view.Number
+                                && current.StartOffset = view.StartOffset
+                                && current.Offset = offset
+                                && current.BytePosition <= min view.ContentEnd view.KnownEnd -> current
+            | _ ->
+                releasePendingPreviewCursor view.SideIndex
+                let reservation = 5_120L
+                let reserved = offset <> 0L && ledger.TryReserve(AllocationCategory.ResponseData, reservation)
+                let created = {
+                    SideIndex = view.SideIndex
+                    Number = view.Number
+                    StartOffset = view.StartOffset
+                    Offset = offset
+                    Decoder = Decoders.createAt encoding (int64 view.StartOffset)
+                    BytePosition = view.StartOffset
+                    DecodedUnits = 0.0
+                    Captured = 0
+                    Units = Array.zeroCreate<uint16> 2_048
+                    Buffer = Array.zeroCreate<byte> 1_024
+                    Reservation = if reserved then reservation else 0L
+                }
+                if reserved then pendingPreviewCursors[view.SideIndex] <- Some created
+                created
         let mutable waiting = false
         let mutable failed = false
         let requestedOffset = float offset
         let requestedEnd = requestedOffset + 2_048.0
-        while captured < 2_048 && decodedUnits < requestedEnd && bytePosition < view.ContentEnd && bytePosition < view.KnownEnd && not waiting && not failed do
-            let count = int (min (float buffer.Length) (min (view.ContentEnd - bytePosition) (view.KnownEnd - bytePosition)))
+        while cursor.Captured < 2_048
+              && cursor.DecodedUnits < requestedEnd
+              && cursor.BytePosition < view.ContentEnd
+              && cursor.BytePosition < view.KnownEnd
+              && not waiting
+              && not failed do
+            let count = int (min (float cursor.Buffer.Length) (min (view.ContentEnd - cursor.BytePosition) (view.KnownEnd - cursor.BytePosition)))
             if count <= 0 then waiting <- true
             else
                 match spec.Source with
                 | None -> waiting <- true
                 | Some source ->
-                    let! outcome = source.ReadAt (int64 bytePosition) buffer 0 count
+                    let! outcome = source.ReadAt (int64 cursor.BytePosition) cursor.Buffer 0 count
                     match outcome with
                     | ReadOutcome.Bytes actual when actual > 0 ->
                         let sink _ _ value =
-                            if decodedUnits >= requestedOffset && decodedUnits < requestedEnd && captured < units.Length then
-                                units[captured] <- uint16 value
-                                captured <- captured + 1
-                            decodedUnits <- decodedUnits + 1.0
-                        let next, result = Decoders.decode decoder buffer 0 actual sink
-                        decoder <- next
-                        bytePosition <- float next.AbsoluteOffset
+                            if cursor.DecodedUnits >= requestedOffset && cursor.DecodedUnits < requestedEnd && cursor.Captured < cursor.Units.Length then
+                                cursor.Units[cursor.Captured] <- uint16 value
+                                cursor.Captured <- cursor.Captured + 1
+                            cursor.DecodedUnits <- cursor.DecodedUnits + 1.0
+                        let next, result = Decoders.decode cursor.Decoder cursor.Buffer 0 actual sink
+                        cursor.Decoder <- next
+                        cursor.BytePosition <- float next.AbsoluteOffset
                         match result with
                         | Error error ->
                             reportDecodeError view.SideIndex error
@@ -1937,13 +1984,16 @@ type TextDiffSession internal (
                     | ReadOutcome.NotYetAvailable -> waiting <- true
                     | ReadOutcome.EndOfSource -> sourceChanged (); failed <- true
                     | ReadOutcome.Bytes _ -> waiting <- true
-        if captured > 0 && units[captured - 1] >= 0xD800us && units[captured - 1] <= 0xDBFFus then captured <- captured - 1
-        let text = Native.utf16Decode units captured
+        let captured =
+            if cursor.Captured > 0 && cursor.Units[cursor.Captured - 1] >= 0xD800us && cursor.Units[cursor.Captured - 1] <= 0xDBFFus then
+                cursor.Captured - 1
+            else cursor.Captured
+        let text = Native.utf16Decode cursor.Units captured
         let endState =
             match view.TotalUtf16 with
             | Some total when offset + int64 captured < total -> SnippetEnd.Truncated
             | Some _ -> if view.EndOfFile then SnippetEnd.EndOfFile else SnippetEnd.LineEnd
-            | None when decodedUnits > requestedOffset + float captured || bytePosition < min view.ContentEnd view.KnownEnd -> SnippetEnd.Truncated
+            | None when cursor.DecodedUnits > requestedOffset + float captured || cursor.BytePosition < min view.ContentEnd view.KnownEnd -> SnippetEnd.Truncated
             | None -> SnippetEnd.MoreTextPending
         return { Line = view.Number; OffsetUtf16 = offset; Text = text; End = endState }
     }
@@ -2117,6 +2167,8 @@ type TextDiffSession internal (
                 return EngineResult.Ok(Resumable.Ready { page with Pending = pending })
         | EngineResult.Ok(Resumable.Ready page) ->
             reservePendingPreview None |> ignore
+            releasePendingPreviewCursor 0
+            releasePendingPreviewCursor 1
             return EngineResult.Ok(Resumable.Ready { page with Pending = None })
         | other -> return other
     }
@@ -2279,8 +2331,6 @@ type TextDiffSession internal (
             pendingLongPair
         match pendingLongPair with
         | Some pending when obj.ReferenceEquals(pending.Item, item) && pending.RowIndex = rowIndex ->
-            pending.PreviousLine <- previousLine
-            pending.CurrentLine <- currentLine
             Some pending
         | Some _ ->
             releasePendingLongPair ()
@@ -2296,6 +2346,76 @@ type TextDiffSession internal (
             if fromHistory > 0 then Array.blit history (historyCount - fromHistory) result 0 fromHistory
             if take > 0 then Array.blit block 0 result fromHistory take
         result, min 128 (min historyCount 128 + blockCount)
+
+    let compareLongPairPrefix (pending: PendingLongPair) (meter: Meter) (cancel: unit -> bool) shared =
+        let mutable compared = 0
+        let mutable mismatch = false
+        let mutable blocked = false
+        let mutable canceled = false
+        while compared < shared && not mismatch && not blocked && not canceled && not (Meter.overBudget meter) do
+            if cancel () then canceled <- true
+            elif Meter.overBudget meter then ()
+            else
+                let segment = min 64 (shared - compared)
+                let equal =
+                    Native.equalUnitPrefix
+                        pending.PreviousBlock
+                        pending.PreviousBlockPosition
+                        pending.CurrentBlock
+                        pending.CurrentBlockPosition
+                        segment
+                Meter.charge meter 1
+                if equal > 0 then
+                    pending.PreviousBlockPosition <- pending.PreviousBlockPosition + equal
+                    pending.CurrentBlockPosition <- pending.CurrentBlockPosition + equal
+                    pending.PrefixLength <- pending.PrefixLength + float equal
+                    compared <- compared + equal
+                if equal < segment then mismatch <- true
+                elif compared < shared && (cancel () || Meter.overBudget meter) then
+                    if cancel () then canceled <- true else blocked <- true
+        compared, mismatch, blocked, canceled
+
+    let compareLongPairSuffix (pending: PendingLongPair) (meter: Meter) (cancel: unit -> bool) =
+        let mutable mismatch = false
+        let mutable blocked = false
+        let mutable canceled = false
+        while pending.PreviousReverse.BlockPosition >= 0
+              && pending.CurrentReverse.BlockPosition >= 0
+              && not mismatch
+              && not blocked
+              && not canceled
+              && not (Meter.overBudget meter) do
+            if cancel () then canceled <- true
+            elif Meter.overBudget meter then blocked <- true
+            else
+                let segment = min 64 (min (pending.PreviousReverse.BlockPosition + 1) (pending.CurrentReverse.BlockPosition + 1))
+                let equal =
+                    Native.equalUnitSuffix
+                        pending.PreviousReverse.Units
+                        (pending.PreviousReverse.BlockPosition + 1)
+                        pending.CurrentReverse.Units
+                        (pending.CurrentReverse.BlockPosition + 1)
+                        segment
+                Meter.charge meter 1
+                if equal > 0 then
+                    pending.SuffixLength <- pending.SuffixLength + float equal
+                    pending.LastSuffixUnit <- pending.PreviousReverse.Units[pending.PreviousReverse.BlockPosition - equal + 1]
+                    pending.HasLastSuffixUnit <- true
+                    pending.PreviousReverse.BlockPosition <- pending.PreviousReverse.BlockPosition - equal
+                    pending.CurrentReverse.BlockPosition <- pending.CurrentReverse.BlockPosition - equal
+                if equal < segment then
+                    mismatch <- true
+                    let previousUnit = pending.PreviousReverse.Units[pending.PreviousReverse.BlockPosition]
+                    let currentUnit = pending.CurrentReverse.Units[pending.CurrentReverse.BlockPosition]
+                    if pending.SuffixLength > 0.0
+                       && pending.HasLastSuffixUnit
+                       && pending.LastSuffixUnit >= 0xDC00us && pending.LastSuffixUnit <= 0xDFFFus
+                       && previousUnit >= 0xD800us && previousUnit <= 0xDBFFus
+                       && currentUnit >= 0xD800us && currentUnit <= 0xDBFFus then
+                        pending.SuffixLength <- pending.SuffixLength - 1.0
+                elif cancel () then canceled <- true
+                elif Meter.overBudget meter then blocked <- true
+        mismatch, blocked, canceled
 
     let advanceLongPair (pending: PendingLongPair) (meter: Meter) (cancel: unit -> bool) = async {
         let mutable blocked = false
@@ -2373,26 +2493,9 @@ type TextDiffSession internal (
                 let previousAvailable = pending.PreviousBlockCount - pending.PreviousBlockPosition
                 let currentAvailable = pending.CurrentBlockCount - pending.CurrentBlockPosition
                 let shared = min previousAvailable currentAvailable
-                let mutable compared = 0
-                let mutable mismatch = false
-                while compared < shared && not mismatch && not canceled && not (Meter.overBudget meter) do
-                    if cancel () then canceled <- true
-                    elif Meter.overBudget meter then ()
-                    else
-                        let segment = min 64 (shared - compared)
-                        let mutable equal = 0
-                        while equal < segment
-                              && pending.PreviousBlock[pending.PreviousBlockPosition + equal] = pending.CurrentBlock[pending.CurrentBlockPosition + equal] do
-                            equal <- equal + 1
-                        Meter.charge meter 1
-                        if equal > 0 then
-                            pending.PreviousBlockPosition <- pending.PreviousBlockPosition + equal
-                            pending.CurrentBlockPosition <- pending.CurrentBlockPosition + equal
-                            pending.PrefixLength <- pending.PrefixLength + float equal
-                            compared <- compared + equal
-                        if equal < segment then mismatch <- true
-                        elif compared < shared && (cancel () || Meter.overBudget meter) then
-                            if cancel () then canceled <- true else blocked <- true
+                let compared, mismatch, compareBlocked, compareCanceled = compareLongPairPrefix pending meter cancel shared
+                blocked <- blocked || compareBlocked
+                canceled <- canceled || compareCanceled
                 if not canceled && not pending.Failed && not blocked then
                     if mismatch then
                         let previousUnit = pending.PreviousBlock[pending.PreviousBlockPosition]
@@ -2424,43 +2527,10 @@ type TextDiffSession internal (
             if previousWaiting || currentWaiting then blocked <- true
             elif cancel () then canceled <- true
             elif not pending.Failed && previousReady && currentReady then
-                let mutable mismatch = false
-                while pending.PreviousReverse.BlockPosition >= 0
-                      && pending.CurrentReverse.BlockPosition >= 0
-                      && not mismatch
-                      && not canceled
-                      && not blocked
-                      && not (Meter.overBudget meter) do
-                    if cancel () then canceled <- true
-                    elif Meter.overBudget meter then blocked <- true
-                    else
-                        let segment = min 64 (min (pending.PreviousReverse.BlockPosition + 1) (pending.CurrentReverse.BlockPosition + 1))
-                        let previousStart = pending.PreviousReverse.BlockPosition
-                        let currentStart = pending.CurrentReverse.BlockPosition
-                        let mutable equal = 0
-                        while equal < segment
-                              && pending.PreviousReverse.Units[previousStart - equal] = pending.CurrentReverse.Units[currentStart - equal] do
-                            equal <- equal + 1
-                        Meter.charge meter 1
-                        if equal > 0 then
-                            pending.SuffixLength <- pending.SuffixLength + float equal
-                            pending.LastSuffixUnit <- pending.PreviousReverse.Units[previousStart - equal + 1]
-                            pending.HasLastSuffixUnit <- true
-                            pending.PreviousReverse.BlockPosition <- pending.PreviousReverse.BlockPosition - equal
-                            pending.CurrentReverse.BlockPosition <- pending.CurrentReverse.BlockPosition - equal
-                        if equal < segment then
-                            mismatch <- true
-                            let previousUnit = pending.PreviousReverse.Units[pending.PreviousReverse.BlockPosition]
-                            let currentUnit = pending.CurrentReverse.Units[pending.CurrentReverse.BlockPosition]
-                            if pending.SuffixLength > 0.0
-                               && pending.HasLastSuffixUnit
-                               && pending.LastSuffixUnit >= 0xDC00us && pending.LastSuffixUnit <= 0xDFFFus
-                               && previousUnit >= 0xD800us && previousUnit <= 0xDBFFus
-                               && currentUnit >= 0xD800us && currentUnit <= 0xDBFFus then
-                                pending.SuffixLength <- pending.SuffixLength - 1.0
-                            pending.ReverseDone <- true
-                        elif cancel () then canceled <- true
-                        elif Meter.overBudget meter then blocked <- true
+                let mismatch, compareBlocked, compareCanceled = compareLongPairSuffix pending meter cancel
+                blocked <- blocked || compareBlocked
+                canceled <- canceled || compareCanceled
+                if mismatch then pending.ReverseDone <- true
                 if not mismatch && not canceled && not blocked && not (Meter.overBudget meter) then
                     if pending.PreviousReverse.BlockPosition < 0 then pending.PreviousReverse.BlockCount <- 0
                     if pending.CurrentReverse.BlockPosition < 0 then pending.CurrentReverse.BlockCount <- 0
@@ -2728,15 +2798,53 @@ type TextDiffSession internal (
             else return Some(Array.sub rows 0 index)
         }
 
+    let hasPageLongPair item start lineCount =
+        match pendingLongPair with
+        | Some pending ->
+            obj.ReferenceEquals(pending.Item, item)
+            && pending.RowIndex >= start
+            && pending.RowIndex < start + lineCount
+        | None -> false
+
+    let readPageLines isPrevious spec encoding item start (lines: LineRef[]) cancel = async {
+        match pendingLongPair with
+        | Some pending when hasPageLongPair item start lines.Length ->
+            let index = pending.RowIndex - start
+            let beforeRefs = if index = 0 then Array.empty else Array.sub lines 0 index
+            let afterRefs = if index + 1 = lines.Length then Array.empty else Array.sub lines (index + 1) (lines.Length - index - 1)
+            let! before = readLines spec encoding beforeRefs cancel
+            match before with
+            | None -> return None
+            | Some earlier ->
+                let! after = readLines spec encoding afterRefs cancel
+                match after with
+                | None -> return None
+                | Some later ->
+                    let result = Array.zeroCreate<DiffLine> lines.Length
+                    if earlier.Length > 0 then Array.blit earlier 0 result 0 earlier.Length
+                    result[index] <- if isPrevious then pending.PreviousLine else pending.CurrentLine
+                    if later.Length > 0 then Array.blit later 0 result (index + 1) later.Length
+                    return Some result
+        | _ -> return! readLines spec encoding lines cancel
+    }
+
     let buildRows (item: QueueItem) (start: int) (count: int) (firstId: int64) (cancel: unit -> bool) (meter: Meter) (pairWorkStarted: bool ref) : Async<DiffRow[] option> = async {
         if cancel () then return None
         else
             let previousRefs, currentRefs = collectRowRefs item start count
-            let! previousLines = readLines previousSpec previousEncoding previousRefs cancel
+            let! previousLines =
+                if hasPageLongPair item start previousRefs.Length then
+                    readPageLines true previousSpec previousEncoding item start previousRefs cancel
+                else
+                    readLines previousSpec previousEncoding previousRefs cancel
             match previousLines with
             | None -> return None
             | Some previousValues ->
-                let! currentLines = readLines currentSpec currentEncoding currentRefs cancel
+                let! currentLines =
+                    if hasPageLongPair item start currentRefs.Length then
+                        readPageLines false currentSpec currentEncoding item start currentRefs cancel
+                    else
+                        readLines currentSpec currentEncoding currentRefs cancel
                 match currentLines with
                 | None -> return None
                 | Some currentValues ->
@@ -3707,12 +3815,12 @@ type TextDiffSession internal (
                 let previousAvailable = analysis.PreviousBlockCount - analysis.PreviousBlockPosition
                 let currentAvailable = analysis.CurrentBlockCount - analysis.CurrentBlockPosition
                 let pairedAvailable = min previousAvailable currentAvailable
-                if pairedAvailable > 0 && analysis.PrefixOpen then
+                let canComparePrefix = not waiting && not (cancel ()) && not (Meter.overBudget meter)
+                if pairedAvailable > 0 && analysis.PrefixOpen && not canComparePrefix then waiting <- true
+                if pairedAvailable > 0 && analysis.PrefixOpen && canComparePrefix then
                     let prefixLimit = max 0.0 (min (float analysis.Previous.Utf16Length) (float analysis.Current.Utf16Length) - analysis.PrefixLength)
                     let limit = min pairedAvailable (int (min (float Int32.MaxValue) prefixLimit))
-                    let mutable equal = 0
-                    while equal < limit && analysis.PreviousBlock[analysis.PreviousBlockPosition + equal] = analysis.CurrentBlock[analysis.CurrentBlockPosition + equal] do
-                        equal <- equal + 1
+                    let equal = Native.equalUnitPrefix analysis.PreviousBlock analysis.PreviousBlockPosition analysis.CurrentBlock analysis.CurrentBlockPosition limit
                     analysis.PrefixLength <- analysis.PrefixLength + float equal
                     if equal < limit then
                         let previousUnit = analysis.PreviousBlock[analysis.PreviousBlockPosition + equal]
@@ -3727,7 +3835,7 @@ type TextDiffSession internal (
                         analysis.LastPrefixUnit <- analysis.PreviousBlock[analysis.PreviousBlockPosition + equal - 1]
                         analysis.HasLastPrefixUnit <- true
                     if analysis.PrefixLength >= min (float analysis.Previous.Utf16Length) (float analysis.Current.Utf16Length) then analysis.PrefixOpen <- false
-                if pairedAvailable > 0 then
+                if pairedAvailable > 0 && (not analysis.PrefixOpen || canComparePrefix) then
                     analysis.PreviousBlockPosition <- analysis.PreviousBlockPosition + pairedAvailable
                     analysis.CurrentBlockPosition <- analysis.CurrentBlockPosition + pairedAvailable
                 elif not analysis.PrefixOpen then
@@ -3749,34 +3857,36 @@ type TextDiffSession internal (
                     let previousReverse = analysis.PreviousReverse
                     let currentReverse = analysis.CurrentReverse
                     if not failed && not waiting && previousReady && currentReady then
-                        let mutable mismatch = false
-                        let mutable continuing = true
-                        while continuing
-                           && previousReverse.BlockPosition >= 0
-                           && currentReverse.BlockPosition >= 0
-                           && not mismatch do
-                            let previousUnit = previousReverse.Units[previousReverse.BlockPosition]
-                            let currentUnit = currentReverse.Units[currentReverse.BlockPosition]
-                            if previousUnit = currentUnit then
-                                analysis.SuffixLength <- analysis.SuffixLength + 1.0
-                                analysis.LastSuffixUnit <- previousUnit
+                        if cancel () || Meter.overBudget meter then waiting <- true
+                        else
+                            let reverseSegment = min (previousReverse.BlockPosition + 1) (currentReverse.BlockPosition + 1)
+                            let equal =
+                                Native.equalUnitSuffix
+                                    previousReverse.Units
+                                    (previousReverse.BlockPosition + 1)
+                                    currentReverse.Units
+                                    (currentReverse.BlockPosition + 1)
+                                    reverseSegment
+                            if equal > 0 then
+                                analysis.SuffixLength <- analysis.SuffixLength + float equal
+                                analysis.LastSuffixUnit <- previousReverse.Units[previousReverse.BlockPosition - equal + 1]
                                 analysis.HasLastSuffixUnit <- true
-                                previousReverse.BlockPosition <- previousReverse.BlockPosition - 1
-                                currentReverse.BlockPosition <- currentReverse.BlockPosition - 1
-                            else
+                                previousReverse.BlockPosition <- previousReverse.BlockPosition - equal
+                                currentReverse.BlockPosition <- currentReverse.BlockPosition - equal
+                            if equal < reverseSegment then
+                                let previousUnit = previousReverse.Units[previousReverse.BlockPosition]
+                                let currentUnit = currentReverse.Units[currentReverse.BlockPosition]
                                 if analysis.SuffixLength > 0
                                    && analysis.HasLastSuffixUnit
                                    && analysis.LastSuffixUnit >= 0xDC00us && analysis.LastSuffixUnit <= 0xDFFFus
                                    && previousUnit >= 0xD800us && previousUnit <= 0xDBFFus
                                    && currentUnit >= 0xD800us && currentUnit <= 0xDBFFus then
                                     analysis.SuffixLength <- analysis.SuffixLength - 1.0
-                                mismatch <- true
                                 analysis.ReverseDone <- true
-                                continuing <- false
-                        if previousReverse.BlockPosition < 0 then previousReverse.BlockCount <- 0
-                        if currentReverse.BlockPosition < 0 then currentReverse.BlockCount <- 0
-                        if previousReverse.Exhausted && previousReverse.BlockCount = 0 then analysis.ReverseDone <- true
-                        if currentReverse.Exhausted && currentReverse.BlockCount = 0 then analysis.ReverseDone <- true
+                            if previousReverse.BlockPosition < 0 then previousReverse.BlockCount <- 0
+                            if currentReverse.BlockPosition < 0 then currentReverse.BlockCount <- 0
+                            if previousReverse.Exhausted && previousReverse.BlockCount = 0 then analysis.ReverseDone <- true
+                            if currentReverse.Exhausted && currentReverse.BlockCount = 0 then analysis.ReverseDone <- true
                     if failed then analysis.Failed <- true
                 if complete && analysis.ReverseDone && not failed && not waiting && not (cancel ()) then
                     let highlights =
@@ -4451,6 +4561,8 @@ type TextDiffSession internal (
                 releasePendingLongPair ()
                 releaseBuffers ()
                 reservePendingPreview None |> ignore
+                releasePendingPreviewCursor 0
+                releasePendingPreviewCursor 1
                 do! pairings.Dispose()
                 journal.Release()
                 do! journal.Dispose()

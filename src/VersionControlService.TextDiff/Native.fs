@@ -47,6 +47,18 @@ module Native =
     [<Emit("$0[$1] = $2")>]
     let writeUnit (units: uint16[]) (index: int) (value: int) : unit = jsNative
 
+    [<Emit("(($left, $leftStart, $right, $rightStart, $count) => { let matched = 0; while (matched < $count && $left[$leftStart + matched] === $right[$rightStart + matched]) matched++; return matched; })($0, $1, $2, $3, $4)")>]
+    let equalUnitPrefix (left: uint16[]) (leftStart: int) (right: uint16[]) (rightStart: int) (count: int) : int = jsNative
+
+    [<Emit("(($left, $leftStart, $right, $rightStart, $count) => { let matched = 0; while (matched < $count && $left[$leftStart + matched] === $right[$rightStart + matched]) matched++; return matched; })($0, $1, $2, $3, $4)")>]
+    let equalIntPrefix (left: int[]) (leftStart: int) (right: int[]) (rightStart: int) (count: int) : int = jsNative
+
+    [<Emit("(($left, $leftEnd, $right, $rightEnd, $count) => { let matched = 0; while (matched < $count && $left[$leftEnd - matched - 1] === $right[$rightEnd - matched - 1]) matched++; return matched; })($0, $1, $2, $3, $4)")>]
+    let equalUnitSuffix (left: uint16[]) (leftEnd: int) (right: uint16[]) (rightEnd: int) (count: int) : int = jsNative
+
+    [<Emit("(($left, $leftStart, $right, $rightStart, $count) => { let matched = 0; while (matched < $count && $left[$leftStart + matched] === $right[$rightStart + matched]) matched++; return matched; })($0, $1, $2, $3, $4)")>]
+    let equalBytePrefix (left: byte[]) (leftStart: int) (right: byte[]) (rightStart: int) (count: int) : int = jsNative
+
     // Buffer's indexOf is a native byte search. TypedArray.prototype.indexOf is about four times slower.
     [<Emit("(ArrayBuffer.isView($0) ? Buffer.prototype.indexOf.call($0, $1, $2) : $0.indexOf($1, $2))")>]
     let private indexOfFrom (bytes: byte[]) (value: int) (start: int) : int = jsNative
@@ -144,6 +156,30 @@ module Native =
     let inline readUnit (units: uint16[]) (index: int) = int units[index]
 
     let inline writeUnit (units: uint16[]) (index: int) (value: int) = units[index] <- uint16 value
+
+    let equalUnitPrefix (left: uint16[]) (leftStart: int) (right: uint16[]) (rightStart: int) (count: int) =
+        let mutable matched = 0
+        while matched < count && left[leftStart + matched] = right[rightStart + matched] do
+            matched <- matched + 1
+        matched
+
+    let equalIntPrefix (left: int[]) (leftStart: int) (right: int[]) (rightStart: int) (count: int) =
+        let mutable matched = 0
+        while matched < count && left[leftStart + matched] = right[rightStart + matched] do
+            matched <- matched + 1
+        matched
+
+    let equalUnitSuffix (left: uint16[]) (leftEnd: int) (right: uint16[]) (rightEnd: int) (count: int) =
+        let mutable matched = 0
+        while matched < count && left[leftEnd - matched - 1] = right[rightEnd - matched - 1] do
+            matched <- matched + 1
+        matched
+
+    let equalBytePrefix (left: byte[]) (leftStart: int) (right: byte[]) (rightStart: int) (count: int) =
+        let mutable matched = 0
+        while matched < count && left[leftStart + matched] = right[rightStart + matched] do
+            matched <- matched + 1
+        matched
 
     /// Returns bytes[offset .. offset + count - 1]. The .NET build copies unless the range is the whole array.
     let view (bytes: byte[]) (offset: int) (count: int) =
