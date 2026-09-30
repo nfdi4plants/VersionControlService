@@ -265,6 +265,142 @@ module TextDiffSessionCases =
 
     let private allParts pages = pages |> Array.collect (fun page -> page.Parts)
 
+    let private jsonStringBytes (value: string) =
+        let mutable size = 2
+        let mutable index = 0
+        while index < value.Length do
+            let unit = int value[index]
+            if unit = 0x22 || unit = 0x5C then size <- size + 2
+            elif unit < 0x20 then
+                if unit = 0x08 || unit = 0x09 || unit = 0x0A || unit = 0x0C || unit = 0x0D then size <- size + 2
+                else size <- size + 6
+            elif unit < 0x80 then size <- size + 1
+            elif unit < 0x800 then size <- size + 2
+            elif unit >= 0xD800 && unit <= 0xDBFF && index + 1 < value.Length && Char.IsLowSurrogate value[index + 1] then
+                size <- size + 4
+                index <- index + 1
+            elif unit >= 0xD800 && unit <= 0xDFFF then size <- size + 6
+            else size <- size + 3
+            index <- index + 1
+        size
+
+    let private jsonFieldBytes name valueBytes = jsonStringBytes name + 1 + valueBytes
+
+    let private jsonObjectBytes (fields: int[]) =
+        2 + (if fields.Length = 0 then 0 else fields.Length - 1) + Array.sum fields
+
+    let private jsonArrayBytes (values: int[]) =
+        2 + (if values.Length = 0 then 0 else values.Length - 1) + Array.sum values
+
+    let private jsonTagBytes tag = jsonObjectBytes [| jsonFieldBytes "tag" (jsonStringBytes tag) |]
+    let private jsonIntBytes value = (string value).Length
+    let private jsonInt64Bytes (value: int64) = jsonStringBytes (string value)
+
+    let private jsonRangeBytes (range: LineRange) =
+        jsonObjectBytes [|
+            jsonFieldBytes "start" (jsonInt64Bytes range.Start)
+            jsonFieldBytes "count" (jsonInt64Bytes range.Count)
+        |]
+
+    let private jsonEndingBytes = function
+        | LineEnding.NoEnding -> jsonTagBytes "NoEnding"
+        | LineEnding.LF -> jsonTagBytes "LF"
+        | LineEnding.CRLF -> jsonTagBytes "CRLF"
+        | LineEnding.CR -> jsonTagBytes "CR"
+
+    let private jsonHighlightBytes (highlight: Highlight) =
+        let kind =
+            match highlight.Kind with
+            | HighlightKind.UnchangedText -> jsonTagBytes "UnchangedText"
+            | HighlightKind.ChangedText -> jsonTagBytes "ChangedText"
+        jsonObjectBytes [|
+            jsonFieldBytes "start" (jsonIntBytes highlight.Start)
+            jsonFieldBytes "length" (jsonIntBytes highlight.Length)
+            jsonFieldBytes "kind" kind
+        |]
+
+    let private jsonLineBytes (line: DiffLine) =
+        let total = line.Slice.TotalUtf16 |> Option.map jsonInt64Bytes |> Option.defaultValue 4
+        let highlights = line.Slice.Highlights |> Array.map jsonHighlightBytes |> jsonArrayBytes
+        let slice =
+            jsonObjectBytes [|
+                jsonFieldBytes "offsetUtf16" (jsonInt64Bytes line.Slice.OffsetUtf16)
+                jsonFieldBytes "totalUtf16" total
+                jsonFieldBytes "text" (jsonStringBytes line.Slice.Text)
+                jsonFieldBytes "highlights" highlights
+            |]
+        jsonObjectBytes [|
+            jsonFieldBytes "number" (jsonInt64Bytes line.Number)
+            jsonFieldBytes "ending" (jsonEndingBytes line.Ending)
+            jsonFieldBytes "slice" slice
+        |]
+
+    let private jsonOptionalLineBytes = function
+        | Some line -> jsonLineBytes line
+        | None -> 4
+
+    let private jsonRowBytes (row: DiffRow) =
+        let kind =
+            match row.Kind with
+            | DiffRowKind.Context -> "Context"
+            | DiffRowKind.Added -> "Added"
+            | DiffRowKind.Removed -> "Removed"
+            | DiffRowKind.Replaced -> "Replaced"
+            | DiffRowKind.EndingChanged -> "EndingChanged"
+        jsonObjectBytes [|
+            jsonFieldBytes "id" (jsonStringBytes row.Id)
+            jsonFieldBytes "kind" (jsonTagBytes kind)
+            jsonFieldBytes "previous" (jsonOptionalLineBytes row.Previous)
+            jsonFieldBytes "current" (jsonOptionalLineBytes row.Current)
+        |]
+
+    let private jsonHunkBodyBytes = function
+        | HunkBody.AlignedRows values ->
+            jsonObjectBytes [|
+                jsonFieldBytes "tag" (jsonStringBytes "AlignedRows")
+                jsonFieldBytes "rows" (values |> Array.map jsonRowBytes |> jsonArrayBytes)
+            |]
+        | HunkBody.UnalignedSides(previous, current) ->
+            jsonObjectBytes [|
+                jsonFieldBytes "tag" (jsonStringBytes "UnalignedSides")
+                jsonFieldBytes "previous" (previous |> Array.map jsonLineBytes |> jsonArrayBytes)
+                jsonFieldBytes "current" (current |> Array.map jsonLineBytes |> jsonArrayBytes)
+            |]
+
+    let private jsonGapBytes (gap: EqualGap) =
+        jsonObjectBytes [|
+            jsonFieldBytes "gapId" (jsonStringBytes gap.GapId)
+            jsonFieldBytes "previousRange" (jsonRangeBytes gap.PreviousRange)
+            jsonFieldBytes "currentRange" (jsonRangeBytes gap.CurrentRange)
+        |]
+
+    let private jsonPartBytes = function
+        | DiffPart.Hunk fragment ->
+            let hunk =
+                jsonObjectBytes [|
+                    jsonFieldBytes "hunkId" (jsonStringBytes fragment.HunkId)
+                    jsonFieldBytes "previousRange" (jsonRangeBytes fragment.PreviousRange)
+                    jsonFieldBytes "currentRange" (jsonRangeBytes fragment.CurrentRange)
+                    jsonFieldBytes "startsHunk" (if fragment.StartsHunk then 4 else 5)
+                    jsonFieldBytes "endsHunk" (if fragment.EndsHunk then 4 else 5)
+                    jsonFieldBytes "body" (jsonHunkBodyBytes fragment.Body)
+                |]
+            jsonObjectBytes [|
+                jsonFieldBytes "tag" (jsonStringBytes "Hunk")
+                jsonFieldBytes "fragment" hunk
+            |]
+        | DiffPart.HiddenEqual gap ->
+            jsonObjectBytes [|
+                jsonFieldBytes "tag" (jsonStringBytes "HiddenEqual")
+                jsonFieldBytes "gap" (jsonGapBytes gap)
+            |]
+        | DiffPart.ExpandedContext(gapId, values) ->
+            jsonObjectBytes [|
+                jsonFieldBytes "tag" (jsonStringBytes "ExpandedContext")
+                jsonFieldBytes "gapId" (jsonStringBytes gapId)
+                jsonFieldBytes "rows" (values |> Array.map jsonRowBytes |> jsonArrayBytes)
+            |]
+
     let private rebuild expected parts previousSide =
         let output = ResizeArray<SourceLine>()
 
@@ -816,6 +952,151 @@ module TextDiffSessionCases =
                     Check.equal (overlapStart - int offset) newChanged[0].Start "The current fallback span starts at the clipped middle."
                     Check.equal expectedLength oldChanged[0].Length "The previous fallback span ends at the slice edge or changed middle."
                     Check.equal expectedLength newChanged[0].Length "The current fallback span ends at the slice edge or changed middle."
+            do! session.Close()
+            return ()
+        }
+        "long fallback slices match line reads", fun () -> async {
+            let words (count: int) (choose: int -> string) = String.Join(" ", Array.init count choose)
+            let limits = { Limits.defaults with MaxUnits = Int32.MaxValue; RequestMs = 1e12; QuantumMs = 1e12 }
+            let run previousText currentText check = async {
+                let previous = [|
+                    { Text = "head"; Ending = LineEnding.LF }
+                    { Text = previousText; Ending = LineEnding.LF }
+                    { Text = "tail"; Ending = LineEnding.NoEnding }
+                |]
+                let current = [|
+                    { Text = "head"; Ending = LineEnding.LF }
+                    { Text = currentText; Ending = LineEnding.LF }
+                    { Text = "tail"; Ending = LineEnding.NoEnding }
+                |]
+                let! session = openSession (config 0 100 64 8 limits) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+                let! pages = readAll session (fun () -> false)
+                let row = rows (allParts pages) |> Array.find (fun value -> value.Kind = DiffRowKind.Replaced)
+                let compare side (pageLine: DiffLine) = async {
+                    let count = pageLine.Slice.Text.Length
+                    let! initial = session.ReadLine(side, pageLine.Number, pageLine.Slice.OffsetUtf16, count, None, fun () -> false)
+                    let! line = resolveLine session side pageLine.Number pageLine.Slice.OffsetUtf16 count initial
+                    Check.equal pageLine.Slice.OffsetUtf16 line.Slice.OffsetUtf16 "The page and line read start at the same unit."
+                    Check.equal pageLine.Slice.Text line.Slice.Text "The page and line read return the same text."
+                    Check.sequence pageLine.Slice.Highlights line.Slice.Highlights "The page and line read return the same highlights."
+                }
+                do! compare DiffSide.Previous row.Previous.Value
+                do! compare DiffSide.Current row.Current.Value
+                check row
+                do! session.Close()
+            }
+
+            let previousText = words 10_000 (fun index -> sprintf "w%06d" index)
+            let changedText = words 10_000 (fun index -> if index = 5_000 || index = 5_400 then sprintf "X%06d" index else sprintf "w%06d" index)
+            do! run previousText changedText ignore
+
+            let insertionSourceText = words 6_000 (fun index -> sprintf "w%05d" index)
+            let insertionStart = insertionSourceText.IndexOf("w03000", StringComparison.Ordinal)
+            let insertedText = insertionSourceText.Insert(insertionStart, "NEW ")
+            do!
+                run insertionSourceText insertedText (fun row ->
+                    let previousChanged = row.Previous.Value.Slice.Highlights |> Array.filter (fun span -> span.Kind = HighlightKind.ChangedText)
+                    let currentChanged = row.Current.Value.Slice.Highlights |> Array.filter (fun span -> span.Kind = HighlightKind.ChangedText)
+                    Check.equal 0 previousChanged.Length "An insertion leaves the previous line plain."
+                    Check.true' (currentChanged.Length > 0) "The inserted text has a changed highlight."
+                    for span in currentChanged do
+                        let start = row.Current.Value.Slice.OffsetUtf16 + int64 span.Start
+                        let finish = start + int64 span.Length
+                        Check.true' (start >= int64 insertionStart && finish <= int64 insertionStart + 4L) "A changed span stays within the inserted text.")
+            return ()
+        }
+        "request budgets preserve page highlights", fun () -> async {
+            let previous =
+                Array.init 3_000 (fun index ->
+                    let text = if index % 10 = 5 then sprintf "a%d X b Y c" index else sprintf "line %d" index
+                    { Text = text; Ending = LineEnding.LF })
+            let current =
+                Array.init 3_000 (fun index ->
+                    let text = if index % 10 = 5 then sprintf "a%d Z b W c" index else sprintf "line %d" index
+                    { Text = text; Ending = LineEnding.LF })
+            let baselineLimits = { Limits.defaults with RequestMs = 1e12; QuantumMs = 1e12 }
+            let sessionConfig = config 0 1_000 1_024 4_096 baselineLimits
+            let run limits = async {
+                let! session = openSession { sessionConfig with Limits = limits } (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+                let! pages = readAll session (fun () -> false)
+                do! session.Close()
+                return pages
+            }
+            let! baseline = run baselineLimits
+            let! limited = run { baselineLimits with MaxUnits = 3_000 }
+            let baselineRows = rows (allParts baseline) |> Array.filter (fun row -> row.Kind = DiffRowKind.Replaced)
+            let replacements = rows (allParts limited) |> Array.filter (fun row -> row.Kind = DiffRowKind.Replaced)
+            Check.sequence baselineRows replacements "The request budget does not change replacement rows or slices."
+            Check.equal 300 replacements.Length "Every changed source line forms a replacement."
+            for row in replacements do
+                let changedText line =
+                    line.Slice.Highlights
+                    |> Array.filter (fun span -> span.Kind = HighlightKind.ChangedText)
+                    |> Array.map (fun span -> line.Slice.Text.Substring(span.Start, span.Length))
+                Check.sequence [| "X"; "Y" |] (changedText row.Previous.Value) "The previous highlights leave the middle word plain."
+                Check.sequence [| "Z"; "W" |] (changedText row.Current.Value) "The current highlights leave the middle word plain."
+            return ()
+        }
+        "token highlight text limits apply to each side", fun () -> async {
+            let previousText = "start old same " + String('p', 33_000) + " first end"
+            let currentText = "start new same q second end"
+            let previous = [| { Text = previousText; Ending = LineEnding.NoEnding } |]
+            let current = [| { Text = currentText; Ending = LineEnding.NoEnding } |]
+            let limits = { Limits.defaults with MaxUnits = Int32.MaxValue; RequestMs = 1e12; QuantumMs = 1e12 }
+            let! session = openSession (config 0 100 64 8 limits) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+            let! _ = readAll session (fun () -> false)
+            let! initial = session.ReadLine(DiffSide.Previous, 0L, 0L, 8_192, None, fun () -> false)
+            let! line = resolveLine session DiffSide.Previous 0L 0L 8_192 initial
+            let changed = line.Slice.Highlights |> Array.filter (fun span -> span.Kind = HighlightKind.ChangedText)
+            let sharedStart = line.Slice.Text.IndexOf("same", StringComparison.Ordinal)
+            Check.equal 1 changed.Length "A side above the text limit uses one bounded middle."
+            Check.true' (changed[0].Start <= sharedStart && changed[0].Start + changed[0].Length >= sharedStart + 4) "The bounded middle covers text between the outer matches."
+            do! session.Close()
+            return ()
+        }
+        "unequal long lines highlight the unmatched suffix", fun () -> async {
+            let previousText = String.replicate 40_000 "ab"
+            let currentText = String.replicate 40_001 "ab"
+            let previous = [| { Text = previousText; Ending = LineEnding.NoEnding } |]
+            let current = [| { Text = currentText; Ending = LineEnding.NoEnding } |]
+            let limits = { Limits.defaults with MaxUnits = Int32.MaxValue; RequestMs = 1e12; QuantumMs = 1e12 }
+            let! session = openSession (config 0 100 64 8 limits) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+            let! _ = readAll session (fun () -> false)
+            let! initial = session.ReadLine(DiffSide.Current, 0L, int64 previousText.Length, 2, None, fun () -> false)
+            let! line = resolveLine session DiffSide.Current 0L (int64 previousText.Length) 2 initial
+            let changed = line.Slice.Highlights |> Array.filter (fun span -> span.Kind = HighlightKind.ChangedText)
+            Check.equal "ab" line.Slice.Text "The line read returns the unmatched suffix."
+            Check.equal 1 changed.Length "The unmatched suffix has one changed span."
+            Check.equal 0 changed[0].Start "The suffix highlight starts at the slice edge."
+            Check.equal 2 changed[0].Length "The suffix highlight covers both units."
+            do! session.Close()
+            return ()
+        }
+        "line read sizing reserves encoded highlights", fun () -> async {
+            let anchorCount = 317
+            let previousCore = String.Join(" ", Array.init anchorCount (fun index -> sprintf "a%03x" index))
+            let currentCore =
+                String.Join(
+                    " ",
+                    Array.init anchorCount (fun index ->
+                        let token = sprintf "a%03x" index
+                        if index + 1 = anchorCount then token else token + ",")
+                )
+            let prefix = String('x', 8_192 - currentCore.Length - 1) + ";"
+            let previousText = prefix + previousCore
+            let currentText = prefix + currentCore
+            let previous = [| { Text = previousText; Ending = LineEnding.NoEnding } |]
+            let current = [| { Text = currentText; Ending = LineEnding.NoEnding } |]
+            let limits = { Limits.defaults with MaxUnits = Int32.MaxValue; RequestMs = 1e12; QuantumMs = 1e12 }
+            let! session = openSession (config 0 100 64 8 limits) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+            let! _ = readAll session (fun () -> false)
+            let! initial = session.ReadLine(DiffSide.Current, 0L, 0L, 8_192, None, fun () -> false)
+            let! line = resolveLine session DiffSide.Current 0L 0L 8_192 initial
+            let estimate = line.Slice.Text.Length * 3 + line.Slice.Highlights.Length * 64 + 512
+            Check.true' (line.Slice.Highlights.Length > 0) "The line read keeps its inline highlights."
+            Check.true' (line.Slice.Text.Length < currentText.Length) $"The line read returns {line.Slice.Text.Length} units and {line.Slice.Highlights.Length} highlights, with estimate {estimate}."
+            Check.true' (estimate <= 64 * 1024) $"The conservative line estimate is {estimate} bytes."
+            Check.true' (jsonLineBytes line <= 64 * 1024) $"The encoded line uses {jsonLineBytes line} bytes."
             do! session.Close()
             return ()
         }
@@ -1919,6 +2200,50 @@ module TextDiffSessionCases =
             match later with
             | EngineResult.Failed(code, _, _) -> Check.equal TextDiffFailureCodes.WorkerFailed code "A later request sees the failed expansion session."
             | other -> failwith $"The failed session accepted another request: {other}."
+            do! session.Close()
+            return ()
+        }
+        "page sizing bounds source reads", fun () -> async {
+            let makeLine ending index =
+                let suffix = string index
+                { Text = String('"', 8_000 - suffix.Length) + suffix; Ending = ending }
+            let previous = Array.init 300 (makeLine LineEnding.LF)
+            let current = Array.init 300 (makeLine LineEnding.CRLF)
+            let previousBytes = encodeLines previous
+            let currentBytes = encodeLines current
+            let previousSource = CountingByteSource previousBytes
+            let currentSource = CountingByteSource currentBytes
+            let previousSpec = sourceSpecWith (previousSource :> IByteSource) "utf-8" 0 (int64 previousBytes.Length)
+            let currentSpec = sourceSpecWith (currentSource :> IByteSource) "utf-8" 0 (int64 currentBytes.Length)
+            let limits = { Limits.defaults with MaxUnits = Int32.MaxValue; RequestMs = 1e12; QuantumMs = 1e12 }
+            let sessionConfig = config 0 1_000 65_536 4_096 limits
+            let size part = jsonPartBytes part + 1
+            let host = Host.createInMemory (ManualClock 0.0 :> IClock)
+            let! session = TextDiffSession.create host (Ledger()) sessionConfig size previousSpec currentSpec
+            let! firstResult = session.FirstPage(fun () -> false)
+            let! first = resolvePage session (fun () -> false) firstResult
+            let pageBytes (page: DiffPage) = page.Parts |> Array.sumBy size
+            let firstBytes = pageBytes first
+            Check.true' (firstBytes <= sessionConfig.PageMaxBytes) "The first page stays within its byte limit."
+            let mutable emittedBytes = int64 firstBytes
+            let mutable emittedRows = first.Parts |> Array.sumBy countRows
+            let mutable page = first
+            let mutable pageCount = 1
+            while page.NextCursor.IsSome do
+                let! result = session.ReadPage page.NextCursor.Value (fun () -> false)
+                let! next = resolvePage session (fun () -> false) result
+                let bytes = pageBytes next
+                Check.true' (bytes <= sessionConfig.PageMaxBytes) $"Page {pageCount + 1} uses {bytes} bytes."
+                emittedBytes <- emittedBytes + int64 bytes
+                emittedRows <- emittedRows + (next.Parts |> Array.sumBy countRows)
+                page <- next
+                pageCount <- pageCount + 1
+            let bytesRead = previousSource.BytesRead + currentSource.BytesRead
+            let readLimit = emittedBytes * 3L / 2L + 131_072L
+            Check.true' (pageCount > 1) "The source spans several bounded pages."
+            Check.equal 300 emittedRows "Every ending change appears in the page stream."
+            Check.true' (emittedBytes > 0L) "The pages emit source text."
+            Check.true' (bytesRead <= readLimit) $"The sources read {bytesRead} bytes for {emittedBytes} emitted bytes."
             do! session.Close()
             return ()
         }

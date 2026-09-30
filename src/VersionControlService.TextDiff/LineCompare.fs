@@ -437,7 +437,10 @@ module internal InlineHighlights =
     let private MaxTokens = 4_096
 
     [<Literal>]
-    let private MaxTextUnits = 64 * 1024
+    let private MaxTokenSteps = 200_000
+
+    [<Literal>]
+    let private MaxTextBytesPerSide = 64 * 1024
 
     type private TokenTable = {
         Starts: int[]
@@ -557,6 +560,16 @@ module internal InlineHighlights =
         appendSpan currentResult (prefix + currentChanged) suffix HighlightKind.UnchangedText
         previousResult.ToArray(), currentResult.ToArray()
 
+    let canUseWholeLine (previousLength: float) (currentLength: float) =
+        // UTF-16 text uses two bytes per code unit, and each side has its own byte limit.
+        previousLength * 2.0 <= float MaxTextBytesPerSide
+        && currentLength * 2.0 <= float MaxTextBytesPerSide
+        && previousLength <= float Int32.MaxValue
+        && currentLength <= float Int32.MaxValue
+
+    let canUseWholeLineText (previous: string) (current: string) =
+        canUseWholeLine (float previous.Length) (float current.Length)
+
     let private middleHighlights (previous: string) (current: string) =
         let prefix = commonPrefix previous current
         let suffix = commonSuffix previous current prefix
@@ -583,8 +596,8 @@ module internal InlineHighlights =
     let clip (_wholeText: string) (offset: int64) (sliceText: string) (highlights: Highlight[]) =
         clipSlice offset sliceText highlights
 
-    let middleSlice (total: float) (prefix: float) (suffix: float) (offset: int64) (sliceText: string) =
-        let suffix = min suffix (max 0.0 (total - prefix))
+    let middleSlice (total: float) (otherTotal: float) (prefix: float) (suffix: float) (offset: int64) (sliceText: string) =
+        let suffix = min suffix (max 0.0 (min total otherTotal - prefix))
         let changedEnd = max prefix (total - suffix)
         let sliceStart = float offset
         let sliceEnd = sliceStart + float sliceText.Length
@@ -600,32 +613,27 @@ module internal InlineHighlights =
         result.ToArray()
 
     let private tokenHighlights (previous: string) (current: string) (meter: Meter) (previousTokens: TokenTable) (currentTokens: TokenTable) =
-        let remaining = max 0 (meter.MaxUnits - meter.Units)
-        if remaining = 0 || Meter.overBudget meter then
-            None
-        else
-            let stepper =
-                MyersStepper(
-                    0,
-                    previousTokens.Count,
-                    0,
-                    currentTokens.Count,
-                    remaining,
-                    meter,
-                    fun previousIndex currentIndex -> tokenEqual previous current previousTokens previousIndex currentTokens currentIndex)
-            let mutable result = None
-            let mutable running = true
-            while running do
-                match stepper.Step() with
-                | MyersStepResult.Complete operations ->
-                    result <- Some operations
-                    running <- false
-                | MyersStepResult.StepLimitExceeded
-                | MyersStepResult.NeedComparison _ ->
-                    running <- false
-                | MyersStepResult.Running ->
-                    if Meter.overBudget meter then running <- false
-            result
+        let stepper =
+            MyersStepper(
+                0,
+                previousTokens.Count,
+                0,
+                currentTokens.Count,
+                MaxTokenSteps,
+                meter,
+                fun previousIndex currentIndex -> tokenEqual previous current previousTokens previousIndex currentTokens currentIndex)
+        let mutable result = None
+        let mutable running = true
+        while running do
+            match stepper.Step() with
+            | MyersStepResult.Complete operations ->
+                result <- Some operations
+                running <- false
+            | MyersStepResult.StepLimitExceeded
+            | MyersStepResult.NeedComparison _ ->
+                running <- false
+            | MyersStepResult.Running -> ()
+        result
 
     let private highlightsFromOperations
         (previous: string)
@@ -650,7 +658,7 @@ module internal InlineHighlights =
     let compute (meter: Meter) (previous: string) (current: string) : Highlight[] * Highlight[] =
         if isNull previous then nullArg (nameof previous)
         if isNull current then nullArg (nameof current)
-        elif previous.Length > MaxTextUnits || current.Length > MaxTextUnits || previous.Length + current.Length > MaxTextUnits then
+        elif not (canUseWholeLineText previous current) then
             middleHighlights previous current
         else
             let previousTokens = tokenize previous
