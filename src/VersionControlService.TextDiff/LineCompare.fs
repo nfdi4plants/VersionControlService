@@ -512,11 +512,10 @@ module internal InlineHighlights =
         else
             count
 
-    let private middleHighlights (previous: string) (current: string) =
-        let prefix = commonPrefix previous current
-        let suffix = commonSuffix previous current prefix
-        let previousChanged = previous.Length - prefix - suffix
-        let currentChanged = current.Length - prefix - suffix
+    let middleBounds previousLength currentLength prefix suffix =
+        let suffix = min suffix (max 0 (min (previousLength - prefix) (currentLength - prefix)))
+        let previousChanged = previousLength - prefix - suffix
+        let currentChanged = currentLength - prefix - suffix
         let previousResult = ResizeArray<Highlight>(3)
         let currentResult = ResizeArray<Highlight>(3)
         appendSpan previousResult 0 prefix HighlightKind.UnchangedText
@@ -526,6 +525,48 @@ module internal InlineHighlights =
         appendSpan previousResult (prefix + previousChanged) suffix HighlightKind.UnchangedText
         appendSpan currentResult (prefix + currentChanged) suffix HighlightKind.UnchangedText
         previousResult.ToArray(), currentResult.ToArray()
+
+    let private middleHighlights (previous: string) (current: string) =
+        let prefix = commonPrefix previous current
+        let suffix = commonSuffix previous current prefix
+        middleBounds previous.Length current.Length prefix suffix
+
+    let clipSlice (offset: int64) (sliceText: string) (highlights: Highlight[]) =
+        let first = max 0 (int offset)
+        let result = ResizeArray<Highlight>()
+        for span in highlights do
+            let mutable start = max 0 (span.Start - first)
+            let mutable end' = min sliceText.Length (span.Start + span.Length - first)
+            if start < end' then
+                if start > 0 && start < sliceText.Length
+                   && Char.IsLowSurrogate sliceText[start]
+                   && Char.IsHighSurrogate sliceText[start - 1] then
+                    start <- start - 1
+                if end' < sliceText.Length && end' > 0
+                   && Char.IsHighSurrogate sliceText[end' - 1]
+                   && Char.IsLowSurrogate sliceText[end'] then
+                    end' <- end' + 1
+                appendSpan result start (end' - start) span.Kind
+        result.ToArray()
+
+    let clip (_wholeText: string) (offset: int64) (sliceText: string) (highlights: Highlight[]) =
+        clipSlice offset sliceText highlights
+
+    let middleSlice (total: float) (prefix: float) (suffix: float) (offset: int64) (sliceText: string) =
+        let suffix = min suffix (max 0.0 (total - prefix))
+        let changedEnd = max prefix (total - suffix)
+        let sliceStart = float offset
+        let sliceEnd = sliceStart + float sliceText.Length
+        let result = ResizeArray<Highlight>(3)
+        let appendInterval start finish kind =
+            let clippedStart = max sliceStart start
+            let clippedEnd = min sliceEnd finish
+            if clippedStart < clippedEnd then
+                appendSpan result (int (clippedStart - sliceStart)) (int (clippedEnd - clippedStart)) kind
+        appendInterval 0.0 prefix HighlightKind.UnchangedText
+        appendInterval prefix changedEnd HighlightKind.ChangedText
+        appendInterval changedEnd total HighlightKind.UnchangedText
+        result.ToArray()
 
     let private tokenHighlights (previous: string) (current: string) (meter: Meter) (previousTokens: TokenTable) (currentTokens: TokenTable) =
         let remaining = max 0 (meter.MaxUnits - meter.Units)

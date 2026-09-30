@@ -281,6 +281,7 @@ module TextDiffSessionCases =
             | Some value -> value
             | None -> failwith "An emitted line has no known length."
         let text = StringBuilder()
+        let highlights = ResizeArray<Highlight>()
         let mutable offset = 0L
         let mutable ending = line.Ending
         let mutable slices = 0
@@ -290,17 +291,45 @@ module TextDiffSessionCases =
             let! slice = resolveLine session side line.Number offset 8_192 initial
             if slice.Slice.OffsetUtf16 <> offset || slice.Slice.Text.Length = 0 then failwith "A line slice did not advance from its requested offset."
             text.Append(slice.Slice.Text) |> ignore
+            for span in slice.Slice.Highlights do
+                let absolute = { span with Start = int offset + span.Start }
+                if highlights.Count > 0 then
+                    let previous = highlights[highlights.Count - 1]
+                    if previous.Kind = absolute.Kind && previous.Start + previous.Length = absolute.Start then
+                        highlights[highlights.Count - 1] <- { previous with Length = previous.Length + absolute.Length }
+                    else
+                        highlights.Add absolute
+                else
+                    highlights.Add absolute
             ending <- slice.Ending
             offset <- offset + int64 slice.Slice.Text.Length
         if offset <> total then failwith "The line slices did not reach the end of the source line."
-        return { Text = text.ToString(); Ending = ending }
+        let sliceHighlights = highlights.ToArray()
+        if total <= 8_192L then
+            let! wholeInitial = session.ReadLine(side, line.Number, 0L, max 1 (int total), None, fun () -> false)
+            let! whole = resolveLine session side line.Number 0L (max 1 (int total)) wholeInitial
+            let wholeHighlights =
+                whole.Slice.Highlights
+                |> Array.map (fun span -> { span with Start = int whole.Slice.OffsetUtf16 + span.Start })
+            Check.sequence wholeHighlights sliceHighlights "Line slices join to the highlights from one full line read."
+            let pageStart = int line.Slice.OffsetUtf16
+            let pageFinish = pageStart + line.Slice.Text.Length
+            let pageHighlights =
+                wholeHighlights
+                |> Array.choose (fun span ->
+                    let start = max pageStart span.Start
+                    let finish = min pageFinish (span.Start + span.Length)
+                    if finish <= start then None
+                    else Some { span with Start = start - pageStart; Length = finish - start })
+            Check.sequence pageHighlights line.Slice.Highlights "A displayed line slice matches the full line highlights."
+        return { Text = text.ToString(); Ending = ending }, sliceHighlights
     }
 
     let private checkSliceOracle (session: TextDiffSession) (previous: SourceLine[]) (current: SourceLine[]) (pages: DiffPage[]) = async {
         let rebuiltPrevious = ResizeArray<SourceLine>()
         let rebuiltCurrent = ResizeArray<SourceLine>()
         let appendLine side (target: ResizeArray<SourceLine>) line = async {
-            let! full = fetchCompleteLine session side line
+            let! full, _ = fetchCompleteLine session side line
             target.Add full
         }
         let appendRange (expected: SourceLine[]) (target: ResizeArray<SourceLine>) (range: LineRange) =
@@ -597,6 +626,149 @@ module TextDiffSessionCases =
             Check.equal 1 oldChanged[0].Length "The old changed span covers one punctuation mark."
             Check.equal 1 newChanged[0].Length "The new changed span covers one punctuation mark."
             do! fallbackSession.Close()
+            return ()
+        }
+        "long replacement slices keep whole line highlights", fun () -> async {
+            let prefix = String('a', 19_997) + " "
+            let suffix = " " + String('b', 9_998)
+            let previous = [| { Text = prefix + "old" + suffix; Ending = LineEnding.NoEnding } |]
+            let current = [| { Text = prefix + "new" + suffix; Ending = LineEnding.NoEnding } |]
+            let limits = { Limits.defaults with MaxUnits = 256; RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 }
+            let! session = openSession (config 0 100 64 8 limits) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+            let! pages = readAll session (fun () -> false)
+            let row = rows (allParts pages) |> Array.find (fun row -> row.Kind = DiffRowKind.Replaced)
+            Check.equal DiffRowKind.Replaced row.Kind "The long lines form one replacement row."
+            let readSlice side offset = async {
+                let! initial = session.ReadLine(side, 0L, offset, 8_192, None, fun () -> false)
+                return! resolveLine session side 0L offset 8_192 initial
+            }
+            let wordStart = int64 prefix.Length
+            for offset in [| 0L; 8_192L; 16_384L; 24_576L |] do
+                let! oldSlice = readSlice DiffSide.Previous offset
+                let! newSlice = readSlice DiffSide.Current offset
+                let oldChanged = oldSlice.Slice.Highlights |> Array.filter (fun span -> span.Kind = HighlightKind.ChangedText)
+                let newChanged = newSlice.Slice.Highlights |> Array.filter (fun span -> span.Kind = HighlightKind.ChangedText)
+                let expectedCount = if offset = 16_384L then 1 else 0
+                Check.equal expectedCount oldChanged.Length "The previous slice has changed text only where the old word falls."
+                Check.equal expectedCount newChanged.Length "The current slice has changed text only where the new word falls."
+                if expectedCount = 1 then
+                    Check.equal (int (wordStart - offset)) oldChanged[0].Start "The previous word span is relative to its slice."
+                    Check.equal (int (wordStart - offset)) newChanged[0].Start "The current word span is relative to its slice."
+                    Check.equal 3 oldChanged[0].Length "The previous span covers the changed word."
+                    Check.equal 3 newChanged[0].Length "The current span covers the changed word."
+                    Check.equal "old" (oldSlice.Slice.Text.Substring(oldChanged[0].Start, oldChanged[0].Length)) "The old slice span selects its word."
+                    Check.equal "new" (newSlice.Slice.Text.Substring(newChanged[0].Start, newChanged[0].Length)) "The new slice span selects its word."
+            do! session.Close()
+            return ()
+        }
+        "large replacement slices clip the differing middle", fun () -> async {
+            let shared = String.concat " " (Array.create 16_500 "p")
+            let middleLength = 9_000
+            let previous = [| { Text = shared + String('o', middleLength) + shared; Ending = LineEnding.NoEnding } |]
+            let current = [| { Text = shared + String('n', middleLength) + shared; Ending = LineEnding.NoEnding } |]
+            let limits = { Limits.defaults with MaxUnits = 256; RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 }
+            let! session = openSession (config 0 100 64 8 limits) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+            let! pages = readAll session (fun () -> false)
+            let row = rows (allParts pages) |> Array.find (fun row -> row.Kind = DiffRowKind.Replaced)
+            Check.equal DiffRowKind.Replaced row.Kind "The long lines form one replacement row."
+            let changedStart = shared.Length
+            let changedFinish = changedStart + middleLength
+            let total = previous[0].Text.Length
+            for offset in [| 0L; 32_768L; 40_960L; 65_536L |] do
+                let! oldInitial = session.ReadLine(DiffSide.Previous, 0L, offset, 4_096, None, fun () -> false)
+                let! oldSlice = resolveLine session DiffSide.Previous 0L offset 4_096 oldInitial
+                let! newInitial = session.ReadLine(DiffSide.Current, 0L, offset, 4_096, None, fun () -> false)
+                let! newSlice = resolveLine session DiffSide.Current 0L offset 4_096 newInitial
+                let sliceFinish = min total (int offset + oldSlice.Slice.Text.Length)
+                let overlapStart = max changedStart (int offset)
+                let overlapFinish = min changedFinish sliceFinish
+                let expectedLength = max 0 (overlapFinish - overlapStart)
+                let oldChanged = oldSlice.Slice.Highlights |> Array.filter (fun span -> span.Kind = HighlightKind.ChangedText)
+                let newChanged = newSlice.Slice.Highlights |> Array.filter (fun span -> span.Kind = HighlightKind.ChangedText)
+                let expectedCount = if expectedLength > 0 then 1 else 0
+                Check.equal expectedCount oldChanged.Length "The previous fallback slice has one clipped middle span when it overlaps the change."
+                Check.equal expectedCount newChanged.Length "The current fallback slice has one clipped middle span when it overlaps the change."
+                if expectedLength > 0 then
+                    Check.equal (overlapStart - int offset) oldChanged[0].Start "The previous fallback span starts at the clipped middle."
+                    Check.equal (overlapStart - int offset) newChanged[0].Start "The current fallback span starts at the clipped middle."
+                    Check.equal expectedLength oldChanged[0].Length "The previous fallback span ends at the slice edge or changed middle."
+                    Check.equal expectedLength newChanged[0].Length "The current fallback span ends at the slice edge or changed middle."
+            do! session.Close()
+            return ()
+        }
+        "line read retries preserve replacement highlights", fun () -> async {
+            let prefix = String('a', 5_000) + " "
+            let suffix = " " + String('b', 5_000)
+            let previous = [| { Text = prefix + "old" + suffix; Ending = LineEnding.NoEnding } |]
+            let current = [| { Text = prefix + "new" + suffix; Ending = LineEnding.NoEnding } |]
+            let limits = { Limits.defaults with MaxUnits = 8; RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 }
+            let! session = openSession (config 0 100 64 8 limits) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+            let! _ = readAll session (fun () -> false)
+            let offset = int64 prefix.Length
+            let! initial = session.ReadLine(DiffSide.Previous, 0L, offset, 64, None, fun () -> false)
+            let mutable result = initial
+            let mutable attempts = 0
+            let mutable retriedHighlights = false
+            while not retriedHighlights && attempts < 1_000 do
+                match result with
+                | EngineResult.Ok(Resumable.Scanning(_, continuation, _)) ->
+                    attempts <- attempts + 1
+                    let! next = session.ReadLine(DiffSide.Previous, 0L, offset, 64, Some continuation, fun () -> false)
+                    let! retry = session.ReadLine(DiffSide.Previous, 0L, offset, 64, Some continuation, fun () -> false)
+                    Check.true' (Unchecked.equals next retry) "Retrying a line continuation returns the same highlight result."
+                    match next with
+                    | EngineResult.Ok(Resumable.Ready line) ->
+                        let changed = line.Slice.Highlights |> Array.filter (fun span -> span.Kind = HighlightKind.ChangedText)
+                        Check.equal 1 changed.Length "The retried slice contains its changed word highlight."
+                        Check.equal "old" (line.Slice.Text.Substring(changed[0].Start, changed[0].Length)) "The retried highlight selects the previous word."
+                        retriedHighlights <- true
+                    | _ -> result <- next
+                | _ -> attempts <- 1_000
+            Check.true' retriedHighlights "A continuation retry reaches the recorded changed highlight."
+            do! session.Close()
+            return ()
+        }
+        "context and ending line reads have no highlights", fun () -> async {
+            let previous = [|
+                { Text = "context"; Ending = LineEnding.LF }
+                { Text = "old"; Ending = LineEnding.LF }
+                { Text = "ending"; Ending = LineEnding.LF }
+            |]
+            let current = [|
+                { Text = "context"; Ending = LineEnding.LF }
+                { Text = "new"; Ending = LineEnding.LF }
+                { Text = "ending"; Ending = LineEnding.CRLF }
+            |]
+            let! session = openSession (config 1 100 64 8 Limits.defaults) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+            let! pages = readAll session (fun () -> false)
+            let allRows = rows (allParts pages)
+            Check.true' (allRows |> Array.exists (fun row -> row.Kind = DiffRowKind.Context && row.Previous.Value.Number = 0L)) "The unchanged line appears as context."
+            Check.true' (allRows |> Array.exists (fun row -> row.Kind = DiffRowKind.EndingChanged && row.Previous.Value.Number = 2L)) "The final line appears as an ending change."
+            for side in [| DiffSide.Previous; DiffSide.Current |] do
+                for line in [| 0L; 2L |] do
+                    let! initial = session.ReadLine(side, line, 0L, 32, None, fun () -> false)
+                    let! value = resolveLine session side line 0L 32 initial
+                    Check.equal 0 value.Slice.Highlights.Length "Context and ending-only reads have no highlights."
+            do! session.Close()
+            return ()
+        }
+        "line read highlights keep surrogate pairs intact", fun () -> async {
+            let prefix = String.concat " " (Array.create 4_096 "a")
+            let previous = [| { Text = prefix + "😀-tail"; Ending = LineEnding.NoEnding } |]
+            let current = [| { Text = prefix + "😁-tail"; Ending = LineEnding.NoEnding } |]
+            let! session = openSession (config 0 100 64 8 Limits.defaults) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+            let! pages = readAll session (fun () -> false)
+            let row = rows (allParts pages) |> Array.find (fun row -> row.Kind = DiffRowKind.Replaced)
+            Check.equal DiffRowKind.Replaced row.Kind "The surrogate pair belongs to a replacement row."
+            for (side, expected) in [| DiffSide.Previous, "😀"; DiffSide.Current, "😁" |] do
+                let! initial = session.ReadLine(side, 0L, int64 prefix.Length, 2, None, fun () -> false)
+                let! value = resolveLine session side 0L (int64 prefix.Length) 2 initial
+                Check.equal expected value.Slice.Text "The slice contains the complete changed surrogate pair."
+                let changed = value.Slice.Highlights |> Array.filter (fun span -> span.Kind = HighlightKind.ChangedText)
+                Check.equal 1 changed.Length "The changed emoji has one highlight span."
+                Check.equal 0 changed[0].Start "The highlight starts at the slice edge."
+                Check.equal 2 changed[0].Length "The highlight covers both surrogate units."
+            do! session.Close()
             return ()
         }
         "ending changes have no inline highlights", fun () -> async {
