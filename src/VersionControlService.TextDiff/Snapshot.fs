@@ -87,6 +87,37 @@ type internal ArraySlot(floats: float[], ints: int[], bytes: byte[], count: int)
     static member OfInts(values: int[], count: int) = ArraySlot(Unchecked.defaultof<float[]>, values, Unchecked.defaultof<byte[]>, count)
     static member OfBytes(values: byte[], count: int) = ArraySlot(Unchecked.defaultof<float[]>, Unchecked.defaultof<int[]>, values, count)
 
+/// Encodes and decodes blocks of slot elements. The loops run outside the async workflows, because the
+/// JavaScript build turns a loop inside a workflow into one continuation per element.
+module internal SlotBlocks =
+    let encode (slot: ArraySlot) (buffer: byte[]) (offset: int) (start: int) (amount: int) =
+        let width = slot.Width
+        if width = Numbers.NumberBytes then
+            for index = 0 to amount - 1 do
+                Numbers.writeNumber buffer (offset + index * width) (Native.readFloat slot.Floats (start + index))
+        elif width = 4 then
+            for index = 0 to amount - 1 do
+                Numbers.writeInt32 buffer (offset + index * width) (Native.readInt slot.Ints (start + index))
+        else
+            for index = 0 to amount - 1 do
+                Native.writeByte buffer (offset + index) (Native.readByte slot.Bytes (start + index))
+
+    let decode (slot: ArraySlot) (scratch: byte[]) (start: int) (amount: int) =
+        let width = slot.Width
+        if width = Numbers.NumberBytes then
+            for index = 0 to amount - 1 do
+                Native.writeFloat slot.Floats (start + index) (Numbers.readNumber scratch (index * width))
+        elif width = 4 then
+            for index = 0 to amount - 1 do
+                Native.writeInt slot.Ints (start + index) (Numbers.readInt32 scratch (index * width))
+        else
+            for index = 0 to amount - 1 do
+                Native.writeByte slot.Bytes (start + index) (Native.readByte scratch index)
+
+    let decodeNumbers (scratch: byte[]) (values: float[]) (start: int) (amount: int) =
+        for index = 0 to amount - 1 do
+            values[start + index] <- Numbers.readNumber scratch (index * Numbers.NumberBytes)
+
 /// Writes a spilled state to a temp store from position zero. The block buffer is transient, so a spill
 /// itself needs only this one buffer while it frees the state it writes.
 type internal SnapshotWriter(store: ITempStore) =
@@ -109,15 +140,7 @@ type internal SnapshotWriter(store: ITempStore) =
             if room = 0 then do! flush ()
             else
                 let amount = min room (slot.Count - written)
-                if width = Numbers.NumberBytes then
-                    for index = 0 to amount - 1 do
-                        Numbers.writeNumber buffer (used + index * width) (Native.readFloat slot.Floats (written + index))
-                elif width = 4 then
-                    for index = 0 to amount - 1 do
-                        Numbers.writeInt32 buffer (used + index * width) (Native.readInt slot.Ints (written + index))
-                else
-                    for index = 0 to amount - 1 do
-                        Native.writeByte buffer (used + index) (Native.readByte slot.Bytes (written + index))
+                SlotBlocks.encode slot buffer used written amount
                 used <- used + amount * width
                 written <- written + amount
     }
@@ -151,8 +174,7 @@ type internal SnapshotReader(store: ITempStore, scratch: byte[]) =
         while done' < count do
             let amount = min perBlock (count - done')
             do! readBlock (amount * Numbers.NumberBytes)
-            for index = 0 to amount - 1 do
-                values[done' + index] <- Numbers.readNumber scratch (index * Numbers.NumberBytes)
+            SlotBlocks.decodeNumbers scratch values done' amount
             done' <- done' + amount
         return values
     }
@@ -170,15 +192,7 @@ type internal SnapshotReader(store: ITempStore, scratch: byte[]) =
         if amount <= 0 then return 0
         else
             do! readBlock (amount * width)
-            if width = Numbers.NumberBytes then
-                for index = 0 to amount - 1 do
-                    Native.writeFloat slot.Floats (slot.Filled + index) (Numbers.readNumber scratch (index * width))
-            elif width = 4 then
-                for index = 0 to amount - 1 do
-                    Native.writeInt slot.Ints (slot.Filled + index) (Numbers.readInt32 scratch (index * width))
-            else
-                for index = 0 to amount - 1 do
-                    Native.writeByte slot.Bytes (slot.Filled + index) (Native.readByte scratch index)
+            SlotBlocks.decode slot scratch slot.Filled amount
             slot.Filled <- slot.Filled + amount
             return amount * width
     }

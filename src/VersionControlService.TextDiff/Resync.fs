@@ -31,6 +31,12 @@ module private ResyncStage =
     let Emit = 5
 
     [<Literal>]
+    let DeepLoad = 6
+
+    [<Literal>]
+    let DeepVerify = 7
+
+    [<Literal>]
     let FollowDiscover = 0
 
     [<Literal>]
@@ -83,6 +89,7 @@ type internal ResyncEngine
     let mask = config.ResyncSampleModulus - 1
 
     let importCounts = Array.zeroCreate<int> 2
+    let mutable importReserved = true
     let mutable reserved = false
     let mutable stage = ResyncStage.Discover
 
@@ -121,6 +128,23 @@ type internal ResyncEngine
     let mutable rowC = 0
     let mutable job: (Meter -> Async<CompareStep>) option = None
 
+    // The backward extension of a confirmed candidate past the line tables that verification holds. It compares
+    // the lines of both sides in pairs with a fixed distance, starting at the earliest pair that the committed
+    // cursors allow.
+    let deepBackOffset = Array.zeroCreate<float> 2
+    let deepRunOffset = Array.zeroCreate<float> 2
+    let mutable deepDelta = 0.0
+    let mutable deepEnd = 0.0
+    let mutable deepNext = 0.0
+    let mutable deepRun = 0.0
+    let mutable deepRunKnown = false
+    let mutable deepChunkStart = 0.0
+    let mutable deepChunkEnd = 0.0
+    let mutable deepRowP = 0
+    let mutable deepRowC = 0
+    let mutable deepVerifyFrom = 0.0
+    let mutable deepVerifyCount = 0
+
     // Emission of the lines between the range start and an end position.
     let endOffset = Array.zeroCreate<float> 2
     let endLine = Array.zeroCreate<float> 2
@@ -134,6 +158,13 @@ type internal ResyncEngine
 
     let tableHeld (side: ScanSide) = side.Table.Capacity > 0
 
+    let isVerifying (value: int) =
+        value = ResyncStage.VerifyLoad
+        || value = ResyncStage.VerifyForward
+        || value = ResyncStage.VerifyBackward
+        || value = ResyncStage.DeepLoad
+        || value = ResyncStage.DeepVerify
+
     let dropTables () =
         for side in 0..1 do
             disc[side].Table.ReleaseWindow()
@@ -142,8 +173,7 @@ type internal ResyncEngine
             procIdx[side] <- 0
             emitLoaded[side] <- false
         job <- None
-        if stage = ResyncStage.VerifyLoad || stage = ResyncStage.VerifyForward || stage = ResyncStage.VerifyBackward then
-            stage <- ResyncStage.VerifyStart
+        if isVerifying stage then stage <- ResyncStage.VerifyStart
 
     let reserve () =
         if reserved then true
@@ -348,8 +378,7 @@ type internal ResyncEngine
                             if otherIndex.Hash id = hash then addCandidate side lineOffset ownBoundOffset ownBoundLine id
                             probes <- probes + 1
                             id <- otherIndex.Older id
-                        if own.CountSame(hash, config.ResyncProbeLimit) < config.ResyncChainLimit then
-                            own.Add(lineOffset, procLine[side], hash)
+                        own.TryAdd(lineOffset, procLine[side], hash, config.ResyncProbeLimit, config.ResyncChainLimit) |> ignore
                         if candCount > 0 then
                             candSide <- side
                             candNext <- candCount - 1
@@ -491,12 +520,142 @@ type internal ResyncEngine
             stage <- ResyncStage.VerifyBackward
             false
 
+    /// Ends the verification of the candidate. The first line of the match must lie at or after both cursors and
+    /// strictly after at least one of them, otherwise the region would be empty.
+    let acceptAt (offsets: float[]) (lines: float[]) =
+        job <- None
+        if lines[0] <= rangeLine[0] && lines[1] <= rangeLine[1] then rejectCandidate ()
+        else beginEmit offsets lines ResyncStage.FollowHandover
+
+    let beginDeep (offsets: float[]) (lines: float[]) =
+        for side in 0..1 do
+            deepBackOffset[side] <- offsets[side]
+            auxLimit[side] <- auxCap
+            startSide aux[side] rangeOffset[side] rangeLine[side] auxCap
+        deepDelta <- candLine[1] - candLine[0]
+        deepEnd <- lines[0]
+        deepNext <- max rangeLine[0] (rangeLine[1] - deepDelta)
+        deepRun <- deepNext
+        deepRunKnown <- false
+        job <- None
+        stage <- ResyncStage.DeepLoad
+
     let acceptCandidate () =
         let offsets = [| aux[0].Table.Start(rowP - backwardCount); aux[1].Table.Start(rowC - backwardCount) |]
         let lines = [| candLine[0] - float backwardCount; candLine[1] - float backwardCount |]
         job <- None
-        if lines[0] <= rangeLine[0] && lines[1] <= rangeLine[1] then rejectCandidate ()
-        else beginEmit offsets lines ResyncStage.FollowHandover
+        let atEdge = rowP - backwardCount <= 0 || rowC - backwardCount <= 0
+        if atEdge && lines[0] > rangeLine[0] && lines[1] > rangeLine[1] then beginDeep offsets lines
+        else acceptAt offsets lines
+
+    /// Stores the offsets of the run start when it lies in the pairs of the current chunk.
+    let recordRun () =
+        if not deepRunKnown && deepRun >= deepChunkStart && deepRun < deepChunkEnd then
+            let shift = int (deepRun - deepChunkStart)
+            deepRunOffset[0] <- aux[0].Table.Start(deepRowP + shift)
+            deepRunOffset[1] <- aux[1].Table.Start(deepRowC + shift)
+            deepRunKnown <- true
+
+    /// Ends the extension. A run that reaches both cursors would leave no region to emit, so the match then
+    /// starts where the verification tables ended.
+    let deepFinish () =
+        if deepRunKnown && (deepRun > rangeLine[0] || deepRun + deepDelta > rangeLine[1]) then
+            acceptAt [| deepRunOffset[0]; deepRunOffset[1] |] [| deepRun; deepRun + deepDelta |]
+        else
+            acceptAt [| deepBackOffset[0]; deepBackOffset[1] |] [| deepEnd; deepEnd + deepDelta |]
+
+    let deepHas (side: int) =
+        let table = aux[side].Table
+        let line = if side = 0 then deepNext else deepNext + deepDelta
+        line < float table.LineBase + float table.Count
+
+    let deepStartJob (from: float) (bufferA: byte[]) (bufferB: byte[]) =
+        deepVerifyFrom <- from
+        deepVerifyCount <- int (deepChunkEnd - from)
+        let shift = int (from - deepChunkStart)
+        makeJob (deepRowP + shift) (deepRowC + shift) deepVerifyCount bufferA bufferB
+        stage <- ResyncStage.DeepVerify
+
+    /// Loads the lines of the next pairs into both windows, compares their keys and starts the text comparison
+    /// of the pairs after the last key mismatch. It ends the extension when every pair up to the verified match
+    /// was seen.
+    let deepLoadStep (bufferA: byte[]) (bufferB: byte[]) (meter: Meter) = async {
+        Meter.charge meter 1
+        if deepNext >= deepEnd then
+            deepFinish ()
+            return ResyncStep.Running
+        else
+            let missing = if not (deepHas 0) then 0 elif not (deepHas 1) then 1 else -1
+            if missing >= 0 then
+                let scan = aux[missing]
+                let table = scan.Table
+                if scan.WindowFull then
+                    scan.Advance(int64 table.LineBase + int64 table.Count, auxCap, Int32.MaxValue)
+                    auxLimit[missing] <- auxCap
+                    return ResyncStep.Running
+                elif scan.Finished then
+                    // The source ended before the pair, so the lines stay as verified.
+                    deepRunKnown <- false
+                    deepRun <- deepEnd
+                    deepFinish ()
+                    return ResyncStep.Running
+                else
+                    let! code = loadStep scan (if missing = 0 then bufferA else bufferB) auxLimit[missing] meter
+                    coverage missing scan.Coverage
+                    return toStep code
+            else
+                let previousTable = aux[0].Table
+                let currentTable = aux[1].Table
+                let previousEnd = float previousTable.LineBase + float previousTable.Count
+                let currentEnd = float currentTable.LineBase + float currentTable.Count - deepDelta
+                deepChunkStart <- deepNext
+                deepChunkEnd <- min deepEnd (min previousEnd currentEnd)
+                deepRowP <- int (deepNext - float previousTable.LineBase)
+                deepRowC <- int (deepNext + deepDelta - float currentTable.LineBase)
+                let count = int (deepChunkEnd - deepNext)
+                recordRun ()
+                for index in 0 .. count - 1 do
+                    if not (sameKeys (deepRowP + index) (deepRowC + index)) then
+                        deepRun <- deepNext + float (index + 1)
+                        deepRunKnown <- false
+                Meter.charge meter (count / 16 + 1)
+                recordRun ()
+                let from = max deepRun deepChunkStart
+                if from < deepChunkEnd then deepStartJob from bufferA bufferB
+                else deepNext <- deepChunkEnd
+                return ResyncStep.Running
+    }
+
+    let deepVerifyStep (bufferA: byte[]) (bufferB: byte[]) (meter: Meter) = async {
+        Meter.charge meter 1
+        match job with
+        | None ->
+            stage <- ResyncStage.DeepLoad
+            return ResyncStep.Running
+        | Some run ->
+            let! step = run meter
+            match step with
+            | CompareStep.Continue -> return ResyncStep.Running
+            | CompareStep.Waiting -> return ResyncStep.Waiting
+            | CompareStep.Changed ->
+                changed ()
+                return ResyncStep.Running
+            | CompareStep.Finished matched ->
+                if matched >= deepVerifyCount then
+                    job <- None
+                    deepNext <- deepChunkEnd
+                    stage <- ResyncStage.DeepLoad
+                else
+                    deepRun <- deepVerifyFrom + float matched + 1.0
+                    deepRunKnown <- false
+                    recordRun ()
+                    if deepRun < deepChunkEnd then deepStartJob deepRun bufferA bufferB
+                    else
+                        job <- None
+                        deepNext <- deepChunkEnd
+                        stage <- ResyncStage.DeepLoad
+                return ResyncStep.Running
+    }
 
     let verifyStep (bufferA: byte[]) (bufferB: byte[]) (meter: Meter) = async {
         Meter.charge meter 1
@@ -537,6 +696,8 @@ type internal ResyncEngine
                 return ResyncStep.Running
             | ResyncStage.VerifyLoad -> return! verifyLoad bufferA bufferB meter
             | ResyncStage.Emit -> return! emitStep bufferA bufferB meter
+            | ResyncStage.DeepLoad -> return! deepLoadStep bufferA bufferB meter
+            | ResyncStage.DeepVerify -> return! deepVerifyStep bufferA bufferB meter
             | _ -> return! verifyStep bufferA bufferB meter
     }
 
@@ -559,9 +720,7 @@ type internal ResyncEngine
     /// reloads its lines, so the line tables are not part of the state.
     member _.Export(header: HeaderBuilder) =
         let saved =
-            if stage = ResyncStage.VerifyLoad || stage = ResyncStage.VerifyForward || stage = ResyncStage.VerifyBackward then
-                ResyncStage.VerifyStart
-            else stage
+            if isVerifying stage then ResyncStage.VerifyStart else stage
         header.Int saved
         header.Int candSide
         header.Int candCount
@@ -586,6 +745,7 @@ type internal ResyncEngine
         header.Int emitKind
         header.Int cutFollow
         header.Number cutCount
+        header.Bool reserved
 
     /// Reads what Export wrote. It returns the entry counts of the two indexes.
     member _.Import(header: HeaderReader) =
@@ -614,13 +774,15 @@ type internal ResyncEngine
         emitKind <- header.Int()
         cutFollow <- header.Int()
         cutCount <- header.Number()
+        importReserved <- header.Bool()
         importCounts[0] <- counts[0]
         importCounts[1] <- counts[1]
 
     /// Reserves the index memory and creates empty arrays for the imported entries. It returns false while
-    /// other sessions hold the reservation.
+    /// other sessions hold the reservation. An engine that had not reserved its index memory when it was
+    /// spilled reserves it at its first step, as before the spill.
     member _.TryAllocate() =
-        if reserved then true
+        if reserved || not importReserved then true
         elif ledger.TryReserve(AllocationCategory.SampledIndexes, indexBytes) then
             reserved <- true
             indexes[0].Prepare importCounts[0]

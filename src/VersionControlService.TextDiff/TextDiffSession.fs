@@ -111,6 +111,9 @@ type TextDiffSession internal (
     let mutable spilled = false
     let mutable spillStore: ITempStore option = None
     let mutable restoreStage = 0
+    /// True from the end of a restore until the end of the next request that runs on the restored state. A restore
+    /// can use a whole request budget, so without this the session would be spilled again before it did any work.
+    let mutable freshlyRestored = false
     let mutable restoreReader: SnapshotReader option = None
     let mutable restoreEngine: ResyncEngine option = None
     let mutable restoreSlots: ArraySlot[] = Array.empty
@@ -1007,6 +1010,7 @@ type TextDiffSession internal (
         restoreLog <- Array.empty
         restoreStage <- 0
         spilled <- false
+        freshlyRestored <- true
 
     /// True when the next microstep touches no source, so a run of them needs no asynchronous scheduling.
     let synchronousStep () =
@@ -1361,10 +1365,15 @@ type TextDiffSession internal (
             return PageBuild.Built(page, fullCount, partialConsumed, rowsUsed, fullFragments, nextRow)
     }
 
-    let recordResult (sequence: int64) (result: Resumable<DiffPage>) = async {
-        do! journal.Append(sequence, result)
-        requestSequence <- sequence + 1L
-    }
+    /// Appends the result for a sequence and advances the sequence. The commit runs to completion even when
+    /// the caller is canceled, so a retry of the same cursor finds the record and never appends a second one.
+    let recordResult (sequence: int64) (result: Resumable<DiffPage>) =
+        Shield.run (
+            async {
+                do! journal.Append(sequence, result)
+                requestSequence <- sequence + 1L
+            }
+        )
 
     let producePage (sequence: int64) (cancel: unit -> bool) : Async<EngineResult<Resumable<DiffPage>> option> = async {
         let! built = buildPage sequence cancel
@@ -1373,25 +1382,35 @@ type TextDiffSession internal (
         | PageBuild.TooLarge -> return Some(failWorker "A diff row exceeds the configured page byte limit.")
         | PageBuild.Built(page, fullCount, partialConsumed, rowsRemoved, fragmentsRemoved, nextRow) ->
             let value = Resumable.Ready page
-            do! recordResult sequence value
-            builder.CommitPage(fullCount, partialConsumed, rowsRemoved, fragmentsRemoved)
-            rowSequence <- nextRow
-            firstPageReturned <- true
-            if page.OutputComplete then releaseBuffers ()
+            // The record and the consumption of the queued rows commit together. A cancellation that arrives
+            // meanwhile takes effect after both are done.
+            do!
+                Shield.run (
+                    async {
+                        do! recordResult sequence value
+                        builder.CommitPage(fullCount, partialConsumed, rowsRemoved, fragmentsRemoved)
+                        rowSequence <- nextRow
+                        firstPageReturned <- true
+                        if page.OutputComplete then releaseBuffers ()
+                    }
+                )
             return Some(EngineResult.Ok value)
     }
 
     let advance (sequence: int64) (cancel: unit -> bool) : Async<EngineResult<Resumable<DiffPage>>> = async {
-        match scratch, holder with
-        | Some coordinator, Some self -> do! coordinator.BeginRequest self
-        | _ -> ()
-        if not (ensureBuffers ()) then
-            // Other sessions hold the chunk scratch. The job suspends and the next request reserves again.
+        let! admitted =
+            match scratch, holder with
+            | Some coordinator, Some self -> coordinator.BeginRequest self
+            | _ -> async.Return true
+        if not admitted || not (ensureBuffers ()) then
+            // Another session is in the middle of a step or was waiting longer, or other sessions hold the
+            // chunk scratch. The job suspends and the next request tries again.
             let value = Resumable.Scanning(progress (), identifier "c" (sequence + 1L), None)
             do! recordResult sequence value
             return EngineResult.Ok value
         else
             let meter = Meter.create host.Clock config.Limits
+            let ranAfterRestore = freshlyRestored && not spilled
             let mutable result: EngineResult<Resumable<DiffPage>> option = None
             let mutable first = true
             while result.IsNone do
@@ -1432,6 +1451,7 @@ type TextDiffSession internal (
                             waited <- false
                             do! host.Yield()
                 first <- false
+            if ranAfterRestore then freshlyRestored <- false
             return result.Value
     }
 
@@ -1502,11 +1522,17 @@ type TextDiffSession internal (
             | Some engine -> engine.HoldsScratch
             | None -> false)
 
-    /// Spills an idle session. A busy session keeps its state because its request is using it.
+    /// True while an alignment step or a restore is in progress, and for the request that follows a restore.
+    /// The intermediate alignment state is not part of a snapshot, so a spill in this state would throw the
+    /// step's work away.
+    let midStep () = aligner.IsSome || freshlyRestored || (spilled && restoreStage >= 1)
+
+    /// Spills an idle session. A busy session keeps its state because its request is using it, and a session
+    /// in the middle of a step keeps it until the step completes.
     let spillSession () : Async<EngineResult<unit>> = async {
         if closed || closing then return failClosed ()
         elif invalidDetail.IsSome then return failContent ()
-        elif busy then return EngineResult.Ok()
+        elif busy || midStep () then return EngineResult.Ok()
         else
             busy <- true
             try
@@ -1648,6 +1674,7 @@ type TextDiffSession internal (
     interface IScratchHolder with
         member _.HoldsScratch = holdsScratch ()
         member _.IsBusy = busy
+        member _.MustKeepScratch = midStep ()
 
         member _.Spill() =
             async {

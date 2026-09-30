@@ -252,8 +252,8 @@ module TextDiffSessionCases =
                 current.InsertRange(start, fresh edit amount)
         previous, current.ToArray()
 
-    /// Reads every page and spills the session between requests, at most spillLimit times.
-    let private readAllSpilling (session: TextDiffSession) spillLimit = async {
+    /// Reads every page and spills the session between requests whenever it may give up its memory.
+    let private readAllSpilling (session: TextDiffSession) = async {
         let pages = ResizeArray<DiffPage>()
         let mutable spills = 0
         let mutable requests = 0
@@ -264,7 +264,8 @@ module TextDiffSessionCases =
         while pending do
             requests <- requests + 1
             if requests > 200_000 then failwith "The session did not finish."
-            if spills < spillLimit && (session :> IScratchHolder).HoldsScratch then
+            let holder = session :> IScratchHolder
+            if holder.HoldsScratch && not holder.MustKeepScratch then
                 let! spilled = session.Spill()
                 match spilled with
                 | EngineResult.Ok() -> spills <- spills + 1
@@ -501,6 +502,68 @@ module TextDiffSessionCases =
             do! uninterrupted.Close()
             return ()
         }
+        "a cancellation during the journal commit does not append a second record on retry", fun () -> async {
+            let previous = Array.init 40 (fun index -> { Text = "line-" + string index; Ending = LineEnding.LF })
+            let current = Array.copy previous
+            current[20] <- { Text = "edited"; Ending = LineEnding.LF }
+            let previousSpec = sourceSpec (encodeLines previous)
+            let currentSpec = sourceSpec (encodeLines current)
+            let sessionConfig = defaultConfig ()
+            let countedHost (appends: int ref) (onAppend: int -> unit) =
+                let plain = Host.createInMemory (ManualClock 0.0 :> IClock)
+                { plain with
+                    CreateTempStore = fun name -> async {
+                        let! created = plain.CreateTempStore name
+                        if name <> sessionConfig.SessionId then return created
+                        else
+                            return
+                                { new ITempStore with
+                                    member _.Append buffer offset count = async {
+                                        appends.Value <- appends.Value + 1
+                                        onAppend appends.Value
+                                        return! created.Append buffer offset count
+                                    }
+                                    member _.WriteAt position buffer offset count = created.WriteAt position buffer offset count
+                                    member _.ReadAt position buffer offset count = created.ReadAt position buffer offset count
+                                    member _.Length() = created.Length()
+                                    member _.Dispose() = created.Dispose()
+                                }
+                    } }
+            let controlAppends = ref 0
+            let! control = TextDiffSession.create (countedHost controlAppends ignore) (Ledger()) sessionConfig (fun _ -> 1) previousSpec currentSpec
+            let! _ = readAll control (fun () -> false)
+            do! control.Close()
+            let appends = ref 0
+            use cts = new System.Threading.CancellationTokenSource()
+            let! session = TextDiffSession.create (countedHost appends (fun count -> if count = 1 then cts.Cancel())) (Ledger()) sessionConfig (fun _ -> 1) previousSpec currentSpec
+            let! _ =
+                Async.FromContinuations(fun (resolve, reject, _) ->
+                    Async.StartWithContinuations(session.FirstPage(fun () -> false), (fun _ -> resolve false), reject, (fun _ -> resolve true), cts.Token))
+            let! pages = readAll session (fun () -> false)
+            checkOracle previous current pages
+            Check.equal controlAppends.Value appends.Value "A retry of the canceled request appends no second record."
+            do! session.Close()
+        }
+        "a page returned by the session cannot change what a later replay returns", fun () -> async {
+            let previous = Array.init 40 (fun index -> { Text = "line-" + string index; Ending = LineEnding.LF })
+            let current = Array.copy previous
+            current[20] <- { Text = "edited"; Ending = LineEnding.LF }
+            let! session = openSession (defaultConfig ()) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+            let! first = session.FirstPage(fun () -> false)
+            let page = unwrap first |> function
+                | Resumable.Ready value -> value
+                | Resumable.Scanning _ -> failwith "The first request did not return a page."
+            Check.true' (page.Parts.Length > 1) "The page has several parts to change."
+            let original = Array.copy page.Parts
+            page.Parts[0] <- page.Parts[1]
+            let! replayed = session.ReplayPage page.PageId
+            let replay = unwrap replayed
+            Check.true' (Unchecked.equals original replay.Parts) "The replay returns the parts the session produced."
+            replay.Parts[0] <- replay.Parts[1]
+            let! again = session.ReplayPage page.PageId
+            Check.true' (Unchecked.equals original (unwrap again).Parts) "A changed replay does not change a later replay."
+            do! session.Close()
+        }
         "growing sources can produce a page before reaching EOF", fun () -> async {
             let previous = Array.append [| { Text = "old"; Ending = LineEnding.LF } |] (Array.init 60 (fun index -> { Text = "line-" + string index; Ending = LineEnding.LF }))
             let current = Array.append [| { Text = "new"; Ending = LineEnding.LF } |] (Array.init 60 (fun index -> { Text = "line-" + string index; Ending = LineEnding.LF }))
@@ -693,7 +756,7 @@ module TextDiffSessionCases =
                 let previous, current = largeEdit random caseIndex
                 let sessionConfig = { config 2 10_000 256 16 limits with WindowMaxBytes = 4 * 1024 }
                 let! session = openSession sessionConfig (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
-                let! pages, spills = readAllSpilling session 12
+                let! pages, spills = readAllSpilling session
                 totalSpills <- totalSpills + spills
                 checkOracle previous current pages
                 do! session.Close()

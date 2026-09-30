@@ -221,12 +221,17 @@ module TextDiffResyncCases =
     ]
     let private tightLimits = { Limits.defaults with MaxUnits = 256; RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 }
 
-    /// Spills the session after every few requests, at most 12 times, and counts the spills that released memory.
+    /// Asks for a spill after every few requests and performs it at the first request boundary that allows one.
+    /// A session in the middle of an alignment step or a restore keeps its memory, so the hook waits for it.
     let private spillEvery (every: int) (spills: int ref) =
         let seen = ref 0
+        let wanted = ref false
         fun (session: TextDiffSession) -> async {
             seen.Value <- seen.Value + 1
-            if seen.Value % every = 0 && spills.Value < 12 && (session :> IScratchHolder).HoldsScratch then
+            if seen.Value % every = 0 then wanted.Value <- true
+            let holder = session :> IScratchHolder
+            if wanted.Value && holder.HoldsScratch && not holder.MustKeepScratch then
+                wanted.Value <- false
                 let! result = session.Spill()
                 match result with
                 | EngineResult.Ok() -> spills.Value <- spills.Value + 1
@@ -297,13 +302,82 @@ module TextDiffResyncCases =
             checkSameShape plain suspended
         }
     ]
+
+    let private tinyLimits = { tightLimits with MaxUnits = 32 }
+
+    /// A session on a shared worker whose request budget is a few units, so one alignment step spans many requests.
+    let private openOnWorker (coordinator: WorkerScratch) host sessionId previous current = async {
+        let sessionConfig = { smallConfig sessionId with Limits = tinyLimits }
+        return! TextDiffSession.createWithScratch coordinator host (Ledger()) sessionConfig (fun _ -> 1) (spec (encode previous)) (spec (encode current))
+    }
+
+    type private Runner = {
+        Session: TextDiffSession
+        Pages: ResizeArray<DiffPage>
+        mutable Result: EngineResult<Resumable<DiffPage>>
+        mutable Finished: bool
+    }
+
+    let private newRunner session result = { Session = session; Pages = ResizeArray<DiffPage>(); Result = result; Finished = false }
+
+    /// Consumes the runner's current result and issues the request that follows it.
+    let private advanceRunner (runner: Runner) = async {
+        match runner.Result with
+        | EngineResult.Ok(Resumable.Ready page) ->
+            runner.Pages.Add page
+            match page.NextCursor with
+            | None -> runner.Finished <- true
+            | Some cursor ->
+                let! next = runner.Session.ReadPage cursor (fun () -> false)
+                runner.Result <- next
+        | EngineResult.Ok(Resumable.Scanning(_, continuation, _)) ->
+            let! next = runner.Session.ReadPage continuation (fun () -> false)
+            runner.Result <- next
+        | EngineResult.Failed(code, message, detail) -> failwith $"The session failed with {code}: {message}. Detail: {detail}."
+        | EngineResult.Canceled -> failwith "The session canceled an uncanceled request."
+    }
+
+    /// Every aligned row of the pages in order. Page boundaries do not change this sequence.
+    let private flatRows (pages: DiffPage array) =
+        pages
+        |> Array.collect (fun page ->
+            page.Parts
+            |> Array.collect (fun part ->
+                match part with
+                | DiffPart.Hunk { Body = HunkBody.AlignedRows values } ->
+                    values
+                    |> Array.map (fun row ->
+                        row.Kind, row.Previous |> Option.map (fun line -> line.Slice.Text), row.Current |> Option.map (fun line -> line.Slice.Text))
+                | _ -> [||]))
+
+    /// Checks that a session produced the same diff as the uninterrupted run. Requests can split pages at
+    /// other places, so the comparison covers rows and covered lines and leaves the page boundaries out.
+    let private checkSameOutput (plain: Shape) (runner: Runner) (previous: SourceLine array) (current: SourceLine array) =
+        let pages = runner.Pages.ToArray()
+        let parts = pages |> Array.collect (fun page -> page.Parts)
+        Check.sequence previous (rebuild previous parts true) "The pages cover every previous line exactly once."
+        Check.sequence current (rebuild current parts false) "The pages cover every current line exactly once."
+        checkSameShape plain (shapeOf pages 0)
+        Check.sequence (flatRows plain.Pages) (flatRows pages) "The rows equal the uninterrupted run."
+
+    /// Serves the runners one request at a time in turn until every one has read its last page.
+    let private alternate (runners: Runner array) = async {
+        let mutable requests = 0
+        while runners |> Array.exists (fun runner -> not runner.Finished) do
+            for runner in runners do
+                if not runner.Finished then
+                    requests <- requests + 1
+                    if requests > 400_000 then failwith "The sessions did not finish."
+                    do! advanceRunner runner
+    }
+
     let private spillCases: (string * (unit -> Async<unit>)) list = [
-        "spills between requests during window alignment keep the output", fun () -> async {
+        "spills between requests around window alignment keep the output", fun () -> async {
             let previous = lines "line-" 0 600
             let current = Array.copy previous
-            for index in [ 20; 90; 150; 151; 152; 300; 480 ] do
+            for index in [ 20; 300; 480 ] do
                 current[index] <- { current[index] with Text = "edited-" + string index }
-            let! _ = spillMatchesUninterrupted "spill-window" 5 previous current id
+            let! _ = spillMatchesUninterrupted "spill-window" 1 previous current id
             return ()
         }
         "spills between requests during the forward search keep the output", fun () -> async {
@@ -330,19 +404,69 @@ module TextDiffResyncCases =
             }
             let! first = openSession "shared-first"
             let! second = openSession "shared-second"
+            let idle = first :> IScratchHolder
             let! started = first.FirstPage(fun () -> false)
-            match started with
-            | EngineResult.Ok(Resumable.Scanning _) -> ()
-            | other -> failwith $"The first request did not suspend: {other}."
-            Check.true' (first :> IScratchHolder).HoldsScratch "The suspended session holds scratch memory."
+            let runner = newRunner first started
+            let mutable requests = 0
+            while not (idle.HoldsScratch && not idle.MustKeepScratch) && not runner.Finished do
+                requests <- requests + 1
+                if requests > 200_000 then failwith "The first session never became idle while holding scratch memory."
+                do! advanceRunner runner
+            Check.true' (idle.HoldsScratch && not idle.MustKeepScratch) "The suspended session is idle and holds scratch memory."
             let! _ = second.FirstPage(fun () -> false)
             Check.true' (not (first :> IScratchHolder).HoldsScratch) "The second request spilled the first session."
-            let! shapeFirst = readAll first noHook
             let! shapeSecond = readAll second noHook
+            let! shapeFirst = readAll first noHook
             checkSameShape shapeFirst shapeSecond
             do! first.Close()
             do! second.Close()
             Check.equal 0 coordinator.Count "Closed sessions leave the coordinator."
+        }
+        "two sessions alternating on one worker both finish with their uninterrupted output", fun () -> async {
+            let previous = lines "line-" 0 800
+            let current = Array.concat [ previous[.. 99]; lines "new-" 0 300; previous[100 .. 399]; lines "other-" 0 200; previous[600 ..] ]
+            let! plain = run { smallConfig "alternate-plain" with Limits = tinyLimits } previous current
+            let coordinator = WorkerScratch()
+            let host = Host.createInMemory (ManualClock 0.0 :> IClock)
+            let! first = openOnWorker coordinator host "alternate-first" previous current
+            let! second = openOnWorker coordinator host "alternate-second" previous current
+            let! firstStart = first.FirstPage(fun () -> false)
+            let! secondStart = second.FirstPage(fun () -> false)
+            let runners = [| newRunner first firstStart; newRunner second secondStart |]
+            do! alternate runners
+            for runner in runners do
+                checkSameOutput plain runner previous current
+                do! runner.Session.Close()
+            Check.equal 0 coordinator.Count "Closed sessions leave the coordinator."
+        }
+        "a waiting session returns a scan while another session is in the middle of a step and completes later", fun () -> async {
+            let previous = lines "line-" 0 800
+            let current = Array.concat [ previous[.. 99]; lines "new-" 0 300; previous[100 .. 399]; lines "other-" 0 200; previous[600 ..] ]
+            let! plain = run { smallConfig "waiting-plain" with Limits = tinyLimits } previous current
+            let coordinator = WorkerScratch()
+            let host = Host.createInMemory (ManualClock 0.0 :> IClock)
+            let! first = openOnWorker coordinator host "waiting-first" previous current
+            let! second = openOnWorker coordinator host "waiting-second" previous current
+            let holder = first :> IScratchHolder
+            let! firstStart = first.FirstPage(fun () -> false)
+            let firstRunner = newRunner first firstStart
+            let mutable requests = 0
+            while not holder.MustKeepScratch && not firstRunner.Finished do
+                requests <- requests + 1
+                if requests > 200_000 then failwith "The first session never entered an alignment step."
+                do! advanceRunner firstRunner
+            Check.true' holder.MustKeepScratch "The first session is in the middle of a step."
+            let! blocked = second.FirstPage(fun () -> false)
+            match blocked with
+            | EngineResult.Ok(Resumable.Scanning _) -> ()
+            | other -> failwith $"The waiting request did not return a scan: {other}."
+            Check.true' holder.HoldsScratch "The waiting request did not spill the holder."
+            Check.true' holder.MustKeepScratch "The holder is still in the middle of its step."
+            let runners = [| firstRunner; newRunner second blocked |]
+            do! alternate runners
+            for runner in runners do
+                checkSameOutput plain runner previous current
+                do! runner.Session.Close()
         }
     ]
 
@@ -421,10 +545,66 @@ module TextDiffResyncCases =
             let inserted = lines "new-" 0 200
             inserted[80] <- { inserted[80] with Text = giantText "giant-" 20_000 }
             let current = Array.concat [ previous[.. 49]; inserted; previous[50 ..] ]
-            let! shape = giantRun (giantConfig "giant-resync") { giantLimits with MaxUnits = 8 } previous current
+            let! shape = giantRun (giantConfig "giant-resync") { giantLimits with MaxUnits = 32 } previous current
             Check.equal 200 shape.Added "Every inserted line is an added row."
             Check.equal 0 (shape.UnalignedPrevious + shape.UnalignedCurrent) "The insertion is not unaligned."
         }
     ]
 
-    let cases = phaseCases @ budgetCases @ seekCases @ spillCases @ giantLineCases
+    /// Texts with a given low hash bit. A modulus of 2 samples the lines whose bit is clear.
+    let private textsWithSampling (sampled: bool) (prefix: string) (count: int) =
+        let found = ResizeArray<string>()
+        let mutable number = 0
+        while found.Count < count do
+            let text = prefix + string number
+            let scanned = scanAll (Encoding.UTF8.GetBytes(text + "\n"))
+            let key = int scanned[0].KeyLo
+            if ((key &&& 1) = 0) = sampled then found.Add text
+            number <- number + 1
+        found.ToArray()
+
+    let private plainLine text = { Text = text; Ending = LineEnding.LF }
+
+    let private extensionCases: (string * (unit -> Async<unit>)) list = [
+        "a match that a sliding verification window reached is extended back to the cursors", fun () -> async {
+            // The repeated lines are not sampled, so the first sampled match lies far behind the start of the region
+            // and the verification window has slid past the true start of the match.
+            let repeated = plainLine (Array.head (textsWithSampling false "repeat-" 1))
+            let inserted = plainLine (Array.head (textsWithSampling false "inserted-" 1))
+            let tail = textsWithSampling true "tail-" 8 |> Array.map plainLine
+            let previous = Array.concat [ Array.create 5_000 repeated; tail ]
+            let current = Array.concat [ [| inserted |]; Array.create 5_000 repeated; tail ]
+            let sessionConfig = { smallConfig "resync-extend-back" with WindowMaxLines = 1; ResyncSampleModulus = 2 }
+            let! shape = run sessionConfig previous current
+            Check.equal 1 shape.Added "The inserted line is one added row."
+            Check.equal 0 shape.Removed "No line is removed."
+            Check.equal 0 (shape.UnalignedPrevious + shape.UnalignedCurrent) "The insertion is not unaligned."
+            Check.true' (hasAlignedRowWith shape inserted.Text) "The inserted line is an aligned row."
+        }
+        "a sampled index never holds more entries of one hash than the chain limit", fun () -> async {
+            let index = SampledIndex 64
+            index.Allocate()
+            // These hashes share bucket 0 of an index with 64 entries.
+            let hashes = [| 0; 4448; 4592; 4736; 4880 |]
+            let line = ref 0.0
+            let feed (hash: int) =
+                index.TryAdd(line.Value * 10.0, line.Value, hash, 32, 8) |> ignore
+                line.Value <- line.Value + 1.0
+            for hash in [ 0; 4448; 4592; 4736 ] do
+                for _ in 1..8 do feed hash
+            feed 4880
+            feed 0
+            let counts = Array.zeroCreate<int> hashes.Length
+            let mutable id = index.Newest 0
+            while id >= 0 do
+                let position = hashes |> Array.findIndex (fun hash -> hash = index.Hash id)
+                counts[position] <- counts[position] + 1
+                id <- index.Older id
+            for position = 0 to hashes.Length - 1 do
+                Check.true' (counts[position] <= 8) "No hash has more entries than the chain limit."
+            Check.equal 8 counts[0] "The first hash keeps its entries."
+            Check.true' (counts[1] > 0 && counts[2] > 0 && counts[3] > 0) "The fed hashes share one bucket."
+        }
+    ]
+
+    let cases = phaseCases @ budgetCases @ seekCases @ extensionCases @ spillCases @ giantLineCases

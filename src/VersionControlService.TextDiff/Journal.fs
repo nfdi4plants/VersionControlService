@@ -373,8 +373,75 @@ module internal JournalRecord =
         if actual.Lo <> storedLo || actual.Hi <> storedHi then invalidOp "The journal record checksum is invalid."
         JournalCodec.decode payload
 
+#if FABLE_COMPILER
+module private Deferred =
+    /// Runs the action after the current call stack has unwound.
+    [<Fable.Core.Emit("Promise.resolve().then($0)")>]
+    let later (action: unit -> unit) : unit = Fable.Core.Util.jsNative
+#endif
+
+/// Runs work to completion even when the surrounding computation is canceled. The work starts with the
+/// default token, so a cancellation that arrives while it runs takes effect after it has finished.
+module internal Shield =
+#if FABLE_COMPILER
+    /// The JavaScript build resumes the caller from a fresh call stack. Otherwise every shielded call would
+    /// keep the rest of the caller's computation nested inside its own stack frames.
+    let run (work: Async<'T>) : Async<'T> =
+        Async.FromContinuations(fun (resolve, reject, _) ->
+            Async.StartWithContinuations(
+                work,
+                (fun value -> Deferred.later (fun () -> resolve value)),
+                (fun error -> Deferred.later (fun () -> reject error)),
+                ignore))
+#else
+    let run (work: Async<'T>) : Async<'T> =
+        Async.FromContinuations(fun (resolve, reject, _) -> Async.StartWithContinuations(work, resolve, reject, ignore))
+#endif
+
+/// Admits one holder at a time. The holder runs inside a shielded computation, so no cancellation can
+/// leave the gate held.
+type private AsyncGate() =
+    let waiters = Queue<unit -> unit>()
+    let mutable held = false
+
+    let enter =
+        Async.FromContinuations(fun (resolve, _, _) ->
+            let proceed =
+                lock waiters (fun () ->
+                    if held then
+                        waiters.Enqueue(fun () -> resolve ())
+                        false
+                    else
+                        held <- true
+                        true)
+            if proceed then resolve ())
+
+    let leave () =
+        let next =
+            lock waiters (fun () ->
+                if waiters.Count > 0 then Some(waiters.Dequeue())
+                else
+                    held <- false
+                    None)
+        match next with
+        | Some resume -> resume ()
+        | None -> ()
+
+    member _.Run(work: Async<'T>) : Async<'T> =
+        Shield.run (
+            async {
+                do! enter
+                try
+                    return! work
+                finally
+                    leave ()
+            }
+        )
+
+/// A cached record keeps the encoded bytes. Every hit decodes a fresh value, so callers never share arrays
+/// with the cache or with each other.
 type private CachedRecord = {
-    Value: Resumable<DiffPage>
+    Record: byte[]
     Cost: int
     mutable LastUse: int64
 }
@@ -409,10 +476,11 @@ type private JournalCache(ledger: Ledger, capBytes: int) =
         | true, entry ->
             tick <- tick + 1L
             entry.LastUse <- tick
-            Some entry.Value
+            Some entry.Record
         | _ -> None
 
-    member _.Add(sequence: int64, value: Resumable<DiffPage>, cost: int) =
+    member _.Add(sequence: int64, record: byte[]) =
+        let cost = record.Length
         if cost <= capBytes then
             match entries.TryGetValue sequence with
             | true, existing ->
@@ -432,7 +500,7 @@ type private JournalCache(ledger: Ledger, capBytes: int) =
                 else retry <- evictOldest ()
             if reserved then
                 tick <- tick + 1L
-                entries[sequence] <- { Value = value; Cost = cost; LastUse = tick }
+                entries[sequence] <- { Record = record; Cost = cost; LastUse = tick }
                 used <- used + cost
 
     member _.Clear() =
@@ -442,6 +510,7 @@ type private JournalCache(ledger: Ledger, capBytes: int) =
 
 type internal Journal(store: ITempStore, ledger: Ledger, cacheBytes: int) =
     let cache = JournalCache(ledger, cacheBytes)
+    let gate = AsyncGate()
     let mutable indexCapacity = 64L
     let mutable dataStart = indexCapacity * 16L
     let mutable count = 0L
@@ -511,32 +580,41 @@ type internal Journal(store: ITempStore, ledger: Ledger, cacheBytes: int) =
             initialized <- true
     }
 
-    member _.Append(sequence: int64, value: Resumable<DiffPage>) = async {
-        if sequence < 0L then invalidArg (nameof sequence) "The journal sequence cannot be negative."
-        if not initialized then invalidOp "The journal has not been initialized."
-        do! growIndex sequence
-        let record = JournalRecord.encode value
-        let! offset = store.Append record 0 record.Length
-        do! writeEntry sequence offset (int64 record.Length)
-        count <- max count (sequence + 1L)
-        cache.Add(sequence, value, record.Length)
-    }
+    /// Records a result. The whole commit runs to completion once it has started, and lookups wait for it,
+    /// so an index relocation never interleaves with a lookup.
+    member _.Append(sequence: int64, value: Resumable<DiffPage>) =
+        gate.Run(
+            async {
+                if sequence < 0L then invalidArg (nameof sequence) "The journal sequence cannot be negative."
+                if not initialized then invalidOp "The journal has not been initialized."
+                do! growIndex sequence
+                let record = JournalRecord.encode value
+                let! offset = store.Append record 0 record.Length
+                do! writeEntry sequence offset (int64 record.Length)
+                count <- max count (sequence + 1L)
+                cache.Add(sequence, record)
+            }
+        )
 
-    member _.Read(sequence: int64) = async {
-        match cache.TryGet sequence with
-        | Some value -> return Some value
-        | None ->
-            let! entry = readEntry sequence
-            match entry with
-            | None -> return None
-            | Some(offset, length) ->
-                if length > int64 Int32.MaxValue then invalidOp "The journal record is too large."
-                let record = Array.zeroCreate<byte> (int length)
-                do! readFully offset record record.Length
-                let value = JournalRecord.decode record
-                cache.Add(sequence, value, record.Length)
-                return Some value
-    }
+    /// Returns a freshly decoded copy of a recorded result.
+    member _.Read(sequence: int64) =
+        gate.Run(
+            async {
+                match cache.TryGet sequence with
+                | Some record -> return Some(JournalRecord.decode record)
+                | None ->
+                    let! entry = readEntry sequence
+                    match entry with
+                    | None -> return None
+                    | Some(offset, length) ->
+                        if length > int64 Int32.MaxValue then invalidOp "The journal record is too large."
+                        let record = Array.zeroCreate<byte> (int length)
+                        do! readFully offset record record.Length
+                        let value = JournalRecord.decode record
+                        cache.Add(sequence, record)
+                        return Some value
+            }
+        )
 
     /// Bytes of cached records, which count against the ledger.
     member _.CachedBytes = cache.Used

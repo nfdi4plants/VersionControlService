@@ -5,7 +5,7 @@ open System
 /// Hash index over the sampled lines of one side. Each entry records the byte offset and line number of a
 /// line together with the low word of its hash. Entries live in fixed-size chunks that are allocated on first
 /// use, and buckets chain entries newest first through an index array.
-type internal SampledIndex(capacity: int) =
+type SampledIndex(capacity: int) =
     static let chunkBits = 12
     static let chunkSize = 1 <<< 12
 
@@ -73,17 +73,6 @@ type internal SampledIndex(capacity: int) =
     /// The newest entry of the bucket that holds a hash, or -1.
     member _.Newest(hash: int) = Native.readInt heads (bucketOf hash) - 1
 
-    /// Counts the entries with this hash among the newest `probeLimit` entries of its bucket.
-    member this.CountSame(hash: int, probeLimit: int) =
-        let mutable same = 0
-        let mutable probes = 0
-        let mutable id = this.Newest hash
-        while id >= 0 && probes < probeLimit do
-            if this.Hash id = hash then same <- same + 1
-            probes <- probes + 1
-            id <- this.Older id
-        same
-
     member _.Add(offset: float, line: float, hash: int) =
         let id = count
         let chunk = id >>> chunkBits
@@ -97,6 +86,22 @@ type internal SampledIndex(capacity: int) =
         Native.writeInt heads bucket (id + 1)
         count <- count + 1
 
+    /// Adds an entry unless the hash already has `chainLimit` entries or the bucket already holds `probeLimit`
+    /// entries. A bucket never grows past the probe limit, so a walk of that length visits every entry of the
+    /// bucket and the count of equal hashes is exact. It returns whether the entry was added.
+    member this.TryAdd(offset: float, line: float, hash: int, probeLimit: int, chainLimit: int) =
+        let mutable same = 0
+        let mutable visited = 0
+        let mutable id = this.Newest hash
+        while id >= 0 && visited < probeLimit do
+            if this.Hash id = hash then same <- same + 1
+            visited <- visited + 1
+            id <- this.Older id
+        if visited >= probeLimit || same >= chainLimit then false
+        else
+            this.Add(offset, line, hash)
+            true
+
     /// Prepares empty arrays for a restore of `entries` entries.
     member this.Prepare(entries: int) =
         this.Allocate()
@@ -104,7 +109,7 @@ type internal SampledIndex(capacity: int) =
         count <- entries
 
     /// The arrays of a spilled index in the order that Prepare filled them.
-    member _.Slots(entries: int) : ArraySlot list =
+    member internal _.Slots(entries: int) : ArraySlot list =
         [
             yield ArraySlot.OfInts(heads, heads.Length)
             for chunk = 0 to chunkCount entries - 1 do
