@@ -4,7 +4,7 @@ open System.Collections.Generic
 open VersionControlService.TextDiff
 
 module WorkerScratchCases =
-    type private ScratchSession(coordinator: WorkerScratch, requestsPerStep: int, stepCount: int) as this =
+    type private ScratchSession(coordinator: WorkerScratch, clock: ManualClock, requestsPerStep: int, stepCount: int) as this =
         let output = ResizeArray<int>()
         let mutable holdsScratch = false
         let mutable mustKeepScratch = false
@@ -17,12 +17,17 @@ module WorkerScratchCases =
         member _.Yields = yields
         /// The number of requests of a step that run before the session reports a step in progress.
         member val Warmup = 0 with get, set
+        /// The engine time in milliseconds that one request takes.
+        member val Duration = 0.0 with get, set
+        /// True when every request that leaves the step in progress also returns a page.
+        member val PagesMidStep = false with get, set
 
-        member _.Register(clock: IClock) =
-            coordinator.Register(this :> IScratchHolder, clock)
+        member _.Register() =
+            coordinator.Register(this :> IScratchHolder, clock :> IClock)
 
         member _.Request() = async {
             let! admitted = coordinator.BeginRequest(this :> IScratchHolder)
+            let mutable pageReady = false
             if admitted && step < stepCount then
                 holdsScratch <- true
                 requestInStep <- requestInStep + 1
@@ -32,6 +37,10 @@ module WorkerScratchCases =
                     step <- step + 1
                     requestInStep <- 0
                     mustKeepScratch <- false
+                    pageReady <- true
+                elif this.PagesMidStep then pageReady <- true
+            clock.Advance this.Duration
+            coordinator.EndRequest(this :> IScratchHolder, pageReady)
             return admitted
         }
 
@@ -52,15 +61,15 @@ module WorkerScratchCases =
             }
 
     let private createSession coordinator clock requestsPerStep stepCount =
-        let session = ScratchSession(coordinator, requestsPerStep, stepCount)
-        session.Register(clock)
+        let session = ScratchSession(coordinator, clock, requestsPerStep, stepCount)
+        session.Register()
         session
 
     let private starvationCase () = async {
         let clock = ManualClock 0.0
         let coordinator = WorkerScratch()
-        let holder = createSession coordinator (clock :> IClock) 4 1
-        let requester = createSession coordinator (clock :> IClock) 1 1
+        let holder = createSession coordinator clock 4 1
+        let requester = createSession coordinator clock 1 1
         let! holderStarted = holder.Request()
         Check.true' holderStarted "The first session starts its scratch-backed step."
         let! firstRefusal = requester.Request()
@@ -80,8 +89,8 @@ module WorkerScratchCases =
     let private burstCase burst = async {
         let clock = ManualClock 0.0
         let coordinator = WorkerScratch()
-        let first = createSession coordinator (clock :> IClock) (burst * 3 + 1) 1
-        let second = createSession coordinator (clock :> IClock) (burst * 3 + 1) 1
+        let first = createSession coordinator clock (burst * 3 + 1) 1
+        let second = createSession coordinator clock (burst * 3 + 1) 1
         second.Warmup <- 2
         let! started = first.Request()
         Check.true' started "The first viewer starts a partial step."
@@ -107,7 +116,7 @@ module WorkerScratchCases =
     let private roundRobinCase () = async {
         let clock = ManualClock 0.0
         let coordinator = WorkerScratch()
-        let sessions = Array.init 4 (fun _ -> createSession coordinator (clock :> IClock) 8 3)
+        let sessions = Array.init 4 (fun _ -> createSession coordinator clock 8 3)
         let mutable requests = 0
         while sessions |> Array.exists (fun session -> not session.Finished) do
             for session in sessions do
@@ -125,8 +134,8 @@ module WorkerScratchCases =
     let private activeHolderCase () = async {
         let clock = ManualClock 0.0
         let coordinator = WorkerScratch()
-        let holder = createSession coordinator (clock :> IClock) 100 1
-        let requester = createSession coordinator (clock :> IClock) 1 1
+        let holder = createSession coordinator clock 100 1
+        let requester = createSession coordinator clock 1 1
         let! started = holder.Request()
         Check.true' started "The holder starts its step."
         for _ in 1 .. 8 do
@@ -139,6 +148,43 @@ module WorkerScratchCases =
         Check.equal false requester.Finished "The waiting requester has not run."
     }
 
+    let private frozenProtectedCase showsPage = async {
+        let clock = ManualClock 0.0
+        let coordinator = WorkerScratch()
+        let holder = createSession coordinator clock 10 1
+        let newcomer = createSession coordinator clock 10 1
+        newcomer.PagesMidStep <- showsPage
+        let! started = holder.Request()
+        Check.true' started "The holder starts its step."
+        clock.Advance 2_000.0
+        let! admitted = newcomer.Request()
+        Check.true' admitted "The newcomer is admitted after the holder went idle."
+        Check.equal 1 holder.Yields "The idle holder yields once."
+        let freezeMs = (clock :> IClock).NowMs()
+        while not holder.Finished && (clock :> IClock).NowMs() - freezeMs < 10_000.0 do
+            clock.Advance 100.0
+            let! _ = holder.Request()
+            ()
+        Check.true' holder.Finished $"The displaced session finishes within ten seconds after the newcomer stops (page mid-step {showsPage})."
+    }
+
+    let private slowRoundRobinCase () = async {
+        let clock = ManualClock 0.0
+        let coordinator = WorkerScratch()
+        let sessions = Array.init 3 (fun _ -> createSession coordinator clock 6 2)
+        for session in sessions do session.Duration <- 2_100.0
+        let mutable rounds = 0
+        while sessions |> Array.exists (fun session -> not session.Finished) do
+            rounds <- rounds + 1
+            if rounds > 400 then failwith "Round-robin requests of 2.1 seconds did not finish."
+            for session in sessions do
+                if not session.Finished then
+                    let! _ = session.Request()
+                    ()
+        for session in sessions do
+            Check.sequence [| 0; 1 |] session.Output "Every session keeps its output when each request takes 2.1 seconds."
+    }
+
     let cases: (string * (unit -> Async<unit>)) list = [
         "an idle holder yields two seconds after its last request", starvationCase
         "bursts of three and four requests finish without reciprocal abandonment", fun () -> async {
@@ -147,4 +193,9 @@ module WorkerScratchCases =
         }
         "four round-robin sessions finish with uninterrupted output", roundRobinCase
         "a holder that keeps requesting is never preempted", activeHolderCase
+        "a newcomer that goes idle gives the displaced session the scratch again within a bounded time", fun () -> async {
+            do! frozenProtectedCase false
+            do! frozenProtectedCase true
+        }
+        "three sessions with 2.1 second requests all finish", slowRoundRobinCase
     ]

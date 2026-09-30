@@ -2225,12 +2225,7 @@ type TextDiffSession internal (
             | _ -> 1
         while count < wanted && not failed && not blocked && not (cancel ()) && not (Meter.overBudget meter) && cursor.Position < cursor.ContentEnd do
             let remainingUnits = wanted - count
-            let requestedBytes =
-                match cursor.Encoding with
-                | TextEncoding.Utf32LE
-                | TextEncoding.Utf32BE -> max 4 ((remainingUnits / 2) * 4)
-                | _ -> remainingUnits * byteWidth
-            let byteCount = int (min (float cursor.Buffer.Length) (min (cursor.ContentEnd - cursor.Position) (float requestedBytes)))
+            let byteCount = int (min (float cursor.Buffer.Length) (min (cursor.ContentEnd - cursor.Position) (float (remainingUnits * byteWidth))))
             if byteCount <= 0 then failed <- true
             else
                 match cursor.Spec.Source with
@@ -2239,22 +2234,36 @@ type TextDiffSession internal (
                     let! outcome = source.ReadAt (int64 cursor.Position) cursor.Buffer 0 byteCount
                     match outcome with
                     | ReadOutcome.Bytes actual when actual > 0 ->
+                        let isUtf32 = byteWidth = 4
                         let mutable overflow: uint16 option = None
-                        let sink _ _ value =
+                        // A UTF-32 read holds up to one code point per unit asked for, so it can hold more than
+                        // the block has room for. The first code point that does not fit is where the next read starts.
+                        let mutable refusedAt = -1.0
+                        let sink (start: int64) _ value =
                             if count < wanted then
                                 target[count] <- uint16 value
                                 count <- count + 1
-                            elif overflow.IsNone then overflow <- Some(uint16 value)
+                            elif not isUtf32 then
+                                if overflow.IsNone then overflow <- Some(uint16 value)
+                            elif refusedAt < 0.0 then
+                                if overflow.IsNone && value >= 0xDC00 && value <= 0xDFFF then overflow <- Some(uint16 value)
+                                else refusedAt <- float start
                         let next, decoded = Decoders.decode cursor.Decoder cursor.Buffer 0 actual sink
-                        cursor.Decoder <- next
-                        cursor.Position <- float next.AbsoluteOffset
-                        cursor.PendingUnit <- overflow
-                        Meter.chargeBytes meter actual
-                        match decoded with
-                        | Error error ->
-                            reportDecodeError (if cursor.Side = DiffSide.Previous then 0 else 1) error
-                            failed <- true
-                        | Ok _ -> ()
+                        if refusedAt >= 0.0 then
+                            Meter.chargeBytes meter (int (refusedAt - cursor.Position))
+                            cursor.Position <- refusedAt
+                            cursor.Decoder <- Decoders.createAt cursor.Encoding (int64 refusedAt)
+                            cursor.PendingUnit <- overflow
+                        else
+                            cursor.Decoder <- next
+                            cursor.Position <- float next.AbsoluteOffset
+                            cursor.PendingUnit <- overflow
+                            Meter.chargeBytes meter actual
+                            match decoded with
+                            | Error error ->
+                                reportDecodeError (if cursor.Side = DiffSide.Previous then 0 else 1) error
+                                failed <- true
+                            | Ok _ -> ()
                     | ReadOutcome.NotYetAvailable -> blocked <- true
                     | ReadOutcome.EndOfSource -> sourceChanged (); failed <- true
                     | ReadOutcome.Bytes _ -> blocked <- true
@@ -2806,18 +2815,30 @@ type TextDiffSession internal (
             else return Some(Array.sub rows 0 index)
         }
 
-    let hasPageLongPair item start lineCount =
+    /// True when the suspended long pair is one of the rows start to start + rowCount - 1 of the item.
+    let hasPageLongPair item start rowCount =
         match pendingLongPair with
         | Some pending ->
             obj.ReferenceEquals(pending.Item, item)
             && pending.RowIndex >= start
-            && pending.RowIndex < start + lineCount
+            && pending.RowIndex < start + rowCount
         | None -> false
 
-    let readPageLines isPrevious spec encoding item start (lines: LineRef[]) cancel = async {
+    /// The slot of a row in the compact line array that collectRowRefs builds for one side. Only the rows that
+    /// read a line from that side take a slot.
+    let sideSlotBefore (item: QueueItem) (start: int) (rowIndex: int) (previousSide: bool) =
+        let mutable total = 0
+        for index = start to rowIndex - 1 do
+            match item.Rows[index].Kind with
+            | DiffRowKind.Added -> if not previousSide then total <- total + 1
+            | DiffRowKind.Replaced -> total <- total + 1
+            | _ -> if previousSide then total <- total + 1
+        total
+
+    let readPageLines isPrevious spec encoding item start rowCount (lines: LineRef[]) cancel = async {
         match pendingLongPair with
-        | Some pending when hasPageLongPair item start lines.Length ->
-            let index = pending.RowIndex - start
+        | Some pending when hasPageLongPair item start rowCount ->
+            let index = sideSlotBefore item start pending.RowIndex isPrevious
             let beforeRefs = if index = 0 then Array.empty else Array.sub lines 0 index
             let afterRefs = if index + 1 = lines.Length then Array.empty else Array.sub lines (index + 1) (lines.Length - index - 1)
             let! before = readLines spec encoding beforeRefs cancel
@@ -2841,16 +2862,16 @@ type TextDiffSession internal (
         else
             let previousRefs, currentRefs = collectRowRefs item start count
             let! previousLines =
-                if hasPageLongPair item start previousRefs.Length then
-                    readPageLines true previousSpec previousEncoding item start previousRefs cancel
+                if hasPageLongPair item start count then
+                    readPageLines true previousSpec previousEncoding item start count previousRefs cancel
                 else
                     readLines previousSpec previousEncoding previousRefs cancel
             match previousLines with
             | None -> return None
             | Some previousValues ->
                 let! currentLines =
-                    if hasPageLongPair item start currentRefs.Length then
-                        readPageLines false currentSpec currentEncoding item start currentRefs cancel
+                    if hasPageLongPair item start count then
+                        readPageLines false currentSpec currentEncoding item start count currentRefs cancel
                     else
                         readLines currentSpec currentEncoding currentRefs cancel
                 match currentLines with
@@ -3135,7 +3156,7 @@ type TextDiffSession internal (
                 return Some(failWorker error.Message)
     }
 
-    let advance (sequence: int64) (cancel: unit -> bool) : Async<EngineResult<Resumable<DiffPage>>> = async {
+    let advanceRequest (sequence: int64) (cancel: unit -> bool) : Async<EngineResult<Resumable<DiffPage>>> = async {
         let! admitted =
             match scratch, holder with
             | Some coordinator, Some self -> coordinator.BeginRequest self
@@ -3192,6 +3213,22 @@ type TextDiffSession internal (
             // A restore that finished in this request keeps its protection for the next request, unless the output is complete.
             if ranAfterRestore || modeIsDone () then freshlyRestored <- false
             return! presentPageResult result.Value
+    }
+
+    /// Runs one request and tells the worker scratch coordinator when it returns, so that the idle time of this
+    /// session counts from the end of the request.
+    let advance (sequence: int64) (cancel: unit -> bool) : Async<EngineResult<Resumable<DiffPage>>> = async {
+        let mutable pageReady = false
+        try
+            let! result = advanceRequest sequence cancel
+            match result with
+            | EngineResult.Ok(Resumable.Ready _) -> pageReady <- true
+            | _ -> ()
+            return result
+        finally
+            match scratch, holder with
+            | Some coordinator, Some self -> coordinator.EndRequest(self, pageReady)
+            | _ -> ()
     }
 
     let specAt sideIndex = if sideIndex = 0 then previousSpec else currentSpec
@@ -3834,8 +3871,10 @@ type TextDiffSession internal (
                     if equal < limit then
                         let previousUnit = analysis.PreviousBlock[analysis.PreviousBlockPosition + equal]
                         let currentUnit = analysis.CurrentBlock[analysis.CurrentBlockPosition + equal]
-                        if analysis.HasLastPrefixUnit
-                           && analysis.LastPrefixUnit >= 0xD800us && analysis.LastPrefixUnit <= 0xDBFFus
+                        let hasUnitBefore = equal > 0 || analysis.HasLastPrefixUnit
+                        let unitBefore = if equal > 0 then analysis.PreviousBlock[analysis.PreviousBlockPosition + equal - 1] else analysis.LastPrefixUnit
+                        if hasUnitBefore
+                           && unitBefore >= 0xD800us && unitBefore <= 0xDBFFus
                            && previousUnit >= 0xDC00us && previousUnit <= 0xDFFFus
                            && currentUnit >= 0xDC00us && currentUnit <= 0xDFFFus then
                             analysis.PrefixLength <- analysis.PrefixLength - 1.0

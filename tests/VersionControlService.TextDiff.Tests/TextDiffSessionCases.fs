@@ -11,8 +11,10 @@ module TextDiffSessionCases =
     type private CountingByteSource(bytes: byte[]) =
         let inner = MemoryByteSource(bytes) :> IByteSource
         let mutable bytesRead = 0L
+        let mutable reads = 0
 
         member _.BytesRead = bytesRead
+        member _.Reads = reads
         member _.Reset() = bytesRead <- 0L
 
         interface IByteSource with
@@ -20,6 +22,7 @@ module TextDiffSessionCases =
             member _.AvailableLength() = inner.AvailableLength()
             member _.IsComplete() = inner.IsComplete()
             member _.ReadAt position buffer offset count = async {
+                reads <- reads + 1
                 let! outcome = inner.ReadAt position buffer offset count
                 match outcome with
                 | ReadOutcome.Bytes actual when actual > 0 -> bytesRead <- bytesRead + int64 actual
@@ -2555,5 +2558,79 @@ module TextDiffSessionCases =
                     let fragments = page.Parts |> Array.filter (function DiffPart.Hunk _ -> true | _ -> false)
                     Check.true' (fragments.Length <= limit) "A page holds at most the configured number of hunk fragments."
                 do! session.Close()
+        }
+        "a long pair resumed after rows without a previous line keeps every row at any budget", fun () -> async {
+            let context = Array.init 10 (fun index -> { Text = $"context line {index}"; Ending = LineEnding.LF })
+            let random = Random(7)
+            let cjk () = String.init 300 (fun _ -> string (char (0x4E00 + random.Next 2_000)))
+            let added = Array.init 550 (fun index -> { Text = $"added {index} " + cjk (); Ending = LineEnding.LF })
+            let equal = [| "equal one"; "equal two" |] |> Array.map (fun text -> { Text = text; Ending = LineEnding.LF })
+            let longPrefix = String('a', 20_000)
+            let tail = Array.init 5 (fun index -> { Text = $"tail added {index}"; Ending = LineEnding.LF })
+            let previous = Array.concat [ context; equal; [| { Text = longPrefix + "PREVIOUS-END"; Ending = LineEnding.LF } |] ]
+            let current = Array.concat [ context; added; equal; [| { Text = longPrefix + "CURRENT-END"; Ending = LineEnding.LF } |]; tail ]
+            let describe (pages: DiffPage array) =
+                let text = function Some (line: DiffLine) -> $"{line.Number}:{line.Slice.Text}" | None -> "-"
+                rows (allParts pages) |> Array.map (fun row -> $"{row.Kind}|{text row.Previous}|{text row.Current}")
+            let run budget = async {
+                let limits = { Limits.defaults with MaxUnits = budget; RequestMs = 1e15; QuantumMs = 1e15 }
+                let host = Host.createInMemory (ManualClock 0.0 :> IClock)
+                let! session = TextDiffSession.create host (Ledger()) { SessionConfig.defaults $"pair-budget-{budget}" with Limits = limits } (fun part -> jsonPartBytes part + 1) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+                let! pages = readAll session (fun () -> false)
+                do! session.Close()
+                return describe pages
+            }
+            let! expected = run Int32.MaxValue
+            Check.true' (expected |> Array.exists (fun row -> row.StartsWith("Replaced|", StringComparison.Ordinal))) "The hunk contains the long replaced pair."
+            for budget in 300 .. 40 .. 780 do
+                let! actual = run budget
+                Check.true' (actual.Length = expected.Length && Array.forall2 (=) expected actual) $"A budget of {budget} units gives the same rows as an unbudgeted run."
+        }
+        "line read highlights a surrogate pair in the long prefix path like the page", fun () -> async {
+            let prefix = String('a', 40_000)
+            let previous = [| { Text = "head"; Ending = LineEnding.LF }; { Text = prefix + "😀" + "bbbbbbbbbb"; Ending = LineEnding.LF }; { Text = "tail"; Ending = LineEnding.LF } |]
+            let current = [| { Text = "head"; Ending = LineEnding.LF }; { Text = prefix + "😁" + "bbbbbbbbbb"; Ending = LineEnding.LF }; { Text = "tail"; Ending = LineEnding.LF } |]
+            let! session = openSession (SessionConfig.defaults "surrogate-prefix") (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+            let! pages = readAll session (fun () -> false)
+            let row = rows (allParts pages) |> Array.find (fun row -> row.Kind = DiffRowKind.Replaced)
+            let changedOf (line: DiffLine) = line.Slice.Highlights |> Array.filter (fun span -> span.Kind = HighlightKind.ChangedText)
+            for (side, line) in [| DiffSide.Previous, row.Previous.Value; DiffSide.Current, row.Current.Value |] do
+                let pageChanged = changedOf line
+                Check.equal 1 pageChanged.Length "The page marks one changed span."
+                Check.equal 2 pageChanged[0].Length "The page span covers the complete surrogate pair."
+                let offset = int64 (prefix.Length - 5)
+                let! initial = session.ReadLine(side, line.Number, offset, 20, None, fun () -> false)
+                let! value = resolveLine session side line.Number offset 20 initial
+                let readChanged = changedOf value
+                Check.equal 1 readChanged.Length "The line read marks one changed span."
+                Check.equal 2 readChanged[0].Length "The line read span covers the complete surrogate pair."
+                Check.equal (int64 line.Slice.OffsetUtf16 + int64 pageChanged[0].Start) (int64 (value.Slice.OffsetUtf16 + int64 readChanged[0].Start)) "The line read span starts where the page span starts."
+            do! session.Close()
+        }
+        "utf-32 long lines read whole blocks from the source", fun () -> async {
+            let body = String('a', 300_000)
+            let utf32LittleEndian (text: string) =
+                let bytes = ResizeArray<byte>()
+                for character in text do
+                    let code = int character
+                    bytes.Add(byte (code &&& 0xFF))
+                    bytes.Add(byte (code >>> 8))
+                    bytes.Add 0uy
+                    bytes.Add 0uy
+                bytes.ToArray()
+            let previousBytes = utf32LittleEndian ("head\n" + body + "X\ntail\n")
+            let currentBytes = utf32LittleEndian ("head\n" + body + "Y\ntail\n")
+            let previousSource = CountingByteSource previousBytes
+            let currentSource = CountingByteSource currentBytes
+            let previousSpec = sourceSpecWith (previousSource :> IByteSource) "utf-32le" 0 (int64 previousBytes.Length)
+            let currentSpec = sourceSpecWith (currentSource :> IByteSource) "utf-32le" 0 (int64 currentBytes.Length)
+            let! session = openSession (SessionConfig.defaults "utf32-long-reads") previousSpec currentSpec
+            let! pages = readAll session (fun () -> false)
+            let row = rows (allParts pages) |> Array.find (fun row -> row.Kind = DiffRowKind.Replaced)
+            Check.equal 1 (row.Current.Value.Slice.Highlights |> Array.filter (fun span -> span.Kind = HighlightKind.ChangedText)).Length "The long line has one changed span."
+            let reads = previousSource.Reads + currentSource.Reads
+            let bytes = previousSource.BytesRead + currentSource.BytesRead
+            Check.true' (int64 reads <= bytes / 8_192L) $"The sources served {reads} reads for {bytes} bytes."
+            do! session.Close()
         }
     ]
