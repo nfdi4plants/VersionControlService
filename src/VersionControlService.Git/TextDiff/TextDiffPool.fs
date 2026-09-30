@@ -280,7 +280,25 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
         match worker.Running with
         | Some request when request.RequestId = requestId && request.Session.Generation = generation ->
             worker.Running <- None
-            settle request result
+
+            if request.Settled then
+                let closeHandle =
+                    match request.Body, result with
+                    | RequestBody.Open _, Ok(ResultPayload.Open(Resumable.Ready(OpenDiffResult.Opened(handle, _, _, _)))) ->
+                        Some handle
+                    | RequestBody.Open _, Ok(ResultPayload.Open(Resumable.Scanning _)) ->
+                        Some { DiffHandle.Id = ""; Version = "" }
+                    | _ -> None
+
+                closeHandle
+                |> Option.iter (fun handle ->
+                    observe
+                        (enqueue request.Session (RequestBody.Close handle) (OperationContext.detached "text-diff-close"))
+                        ignore
+                        ignore)
+            else
+                settle request result
+
             pumpWorker worker
         | _ -> ()
 
@@ -510,6 +528,7 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
                 | Some running when obj.ReferenceEquals(running, request) && not request.CancelPosted ->
                     request.CancelPosted <- true
                     post worker (TextDiffMessage.Cancel(request.RequestId, request.Session.Generation))
+                    settle request (Error(canceled ()))
                 | _ -> ()
 
     // The slot stays taken until the worker acknowledged the close and the supervisor released the session.
