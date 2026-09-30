@@ -11,6 +11,9 @@ module NodePath = VersionControlService.Runtime.Node.Path
 module NodePositionalFile = VersionControlService.Runtime.Node.PositionalFile
 module NodeProcess = VersionControlService.Runtime.Node.Process
 
+[<Emit("$0?.code ?? ''")>]
+let private errorCode (_error: obj) : string = jsNative
+
 [<Literal>]
 let private readFailureCode = "diff_read_failed"
 
@@ -129,6 +132,8 @@ type private FileSourceCore(
                     return raiseFailure (report (changedFailure path))
             with
             | :? TextDiffSourceException as error -> return raise error
+            | error when errorCode (box error) = "ENOENT" || errorCode (box error) = "ENOTDIR" ->
+                return raiseFailure (report (changedFailure path))
             | error ->
                 return raiseFailure (report (readFailure (NodeInterop.errorMessage (box error))))
     }
@@ -380,7 +385,9 @@ type SpoolSource private (
     initialLength: int64,
     retained: byte[] option,
     childClosed: JS.Promise<NodeProcess.ChildExit>,
-    callback: TextDiffSourceFailureCallback
+    callback: TextDiffSourceFailureCallback,
+    onWait: unit -> unit,
+    readAt: int -> byte[] -> int -> int -> int64 -> JS.Promise<int>
 ) =
     let mutable disposed = false
     let mutable available = initialLength
@@ -402,6 +409,10 @@ type SpoolSource private (
         if disposed then
             raise (ObjectDisposedException("The text diff spool has been disposed."))
 
+    let notYetAvailable () =
+        onWait ()
+        ReadOutcome.NotYetAvailable
+
     let validateChild exit actualLength =
         if completedChild exit && actualLength = expectedLength then
             complete <- true
@@ -417,6 +428,7 @@ type SpoolSource private (
         | Some failure -> return raiseFailure failure
         | None ->
             try
+                let exitBeforeStat = childExit
                 let! stats = NodePositionalFile.fstat descriptor |> Async.AwaitPromise
                 available <- stats.Size
 
@@ -431,13 +443,17 @@ type SpoolSource private (
                         let start = cached
 
                         let! amount =
-                            NodePositionalFile.readAt descriptor memory (int start) (int (min (limit - start) 262144L)) start
+                            readAt descriptor memory (int start) (int (min (limit - start) 262144L)) start
                             |> Async.AwaitPromise
 
                         if amount <= 0 then stalled <- true else cached <- max cached (start + int64 amount)
                 | None -> ()
 
                 match childExit with
+                | Some exit when exitBeforeStat.IsNone ->
+                    let! afterExit = NodePositionalFile.fstat descriptor |> Async.AwaitPromise
+                    available <- afterExit.Size
+                    validateChild exit available
                 | Some exit -> validateChild exit available
                 | None -> ()
 
@@ -494,9 +510,16 @@ type SpoolSource private (
         expectedLength: int64,
         retained: byte[] option,
         childClosed: JS.Promise<NodeProcess.ChildExit>,
-        ?onFailure: TextDiffSourceFailureCallback
+        ?onFailure: TextDiffSourceFailureCallback,
+        ?onWait: unit -> unit,
+        ?readAt: (int -> byte[] -> int -> int -> int64 -> JS.Promise<int>)
     ) : JS.Promise<SpoolSource> =
         let callback = defaultArg onFailure (fun _ -> ())
+        let waitCallback = defaultArg onWait ignore
+        let readAt =
+            defaultArg
+                readAt
+                (fun file buffer offset count position -> NodePositionalFile.readAt file buffer offset count position)
 
         async {
             if expectedLength < 0L then invalidArg (nameof expectedLength) "The source length cannot be negative."
@@ -505,7 +528,7 @@ type SpoolSource private (
 
             try
                 let! stats = NodePositionalFile.fstat descriptor |> Async.AwaitPromise
-                return SpoolSource(path, expectedLength, descriptor, stats.Size, retained, childClosed, callback)
+                return SpoolSource(path, expectedLength, descriptor, stats.Size, retained, childClosed, callback, waitCallback, readAt)
             with error ->
                 try
                     do! NodePositionalFile.close descriptor |> Async.AwaitPromise
@@ -525,16 +548,16 @@ type SpoolSource private (
 
         if count = 0 then
             if complete then return ReadOutcome.Bytes 0
-            else return ReadOutcome.NotYetAvailable
+            else return notYetAvailable ()
         elif position >= expectedLength then
             if complete then return ReadOutcome.EndOfSource
-            else return ReadOutcome.NotYetAvailable
+            else return notYetAvailable ()
         elif retained.IsSome then
             let memory = retained.Value
 
             if position >= cached then
                 if complete then return ReadOutcome.EndOfSource
-                else return ReadOutcome.NotYetAvailable
+                else return notYetAvailable ()
             else
                 let amount = int (min (int64 count) (cached - position))
                 Array.blit memory (int position) buffer offset amount
@@ -544,14 +567,13 @@ type SpoolSource private (
 
             if readable <= 0L then
                 if complete then return ReadOutcome.EndOfSource
-                else return ReadOutcome.NotYetAvailable
+                else return notYetAvailable ()
             else
                 let! result =
                     async {
                         try
                             let! amount =
-                                NodePositionalFile.readAt descriptor buffer offset (int readable) position
-                                |> Async.AwaitPromise
+                                readAt descriptor buffer offset (int readable) position |> Async.AwaitPromise
 
                             return Choice1Of2 amount
                         with error ->
@@ -576,7 +598,7 @@ type SpoolSource private (
                     | Choice1Of2 amount when amount > 0 -> return ReadOutcome.Bytes amount
                     | Choice1Of2 _ ->
                         if complete then return ReadOutcome.EndOfSource
-                        else return ReadOutcome.NotYetAvailable
+                        else return notYetAvailable ()
     }
 
     interface IByteSource with
@@ -710,14 +732,30 @@ type NodeTempStore private (path: string, descriptor: int, initialLength: int64)
         |> Async.StartAsPromise
 
     static member Create(directory: string, fileName: string) : JS.Promise<NodeTempStore> =
-        if String.IsNullOrWhiteSpace fileName
-           || fileName = "."
-           || fileName = ".."
-           || fileName.Contains "/"
-           || fileName.Contains "\\" then
-            invalidArg (nameof fileName) "The temporary store name must be a single path segment."
+        if String.IsNullOrWhiteSpace fileName then
+            invalidArg (nameof fileName) "The temporary store name cannot be empty."
 
-        NodeTempStore.Open(NodePath.join [| directory; fileName |])
+        let safeFileName =
+            fileName
+            |> Seq.map (fun character ->
+                if
+                    (character >= 'A' && character <= 'Z')
+                    || (character >= 'a' && character <= 'z')
+                    || (character >= '0' && character <= '9')
+                    || character = '.'
+                    || character = '_'
+                    || character = '-'
+                then
+                    character
+                else
+                    '-')
+            |> Seq.toArray
+            |> String
+
+        if safeFileName = "." || safeFileName = ".." then
+            invalidArg (nameof fileName) "The temporary store name must identify a file."
+
+        NodeTempStore.Open(NodePath.join [| directory; safeFileName |])
 
     interface ITempStore with
         member this.Append buffer offset count = this.Append buffer offset count

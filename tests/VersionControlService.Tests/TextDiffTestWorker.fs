@@ -65,9 +65,24 @@ let private slowResolverHandler =
         | _ -> return result
     })
 
+let private slowPreparationHandler =
+    let mutable delayed = false
+
+    TextDiffWorker.createDefaultHandlerWithRunner(fun host owner arguments -> promise {
+        let! result = host.SpawnShort(owner.WorkspaceRoot, arguments)
+
+        match arguments with
+        | [| "cat-file"; "-s"; _ |] when not delayed ->
+            delayed <- true
+            do! delay 500
+            return result
+        | _ -> return result
+    })
+
 do
     match NodeWorkerThreads.parentPort with
     | Some port when workerMode () = "default" -> TextDiffWorker.bootstrap port
     | Some port when workerMode () = "slow-resolver" -> TextDiffWorker.bootstrapWith port slowResolverHandler
+    | Some port when workerMode () = "slow-preparation" -> TextDiffWorker.bootstrapWith port slowPreparationHandler
     | Some port -> TextDiffWorker.bootstrapWith port spoolingHandler
     | None -> ()

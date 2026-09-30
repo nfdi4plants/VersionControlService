@@ -142,7 +142,6 @@ let private categoryOf (code: string) =
     | TextDiffFailureCodes.ContinuationMismatch
     | TextDiffFailureCodes.PreparationMismatch -> Validation
     | TextDiffFailureCodes.SourceChanged -> Concurrency
-    | "not_implemented" -> Unsupported
     | _ -> ProviderError
 
 let private failure (code: string) (message: string) = OperationFailure.create (categoryOf code) code message
@@ -224,6 +223,7 @@ type private Slot(generation: int, owner: TextDiffOwner, request: OpenDiffReques
     member val PreviousOutcome: ClassOutcome option = None with get, set
     member val CurrentOutcome: ClassOutcome option = None with get, set
     member val Retained = 0L with get, set
+    member val SpoolWaitYield = false with get, set
     member val Failure: TextDiffSourceFailure option = None with get, set
     member val Session: TextDiffSession option = None with get, set
     member val Infos: (DiffSourceInfo * DiffSourceInfo) option = None with get, set
@@ -257,6 +257,7 @@ type private Worker = {
     RunShort: WorkerHost -> TextDiffOwner -> string[] -> JS.Promise<GitShort>
     Tokens: PreparationTokenStore
     BlobLedger: Ledger
+    Scratch: WorkerScratch
     Slots: Dictionary<int, Slot>
     ActiveOpens: Dictionary<string, WorkerHost>
     Clock: IClock
@@ -503,7 +504,8 @@ let private openBlobSide
                             start.BlobSize,
                             start.Retained,
                             start.Closed,
-                            onFailure = (fun value -> slot.RecordFailure value)
+                            onFailure = (fun value -> slot.RecordFailure value),
+                            onWait = (fun () -> slot.SpoolWaitYield <- true)
                         )
                         |> Async.AwaitPromise
 
@@ -851,7 +853,12 @@ let private createStep (worker: Worker) (host: WorkerHost) (request: OpenDiffReq
 
         let engine: EngineHost = {
             Clock = worker.Clock
-            Yield = fun () -> host.Yield() |> Async.AwaitPromise
+            Yield = fun () ->
+                if slot.SpoolWaitYield then
+                    slot.SpoolWaitYield <- false
+                    sleep SpoolPollMs
+                else
+                    host.Yield() |> Async.AwaitPromise
             CreateTempStore =
                 fun name -> async {
                     let! store =
@@ -863,7 +870,8 @@ let private createStep (worker: Worker) (host: WorkerHost) (request: OpenDiffReq
         }
 
         let! session =
-            TextDiffSession.create
+            TextDiffSession.createWithScratch
+                worker.Scratch
                 engine
                 worker.BlobLedger
                 config
@@ -872,6 +880,7 @@ let private createStep (worker: Worker) (host: WorkerHost) (request: OpenDiffReq
                 (sourceSpec current currentClass)
 
         slot.Session <- Some session
+        slot.SpoolWaitYield <- false
         let! first = session.FirstPage host.IsCanceled
 
         match first with
@@ -995,7 +1004,13 @@ let private openRequest
         }
 
         match found with
-        | Error problem -> return Error problem
+        | Error problem ->
+            if problem.Code = TextDiffFailureCodes.ContinuationMismatch then
+                match worker.Slots.TryGetValue host.Generation with
+                | true, slot -> do! disposeSlot worker slot
+                | _ -> ()
+
+            return Error problem
         | Ok slot ->
             slot.Host <- host
             slot.Busy <- true
@@ -1135,6 +1150,7 @@ let private readingCall
         | None -> return Error(closedFailure ())
         | Some session ->
             do! checkSources slot
+            slot.SpoolWaitYield <- false
             let! result = call session
             do! checkSources slot
             let! settled = settle worker slot result
@@ -1152,6 +1168,7 @@ let private createHandler
         RunShort = runShort
         Tokens = PreparationTokenStore()
         BlobLedger = Ledger()
+        Scratch = WorkerScratch()
         Slots = Dictionary<int, Slot>()
         ActiveOpens = Dictionary<string, WorkerHost>()
         Clock = { new IClock with member _.NowMs() = performanceNow () }

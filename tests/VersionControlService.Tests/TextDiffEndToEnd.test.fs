@@ -10,6 +10,7 @@ open VersionControlService.Git
 open VersionControlService.Git.TextDiff
 open VersionControlService.Git.TextDiff.TextDiffProtocol
 open VersionControlService.Git.TextDiff.TextDiffTransport
+open VersionControlService.TextDiff
 
 module GitWorkspaceSession = VersionControlService.Git.GitWorkspaceSession
 module GitCredentialStrategy = VersionControlService.Git.GitCredentialStrategy
@@ -17,9 +18,12 @@ module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodePath = VersionControlService.Runtime.Node.Path
 module NodePositionalFile = VersionControlService.Runtime.Node.PositionalFile
 module NodeProcess = VersionControlService.Runtime.Node.Process
+module NodeInterop = VersionControlService.Runtime.Node.Interop
 module NodeWorkerThreads = VersionControlService.Runtime.Node.WorkerThreads
 module TextDiffPool = VersionControlService.Git.TextDiff.TextDiffPool
 module TextDiffSupervisor = VersionControlService.Git.TextDiff.TextDiffSupervisor
+module TextDiffSourceResolver = VersionControlService.Git.TextDiff.TextDiffSourceResolver
+module TextDiffSources = VersionControlService.Git.TextDiff.TextDiffSources
 
 [<Import("mkdtemp", "node:fs/promises")>]
 let private mkdtemp (prefix: string) : JS.Promise<string> = jsNative
@@ -523,6 +527,182 @@ Vitest.describe (
                 | None -> ()
             }),
             120000
+        )
+
+        Vitest.test (
+            "creates and removes a temporary store with a safe file name",
+            fun () -> promise {
+                let directory = NodePath.join [| (currentFixture ()).Root; "safe-store" |]
+                do! NodePositionalFile.mkdirRecursive directory
+                let! store = TextDiffSources.NodeTempStore.Create(directory, "pairs:test.tmp")
+                let! stats = NodePositionalFile.lstat store.Path
+                let path = store.Path
+                do! store.Dispose() |> Async.StartAsPromise
+
+                Vitest.expect(path.EndsWith "pairs-test.tmp").toBe true
+                Vitest.expect(stats.IsFile).toBe true
+                Vitest.expect(NodeFileSystem.existsSync path).toBe false
+            }
+        )
+
+        Vitest.test (
+            "validates a spool after its child exits during a pending read",
+            TestOptions(timeout = 30000),
+            fun () -> promise {
+                let filePath = NodePath.join [| (currentFixture ()).Root; "racing-spool.blob" |]
+                let! writer = NodePositionalFile.openCreateExclusiveReadWrite filePath
+                let initial = Encoding.UTF8.GetBytes "part"
+                let! _ = NodePositionalFile.writeAt writer initial 0 initial.Length 0L
+                let mutable resolveChild: (NodeProcess.ChildExit -> unit) option = None
+                let childClosed: JS.Promise<NodeProcess.ChildExit> =
+                    JS.Constructors.Promise.Create(fun resolve _ -> resolveChild <- Some resolve)
+                let mutable releaseRead: (unit -> unit) option = None
+                let mutable firstRead = true
+
+                let readAt file buffer offset count position =
+                    if firstRead then
+                        firstRead <- false
+
+                        JS.Constructors.Promise.Create(fun resolve reject ->
+                            releaseRead <-
+                                Some(fun () ->
+                                    NodeInterop.observePromise
+                                        (NodePositionalFile.readAt file buffer offset count position)
+                                        resolve
+                                        reject))
+                    else
+                        NodePositionalFile.readAt file buffer offset count position
+
+                let! source =
+                    TextDiffSources.SpoolSource.Open(
+                        filePath,
+                        16L,
+                        Some(Array.zeroCreate 16),
+                        childClosed,
+                        readAt = readAt
+                    )
+
+                let refresh = source.RefreshAvailableLength() |> Async.StartAsPromise
+                do! waitFor "the pending spool read" 5000.0 (fun () -> Promise.lift releaseRead.IsSome)
+
+                let finalBytes = Encoding.UTF8.GetBytes "abcdefghijklmnop"
+                let! _ = NodePositionalFile.writeAt writer finalBytes 0 finalBytes.Length 0L
+                resolveChild.Value {
+                    ExitCode = Some 0
+                    Signal = None
+                    Stderr = ""
+                    StderrTruncated = false
+                    SpawnError = None
+                }
+                releaseRead.Value ()
+
+                let mutable readFailure = None
+
+                try
+                    let! _ = refresh
+                    ()
+                with error ->
+                    readFailure <- Some error
+
+                do! waitFor "the completed spool" 5000.0 (fun () -> Promise.lift(source.IsComplete() || source.Failure.IsSome))
+                Vitest.expect(readFailure.IsNone).toBe true
+                Vitest.expect(source.Failure.IsNone).toBe true
+                Vitest.expect(source.IsComplete()).toBe true
+                do! source.Dispose()
+                do! NodePositionalFile.close writer
+            }
+        )
+
+        Vitest.test (
+            "signals when a spool read has to wait for more bytes",
+            fun () -> promise {
+                let filePath = NodePath.join [| (currentFixture ()).Root; "waiting-spool.blob" |]
+                do! writeText filePath "part"
+                let childClosed: JS.Promise<NodeProcess.ChildExit> = JS.Constructors.Promise.Create(fun _ _ -> ())
+                let mutable waits = 0
+                let! source =
+                    TextDiffSources.SpoolSource.Open(
+                        filePath,
+                        16L,
+                        Some(Array.zeroCreate 16),
+                        childClosed,
+                        onWait = (fun () -> waits <- waits + 1)
+                    )
+                let buffer = Array.zeroCreate<byte> 1
+                let! outcome = source.ReadAt 8L buffer 0 1 |> Async.StartAsPromise
+                do! source.Dispose()
+
+                Vitest.expect(outcome).toEqual(ReadOutcome.NotYetAvailable)
+                Vitest.expect(waits).toBe 1
+            }
+        )
+
+        Vitest.test (
+            "reports a deleted working file as changed",
+            fun () -> promise {
+                let filePath = NodePath.join [| (currentFixture ()).Root; "deleted-working-file.txt" |]
+                do! writeText filePath "working source"
+                let! stats = NodePositionalFile.lstat filePath
+                let identity: TextDiffSourceResolver.FileIdentity = {
+                    Size = stats.Size
+                    MtimeNs = stats.MtimeNs
+                    Ino = stats.Ino
+                    Dev = stats.Dev
+                }
+                let! source = TextDiffSources.WorkingFileSource.Open(filePath, identity)
+                NodeFileSystem.unlinkSync filePath
+                let mutable failureCode = None
+
+                try
+                    do! source.CheckIdentity() |> Async.StartAsPromise
+                with :? TextDiffSources.TextDiffSourceException as error ->
+                    failureCode <- Some error.Code
+
+                do! source.Dispose()
+                Vitest.expect(failureCode).toEqual(Some TextDiffFailureCodes.SourceChanged)
+            }
+        )
+
+        Vitest.test (
+            "pages large diffs in turns with shared scratch",
+            TestOptions(timeout = 600000),
+            fun () -> promise {
+                let! repository = newRepository ()
+                let relativePaths = [| "scratch-a.txt"; "scratch-b.txt"; "scratch-c.txt" |]
+                let fileSize = 4L * 1024L * 1024L + 64L
+                let sharedLine = new System.String(Array.create (1024 * 1024) 'x')
+
+                for relativePath in relativePaths do
+                    do! writePatternFile (NodePath.join [| repository; relativePath |]) fileSize "before-first-line" sharedLine
+
+                do! runGitOk repository (Array.append [| "add"; "--" |] relativePaths)
+                do! runGitOk repository [| "commit"; "-q"; "-m"; "large scratch sources" |]
+
+                for relativePath in relativePaths do
+                    do! writePatternFile (NodePath.join [| repository; relativePath |]) fileSize "after-first-line" sharedLine
+
+                let session = createSession (currentFixture ()).Pool repository
+                let service = serviceFor session
+                let opened = ResizeArray<DiffHandle * DiffPage>()
+                let mutable failure = None
+
+                try
+                    for relativePath in relativePaths do
+                        let! handle, _, _, first =
+                            openedWithFirstPage service (openRequest relativePath) ("scratch-" + relativePath)
+                        Vitest.expect(pageHasChange first).toBe true
+                        opened.Add(handle, first)
+
+                    for index = 0 to opened.Count - 1 do
+                        let handle, first = opened[index]
+                        let! pages = readAllPages service handle first ("scratch-page-" + string index)
+                        Vitest.expect(pages.Length > 0).toBe true
+                        Vitest.expect(pages[pages.Length - 1].NextCursor.IsNone).toBe true
+                with error ->
+                    failure <- Some error
+
+                do! closeSession session failure
+            }
         )
 
         Vitest.test (

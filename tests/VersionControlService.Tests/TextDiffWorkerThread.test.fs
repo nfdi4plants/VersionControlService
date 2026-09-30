@@ -241,6 +241,9 @@ Vitest.describe (
                 do! writeLargeTextFile (NodePath.join [| repository; "large.txt" |]) (256L * 1024L * 1024L)
                 do! runGitOk repository [| "add"; "--"; "large.txt" |]
                 do! runGitOk repository [| "commit"; "-q"; "-m"; "large blob" |]
+                do! writeLargeTextFile (NodePath.join [| repository; "retained.txt" |]) (2L * 1024L * 1024L)
+                do! runGitOk repository [| "add"; "--"; "retained.txt" |]
+                do! runGitOk repository [| "commit"; "-q"; "-m"; "retained blob" |]
             }),
             600000
         )
@@ -267,6 +270,55 @@ Vitest.describe (
                         | Resumable.Ready(OpenDiffResult.Opened _) -> ()
                         | other -> failwith $"Expected an opened diff, got %A{other}"
                     | other -> failwith $"Open failed: %A{other}"
+                })
+        )
+
+        Vitest.test (
+            "disposes the preparation slot after a mismatched continuation",
+            TestOptions(timeout = 120000),
+            fun () ->
+                withWorkerPool "slow-preparation" (ResizeArray()) (fun pool _ transports -> promise {
+                    let service = pool.Service(owner ())
+                    let request = { openRequest with Path = path "retained.txt" }
+                    let! initial = service.Open request (OperationContext.detached "preparation-open") |> Async.StartAsPromise
+
+                    let continuation =
+                        match initial with
+                        | Succeeded outcome ->
+                            match outcome.Value with
+                            | Resumable.Scanning(_, continuation, _) -> continuation
+                            | other -> failwith $"Expected a preparation continuation, got %A{other}"
+                        | other -> failwith $"Open failed before returning a continuation: %A{other}"
+
+                    let mismatched = { request with Path = path "large.txt"; Continuation = Some continuation }
+                    let! mismatch = service.Open mismatched (OperationContext.detached "preparation-mismatch") |> Async.StartAsPromise
+
+                    match mismatch with
+                    | Failed failure -> Vitest.expect(failure.Code).toBe TextDiffFailureCodes.ContinuationMismatch
+                    | other -> failwith $"Expected a continuation mismatch, got %A{other}"
+
+                    let probeId = "preparation-slot-probe"
+                    let probeReply: JS.Promise<OperationFailure> =
+                        JS.Constructors.Promise.Create(fun resolve reject ->
+                            transports[0].OnMessage(fun raw ->
+                                match decodeMessage raw with
+                                | Ok(TextDiffMessage.Error(requestId, _, failure)) when requestId = probeId -> resolve failure
+                                | Ok(TextDiffMessage.Result(requestId, _, _)) when requestId = probeId ->
+                                    reject (box (InvalidOperationException("The worker kept the mismatched preparation slot.")))
+                                | _ -> ()))
+
+                    transports[0].Post(
+                        encode(
+                            TextDiffMessage.Request(
+                                probeId,
+                                1,
+                                RequestBody.Open({ request with Continuation = Some continuation }, owner ())
+                            )
+                        )
+                    )
+
+                    let! probeFailure = probeReply
+                    Vitest.expect(probeFailure.Code).toBe TextDiffFailureCodes.ContinuationMismatch
                 })
         )
 
