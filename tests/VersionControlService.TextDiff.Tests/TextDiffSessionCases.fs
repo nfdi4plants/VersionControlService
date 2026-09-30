@@ -2178,6 +2178,10 @@ module TextDiffSessionCases =
             match later with
             | EngineResult.Failed(code, _, _) -> Check.equal TextDiffFailureCodes.WorkerFailed code "A later page request sees the failed session."
             | other -> failwith $"The failed session accepted another page request: {other}."
+            let holder = session :> IScratchHolder
+            Check.true' (not holder.MustKeepScratch) "A failed session does not keep its scratch."
+            do! holder.Spill()
+            Check.true' (not holder.HoldsScratch) "A failed session releases its scratch when asked to spill."
             do! session.Close()
             return ()
         }

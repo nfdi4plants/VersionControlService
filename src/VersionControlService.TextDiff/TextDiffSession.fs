@@ -3792,13 +3792,27 @@ type TextDiffSession internal (
     /// True while an alignment step or a restore is in progress, and for the request that follows a restore.
     /// The intermediate alignment state is not part of a snapshot, so a spill in this state would throw the
     /// step's work away.
-    let midStep () = aligner.IsSome || freshlyRestored || (spilled && restoreStage >= 1)
+    /// A failed session never resumes a step, so it can always give its scratch back.
+    let midStep () =
+        failure.IsNone && (aligner.IsSome || freshlyRestored || (spilled && restoreStage >= 1))
 
     /// Spills an idle session. A busy session keeps its state because its request is using it, and a session
     /// in the middle of a step keeps it until the step completes.
     let spillSession () : Async<EngineResult<unit>> = async {
         if closed || closing then return failClosed ()
         elif failure.IsSome then
+            // Only Close is still useful, so an idle failed session releases what other sessions may need.
+            if not busy then
+                match aligner with
+                | Some active ->
+                    active.Dispose()
+                    aligner <- None
+                | None -> ()
+                disposeResync ()
+                releaseWindows ()
+                releaseBuffers ()
+                for pending in pendingLineReads.Values do releasePendingLineRead pending
+                pendingLineReads.Clear()
             let code, message = failure.Value
             return EngineResult.Failed(code, message, None)
         elif invalidDetail.IsSome then return failContent ()
