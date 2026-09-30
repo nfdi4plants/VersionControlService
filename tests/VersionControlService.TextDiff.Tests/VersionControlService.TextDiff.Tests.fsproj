@@ -6,6 +6,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="TextDiffEngineCases.fs" />
+    <Compile Include="WorkerScratchCases.fs" />
     <Compile Include="TextDiffSessionCases.fs" />
     <Compile Include="TextDiffStreamingCases.fs" />
     <Compile Include="TextDiffResyncCases.fs" />

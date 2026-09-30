@@ -2385,4 +2385,175 @@ module TextDiffSessionCases =
             do! session.Close()
             return ()
         }
+        "a long line whose length is a multiple of the comparison block keeps correct slices", fun () -> async {
+            for length in [ 12_288; 12_289 ] do
+                let body = String.init length (fun index -> string (char (int 'a' + (index / 7) % 26)))
+                let previousText = body
+                let currentText = body + String.replicate 50 "XYZ"
+                let previous = [| { Text = "head"; Ending = LineEnding.LF }; { Text = previousText; Ending = LineEnding.LF }; { Text = "tail"; Ending = LineEnding.LF } |]
+                let current = [| { Text = "head"; Ending = LineEnding.LF }; { Text = currentText; Ending = LineEnding.LF }; { Text = "tail"; Ending = LineEnding.LF } |]
+                let! session = openSession (defaultConfig ()) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+                let! pages = readAll session (fun () -> false)
+                let changed = rows (allParts pages) |> Array.find (fun row -> row.Kind = DiffRowKind.Replaced)
+                for line, whole in [ changed.Previous.Value, previousText; changed.Current.Value, currentText ] do
+                    let offset = int line.Slice.OffsetUtf16
+                    Check.true' (offset <= whole.Length) "The slice starts inside the line."
+                    Check.equal (whole.Substring(offset, min line.Slice.Text.Length (whole.Length - offset))) line.Slice.Text "The slice text equals the source text."
+                do! session.Close()
+        }
+        "a UTF-32 long line with astral characters keeps its slices and replays them", fun () -> async {
+            let astral = "\U0001F600\U0001F600"
+            let previousText = String.replicate 4_094 "a" + astral + String.replicate 5_000 "b" + "X"
+            let currentText = String.replicate 4_094 "a" + astral + "c" + String.replicate 4_999 "b" + "X"
+            let utf32LittleEndian (text: string) =
+                let bytes = ResizeArray<byte>()
+                let mutable index = 0
+                while index < text.Length do
+                    let mutable codePoint = int text[index]
+                    if Char.IsHighSurrogate text[index] && index + 1 < text.Length then
+                        codePoint <- 0x10000 + ((codePoint - 0xD800) <<< 10) + (int text[index + 1] - 0xDC00)
+                        index <- index + 1
+                    for shift in [ 0; 8; 16; 24 ] do bytes.Add(byte ((codePoint >>> shift) &&& 0xFF))
+                    index <- index + 1
+                bytes.ToArray()
+            let previousBytes = utf32LittleEndian ("head\n" + previousText + "\nend\n")
+            let currentBytes = Encoding.Unicode.GetBytes("head\n" + currentText + "\nend\n")
+            let previous = sourceSpecWith (MemoryByteSource(previousBytes) :> IByteSource) "utf-32le" 0 (int64 previousBytes.Length)
+            let current = sourceSpecWith (MemoryByteSource(currentBytes) :> IByteSource) "utf-16le" 0 (int64 currentBytes.Length)
+            let! session = openSession (defaultConfig ()) previous current
+            let! pages = readAll session (fun () -> false)
+            let changed = rows (allParts pages) |> Array.find (fun row -> row.Kind = DiffRowKind.Replaced)
+            for line, whole in [ changed.Previous.Value, previousText; changed.Current.Value, currentText ] do
+                let offset = int line.Slice.OffsetUtf16
+                Check.true' (offset <= whole.Length) "The slice starts inside the line."
+                Check.equal (whole.Substring(offset, min line.Slice.Text.Length (whole.Length - offset))) line.Slice.Text "The slice text equals the source text."
+            for page in pages do
+                let! replay = session.ReplayPage page.PageId
+                Check.true' (Unchecked.equals page.Parts (unwrap replay).Parts) "Replay returns the page parts."
+            do! session.Close()
+        }
+        "a continuation answered before its read was evicted returns the recorded result", fun () -> async {
+            let longLine index = String.replicate 3_000 ("w" + string index + " ")
+            let previous = Array.init 10 (fun index -> { Text = longLine index; Ending = LineEnding.LF })
+            let current = Array.init 10 (fun index -> { Text = "x" + longLine index; Ending = LineEnding.LF })
+            let limits = { Limits.defaults with MaxUnits = 2; RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 }
+            let! session = openSession (config 1 1_000 1_024 4_096 limits) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+            let! _ = readAll session (fun () -> false)
+            let continuationOf = function
+                | EngineResult.Ok(Resumable.Scanning(_, value, _)) -> value
+                | other -> failwith $"The line read returned {other}."
+            let! started = session.ReadLine(DiffSide.Current, 0L, 8_192L, 8_192, None, fun () -> false)
+            let first = continuationOf started
+            let! answered = session.ReadLine(DiffSide.Current, 0L, 8_192L, 8_192, Some first, fun () -> false)
+            let second = continuationOf answered
+            for line in 1L .. 8L do
+                let! _ = session.ReadLine(DiffSide.Current, line, 8_192L, 8_192, None, fun () -> false)
+                ()
+            let! retry = session.ReadLine(DiffSide.Current, 0L, 8_192L, 8_192, Some first, fun () -> false)
+            Check.equal second (continuationOf retry) "The retry returns the continuation it answered before."
+            let! line = resolveLine session DiffSide.Current 0L 8_192L 8_192 retry
+            Check.equal (current[0].Text.Substring 8_192) line.Slice.Text "The recreated read completes with the source slice."
+            do! session.Close()
+        }
+        "a continuation that the session never issued is a mismatch", fun () -> async {
+            let longLine index = String.replicate 3_000 ("w" + string index + " ")
+            let previous = Array.init 4 (fun index -> { Text = longLine index; Ending = LineEnding.LF })
+            let current = Array.init 4 (fun index -> { Text = "x" + longLine index; Ending = LineEnding.LF })
+            let limits = { Limits.defaults with MaxUnits = 2; RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 }
+            let sessionConfig = config 1 1_000 1_024 4_096 limits
+            let! issuer = openSession sessionConfig (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+            let! other = openSession sessionConfig (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+            let mutable token = None
+            for _ in 1 .. 3 do
+                let! result = issuer.ReadLine(DiffSide.Current, 1L, 8_192L, 8_192, token, fun () -> false)
+                match result with
+                | EngineResult.Ok(Resumable.Scanning(_, value, _)) -> token <- Some value
+                | unexpected -> failwith $"The line read returned {unexpected}."
+            let! rejected = other.ReadLine(DiffSide.Current, 1L, 8_192L, 8_192, token, fun () -> false)
+            match rejected with
+            | EngineResult.Failed("continuation_mismatch", _, _) -> ()
+            | unexpected -> failwith $"A continuation that was never issued returned {unexpected}."
+            do! issuer.Close()
+            do! other.Close()
+        }
+        "a continued line read stays cached when other reads fill the cache", fun () -> async {
+            let longLine index = String.replicate 3_000 ("w" + string index + " ")
+            let previous = Array.init 12 (fun index -> { Text = longLine index; Ending = LineEnding.LF })
+            let current = Array.init 12 (fun index -> { Text = "x" + longLine index; Ending = LineEnding.LF })
+            let limits = { Limits.defaults with MaxUnits = 2; RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 }
+            // Returns the number of requests the read needs after the cache filled up around it.
+            let remainingRequests touchFirst = async {
+                let! session = openSession (config 1 1_000 1_024 4_096 limits) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+                let! _ = readAll session (fun () -> false)
+                let continuationOf = function
+                    | EngineResult.Ok(Resumable.Scanning(_, value, _)) -> Some value
+                    | _ -> None
+                let! started = session.ReadLine(DiffSide.Current, 0L, 8_192L, 8_192, None, fun () -> false)
+                let mutable token = continuationOf started
+                for _ in 1 .. 3 do
+                    let! next = session.ReadLine(DiffSide.Current, 0L, 8_192L, 8_192, token, fun () -> false)
+                    token <- continuationOf next
+                for line in 1L .. 7L do
+                    let! _ = session.ReadLine(DiffSide.Current, line, 8_192L, 8_192, None, fun () -> false)
+                    ()
+                if touchFirst then
+                    let! next = session.ReadLine(DiffSide.Current, 0L, 8_192L, 8_192, token, fun () -> false)
+                    token <- continuationOf next
+                let! _ = session.ReadLine(DiffSide.Current, 8L, 8_192L, 8_192, None, fun () -> false)
+                let mutable requests = 0
+                while token.IsSome do
+                    requests <- requests + 1
+                    let! next = session.ReadLine(DiffSide.Current, 0L, 8_192L, 8_192, token, fun () -> false)
+                    token <- continuationOf next
+                do! session.Close()
+                return requests
+            }
+            let! touched = remainingRequests true
+            let! untouched = remainingRequests false
+            Check.true' (touched < untouched) "A continued read is the newest cache entry, so a later read evicts an older one."
+        }
+        "a long pair comparison charges its work by the bytes compared", fun () -> async {
+            let prefix = String('p', 400_000)
+            let previous = [| { Text = "head"; Ending = LineEnding.LF }; { Text = prefix + "old" + String('s', 1_000); Ending = LineEnding.LF }; { Text = "tail"; Ending = LineEnding.LF } |]
+            let current = [| { Text = "head"; Ending = LineEnding.LF }; { Text = prefix + "new" + String('s', 1_000); Ending = LineEnding.LF }; { Text = "tail"; Ending = LineEnding.LF } |]
+            let limits = { Limits.defaults with MaxUnits = 64; RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 }
+            let! session = openSession (config 1 1_000 1_024 4_096 limits) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+            let! first = session.FirstPage(fun () -> false)
+            let mutable result = first
+            let mutable requests = 1
+            let mutable pending = true
+            while pending do
+                match result with
+                | EngineResult.Ok(Resumable.Ready page) ->
+                    match page.NextCursor with
+                    | None -> pending <- false
+                    | Some cursor ->
+                        requests <- requests + 1
+                        let! next = session.ReadPage cursor (fun () -> false)
+                        result <- next
+                | EngineResult.Ok(Resumable.Scanning(_, continuation, _)) ->
+                    requests <- requests + 1
+                    if requests > 10_000 then failwith "The session did not finish."
+                    let! next = session.ReadPage continuation (fun () -> false)
+                    result <- next
+                | other -> failwith $"The session returned {other}."
+            Check.true' (requests <= 40) "The comparison of 400,000 equal units needs a small number of requests."
+            do! session.Close()
+        }
+        "pages with many small hunks never exceed the fragment limit", fun () -> async {
+            for seed in 1 .. 40 do
+                let random = Random(seed)
+                let count = random.Next(10, 80)
+                let previous = Array.init count (fun index -> { Text = $"line {index}"; Ending = LineEnding.LF })
+                let current = previous |> Array.mapi (fun index line -> if random.Next 4 = 0 || index = count - 1 then { line with Text = line.Text + " x" } else line)
+                let limit = random.Next(1, 4)
+                let limits = { Limits.defaults with MaxUnits = random.Next(5, 60); RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 }
+                let sessionConfig = { config 3 (random.Next(2, 12)) 1_024 4_096 limits with PageMaxFragments = limit }
+                let! session = openSession sessionConfig (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+                let! pages = readAll session (fun () -> false)
+                for page in pages do
+                    let fragments = page.Parts |> Array.filter (function DiffPart.Hunk _ -> true | _ -> false)
+                    Check.true' (fragments.Length <= limit) "A page holds at most the configured number of hunk fragments."
+                do! session.Close()
+        }
     ]

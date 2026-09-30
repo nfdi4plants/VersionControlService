@@ -15,28 +15,26 @@ type IScratchHolder =
     /// Writes the suspended state to the session's temp store and releases the scratch memory.
     abstract Spill: unit -> Async<unit>
 
-type private Registration(holder: IScratchHolder) =
-    member _.Holder = holder
-    /// The position of the session's last served request. Zero means it was never served.
-    member val LastServed = 0L with get, set
-    member val Waiting = false with get, set
-    /// The position of the session's latest request among all requests of the worker.
-    member val LastRequest = 0L with get, set
-    /// The number of requests in a row that were refused. An admitted request resets it.
-    member val Refusals = 0 with get, set
-    /// The position of the first refused request of the current run of refusals.
-    member val RefusedSince = 0L with get, set
+module private ScratchTiming =
+    [<Literal>]
+    let ScratchYieldIdleMs = 2_000.0
 
-/// Coordinates the sessions of one worker. Scratch memory is limited per worker. A session that is in the
-/// middle of an alignment step or a restore keeps its scratch while it keeps requesting. When it asks for nothing
-/// while another session is refused several times in a row, it yields. A request first asks every other idle
-/// session to spill what it holds. Waiting sessions are served in order of their last served request.
+type private Registration(holder: IScratchHolder, clock: IClock) =
+    member _.Holder = holder
+    member _.Clock = clock
+    /// The engine clock time when this session last asked to use scratch memory.
+    member val LastRequestMs = clock.NowMs() with get, set
+    /// The session that yielded so this one could finish its current scratch-backed step.
+    member val ProtectedFrom: Registration option = None with get, set
+    /// True once this session reported an unfinished step after it gained protection.
+    member val KeptSinceProtected = false with get, set
+
+/// Coordinates scratch memory for the sessions of one worker. A session keeps unfinished work while it requests
+/// within the idle interval. After that interval, another requester may ask it to yield. The requester that gains
+/// scratch through a yield keeps it until it completes one step, so the displaced session cannot yield it back while
+/// the new holder is still warming up. An admitted request spills other idle sessions whose scratch is safe to release.
 type WorkerScratch() =
-    /// The number of refused requests in a row after which an idle mid-step session gives up its unfinished work.
-    let refusalsBeforeYield = 3
     let registrations = List<Registration>()
-    let mutable served = 0L
-    let mutable requestTick = 0L
 
     let find (holder: IScratchHolder) =
         let mutable found: Registration option = None
@@ -50,67 +48,68 @@ type WorkerScratch() =
             if not (obj.ReferenceEquals(registration.Holder, requester)) && registration.Holder.MustKeepScratch then keeps <- true
         keeps
 
-    /// The waiting session that was served least recently. Sessions with the same position keep the order in
-    /// which they registered.
-    let firstWaiting () =
-        let mutable first: Registration option = None
-        for registration in registrations do
-            if registration.Waiting then
-                match first with
-                | Some current when current.LastServed <= registration.LastServed -> ()
-                | _ -> first <- Some registration
-        first
-
-    member _.Register(holder: IScratchHolder) =
-        if (find holder).IsNone then registrations.Add(Registration holder)
+    member _.Register(holder: IScratchHolder, clock: IClock) =
+        if (find holder).IsNone then registrations.Add(Registration(holder, clock))
 
     member _.Unregister(holder: IScratchHolder) =
         match find holder with
-        | Some registration -> registrations.Remove registration |> ignore
+        | Some registration ->
+            registrations.Remove registration |> ignore
+            for other in registrations do
+                match other.ProtectedFrom with
+                | Some displaced when obj.ReferenceEquals(displaced, registration) ->
+                    other.ProtectedFrom <- None
+                    other.KeptSinceProtected <- false
+                | _ -> ()
         | None -> ()
 
     member _.Count = registrations.Count
 
-    /// Decides whether the requester may use the worker's scratch memory now. A holder that is idle in the
-    /// middle of a step yields once the requester has been refused several times in a row and the holder has
-    /// asked for nothing since the first of those refusals. A requester that may proceed first spills every other
-    /// idle session that holds scratch memory and is not in the middle of a step. It returns false when the
-    /// requester has to wait.
+    /// Decides whether the requester may use the worker's scratch memory now. An idle holder yields unfinished
+    /// work after the yield interval. A holder that asks within the interval keeps its work. A requester admitted
+    /// after a yield may finish its current step before the displaced holder can take the scratch back. An admitted
+    /// requester first spills other idle sessions whose scratch is safe to release.
     member _.BeginRequest(requester: IScratchHolder) = async {
         let registration =
             match find requester with
             | Some existing -> existing
-            | None ->
-                let created = Registration requester
-                registrations.Add created
-                created
-        requestTick <- requestTick + 1L
-        registration.LastRequest <- requestTick
-        registration.Waiting <- true
-        let refusedInARow = registration.Refusals + 1
-        let refusedSince = if registration.Refusals = 0 then requestTick else registration.RefusedSince
-        if not requester.MustKeepScratch && refusedInARow >= refusalsBeforeYield then
+            | None -> invalidOp "The scratch holder must be registered before it begins a request."
+        registration.LastRequestMs <- registration.Clock.NowMs()
+        for current in registrations do
+            if current.ProtectedFrom.IsSome then
+                if current.Holder.MustKeepScratch then current.KeptSinceProtected <- true
+                elif current.KeptSinceProtected then
+                    current.ProtectedFrom <- None
+                    current.KeptSinceProtected <- false
+        let mutable displaced: Registration option = None
+        if not requester.MustKeepScratch then
             for other in registrations.ToArray() do
-                if not (obj.ReferenceEquals(other.Holder, requester))
-                   && not other.Holder.IsBusy
-                   && other.Holder.MustKeepScratch
-                   && other.LastRequest < refusedSince then
+                let protectedFromRequester =
+                    match other.ProtectedFrom with
+                    | Some protectedFrom -> obj.ReferenceEquals(protectedFrom.Holder, requester)
+                    | None -> false
+                if
+                    not (obj.ReferenceEquals(other.Holder, requester))
+                    && not other.Holder.IsBusy
+                    && other.Holder.MustKeepScratch
+                    && not protectedFromRequester
+                    && other.Clock.NowMs() - other.LastRequestMs >= ScratchTiming.ScratchYieldIdleMs
+                then
                     do! other.Holder.YieldScratch()
+                    if not other.Holder.MustKeepScratch then
+                        other.ProtectedFrom <- None
+                        other.KeptSinceProtected <- false
+                        displaced <- Some other
         let mustWait =
             not requester.MustKeepScratch
-            && (othersKeepScratch requester
-                || (match firstWaiting () with
-                    | Some first -> not (obj.ReferenceEquals(first, registration))
-                    | None -> false))
-        registration.Waiting <- false
-        if mustWait then
-            if registration.Refusals = 0 then registration.RefusedSince <- refusedSince
-            registration.Refusals <- refusedInARow
-            return false
+            && othersKeepScratch requester
+        if mustWait then return false
         else
-            registration.Refusals <- 0
-            served <- served + 1L
-            registration.LastServed <- served
+            match displaced with
+            | Some yielded ->
+                registration.ProtectedFrom <- Some yielded
+                registration.KeptSinceProtected <- false
+            | None -> ()
             for other in registrations.ToArray() do
                 let holder = other.Holder
                 if not (obj.ReferenceEquals(holder, requester)) && holder.HoldsScratch && not holder.IsBusy && not holder.MustKeepScratch then

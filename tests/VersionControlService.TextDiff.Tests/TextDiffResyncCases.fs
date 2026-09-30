@@ -45,6 +45,16 @@ module TextDiffResyncCases =
         ByteLength = int64 bytes.Length
     }
 
+    /// The bytes start with a UTF-8 byte order mark that the session does not decode as text.
+    let private bomSpec (bytes: byte[]) =
+        let withMark = Array.append [| 0xEFuy; 0xBBuy; 0xBFuy |] bytes
+        {
+            Source = Some(MemoryByteSource(withMark) :> IByteSource)
+            Encoding = "utf-8"
+            BomLength = 3
+            ByteLength = int64 withMark.Length
+        }
+
     let private lines prefix start count =
         Array.init count (fun index -> { Text = prefix + string (start + index); Ending = LineEnding.LF })
 
@@ -486,7 +496,8 @@ module TextDiffResyncCases =
             let! plainLarge = run { smallConfig "yield-plain-large" with Limits = tinyLimits } previous current
             let! plainSmall = run { smallConfig "yield-plain-small" with Limits = tinyLimits } smallPrevious smallCurrent
             let coordinator = WorkerScratch()
-            let host = Host.createInMemory (ManualClock 0.0 :> IClock)
+            let clock = ManualClock 0.0
+            let host = Host.createInMemory (clock :> IClock)
             let! first = openOnWorker coordinator host "yield-large" previous current
             let! second = openOnWorker coordinator host "yield-small" smallPrevious smallCurrent
             let holder = first :> IScratchHolder
@@ -501,6 +512,7 @@ module TextDiffResyncCases =
                 if requests > 200_000 then failwith "The first session never entered an alignment step."
                 do! advanceRunner firstRunner
             Check.true' (holder.MustKeepScratch && hasReadyPage firstRunner.Result) "The viewer stops after a ready page while alignment is incomplete."
+            clock.Advance 2_000.0
             let! secondStart = second.FirstPage(fun () -> false)
             let secondRunner = newRunner second secondStart
             let mutable secondRequests = 1
@@ -521,14 +533,15 @@ module TextDiffResyncCases =
             Check.equal 0 coordinator.Count "Closed sessions leave the coordinator."
         }
         "a requester that stops waiting does not keep its place", fun () -> async {
+            let clock = ManualClock 0.0
             let coordinator = WorkerScratch()
             let holder = TestScratchHolder()
             let stopped = TestScratchHolder()
             let next = TestScratchHolder()
             holder.Set(true, true, true)
-            coordinator.Register(holder :> IScratchHolder)
-            coordinator.Register(stopped :> IScratchHolder)
-            coordinator.Register(next :> IScratchHolder)
+            coordinator.Register(holder :> IScratchHolder, clock :> IClock)
+            coordinator.Register(stopped :> IScratchHolder, clock :> IClock)
+            coordinator.Register(next :> IScratchHolder, clock :> IClock)
             let! firstAttempt = coordinator.BeginRequest(stopped :> IScratchHolder)
             Check.equal false firstAttempt "The requester waits while a busy session keeps scratch."
             holder.Set(true, false, false)
@@ -567,6 +580,63 @@ module TextDiffResyncCases =
             do! invalidSession.Close()
             do! nextSession.Close()
             Check.equal 0 coordinator.Count "Closed sessions leave the coordinator."
+        }
+        "a session that finishes in the request that completed its restore does not keep scratch", fun () -> async {
+            let previous = lines "line-" 0 300
+            let current = Array.copy previous
+            for index in 20 .. 25 do
+                current[index] <- { current[index] with Text = "edited-" + string index }
+            let host = Host.createInMemory (ManualClock 0.0 :> IClock)
+            let spills = ref 0
+            let! session = TextDiffSession.create host (Ledger()) { smallConfig "restore-finish" with Limits = tightLimits } (fun _ -> 1) (spec (encode previous)) (spec (encode current))
+            let! _ = readAll session (spillEvery 1 spills)
+            Check.true' (spills.Value > 0) "The run spilled at least once."
+            Check.true' (not (session :> IScratchHolder).MustKeepScratch) "A finished session releases its claim on scratch memory."
+            do! session.Close()
+        }
+        "a yield with a byte order mark on one side reloads from after the mark", fun () -> async {
+            let random = Random(5)
+            let previous = Array.init 400 (fun index -> { Text = $"line {index} {random.Next 100_000}"; Ending = LineEnding.LF })
+            let current = previous |> Array.mapi (fun index line -> if index % 3 = 0 then { line with Text = line.Text + " x" } else line)
+            let smallPrevious = [| { Text = "one"; Ending = LineEnding.LF }; { Text = "two"; Ending = LineEnding.LF } |]
+            let smallCurrent = [| { Text = "one"; Ending = LineEnding.LF }; { Text = "TWO"; Ending = LineEnding.LF } |]
+            let coordinator = WorkerScratch()
+            let clock = ManualClock 0.0
+            let host = Host.createInMemory (clock :> IClock)
+            let! first =
+                TextDiffSession.createWithScratch coordinator host (Ledger()) { smallConfig "bom-yield-large" with Limits = tinyLimits } (fun _ -> 1) (bomSpec (encode previous)) (spec (encode current))
+            let! second = openOnWorker coordinator host "bom-yield-small" smallPrevious smallCurrent
+            let holder = first :> IScratchHolder
+            let! firstStart = first.FirstPage(fun () -> false)
+            let firstRunner = newRunner first firstStart
+            let mutable requests = 0
+            while not holder.MustKeepScratch && not firstRunner.Finished do
+                requests <- requests + 1
+                if requests > 200_000 then failwith "The first session never entered an alignment step."
+                do! advanceRunner firstRunner
+            Check.true' holder.MustKeepScratch "The first session stops inside an alignment step."
+            clock.Advance 2_000.0
+            let! secondStart = second.FirstPage(fun () -> false)
+            Check.true' (not holder.MustKeepScratch) "The idle session yields to the other request."
+            let secondRunner = newRunner second secondStart
+            while not secondRunner.Finished do do! advanceRunner secondRunner
+            while not firstRunner.Finished do do! advanceRunner firstRunner
+            let parts = firstRunner.Pages.ToArray() |> Array.collect (fun page -> page.Parts)
+            Check.sequence previous (rebuild previous parts true) "The yielded session covers every previous line without the mark."
+            Check.sequence current (rebuild current parts false) "The yielded session covers every current line."
+            do! first.Close()
+            do! second.Close()
+        }
+        "a resync that starts in the first window skips a byte order mark", fun () -> async {
+            let previous = lines "old-" 0 300
+            let current = Array.append (lines "new-" 0 150) previous[150 ..]
+            let host = Host.createInMemory (ManualClock 0.0 :> IClock)
+            let! session = TextDiffSession.create host (Ledger()) (smallConfig "bom-resync") (fun _ -> 1) (bomSpec (encode previous)) (spec (encode current))
+            let! shape = readAll session noHook
+            let parts = shape.Pages |> Array.collect (fun page -> page.Parts)
+            Check.sequence previous (rebuild previous parts true) "The pages cover every previous line without the mark."
+            Check.sequence current (rebuild current parts false) "The pages cover every current line."
+            do! session.Close()
         }
     ]
 

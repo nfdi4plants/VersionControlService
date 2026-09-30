@@ -487,8 +487,8 @@ type TextDiffSession internal (
     let mutable feedPrevious = 0
     let mutable feedCurrent = 0
     let mutable regionStarted = false
-    let mutable pBase = 0.0
-    let mutable cBase = 0.0
+    let mutable pBase = float previousSpec.BomLength
+    let mutable cBase = float currentSpec.BomLength
     let mutable partialAlign = false
     let mutable partialPrevious = -1
     let mutable partialCurrent = -1
@@ -2225,7 +2225,12 @@ type TextDiffSession internal (
             | _ -> 1
         while count < wanted && not failed && not blocked && not (cancel ()) && not (Meter.overBudget meter) && cursor.Position < cursor.ContentEnd do
             let remainingUnits = wanted - count
-            let byteCount = int (min (float cursor.Buffer.Length) (min (cursor.ContentEnd - cursor.Position) (float (remainingUnits * byteWidth))))
+            let requestedBytes =
+                match cursor.Encoding with
+                | TextEncoding.Utf32LE
+                | TextEncoding.Utf32BE -> max 4 ((remainingUnits / 2) * 4)
+                | _ -> remainingUnits * byteWidth
+            let byteCount = int (min (float cursor.Buffer.Length) (min (cursor.ContentEnd - cursor.Position) (float requestedBytes)))
             if byteCount <= 0 then failed <- true
             else
                 match cursor.Spec.Source with
@@ -2354,7 +2359,6 @@ type TextDiffSession internal (
         let mutable canceled = false
         while compared < shared && not mismatch && not blocked && not canceled && not (Meter.overBudget meter) do
             if cancel () then canceled <- true
-            elif Meter.overBudget meter then ()
             else
                 let segment = min 64 (shared - compared)
                 let equal =
@@ -2364,15 +2368,14 @@ type TextDiffSession internal (
                         pending.CurrentBlock
                         pending.CurrentBlockPosition
                         segment
-                Meter.charge meter 1
+                Meter.chargeBytes meter (segment * 2)
                 if equal > 0 then
                     pending.PreviousBlockPosition <- pending.PreviousBlockPosition + equal
                     pending.CurrentBlockPosition <- pending.CurrentBlockPosition + equal
                     pending.PrefixLength <- pending.PrefixLength + float equal
                     compared <- compared + equal
                 if equal < segment then mismatch <- true
-                elif compared < shared && (cancel () || Meter.overBudget meter) then
-                    if cancel () then canceled <- true else blocked <- true
+                elif compared < shared && cancel () then canceled <- true
         compared, mismatch, blocked, canceled
 
     let compareLongPairSuffix (pending: PendingLongPair) (meter: Meter) (cancel: unit -> bool) =
@@ -2386,7 +2389,6 @@ type TextDiffSession internal (
               && not canceled
               && not (Meter.overBudget meter) do
             if cancel () then canceled <- true
-            elif Meter.overBudget meter then blocked <- true
             else
                 let segment = min 64 (min (pending.PreviousReverse.BlockPosition + 1) (pending.CurrentReverse.BlockPosition + 1))
                 let equal =
@@ -2396,7 +2398,7 @@ type TextDiffSession internal (
                         pending.CurrentReverse.Units
                         (pending.CurrentReverse.BlockPosition + 1)
                         segment
-                Meter.charge meter 1
+                Meter.chargeBytes meter (segment * 2)
                 if equal > 0 then
                     pending.SuffixLength <- pending.SuffixLength + float equal
                     pending.LastSuffixUnit <- pending.PreviousReverse.Units[pending.PreviousReverse.BlockPosition - equal + 1]
@@ -2414,7 +2416,6 @@ type TextDiffSession internal (
                        && currentUnit >= 0xD800us && currentUnit <= 0xDBFFus then
                         pending.SuffixLength <- pending.SuffixLength - 1.0
                 elif cancel () then canceled <- true
-                elif Meter.overBudget meter then blocked <- true
         mismatch, blocked, canceled
 
     let advanceLongPair (pending: PendingLongPair) (meter: Meter) (cancel: unit -> bool) = async {
@@ -2511,9 +2512,16 @@ type TextDiffSession internal (
                             Array.blit nextPrevious 0 pending.PreviousHistory 0 nextPreviousCount
                             Array.blit nextCurrent 0 pending.CurrentHistory 0 nextCurrentCount
                             pending.HistoryCount <- min nextPreviousCount nextCurrentCount
-                            pending.UnitOffset <- pending.UnitOffset + float pending.PreviousBlockCount
+                            let consumed = pending.PreviousBlockCount
+                            pending.UnitOffset <- pending.UnitOffset + float consumed
                             pending.PrefixLength <- pending.UnitOffset
-                            if pending.PreviousBlockCount = 0 then
+                            pending.PreviousBlockPosition <- 0
+                            pending.PreviousBlockCount <- 0
+                            pending.PreviousBlockComplete <- false
+                            pending.CurrentBlockPosition <- 0
+                            pending.CurrentBlockCount <- 0
+                            pending.CurrentBlockComplete <- false
+                            if consumed = 0 then
                                 makeFound pending.UnitOffset None None
                         elif pending.PreviousFinished && pending.PreviousBlockPosition >= pending.PreviousBlockCount then
                             makeFound (pending.UnitOffset + float pending.PreviousBlockPosition) None None
@@ -2967,6 +2975,7 @@ type TextDiffSession internal (
                     usedBytes <- usedBytes + size
                     fullCount <- fullCount + 1
                     index <- index + 1
+            elif fragments >= config.PageMaxFragments || (item.Total > 0 && rowsUsed >= config.PageMaxRows) then stop <- true
             elif item.Kind = ItemKind.Rows && item.Total = 0 then
                 let start = item.Consumed
                 let previousBefore = countSide item.Rows 0 start true
@@ -2983,7 +2992,6 @@ type TextDiffSession internal (
                     fullCount <- fullCount + 1
                     fullFragments <- fullFragments + 1
                     index <- index + 1
-            elif fragments >= config.PageMaxFragments || (item.Total > 0 && rowsUsed >= config.PageMaxRows) then stop <- true
             else
                 let start = item.Consumed
                 let requested = min item.Remaining (config.PageMaxRows - rowsUsed)
@@ -3015,7 +3023,7 @@ type TextDiffSession internal (
                             match built with
                             | None -> return None
                             | Some rows ->
-                                noRowsBuilt <- rows.Length = 0 && available > 0
+                                noRowsBuilt <- rows.Length = 0
                                 return takeBuiltFragment rows.Length byteRoom cancel rows (fun values -> rowsPart hunkId item start previousBefore currentBefore values)
                         }
                         elif item.PreviousLines.Length > 0 then async {
@@ -3133,8 +3141,8 @@ type TextDiffSession internal (
             | Some coordinator, Some self -> coordinator.BeginRequest self
             | _ -> async.Return true
         if not admitted || not (ensureBuffers ()) then
-            // Another session is in the middle of a step or was waiting longer, or other sessions hold the
-            // chunk scratch. The job suspends and the next request tries again.
+            // Another session is in the middle of a step, or other sessions hold the chunk scratch.
+            // The job suspends and the next request tries again.
             let value = Resumable.Scanning(progress (), identifier "c" (sequence + 1L), None)
             do! recordResult sequence value
             return! presentPageResult (EngineResult.Ok value)
@@ -3181,7 +3189,8 @@ type TextDiffSession internal (
                             waited <- false
                             do! host.Yield()
                 first <- false
-            if ranAfterRestore then freshlyRestored <- false
+            // A restore that finished in this request keeps its protection for the next request, unless the output is complete.
+            if ranAfterRestore || modeIsDone () then freshlyRestored <- false
             return! presentPageResult result.Value
     }
 
@@ -4039,11 +4048,24 @@ type TextDiffSession internal (
         lineReadUse <- lineReadUse + 1L
         pending.LastUsed <- lineReadUse
 
+    let lineReadContinuationWasIssued attempt sequence =
+        attempt >= 0L
+        && attempt < nextLineAttempt
+        && sequence >= 0L
+        && sequence < nextLineRequest
+
+    let cacheLineRead (pending: PendingLineRead) =
+        touchLineRead pending
+        pendingLineReads[pending.Attempt] <- pending
+        while pendingLineReads.Count > 8 do
+            let expired = pendingLineReads.Values |> Seq.minBy (fun candidate -> candidate.LastUsed)
+            releasePendingLineRead expired
+            pendingLineReads.Remove expired.Attempt |> ignore
+
     let recreateLineRead side line offset maxUtf16 attempt sequence = async {
         let! pairedLine = pairings.Find(side, line)
         let! pending = createLineRead side line offset maxUtf16 attempt sequence pairedLine
-        touchLineRead pending
-        pendingLineReads[attempt] <- pending
+        cacheLineRead pending
         return pending
     }
 
@@ -4163,6 +4185,22 @@ type TextDiffSession internal (
             releasePendingLineRequest pending
     }
 
+    let runRecreatedLineReadRequest (pending: PendingLineRead) sequence (cancel: unit -> bool) = async {
+        let discard () =
+            releasePendingLineRead pending
+            pendingLineReads.Remove pending.Attempt |> ignore
+        try
+            let! result = runLineReadRequest pending sequence cancel
+            match result with
+            | EngineResult.Canceled
+            | EngineResult.Failed _ -> discard ()
+            | _ -> ()
+            return result
+        with error ->
+            discard ()
+            return failWorker error.Message
+    }
+
     let sourceInfo sideIndex =
         let spec = specAt sideIndex
         let side = scanSideAt sideIndex
@@ -4197,7 +4235,8 @@ type TextDiffSession internal (
     /// step's work away.
     /// A failed session never resumes a step, so it can always give its scratch back.
     let midStep () =
-        failure.IsNone
+        not (modeIsDone ())
+        && failure.IsNone
         && invalidDetail.IsNone
         && (aligner.IsSome || freshlyRestored || (spilled && restoreStage >= 1))
 
@@ -4473,39 +4512,35 @@ type TextDiffSession internal (
                             | Some token ->
                                 match readOperationIdentifier "l" binding token with
                                 | None -> return failMismatch ()
+                                | Some(attempt, sequence) when not (lineReadContinuationWasIssued attempt sequence) -> return failMismatch ()
                                 | Some(attempt, sequence) ->
                                     let! recorded = journal.Read(journalKey 2L sequence)
                                     match recorded with
-                                    | Some(JournalValue.Line(Resumable.Scanning(scanProgress, recordedContinuation, _))) ->
+                                    | Some(JournalValue.Line(Resumable.Scanning(scanProgress, recordedContinuation, _) as recordedResult)) ->
                                         match pendingLineReads.TryGetValue attempt with
                                         | true, pending ->
                                             touchLineRead pending
                                             let! preview = pending.Search |> Option.map pendingSeekPreview |> Option.defaultValue (async.Return None)
                                             if invalidDetail.IsSome then return failContent ()
                                             else return EngineResult.Ok(Resumable.Scanning(scanProgress, recordedContinuation, preview))
-                                        | _ ->
-                                            let! pending = recreateLineRead side line offsetUtf16 maxUtf16 attempt sequence
-                                            return! runLineReadRequest pending sequence cancel
+                                        | _ -> return EngineResult.Ok recordedResult
                                     | Some(JournalValue.Line result) -> return EngineResult.Ok result
                                     | Some _ -> return failMismatch ()
                                     | None ->
                                         match pendingLineReads.TryGetValue attempt with
                                         | true, pending when pending.Side = side && pending.Line = line && pending.OffsetUtf16 = offsetUtf16 && pending.MaxUtf16 = maxUtf16 && pending.RequestSequence = sequence ->
+                                            touchLineRead pending
                                             return! runLineReadRequest pending sequence cancel
-                                        | _ ->
+                                        | _ when lineReadContinuationWasIssued attempt sequence ->
                                             let! pending = recreateLineRead side line offsetUtf16 maxUtf16 attempt sequence
-                                            return! runLineReadRequest pending sequence cancel
+                                            return! runRecreatedLineReadRequest pending sequence cancel
+                                        | _ -> return failMismatch ()
                             | None ->
                                 let attempt = allocateLineAttempt ()
                                 let sequence = allocateLineRequest ()
                                 let! pairedLine = pairings.Find(side, line)
                                 let! pending = createLineRead side line offsetUtf16 maxUtf16 attempt sequence pairedLine
-                                touchLineRead pending
-                                pendingLineReads[attempt] <- pending
-                                while pendingLineReads.Count > 8 do
-                                    let expired = pendingLineReads.Values |> Seq.minBy (fun candidate -> candidate.LastUsed)
-                                    releasePendingLineRead expired
-                                    pendingLineReads.Remove expired.Attempt |> ignore
+                                cacheLineRead pending
                                 let! result = runLineReadRequest pending sequence cancel
                                 match result with
                                 | EngineResult.Canceled
@@ -4535,7 +4570,7 @@ type TextDiffSession internal (
         let self = this :> IScratchHolder
         scratch <- Some coordinator
         holder <- Some self
-        coordinator.Register self
+        coordinator.Register(self, host.Clock)
 
     member _.Close() = async {
         if not closed then
