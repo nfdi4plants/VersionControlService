@@ -933,6 +933,10 @@ type TextDiffSession internal (
         releaseWindows ()
         mode <- Mode.Resync
 
+    /// A window may still grow while its limit is below the largest size and neither side filled its bytes.
+    let canGrowWindow () =
+        windowLimit < config.WindowMaxLines && not previousSide.ByteFull && not currentSide.ByteFull
+
     /// Chooses how many operations the window commits. Trailing changes stay unsettled because the next window
     /// may match them differently.
     let decideCommit () =
@@ -940,7 +944,7 @@ type TextDiffSession internal (
         let currentTable = currentSide.Table
         let bothFinished = previousSide.Finished && currentSide.Finished
         let emptyTable = previousTable.Count = 0 || currentTable.Count = 0
-        let canGrow = windowLimit < config.WindowMaxLines && not previousSide.ByteFull && not currentSide.ByteFull
+        let canGrow = canGrowWindow ()
         preserveWindowAfterCommit <- false
         let mutable lastAnchored = -1
         let mutable lastPrefixAnchor = -1
@@ -1034,7 +1038,7 @@ type TextDiffSession internal (
                 else Array.empty
             decideCommit ()
         else
-            aligner <- Some(WindowAligner(previousTable, currentTable, config.MyersStepsPerGap, previousSpec.ByteLength = currentSpec.ByteLength, not partialAlign, ledger))
+            aligner <- Some(WindowAligner(previousTable, currentTable, config.MyersStepsPerGap, previousSpec.ByteLength = currentSpec.ByteLength, (not partialAlign) && not (canGrowWindow ()), ledger))
             windowState <- WindowState.Aligning
 
     let loadSide (side: ScanSide) (buffer: byte[]) (meter: Meter) = async {

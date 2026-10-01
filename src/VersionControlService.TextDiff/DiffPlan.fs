@@ -208,8 +208,9 @@ type private AlignPhase =
 /// Aligns the lines of two windows without ever holding line text. Line keys (two hash halves and the
 /// UTF-16 length) select candidates, and the caller confirms every claimed run of equal lines against the
 /// source bytes through NeedRun and ResolveRun. The work is split into steps that each do a bounded amount
-/// of work and charge the meter. A window of a source that is still growing passes false for longRunAnchors,
-/// because a long equal run in repetitive text can line up at a shifted position until more lines arrive.
+/// of work and charge the meter. A window of a source that is still growing, or a window that can still grow,
+/// passes false for longRunAnchors, because a long equal run in repetitive text can line up at a shifted
+/// position until more lines arrive.
 type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap: int, sameSourceLength: bool, longRunAnchors: bool, ledger: Ledger) =
     let stepChunk = 512
     let lookaheadLines = 2

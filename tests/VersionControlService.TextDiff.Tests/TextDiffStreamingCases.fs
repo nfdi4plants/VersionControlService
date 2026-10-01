@@ -136,6 +136,30 @@ module TextDiffStreamingCases =
             | _ -> ()
         added, removed, unalignedPrevious, unalignedCurrent
 
+    /// Counts equal lines (hidden and context), added, removed and replaced rows, and unaligned lines.
+    let private rowCounts pages =
+        let mutable equal = 0
+        let mutable added = 0
+        let mutable removed = 0
+        let mutable replaced = 0
+        let mutable unaligned = 0
+        for part in allParts pages do
+            match part with
+            | DiffPart.HiddenEqual gap -> equal <- equal + int gap.PreviousRange.Count
+            | DiffPart.Hunk fragment ->
+                match fragment.Body with
+                | HunkBody.AlignedRows rows ->
+                    for row in rows do
+                        match row.Kind with
+                        | DiffRowKind.Context -> equal <- equal + 1
+                        | DiffRowKind.Added -> added <- added + 1
+                        | DiffRowKind.Removed -> removed <- removed + 1
+                        | DiffRowKind.Replaced -> replaced <- replaced + 1
+                        | _ -> ()
+                | HunkBody.UnalignedSides(previous, current) -> unaligned <- unaligned + previous.Length + current.Length
+            | _ -> ()
+        equal, added, removed, replaced, unaligned
+
     let private rebuild expected parts previousSide =
         let output = ResizeArray<SourceLine>()
 
@@ -642,6 +666,34 @@ module TextDiffStreamingCases =
             let changed = allParts pages |> Array.collect (function DiffPart.Hunk { Body = HunkBody.AlignedRows rows } -> rows | _ -> [||])
             Check.true' (changed |> Array.exists (fun row -> row.Kind = DiffRowKind.Replaced)) "Different lines with equal masked hashes stay changed."
             do! session.Close()
+            return ()
+        }
+        "a repeated line run before a unique line keeps the single insertion exact", fun () -> async {
+            let sourceLine text = { Text = text; Ending = LineEnding.LF }
+            let previous = Array.append (Array.create 1_000 (sourceLine "a")) [| sourceLine "MARK" |]
+            let current = Array.append [| sourceLine "b" |] previous
+            let! session = openSession (Ledger()) (SessionConfig.defaults "stream-run-anchor-growth") (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+            let! pages, _ = readAll session
+            checkOracle previous current pages
+            Check.equal (1_001, 1, 0, 0, 0) (rowCounts pages) "The window grows before a long equal run settles it, so one line is added and nothing is replaced."
+            do! session.Close()
+            return ()
+        }
+        "a cyclic log with a growing previous source misses no equal lines", fun () -> async {
+            let sourceLine text = { Text = text; Ending = LineEnding.LF }
+            let cycle index = sourceLine $"cycle line {index % 13}"
+            let previous = Array.init 6_000 (fun index -> if index % 97 = 0 then sourceLine $"m marker {index}" else cycle index)
+            let current = Array.concat [ previous[.. 1_999]; Array.init 700 cycle; previous[2_000 ..] ]
+            let previousBytes = encodeLines previous
+            let currentBytes = encodeLines current
+            for growth in [| 1_024; 4_096; 16_384 |] do
+                let growing = GrowingByteSource(previousBytes, growth, 2) :> IByteSource
+                let! session = openSession (Ledger()) (SessionConfig.defaults $"stream-cyclic-growth-{growth}") (sourceSpecWith growing previousBytes) (sourceSpec currentBytes)
+                let! pages, _ = readAll session
+                checkOracle previous current pages
+                let _, added, removed, replaced, unaligned = rowCounts pages
+                Check.equal (700, 0, 0, 0) (added, removed, replaced, unaligned) $"Growth by {growth} bytes shows only the inserted lines."
+                do! session.Close()
             return ()
         }
     ]
