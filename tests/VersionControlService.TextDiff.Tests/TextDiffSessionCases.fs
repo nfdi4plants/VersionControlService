@@ -2827,4 +2827,43 @@ module TextDiffSessionCases =
             with error -> message <- error.Message
             Check.true' (message.Contains "WindowMaxLines") $"The oversize window is rejected with a message that names WindowMaxLines. Got: {message}"
         }
+        "equal lines between different encodings are confirmed in large reads", fun () -> async {
+            let lineCount = 100_000
+            let differing = 50_000
+            let textOf (index: int) (special: string) =
+                if index = differing then special + " von Hohenlohe\n" else sprintf "common line %06d with some padding text\n" index
+            let build (special: string) = String.concat "" [ for index in 0 .. lineCount - 1 -> textOf index special ]
+            let previousBytes = Encoding.UTF8.GetBytes(build "Graefin")
+            let currentText = build "Gräfin"
+            let currentLatin1 = Array.init currentText.Length (fun index -> byte currentText[index])
+            let currentUtf8 = Encoding.UTF8.GetBytes currentText
+            let rowShape pages =
+                allParts pages
+                |> Array.collect (function
+                    | DiffPart.Hunk { Body = HunkBody.AlignedRows values } ->
+                        values
+                        |> Array.map (fun row ->
+                            row.Kind,
+                            row.Previous |> Option.map (fun line -> line.Number, line.Slice.Text),
+                            row.Current |> Option.map (fun line -> line.Number, line.Slice.Text))
+                    | _ -> Array.empty)
+            let previousSource = CountingByteSource previousBytes
+            let currentSource = CountingByteSource currentLatin1
+            let mixed = SessionConfig.defaults "decode-compare-reads"
+            let! mixedSession =
+                openSession
+                    mixed
+                    (sourceSpecWith (previousSource :> IByteSource) "utf-8" 0 (int64 previousBytes.Length))
+                    (sourceSpecWith (currentSource :> IByteSource) "windows-1252" 0 (int64 currentLatin1.Length))
+            let! mixedPages = readAll mixedSession (fun () -> false)
+            do! mixedSession.Close()
+            let! uniformSession = openSession (SessionConfig.defaults "decode-compare-uniform") (sourceSpec previousBytes) (sourceSpec currentUtf8)
+            let! uniformPages = readAll uniformSession (fun () -> false)
+            do! uniformSession.Close()
+            let expected = rowShape uniformPages
+            Check.true' (expected |> Array.exists (fun (kind, _, _) -> kind = DiffRowKind.Replaced)) "The comparison has a replaced row."
+            Check.sequence expected (rowShape mixedPages) "Mixed encodings give the rows of the same text in one encoding."
+            let reads = previousSource.Reads + currentSource.Reads
+            Check.true' (reads < 2_000) $"The mixed encoding comparison used {reads} reads."
+        }
     ]

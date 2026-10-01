@@ -387,26 +387,113 @@ type internal DecodeFeed(side: ScanSide, buffer: byte[]) =
         | _ -> return 0
     }
 
+/// Decodes whole lines that are already in a byte buffer into a reusable array of UTF-16 units.
+type internal LineDecoder(encoding: TextEncoding) =
+    let mutable units = Array.zeroCreate<int> 256
+    let mutable filled = 0
+    let sink = fun (_: int64) (_: int64) (value: int) ->
+        units[filled] <- value
+        filled <- filled + 1
+
+    member _.Units = units
+    member _.Count = filled
+
+    /// Decodes count bytes that hold complete characters. Invalid bytes were reported when the line was scanned.
+    member _.Decode(bytes: byte[], offset: int, count: int, start: float) =
+        // No encoding produces more units than it consumes bytes.
+        if units.Length < count then units <- Array.zeroCreate<int> (max count (units.Length * 2))
+        filled <- 0
+        if count > 0 then Decoders.decode (Decoders.createAt encoding (int64 start)) bytes offset count sink |> ignore
+
 /// Confirms a claimed run of equal lines when the two sources use different encodings, by comparing the
-/// decoded UTF-16 units of each line pair.
+/// decoded UTF-16 units of each line pair. Whole lines are read in chunks of up to 64 KiB per side and compared
+/// in a loop. A line longer than the chunk is fed through small pieces.
 type internal DecodeCompare(previous: ScanSide, current: ScanSide, previousIndex: int, currentIndex: int, count: int, bufferA: byte[], bufferB: byte[]) =
     let feedA = DecodeFeed(previous, bufferA)
     let feedB = DecodeFeed(current, bufferB)
+    let decoderA = LineDecoder(previous.Encoding)
+    let decoderB = LineDecoder(current.Encoding)
     let mutable pair = 0
     let mutable open' = false
+
+    let beginLine () =
+        let pt = previous.Table
+        let ct = current.Table
+        feedA.Begin(pt.Start(previousIndex + pair), pt.Finish(previousIndex + pair) - Widths.endingWidth previous.Encoding (pt.EndingCode(previousIndex + pair)))
+        feedB.Begin(ct.Start(currentIndex + pair), ct.Finish(currentIndex + pair) - Widths.endingWidth current.Encoding (ct.EndingCode(currentIndex + pair)))
+        open' <- true
+
+    /// Counts the lines from the first unconfirmed pair on one side whose last byte lies within limit bytes of the chunk start.
+    let linesWithin (table: LineTable) (index: int) (limit: float) =
+        let first = table.Start(index + pair)
+        let mutable lines = 0
+        while pair + lines < count && table.Finish(index + pair + lines) - first <= limit do
+            lines <- lines + 1
+        lines
+
+    /// Compares the decoded content of the pairs that both buffers hold completely. Returns the number of equal
+    /// pairs before the first unequal one, and whether an unequal pair was found.
+    let compareChunk (meter: Meter) (lines: int) (startP: float) (startC: float) =
+        let pt = previous.Table
+        let ct = current.Table
+        let mutable index = 0
+        let mutable equal = true
+        while equal && index < lines do
+            let lineP = previousIndex + pair + index
+            let lineC = currentIndex + pair + index
+            let beginP = pt.Start lineP
+            let beginC = ct.Start lineC
+            let lengthP = pt.Finish lineP - beginP - Widths.endingWidth previous.Encoding (pt.EndingCode lineP)
+            let lengthC = ct.Finish lineC - beginC - Widths.endingWidth current.Encoding (ct.EndingCode lineC)
+            decoderA.Decode(bufferA, int (beginP - startP), int lengthP, beginP)
+            decoderB.Decode(bufferB, int (beginC - startC), int lengthC, beginC)
+            let shared = min decoderA.Count decoderB.Count
+            let matched = Native.equalIntPrefix decoderA.Units 0 decoderB.Units 0 shared
+            Meter.charge meter (1 + matched / 256)
+            if matched = shared && decoderA.Count = decoderB.Count then index <- index + 1
+            else equal <- false
+        index, not equal
 
     member _.Step(meter: Meter) : Async<CompareStep> = async {
         if pair >= count then return CompareStep.Finished count
         elif not open' then
-            Meter.charge meter 1
-            let pt = previous.Table
-            let ct = current.Table
-            let startP = pt.Start(previousIndex + pair)
-            let startC = ct.Start(currentIndex + pair)
-            feedA.Begin(startP, pt.Finish(previousIndex + pair) - Widths.endingWidth previous.Encoding (pt.EndingCode(previousIndex + pair)))
-            feedB.Begin(startC, ct.Finish(currentIndex + pair) - Widths.endingWidth current.Encoding (ct.EndingCode(currentIndex + pair)))
-            open' <- true
-            return CompareStep.Continue
+            let limit = float (min 65_536 (min bufferA.Length bufferB.Length))
+            let lines = min (linesWithin previous.Table previousIndex limit) (linesWithin current.Table currentIndex limit)
+            if lines = 0 then
+                Meter.charge meter 1
+                beginLine ()
+                return CompareStep.Continue
+            else
+                let pt = previous.Table
+                let ct = current.Table
+                let startP = pt.Start(previousIndex + pair)
+                let startC = ct.Start(currentIndex + pair)
+                let wantP = int (pt.Finish(previousIndex + pair + lines - 1) - startP)
+                let wantC = int (ct.Finish(currentIndex + pair + lines - 1) - startC)
+                let! first = previous.Spec.Source.Value.ReadAt (int64 startP) bufferA 0 wantP
+                match first with
+                | ReadOutcome.EndOfSource -> return CompareStep.Changed
+                | ReadOutcome.Bytes gotP when gotP > 0 ->
+                    let! second = current.Spec.Source.Value.ReadAt (int64 startC) bufferB 0 wantC
+                    match second with
+                    | ReadOutcome.EndOfSource -> return CompareStep.Changed
+                    | ReadOutcome.Bytes gotC when gotC > 0 ->
+                        // A short read leaves only the lines that arrived whole. If none did, the line is fed in pieces.
+                        let whole = min (linesWithin previous.Table previousIndex (float gotP)) (linesWithin current.Table currentIndex (float gotC))
+                        let usable = min lines whole
+                        if usable = 0 then
+                            Meter.charge meter 1
+                            beginLine ()
+                            return CompareStep.Continue
+                        else
+                            Meter.chargeBytes meter (gotP + gotC)
+                            let equalPairs, unequal = compareChunk meter usable startP startC
+                            if unequal then return CompareStep.Finished(pair + equalPairs)
+                            else
+                                pair <- pair + usable
+                                return if pair >= count then CompareStep.Finished count else CompareStep.Continue
+                    | _ -> return CompareStep.Waiting
+                | _ -> return CompareStep.Waiting
         elif feedA.Available = 0 && not feedA.Exhausted then
             let! filled = feedA.Fill meter
             return if filled > 0 then CompareStep.Continue elif filled = 0 then CompareStep.Waiting else CompareStep.Changed
