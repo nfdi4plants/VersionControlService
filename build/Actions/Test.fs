@@ -16,6 +16,40 @@ let TextDiff () =
     run "dotnet" [ "fable"; "-o"; "output"; "-s" ] projectPath
     run npx [ "vitest"; "run"; "output/TextDiffEngineCases.test.js"; "--configLoader"; "native" ] projectPath
 
+/// The compiler version Swate builds the library with. `dotnet tool exec` downloads it on first use
+/// and leaves the pinned tool of this repository alone.
+let private swateFableVersion = "5.0.0-alpha.21"
+
+/// Compiles the text-diff engine cases and the three worker test files with the compiler Swate uses and
+/// runs them in Vitest. The suites write to their usual output folders, which the Vitest configuration requires.
+let TextDiffSwateFable () =
+    let compile projectPath =
+        cleanGeneratedOutput projectPath
+
+        run
+            "dotnet"
+            [ "tool"; "exec"; "fable"; "--version"; swateFableVersion; "--yes"; "--"; "-o"; "output"; "-s" ]
+            projectPath
+
+    let engineProject = Path.GetFullPath "tests/VersionControlService.TextDiff.FableTests"
+    compile engineProject
+    run npx [ "vitest"; "run"; "output/TextDiffEngineCases.test.js"; "--configLoader"; "native" ] engineProject
+
+    compile ProjectPaths.testsPath
+
+    run
+        npx
+        [
+            "vitest"
+            "run"
+            "output/TextDiffEndToEnd.test.js"
+            "output/TextDiffWorkerThread.test.js"
+            "output/TextDiffPool.test.js"
+            "--configLoader"
+            "native"
+        ]
+        ProjectPaths.testsPath
+
 /// Fable starts the Vitest runner itself, so "npx" is spelled plainly in these arguments.
 let private suiteArgs = [
     "fable"

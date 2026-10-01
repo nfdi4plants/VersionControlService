@@ -41,6 +41,8 @@ type IResolverHost =
     abstract member IsCanceled: unit -> bool
     /// Reads at most the given number of bytes from the start of a file.
     abstract member ReadPrefix: string -> int -> Async<byte[]>
+    /// Resolves symbolic links in the existing part of a path. A missing tail stays as written.
+    abstract member Realpath: string -> Async<string>
 
 /// The lstat values that tell an edited file apart from the one that was resolved.
 type FileIdentity = {
@@ -109,11 +111,26 @@ let private commandFailure (command: string) (result: GitShort) =
     ResolveOutcome.ReadError $"git {command} failed: {detail}"
 
 /// Git reports a locally missing object this way when lazy fetching is off, and older versions report the
-/// refused promisor fetch.
+/// refused promisor fetch. Both sides are lower-cased because Fable compiles an ignore-case Contains to a
+/// case-sensitive search.
+let stderrReportsMissingObject (stderr: string) =
+    let lowered = stderr.ToLowerInvariant()
+
+    [ "could not get object info"; "promisor remote"; "not a valid object name" ]
+    |> List.exists (fun text -> lowered.Contains(text.ToLowerInvariant()))
+
 let private isMissingObject (result: GitShort) =
-    result.Error.IsNone
-    && [ "could not get object info"; "promisor remote"; "not a valid object name" ]
-       |> List.exists (fun text -> result.Stderr.Contains(text, StringComparison.OrdinalIgnoreCase))
+    result.Error.IsNone && stderrReportsMissingObject result.Stderr
+
+let private isDrivePath (path: string) = path.Length >= 2 && path[1] = ':'
+
+/// Whether a resolved folder is the workspace root or lies below it. Drive letter paths compare without case.
+let private isInsideRoot (root: string) (folder: string) =
+    let normalize (path: string) = path.Replace('\\', '/').TrimEnd('/')
+    let comparison = if isDrivePath root then StringComparison.OrdinalIgnoreCase else StringComparison.Ordinal
+    let root = normalize root
+    let folder = normalize folder
+    folder.Equals(root, comparison) || folder.StartsWith(root + "/", comparison)
 
 let private isObjectId (value: string) =
     (value.Length = 40 || value.Length = 64)
@@ -229,8 +246,7 @@ let private resolvePrevious (host: IResolverHost) (input: ResolverInput) (commit
             | Ok(Some entry) -> return Stop(ResolveOutcome.ReadError $"The HEAD tree entry has an unexpected mode {entry.Mode} {entry.Kind}.")
 }
 
-let private resolveCurrent (host: IResolverHost) (input: ResolverInput) : Async<Step<ResolvedSide>> = async {
-    let path = NodePath.join [| input.RepositoryRoot; input.Path |]
+let private resolveCurrentFile (host: IResolverHost) (input: ResolverInput) (path: string) : Async<Step<ResolvedSide>> = async {
     let! stat = awaitHost host (host.Lstat path)
 
     match stat with
@@ -249,6 +265,25 @@ let private resolveCurrent (host: IResolverHost) (input: ResolverInput) : Async<
             | None -> return Continue(ResolvedSide.WorkingFile(path, identity))
         else
             return Continue(ResolvedSide.WorkingFile(path, identity))
+}
+
+let private resolveCurrent (host: IResolverHost) (input: ResolverInput) : Async<Step<ResolvedSide>> = async {
+    let path = NodePath.join [| input.RepositoryRoot; input.Path |]
+
+    let insideGitFolder =
+        input.Path.Split('/') |> Array.exists (fun segment -> segment.Equals(".git", StringComparison.OrdinalIgnoreCase))
+
+    if insideGitFolder then
+        return Stop(ResolveOutcome.ReadError $"The path {input.Path} is inside the .git folder and cannot be diffed.")
+    else
+        // A symlinked folder on the way can point outside the workspace, and lstat only inspects the last segment.
+        let! root = awaitHost host (host.Realpath input.RepositoryRoot)
+        let! parent = awaitHost host (host.Realpath(NodePath.dirname path))
+
+        if not (isInsideRoot root parent) then
+            return Stop(ResolveOutcome.ReadError $"The path {input.Path} resolves to a folder outside the workspace.")
+        else
+            return! resolveCurrentFile host input path
 }
 
 /// Resolves both sides. The previous side is decided first, so its blocker wins when both sides are blocked.

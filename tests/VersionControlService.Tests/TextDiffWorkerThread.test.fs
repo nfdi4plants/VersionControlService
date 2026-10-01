@@ -352,7 +352,22 @@ Vitest.describe (
                     )
 
                     let! probeFailure = probeReply
-                    Vitest.expect(probeFailure.Code).toBe TextDiffFailureCodes.ContinuationMismatch
+                    Vitest.expect(probeFailure.Code).toBe TextDiffFailureCodes.SessionClosed
+                })
+        )
+
+        Vitest.test (
+            "answers a session closed failure for a continuation without a preparation slot",
+            TestOptions(timeout = 120000),
+            fun () ->
+                withWorkerPool "default" (ResizeArray()) (fun pool _ _ -> promise {
+                    let service = pool.Service(owner ())
+                    let request = { openRequest with Path = path "retained.txt"; Continuation = Some "evicted-continuation" }
+                    let! result = service.Open request (OperationContext.detached "unknown-continuation") |> Async.StartAsPromise
+
+                    match result with
+                    | Failed failure -> Vitest.expect(failure.Code).toBe TextDiffFailureCodes.SessionClosed
+                    | other -> failwith $"Expected a closed session failure, got %A{other}"
                 })
         )
 

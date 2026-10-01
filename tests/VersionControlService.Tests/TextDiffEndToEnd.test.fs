@@ -95,6 +95,16 @@ let private writeBytes (filePath: string) (bytes: int[]) = promise {
     return ()
 }
 
+/// An ASCII file of about 600,000 bytes. The first 64 KiB, middle and last 64 KiB samples never reach the
+/// positions used for the umlaut in the tests. A negative position leaves out the umlaut or the changed byte.
+let private lateUmlautFile (umlautAt: int) (changeAt: int) =
+    let line = "0123456789abcdefghij\n"
+    let lines = 600000 / line.Length
+    let bytes = Array.init (lines * line.Length) (fun index -> int line[index % line.Length])
+    if changeAt >= 0 then bytes[changeAt] <- int 'X'
+    if umlautAt >= 0 then bytes[umlautAt] <- 0xE4
+    bytes
+
 let private initializeRepository (repository: string) = promise {
     do! NodePositionalFile.mkdirRecursive repository
     do! runGitOk repository [| "init"; "-q" |]
@@ -685,7 +695,7 @@ Vitest.describe (
 
                 do! source.Dispose()
                 Vitest.expect(answer).toEqual None
-                Vitest.expect(failureCode).toEqual(Some TextDiffWorker.ReadFailedCode)
+                Vitest.expect(failureCode).toEqual(Some TextDiffFailureCodes.ReadFailed)
             }
         )
 
@@ -1242,6 +1252,83 @@ Vitest.describe (
                 Vitest.expect(pageHasChange firstPage).toBe true
                 let! closeResult = service.Close handle (context "close-legacy-window-a") |> Async.StartAsPromise
                 ignore (operationValue "Close" closeResult)
+                do! session.Close() |> Async.StartAsPromise
+            }
+        )
+
+        Vitest.test (
+            "asks for an encoding when a late Windows-1252 byte is reached before the first page",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! repository = newRepository ()
+                do! commitBytes repository "late.csv" (lateUmlautFile -1 -1)
+                do! writeBytes (NodePath.join [| repository; "late.csv" |]) (lateUmlautFile 100000 599980)
+                let session = createSession (currentFixture ()).Pool repository
+                let service = serviceFor session
+                let! opened = openUntilReady service (openRequest "late.csv") "late-umlaut-open"
+
+                match opened with
+                | OpenDiffResult.NotDiffable(DiffBlocker.EncodingRequired(side, _, candidates)) ->
+                    Vitest.expect(side).toEqual DiffSide.Current
+                    Vitest.expect(candidates |> Array.map (fun candidate -> candidate.Encoding)).toEqual [| "utf-8"; "windows-1252" |]
+                | other -> failwith $"Expected EncodingRequired, got %A{other}."
+
+                do! session.Close() |> Async.StartAsPromise
+            }
+        )
+
+        Vitest.test (
+            "fails a session with an encoding mismatch when a late Windows-1252 byte follows the first page",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! repository = newRepository ()
+                do! commitBytes repository "after.csv" (lateUmlautFile -1 -1)
+                do! writeBytes (NodePath.join [| repository; "after.csv" |]) (lateUmlautFile 450000 10)
+                let session = createSession (currentFixture ()).Pool repository
+                let service = serviceFor session
+                let! handle, _, _, first = openedWithFirstPage service (openRequest "after.csv") "after-umlaut-window-a"
+                let mutable cursor = first.NextCursor
+                let mutable failure = None
+
+                while failure.IsNone && cursor.IsSome do
+                    let! result =
+                        service.ReadPage { Handle = handle; Cursor = cursor.Value } (context "after-umlaut-page")
+                        |> Async.StartAsPromise
+
+                    match result with
+                    | Failed error -> failure <- Some error
+                    | Succeeded { Value = Resumable.Ready page } -> cursor <- page.NextCursor
+                    | Succeeded { Value = Resumable.Scanning(_, continuation, _) } -> cursor <- Some continuation
+                    | other -> failwith $"Unexpected ReadPage result %A{other}."
+
+                match failure with
+                | Some error ->
+                    Vitest.expect(error.Code).toBe TextDiffFailureCodes.EncodingMismatch
+                    Vitest.expect(error.DiffDetail.Value.Side).toEqual DiffSide.Current
+                    Vitest.expect(error.DiffDetail.Value.Evidence.Contains "at byte 450000").toBe true
+                | None -> failwith "The session did not fail."
+
+                do! session.Close() |> Async.StartAsPromise
+            }
+        )
+
+        Vitest.test (
+            "reports an invalid UTF-8 sequence as content that is not text when the caller chose UTF-8",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! repository = newRepository ()
+                do! commitBytes repository "chosen.csv" (lateUmlautFile -1 -1)
+                do! writeBytes (NodePath.join [| repository; "chosen.csv" |]) (lateUmlautFile 100000 599980)
+                let session = createSession (currentFixture ()).Pool repository
+                let service = serviceFor session
+                let! opened = openUntilReady service { openRequest "chosen.csv" with CurrentEncoding = Some "utf-8" } "chosen-utf8-open"
+
+                match opened with
+                | OpenDiffResult.NotDiffable(DiffBlocker.Binary(side, evidence)) ->
+                    Vitest.expect(side).toEqual DiffSide.Current
+                    Vitest.expect(evidence.Contains "invalid utf-8").toBe true
+                | other -> failwith $"Expected a Binary blocker, got %A{other}."
+
                 do! session.Close() |> Async.StartAsPromise
             }
         )

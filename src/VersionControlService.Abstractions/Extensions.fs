@@ -200,6 +200,18 @@ module TextDiffFailureCodes =
     [<Literal>]
     let ContentNotText = "diff_content_not_text"
 
+    /// The bytes of a side that classification read as UTF-8 contain a sequence that is invalid in UTF-8 but
+    /// valid in Windows-1252, and the caller did not choose the encoding. `OperationFailure.DiffDetail` names
+    /// the side and the evidence. When `Open` finds the sequence before the first page, it returns
+    /// `DiffBlocker.EncodingRequired` for that side.
+    [<Literal>]
+    let EncodingMismatch = "diff_encoding_mismatch"
+
+    /// A source could not be read because of a file system or process error, for example a working file that
+    /// cannot be opened or a Git child that cannot be started. Any call that reads a source can return it.
+    [<Literal>]
+    let ReadFailed = "diff_read_failed"
+
     /// A pinned source identity changed while its diff was open.
     [<Literal>]
     let SourceChanged = "source_changed"

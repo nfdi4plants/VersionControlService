@@ -289,6 +289,8 @@ module TextDiffEngineCasesTests =
                 Vitest.it(name, fun () -> Async.StartAsPromise(run ()))
             for name, run in TextDiffResyncCases.cases do
                 Vitest.it(name, fun () -> Async.StartAsPromise(run ()))
+            for name, run in RowLinesCases.cases do
+                Vitest.it(name, fun () -> Async.StartAsPromise(run ()))
     )
 
     Vitest.it (

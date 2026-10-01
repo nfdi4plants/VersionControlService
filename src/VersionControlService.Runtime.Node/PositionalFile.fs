@@ -9,6 +9,8 @@ type PositionalFileStats = {
     MtimeNs: string
     Ino: string
     Dev: string
+    /// The owning user id in decimal. It is "0" on Windows.
+    Uid: string
     IsFile: bool
     IsSymbolicLink: bool
     IsDirectory: bool
@@ -24,13 +26,14 @@ type private BigIntStats =
     abstract member mtimeNs: int64
     abstract member ino: int64
     abstract member dev: int64
+    abstract member uid: int64
     abstract member isFile: unit -> bool
     abstract member isSymbolicLink: unit -> bool
     abstract member isDirectory: unit -> bool
 
 type private FileSystem =
     abstract member ``open``:
-        path: string * flags: string * callback: Action<NodeError, int> -> unit
+        path: string * flags: string * mode: int * callback: Action<NodeError, int> -> unit
 
     abstract member read:
         fd: int *
@@ -72,6 +75,12 @@ let private int64ToNumber (_value: int64) : float = jsNative
 
 let private maxSafeFilePosition = 9007199254740991L
 
+/// New files are readable and writable by their owner only, because scratch content can come from private repositories.
+let private fileMode = 0o600
+
+/// New folders are accessible to their owner only.
+let private directoryMode = 0o700
+
 let private rejectNodeError (reject: exn -> unit) (error: NodeError) =
     reject (unbox<exn> error)
 
@@ -81,6 +90,7 @@ let private openWithFlags path flags : JS.Promise<int> =
             fileSystem.``open``(
                 path,
                 flags,
+                fileMode,
                 Action<NodeError, int>(fun error fd ->
                     if isNull error then
                         resolve fd
@@ -96,7 +106,7 @@ let openRead (path: string) : JS.Promise<int> =
 let openCreateExclusive (path: string) : JS.Promise<int> =
     openWithFlags path "wx"
 
-/// Opens a new file for both reading and writing, failing if it already exists.
+/// Opens a new file for reading and writing. It fails if the file already exists.
 let openCreateExclusiveReadWrite (path: string) : JS.Promise<int> =
     openWithFlags path "wx+"
 
@@ -156,6 +166,7 @@ let private toFileStats (stats: BigIntStats) = {
     MtimeNs = bigintToDecimalString stats.mtimeNs
     Ino = bigintToDecimalString stats.ino
     Dev = bigintToDecimalString stats.dev
+    Uid = bigintToDecimalString stats.uid
     IsFile = stats.isFile ()
     IsSymbolicLink = stats.isSymbolicLink ()
     IsDirectory = stats.isDirectory ()
@@ -210,7 +221,7 @@ let mkdirRecursive (path: string) : JS.Promise<unit> =
         try
             fileSystem.mkdir(
                 path,
-                createObj [ "recursive" ==> true ],
+                createObj [ "recursive" ==> true; "mode" ==> directoryMode ],
                 Action<NodeError>(fun error ->
                     if isNull error then
                         resolve ()

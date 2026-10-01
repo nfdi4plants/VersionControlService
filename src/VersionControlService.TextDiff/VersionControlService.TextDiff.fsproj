@@ -29,6 +29,7 @@
   </ItemGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="VersionControlService.TextDiff.Tests" />
+    <InternalsVisibleTo Include="VersionControlService.TextDiff.FableTests" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\VersionControlService.Abstractions\VersionControlService.Abstractions.fsproj" />

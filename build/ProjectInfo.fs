@@ -79,7 +79,7 @@ module Packages =
             abstractions, []
             textDiff, [ abstractions ]
             runtimeNode, [ abstractions ]
-            git, [ abstractions; runtimeNode ]
+            git, [ abstractions; runtimeNode; textDiff ]
             lakeFs, [ abstractions; runtimeNode ]
             umbrella, [ abstractions; textDiff; runtimeNode; git; lakeFs ]
         ]

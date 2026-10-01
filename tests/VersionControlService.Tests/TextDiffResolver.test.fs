@@ -476,6 +476,54 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "refuses a working path that runs through a symlinked folder leaving the workspace",
+            TestOptions(timeout = 60000),
+            fun () -> promise {
+                let! repository = newRepository ()
+                do! commitFile repository "a.txt" "one\n"
+                let outside = newRepositoryPath ()
+                do! writeText (NodePath.join [| outside; "secret.txt" |]) "secret\n"
+                let mutable created = true
+
+                try
+                    do! symlink outside (NodePath.join [| repository; "escape" |])
+                with error ->
+                    created <- false
+                    writeLog $"Skipping the symlinked folder check because this platform refused to create one: {errorCode error}"
+
+                if created then
+                    let! outcome = resolveIn repository "escape/secret.txt" None
+
+                    match outcome with
+                    | ResolveOutcome.ReadError message -> Vitest.expect(message.Contains "outside the workspace").toBe true
+                    | other -> failwith $"Expected a read error, got %A{other}"
+            }
+        )
+
+        Vitest.test (
+            "refuses a working path below the .git folder",
+            TestOptions(timeout = 60000),
+            fun () -> promise {
+                let! repository = newRepository ()
+                do! commitFile repository "a.txt" "one\n"
+                let! outcome = resolveIn repository ".git/config" None
+
+                match outcome with
+                | ResolveOutcome.ReadError message -> Vitest.expect(message.Contains ".git folder").toBe true
+                | other -> failwith $"Expected a read error, got %A{other}"
+            }
+        )
+
+        Vitest.test (
+            "matches a missing object message whatever its letter case",
+            TestOptions(timeout = 60000),
+            fun () -> promise {
+                Vitest.expect(stderrReportsMissingObject "fatal: Not a valid object name abc123").toBe true
+                Vitest.expect(stderrReportsMissingObject "fatal: bad revision").toBe false
+            }
+        )
+
+        Vitest.test (
             "reports a missing promisor blob as unavailable without fetching it",
             TestOptions(timeout = 120000),
             fun () -> promise {

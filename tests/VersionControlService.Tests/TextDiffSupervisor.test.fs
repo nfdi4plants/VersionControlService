@@ -40,6 +40,15 @@ let private bytesToUtf8 (_bytes: byte[]) : string = jsNative
 [<Emit("console.log($0)")>]
 let private writeLog (_message: string) : unit = jsNative
 
+[<Import("statSync", "node:fs")>]
+let private statSync (path: string) : obj = jsNative
+
+[<Emit("$0.mode & 0o777")>]
+let private permissionBits (_stats: obj) : int = jsNative
+
+[<Emit("process.platform")>]
+let private platformName () : string = jsNative
+
 let private createTempDirectory () : JS.Promise<string> =
     mkdtemp (NodePath.join [| systemTempDirectory (); "vcs-text-diff-" |])
 
@@ -462,6 +471,67 @@ Vitest.describe (
 
                     do! removeDirectory root
                     return raise error
+            }
+        )
+)
+
+Vitest.describe (
+    "Text diff supervisor folder permissions",
+    fun () ->
+        Vitest.test (
+            "creates folders for the current user only and files with owner access only",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                if platformName () = "win32" then
+                    writeLog "Skipping the folder mode check because Windows has no POSIX modes."
+                else
+                    let! root = createTempDirectory ()
+
+                    try
+                        let! supervisor = createSupervisor root None
+                        let! workerDirectory = supervisor.WorkerDirectory "worker-mode"
+                        let filePath = NodePath.join [| workerDirectory; "scratch.bin" |]
+                        let! descriptor = NodePositionalFile.openCreateExclusive filePath
+                        do! NodePositionalFile.close descriptor
+
+                        Vitest.expect(permissionBits (statSync (NodePath.join [| root; "text-diff" |]))).toBe 0o700
+                        Vitest.expect(permissionBits (statSync supervisor.InstanceDirectory)).toBe 0o700
+                        Vitest.expect(permissionBits (statSync workerDirectory)).toBe 0o700
+                        Vitest.expect(permissionBits (statSync filePath)).toBe 0o600
+                        do! supervisor.Dispose ()
+                        do! removeDirectory root
+                    with error ->
+                        do! removeDirectory root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "rejects an existing folder that belongs to another user",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let folderStats uid : NodePositionalFile.PositionalFileStats = {
+                    Size = 0L
+                    MtimeNs = "0"
+                    Ino = "1"
+                    Dev = "1"
+                    Uid = uid
+                    IsFile = false
+                    IsSymbolicLink = false
+                    IsDirectory = true
+                }
+
+                let rejects userId stats =
+                    try
+                        TextDiffSupervisor.checkFolderOwner userId "/tmp/text-diff" stats
+                        false
+                    with error ->
+                        error.Message.Contains "/tmp/text-diff"
+
+                Vitest.expect(rejects 1000 (folderStats "0")).toBe true
+                Vitest.expect(rejects 1000 { folderStats "1000" with IsSymbolicLink = true }).toBe true
+                Vitest.expect(rejects 1000 (folderStats "1000")).toBe false
+                Vitest.expect(rejects -1 (folderStats "0")).toBe false
             }
         )
 )

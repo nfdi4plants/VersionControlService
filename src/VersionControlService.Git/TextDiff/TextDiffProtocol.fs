@@ -75,7 +75,6 @@ let private jsonByteLength (_message: obj) : int = jsNative
 /// UTF-8 byte length of the JSON text of a message.
 let envelopeByteLength (message: obj) : int = jsonByteLength message
 
-// ---- Value readers
 
 [<Emit("$0 !== null && typeof $0 === 'object' && !Array.isArray($0)")>]
 let private isPlainObject (_value: obj) : bool = jsNative
@@ -191,7 +190,6 @@ let private decodeTagged (cases: string -> (obj -> Result<'T, string>) option) :
             | Some body -> body value
             | None -> Error $"unknown tag '{tag}'")
 
-// ---- Encoding helpers
 
 let private encodeInt64 (value: int64) : obj = box (string value)
 
@@ -204,7 +202,6 @@ let private encodeArray (encoder: 'T -> obj) (values: 'T[]) : obj = box (values 
 
 let private tagged (tag: string) (fields: (string * obj) list) : obj = createObj (("tag" ==> tag) :: fields)
 
-// ---- Contract types
 
 let private encodeSide (side: DiffSide) =
     match side with
@@ -679,7 +676,6 @@ let private decodeOpenResult: Decoder<OpenDiffResult> =
             })
         | _ -> None)
 
-// ---- Failures
 
 let private categoryName (category: FailureCategory) =
     match category with
@@ -797,7 +793,6 @@ let private decodeFailure: Decoder<OperationFailure> =
         }
     })
 
-// ---- Requests
 
 let private encodeOpenRequest (request: OpenDiffRequest) =
     createObj [
@@ -982,7 +977,6 @@ let private decodeRequestBody (messageType: string) (value: obj) : Result<Reques
     | "close" -> Some(field "handle" decodeHandle value |> Result.map RequestBody.Close)
     | _ -> None
 
-// ---- Results
 
 let private encodePayload (payload: ResultPayload) =
     match payload with
@@ -1011,7 +1005,6 @@ let private decodePayload: Decoder<ResultPayload> =
         | "Close" -> Some(fun _ -> Ok ResultPayload.Close)
         | _ -> None)
 
-// ---- Git child messages
 
 let private encodeChildOwner (owner: Supervisor.ChildOwner) =
     createObj [ "workerId" ==> owner.WorkerId; "sessionId" ==> owner.SessionId; "requestId" ==> owner.RequestId ]
@@ -1080,7 +1073,6 @@ let private decodeOutcome: Decoder<SpawnOutcome> =
         | "Failed" -> Some(fun value -> field "message" decodeString value |> Result.map SpawnOutcome.Failed)
         | _ -> None)
 
-// ---- Envelopes
 
 let private envelope (messageType: string) (fields: (string * obj) list) : obj =
     createObj ([ "v" ==> ProtocolVersion; "t" ==> messageType ] @ fields)

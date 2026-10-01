@@ -748,10 +748,20 @@ fails with `diff_content_not_text`, and `failure.DiffDetail` records the side an
 evidence. The evidence is a binary signature, a NUL byte, a control-character ratio
 above 1 percent in a window of the file, or a byte sequence that is invalid in the
 encoding. A recognized BOM selects its encoding. Valid UTF-8 that contains multi-byte
-sequences is selected without asking. `DiffBlocker.EncodingRequired` appears when the bytes
-are not valid UTF-8 and more than one single-byte encoding fits. It returns a
-`PreparationToken` and `EncodingCandidate` values. Ask the user to choose a candidate, then
-retry the same open request with that token and the chosen encoding on the reported side.
+sequences is selected without asking. Windows-1252 is the only single-byte candidate, so
+bytes that are invalid as UTF-8 open as Windows-1252 without asking. Other legacy encodings
+such as Latin-2, KOI8-R and Shift-JIS decode as Windows-1252 too.
+
+`DiffBlocker.EncodingRequired` appears for UTF-16 without a BOM when the byte order is
+ambiguous. It also appears when a file that classification read as UTF-8 contains a
+sequence that is invalid in UTF-8 but valid in Windows-1252, and `Open` reaches that
+sequence before the first page. The candidates are then utf-8 and windows-1252. If the
+sequence comes after the first page, the session fails with `diff_encoding_mismatch` and
+`failure.DiffDetail` records the side and the evidence. Close the handle and open the diff
+again with the Windows-1252 encoding on that side. A caller that chose utf-8 gets
+`diff_content_not_text` for the same bytes. `EncodingRequired` returns a `PreparationToken`
+and `EncodingCandidate` values. Ask the user to choose a candidate, then retry the same
+open request with that token and the chosen encoding on the reported side.
 
 ```fsharp
 let chooseEncoding (request: OpenDiffRequest) (side: DiffSide) (token: PreparationToken) (encoding: string) =
@@ -770,7 +780,9 @@ recently used idle handle. The default pool has three workers with one session e
 this happens when a fourth diff opens. Open a new diff when the error occurs.
 `source_changed` means a pinned source changed while the handle was open, so close it
 and open the current sources again.
-For `diff_content_not_text`, inspect `failure.DiffDetail` for the blocked side and evidence.
+For `diff_content_not_text` and `diff_encoding_mismatch`, inspect `failure.DiffDetail` for the blocked side and evidence.
+A `diff_read_failed` result means a source could not be read because of a file system or
+process error. Any call that reads a source can return it.
 For `preparation_mismatch`, discard the token and start `Open` again. A continuation is
 bound to its original request fields. On `continuation_mismatch`, retry with those fields
 or start a new request without that continuation. A `diff_worker_failed` result means the

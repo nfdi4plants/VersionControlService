@@ -102,7 +102,7 @@ type WorkerScratch() =
     /// Decides whether the requester may use the worker's scratch memory now. Returns false when the requester
     /// has to wait because another session is in the middle of a step. An idle holder yields unfinished work
     /// after ScratchYieldIdleMs, unless it is protected. A requester admitted after a yield is protected until
-    /// it is between steps again or its idle time passes its protection limit (see the type documentation).
+    /// it is between steps again or its idle time passes its protection limit.
     /// An admitted requester first spills other idle sessions whose scratch is safe to release.
     member _.BeginRequest(requester: IScratchHolder) = async {
         let registration =

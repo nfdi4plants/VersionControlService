@@ -14,9 +14,6 @@ module NodeProcess = VersionControlService.Runtime.Node.Process
 [<Emit("$0?.code ?? ''")>]
 let private errorCode (_error: obj) : string = jsNative
 
-[<Literal>]
-let private readFailureCode = "diff_read_failed"
-
 type TextDiffSourceFailure = {
     Code: string
     Message: string
@@ -36,7 +33,7 @@ let private changedFailure path = {
 }
 
 let private readFailure message = {
-    Code = readFailureCode
+    Code = TextDiffFailureCodes.ReadFailed
     Message = message
 }
 

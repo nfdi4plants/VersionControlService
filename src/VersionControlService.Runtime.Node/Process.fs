@@ -336,11 +336,11 @@ type BoundedResult = {
 }
 
 [<AllowNullLiteral>]
-type private TypedProcessStream =
+type TypedProcessStream =
     abstract member on: eventName: string * listener: (obj -> unit) -> TypedProcessStream
 
 [<AllowNullLiteral>]
-type private TypedChildProcess =
+type TypedChildProcess =
     abstract member pid: int
     abstract member stdout: TypedProcessStream
     abstract member stderr: TypedProcessStream
@@ -468,7 +468,10 @@ let private closeDescriptorThen
     =
     Interop.observePromise (closeDescriptor descriptor) onClosed onError
 
-let spawnToFileTracked
+/// Spawns a child that writes its standard output to the descriptor. The spawn function is a parameter so a
+/// caller can substitute a child, for example one without stdio streams as after an EMFILE failure.
+let spawnToFileTrackedWith
+    (spawn: string * string[] * obj -> TypedChildProcess)
     (command: string)
     (arguments: string[])
     (cwd: string)
@@ -481,7 +484,7 @@ let spawnToFileTracked
         let options = spawnOptions cwd environment (box [| box "ignore"; box descriptor; box "pipe" |])
 
         try
-            let child = typedChildProcess.spawn(command, arguments, options)
+            let child = spawn (command, arguments, options)
             let pid =
                 try unbox<int> (box child.pid)
                 with _ -> 0
@@ -491,11 +494,13 @@ let spawnToFileTracked
             let stderrTruncated = ref false
             let spawnError = ref None
 
-            child.stderr.on("data", fun data ->
-                captureBounded stderrChunks 65536 stderrLength stderrTruncated data)
-            |> ignore
-
+            // A failed spawn emits 'error' and can leave the stdio streams null, so the listener comes first.
             child.on("error", fun error -> spawnError.Value <- Some(Interop.errorMessage error)) |> ignore
+
+            if not (isNull child.stderr) then
+                child.stderr.on("data", fun data ->
+                    captureBounded stderrChunks 65536 stderrLength stderrTruncated data)
+                |> ignore
 
             child.on("close", fun code signal ->
                 let exitCode = if isNull code then None else Some(unbox<int> code)
@@ -539,6 +544,16 @@ let spawnToFileTracked
                 (fun () -> resolve { Pid = 0; Closed = closed })
                 (fun closeError -> reject (Exception(Interop.errorMessage closeError))))
 
+let spawnToFileTracked
+    (command: string)
+    (arguments: string[])
+    (cwd: string)
+    (environment: obj)
+    (descriptor: int)
+    (onStarted: int -> JS.Promise<ChildExit> -> unit)
+    : JS.Promise<SpawnToFileHandle> =
+    spawnToFileTrackedWith typedChildProcess.spawn command arguments cwd environment descriptor onStarted
+
 let spawnToFile
     (command: string)
     (arguments: string[])
@@ -548,7 +563,10 @@ let spawnToFile
     : JS.Promise<SpawnToFileHandle> =
     spawnToFileTracked command arguments cwd environment descriptor (fun _ _ -> ())
 
-let runBoundedWithLifecycle
+/// Runs a child with bounded output. The spawn function is a parameter so a caller can substitute a child, for
+/// example one without stdio streams as after an EMFILE failure.
+let runBoundedWithSpawn
+    (spawn: string * string[] * obj -> TypedChildProcess)
     (command: string)
     (arguments: string[])
     (cwd: string)
@@ -561,7 +579,7 @@ let runBoundedWithLifecycle
         let options = spawnOptions cwd environment (box [| box "ignore"; box "pipe"; box "pipe" |])
 
         try
-            let child = typedChildProcess.spawn(command, arguments, options)
+            let child = spawn (command, arguments, options)
             let pid =
                 try unbox<int> (box child.pid)
                 with _ -> 0
@@ -576,21 +594,24 @@ let runBoundedWithLifecycle
             let spawnError = ref None
             let mutable overflowKillStarted = false
 
-            child.stdout.on("data", fun data ->
-                captureBounded stdoutChunks stdoutLimit stdoutLength stdoutTruncated data
-
-                if stdoutTruncated.Value && not overflowKillStarted then
-                    overflowKillStarted <- true
-
-                    if pid > 0 then
-                        Interop.observePromise (killProcessTreeAsync pid) ignore ignore)
-            |> ignore
-
-            child.stderr.on("data", fun data ->
-                captureBounded stderrChunks stderrLimit stderrLength stderrTruncated data)
-            |> ignore
-
+            // A failed spawn emits 'error' and can leave the stdio streams null, so the listener comes first.
             child.on("error", fun error -> spawnError.Value <- Some(Interop.errorMessage error)) |> ignore
+
+            if not (isNull child.stdout) then
+                child.stdout.on("data", fun data ->
+                    captureBounded stdoutChunks stdoutLimit stdoutLength stdoutTruncated data
+
+                    if stdoutTruncated.Value && not overflowKillStarted then
+                        overflowKillStarted <- true
+
+                        if pid > 0 then
+                            Interop.observePromise (killProcessTreeAsync pid) ignore ignore)
+                |> ignore
+
+            if not (isNull child.stderr) then
+                child.stderr.on("data", fun data ->
+                    captureBounded stderrChunks stderrLimit stderrLength stderrTruncated data)
+                |> ignore
 
             child.on("close", fun code signal ->
                 let exitCode = if isNull code then None else Some(unbox<int> code)
@@ -629,6 +650,17 @@ let runBoundedWithLifecycle
                 Stderr = ""
                 Error = Some(Interop.errorMessage (box error))
             })
+
+let runBoundedWithLifecycle
+    (command: string)
+    (arguments: string[])
+    (cwd: string)
+    (environment: obj)
+    (stdoutLimit: int)
+    (stderrLimit: int)
+    (onStarted: int -> JS.Promise<ChildExit> -> unit)
+    : JS.Promise<BoundedResult> =
+    runBoundedWithSpawn typedChildProcess.spawn command arguments cwd environment stdoutLimit stderrLimit onStarted
 
 let runBounded
     (command: string)

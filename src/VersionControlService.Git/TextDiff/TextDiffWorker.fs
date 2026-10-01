@@ -14,14 +14,11 @@ open VersionControlService.Git.TextDiff.TextDiffPreparation
 open VersionControlService.Git.TextDiff.TextDiffSources
 
 module NodeInterop = VersionControlService.Runtime.Node.Interop
+module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodePath = VersionControlService.Runtime.Node.Path
 module NodeProcess = VersionControlService.Runtime.Node.Process
 module NodePositionalFile = VersionControlService.Runtime.Node.PositionalFile
 module NodeWorkerThreads = VersionControlService.Runtime.Node.WorkerThreads
-
-/// The failure code of an Open whose sources could not be read.
-[<Literal>]
-let ReadFailedCode = "diff_read_failed"
 
 /// Progress messages go out about four times per second.
 [<Literal>]
@@ -128,16 +125,17 @@ let localFileHostWithCancellation (runGit: string[] -> Async<GitShort>) (isCance
         member _.Lstat path = lstat path
         member _.IsCanceled() = isCanceled ()
         member _.ReadPrefix path count = readPrefix path count
+        member _.Realpath path = async { return NodeFileSystem.realpathSync path }
     }
 
 let localFileHost (runGit: string[] -> Async<GitShort>) : IResolverHost =
     localFileHostWithCancellation runGit (fun () -> false)
 
-// ---- Failures
 
 let private categoryOf (code: string) =
     match code with
     | TextDiffFailureCodes.ContentNotText
+    | TextDiffFailureCodes.EncodingMismatch
     | TextDiffFailureCodes.SessionClosed
     | TextDiffFailureCodes.ContinuationMismatch
     | TextDiffFailureCodes.PreparationMismatch -> Validation
@@ -159,11 +157,10 @@ let private describeError (sourceFailureOf: TextDiffSourceFailure option) (error
         | :? TextDiffSourceException as source -> failure source.Code source.Message
         | _ ->
             let code =
-                if errorCode (box error) <> "" then ReadFailedCode else TextDiffFailureCodes.WorkerFailed
+                if errorCode (box error) <> "" then TextDiffFailureCodes.ReadFailed else TextDiffFailureCodes.WorkerFailed
 
             failure code (NodeInterop.errorMessage (box error))
 
-// ---- Worker state
 
 /// The encoding of one classified side.
 type private SideClass = { Enc: TextEncoding; BomLen: int; Chosen: bool }
@@ -347,7 +344,6 @@ let private guardEnvelope (host: WorkerHost) (limit: int) (payload: ResultPayloa
     else
         Ok value
 
-// ---- Open
 
 type private OpenStep =
     | Proceed
@@ -411,7 +407,7 @@ let private resolveStep (worker: Worker) (host: WorkerHost) (request: OpenDiffRe
             match outcome with
             | ResolveOutcome.Canceled -> return canceledStep
             | ResolveOutcome.Blocked blocker -> return Finish(Ok(Resumable.Ready(OpenDiffResult.NotDiffable blocker)))
-            | ResolveOutcome.ReadError message -> return Finish(Error(OperationFailure.create ProviderError ReadFailedCode message))
+            | ResolveOutcome.ReadError message -> return Finish(Error(OperationFailure.create ProviderError TextDiffFailureCodes.ReadFailed message))
             | ResolveOutcome.Resolved sources ->
                 let binding = bindingOf path previousPath sources
 
@@ -493,7 +489,7 @@ let private openBlobSide
             if host.IsCanceled() then
                 stop <- Some canceledStep
             elif start.SpawnFailure.Value.IsSome then
-                stop <- Some(Finish(Error(OperationFailure.create ProviderError ReadFailedCode start.SpawnFailure.Value.Value)))
+                stop <- Some(Finish(Error(OperationFailure.create ProviderError TextDiffFailureCodes.ReadFailed start.SpawnFailure.Value.Value)))
             elif Meter.overBudget meter then
                 stop <- Some Pause
             else
@@ -718,6 +714,157 @@ let private classifySide (slot: Slot) (host: WorkerHost) (meter: Meter) (side: D
         | _ -> return true
 }
 
+/// Answers an Open with the encoding choice for one side. The token keeps the settled encoding of the other side.
+let private requireEncoding
+    (worker: Worker)
+    (request: OpenDiffRequest)
+    (owner: TextDiffOwner)
+    (slot: Slot)
+    (side: DiffSide)
+    (candidates: EncodingCandidate[])
+    : OpenStep =
+    let token = worker.Tokens.Issue(slot.Binding.Value, owner.WindowOwner)
+
+    let other =
+        match side with
+        | DiffSide.Previous -> DiffSide.Current
+        | DiffSide.Current -> DiffSide.Previous
+
+    let kept =
+        match slot.OutcomeOf other, slot.Resolved with
+        | Some(Settled settled), Some sources when not (isAbsent (resolvedSideOf sources other)) ->
+            [|
+                {
+                    Side = other
+                    Encoding = Decoders.name settled.Enc
+                    BomLength = settled.BomLen
+                    WasChosen = settled.Chosen
+                }
+            |]
+        | _ -> [||]
+
+    worker.Tokens.Keep(token, kept)
+    request.Preparation |> Option.iter worker.Tokens.Release
+    Finish(Ok(Resumable.Ready(OpenDiffResult.NotDiffable(DiffBlocker.EncodingRequired(side, token, candidates)))))
+
+/// The byte offset of an invalid UTF-8 sequence that the engine reports as "invalid utf-8 sequence: ... at byte N".
+let private invalidUtf8Offset (evidence: string) : int64 option =
+    let marker = " at byte "
+    let at = evidence.LastIndexOf(marker, StringComparison.Ordinal)
+
+    if at < 0 || not (evidence.StartsWith("invalid " + Decoders.name TextEncoding.Utf8 + " sequence", StringComparison.Ordinal)) then
+        None
+    else
+        match Int64.TryParse(evidence.Substring(at + marker.Length)) with
+        | true, offset -> Some offset
+        | _ -> None
+
+/// Bytes on each side of an invalid sequence that the encoding previews show.
+[<Literal>]
+let private MismatchPreviewBytes = 512
+
+/// Decodes UTF-8 and replaces each byte that does not start a valid sequence with U+FFFD.
+let private lenientUtf8 (bytes: byte[]) (start: int) : string =
+    let text = System.Text.StringBuilder()
+    let mutable index = start
+
+    while index < bytes.Length do
+        let lead = int bytes[index]
+
+        let width =
+            if lead < 0x80 then 1
+            elif lead >= 0xC2 && lead < 0xE0 then 2
+            elif lead >= 0xE0 && lead < 0xF0 then 3
+            elif lead >= 0xF0 && lead < 0xF5 then 4
+            else 0
+
+        let mutable valid = width > 0 && index + width <= bytes.Length
+
+        let mutable scalar =
+            if width = 1 then lead
+            elif width = 2 then lead &&& 0x1F
+            elif width = 3 then lead &&& 0x0F
+            else lead &&& 0x07
+
+        for follower = 1 to width - 1 do
+            if valid then
+                let next = int bytes[index + follower]
+
+                if (next &&& 0xC0) = 0x80 then
+                    scalar <- (scalar <<< 6) ||| (next &&& 0x3F)
+                else
+                    valid <- false
+
+        valid <-
+            valid
+            && (width = 1
+                || (width = 2 && scalar >= 0x80)
+                || (width = 3 && scalar >= 0x800 && not (scalar >= 0xD800 && scalar <= 0xDFFF))
+                || (width = 4 && scalar >= 0x10000 && scalar <= 0x10FFFF))
+
+        if not valid then
+            text.Append('\uFFFD') |> ignore
+            index <- index + 1
+        else
+            if scalar < 0x10000 then
+                text.Append(char scalar) |> ignore
+            else
+                text.Append(char (0xD800 + ((scalar - 0x10000) >>> 10))).Append(char (0xDC00 + ((scalar - 0x10000) &&& 0x3FF)))
+                |> ignore
+
+            index <- index + width
+
+    text.ToString()
+
+let private windows1252Text (bytes: byte[]) (start: int) : string =
+    let text = System.Text.StringBuilder()
+
+    for index = start to bytes.Length - 1 do
+        let scalar = Decoders.windows1252Scalar (int bytes[index])
+        text.Append(if scalar < 0 then '\uFFFD' else char scalar) |> ignore
+
+    text.ToString()
+
+/// Decides whether a content failure is an invalid UTF-8 sequence on a side that classification read as UTF-8
+/// without a byte order mark or a choice of the caller, and that Windows-1252 can decode. It answers the two
+/// candidates with previews of the text around the sequence, or none for any other failure.
+let private encodingMismatchCandidates (worker: Worker) (slot: Slot) (detail: DiffContentBlocked) : Async<EncodingCandidate[] option> = async {
+    match invalidUtf8Offset detail.Evidence, slot.OutcomeOf detail.Side, slot.StateOf detail.Side with
+    | Some offset, Some(Settled settled), SideState.SideOpen opened when
+        settled.Enc = TextEncoding.Utf8 && not settled.Chosen && settled.BomLen = 0 && offset >= 0L && offset < opened.SideLength
+        ->
+        match opened.Src with
+        | None -> return None
+        | Some source ->
+            let start = max 0L (offset - int64 MismatchPreviewBytes)
+            let count = int (min (offset + int64 MismatchPreviewBytes) opened.SideLength - start)
+            let meter = Meter.create worker.Clock Limits.defaults
+            let! read = readRange source meter slot.Host.IsCanceled start count
+
+            match read with
+            | Some bytes when bytes.Length > int (offset - start) ->
+                let bad = int bytes[int (offset - start)]
+
+                if bad < 0x80 || Decoders.windows1252Scalar bad < 0 then
+                    return None
+                else
+                    // A window that starts inside a sequence would show a replacement character the file does not have.
+                    let mutable first = 0
+
+                    while start > 0L && first < 3 && first < int (offset - start) && (int bytes[first] &&& 0xC0) = 0x80 do
+                        first <- first + 1
+
+                    let trimmed = Array.sub bytes first (bytes.Length - first)
+
+                    return
+                        Some [|
+                            { Encoding = Decoders.name TextEncoding.Utf8; Preview = lenientUtf8 trimmed 0 }
+                            { Encoding = Decoders.name TextEncoding.Windows1252; Preview = windows1252Text trimmed 0 }
+                        |]
+            | _ -> return None
+    | _ -> return None
+}
+
 let private classifyStep
     (worker: Worker)
     (host: WorkerHost)
@@ -737,36 +884,11 @@ let private classifyStep
         elif not (previousDone && currentDone) then
             return Pause
         else
-            let requireEncoding (side: DiffSide) (candidates: EncodingCandidate[]) =
-                let token = worker.Tokens.Issue(slot.Binding.Value, owner.WindowOwner)
-
-                let other =
-                    match side with
-                    | DiffSide.Previous -> DiffSide.Current
-                    | DiffSide.Current -> DiffSide.Previous
-
-                let kept =
-                    match slot.OutcomeOf other, slot.Resolved with
-                    | Some(Settled settled), Some sources when not (isAbsent (resolvedSideOf sources other)) ->
-                        [|
-                            {
-                                Side = other
-                                Encoding = Decoders.name settled.Enc
-                                BomLength = settled.BomLen
-                                WasChosen = settled.Chosen
-                            }
-                        |]
-                    | _ -> [||]
-
-                worker.Tokens.Keep(token, kept)
-                request.Preparation |> Option.iter worker.Tokens.Release
-                Finish(Ok(Resumable.Ready(OpenDiffResult.NotDiffable(DiffBlocker.EncodingRequired(side, token, candidates)))))
-
             match slot.PreviousOutcome.Value, slot.CurrentOutcome.Value with
             | Evidence evidence, _ -> return Finish(Ok(Resumable.Ready(OpenDiffResult.NotDiffable(DiffBlocker.Binary(DiffSide.Previous, evidence)))))
             | _, Evidence evidence -> return Finish(Ok(Resumable.Ready(OpenDiffResult.NotDiffable(DiffBlocker.Binary(DiffSide.Current, evidence)))))
-            | Ambiguous candidates, _ -> return requireEncoding DiffSide.Previous candidates
-            | _, Ambiguous candidates -> return requireEncoding DiffSide.Current candidates
+            | Ambiguous candidates, _ -> return requireEncoding worker request owner slot DiffSide.Previous candidates
+            | _, Ambiguous candidates -> return requireEncoding worker request owner slot DiffSide.Current candidates
             | Settled _, Settled _ -> return Proceed
     }
 
@@ -832,7 +954,7 @@ let private sourceSpec (opened: OpenedSide) (settled: SideClass) : SourceSpec = 
 }
 
 /// Creates the engine session and runs its first page.
-let private createStep (worker: Worker) (host: WorkerHost) (request: OpenDiffRequest) (slot: Slot) : Async<OpenStep> = async {
+let private createStep (worker: Worker) (host: WorkerHost) (request: OpenDiffRequest) (owner: TextDiffOwner) (slot: Slot) : Async<OpenStep> = async {
     match slot.Previous, slot.Current, slot.PreviousOutcome, slot.CurrentOutcome, slot.Resolved with
     | SideState.SideOpen previous, SideState.SideOpen current, Some(Settled previousClass), Some(Settled currentClass), Some sources ->
         let handle: DiffHandle = { Id = string host.Generation; Version = slot.Version }
@@ -895,7 +1017,11 @@ let private createStep (worker: Worker) (host: WorkerHost) (request: OpenDiffReq
                 return Finish(Ok opened)
             | Error problem -> return Finish(Error problem)
         | EngineResult.Failed(code, _, Some detail) when code = TextDiffFailureCodes.ContentNotText ->
-            return Finish(Ok(Resumable.Ready(OpenDiffResult.NotDiffable(DiffBlocker.Binary(detail.Side, detail.Evidence)))))
+            let! candidates = encodingMismatchCandidates worker slot detail
+
+            match candidates with
+            | Some found -> return requireEncoding worker request owner slot detail.Side found
+            | None -> return Finish(Ok(Resumable.Ready(OpenDiffResult.NotDiffable(DiffBlocker.Binary(detail.Side, detail.Evidence)))))
         | EngineResult.Failed(code, message, detail) ->
             let problem =
                 match slot.Failure with
@@ -931,7 +1057,7 @@ let private runOpen
                     let! classified = classifyStep worker host request owner slot meter previousChoice currentChoice
 
                     match classified with
-                    | Proceed -> return! createStep worker host request slot
+                    | Proceed -> return! createStep worker host request owner slot
                     | other -> return other
                 | other -> return other
             | other -> return other
@@ -991,8 +1117,13 @@ let private openRequest
                     && existing.Owner = owner
                     ->
                     return Ok existing
-                | _ ->
+                | true, existing when
+                    (match existing.Phase with
+                     | SlotPhase.Ended -> false
+                     | _ -> true)
+                    ->
                     return Error(failure TextDiffFailureCodes.ContinuationMismatch "The continuation does not belong to this session.")
+                | _ -> return Error(closedFailure ())
             | None ->
                 match worker.Slots.TryGetValue host.Generation with
                 | true, old -> do! disposeSlot worker old
@@ -1061,7 +1192,6 @@ let private openRequest
             return result
     }
 
-// ---- Handle calls
 
 let private findActive (worker: Worker) (host: WorkerHost) (handle: DiffHandle) : Result<Slot, OperationFailure> =
     match worker.Slots.TryGetValue host.Generation with
@@ -1090,10 +1220,24 @@ let private settle (worker: Worker) (slot: Slot) (result: EngineResult<'T>) : As
     | EngineResult.Ok value -> return Ok value
     | EngineResult.Canceled -> return Error(canceledFailure ())
     | EngineResult.Failed(code, message, detail) ->
+        let! candidates = async {
+            match detail with
+            | Some blocked when code = TextDiffFailureCodes.ContentNotText && slot.Failure.IsNone ->
+                return! encodingMismatchCandidates worker slot blocked
+            | _ -> return None
+        }
+
         let problem =
-            match slot.Failure with
-            | Some value -> sourceFailure value
-            | None -> { (failure code message) with DiffDetail = detail }
+            match slot.Failure, detail, candidates with
+            | Some value, _, _ -> sourceFailure value
+            | None, Some blocked, Some _ ->
+                let side = if blocked.Side = DiffSide.Previous then "previous" else "current"
+
+                {
+                    (failure TextDiffFailureCodes.EncodingMismatch $"The {side} source was read as UTF-8 and holds bytes that are invalid in UTF-8 but valid in Windows-1252 ({blocked.Evidence}). Open the diff again with an encoding chosen.") with
+                        DiffDetail = detail
+                }
+            | None, _, _ -> { (failure code message) with DiffDetail = detail }
 
         if
             slot.Failure.IsSome

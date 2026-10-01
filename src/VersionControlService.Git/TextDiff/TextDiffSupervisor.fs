@@ -75,13 +75,17 @@ let private processId () : int = jsNative
 [<Emit("process.platform")>]
 let private processPlatform () : string = jsNative
 
+/// The id of the current user, or -1 where the platform has none (Windows).
+[<Emit("(typeof process.getuid === 'function' ? process.getuid() : -1)")>]
+let private currentUserId () : int = jsNative
+
 [<Emit("performance.now()")>]
 let private performanceNow () : float = jsNative
 
 [<Emit("$0.PATH || $0.Path || $0.path || ''")>]
 let private environmentPath (_environment: obj) : string = jsNative
 
-[<Emit("Object.assign({}, $0, { GIT_NO_LAZY_FETCH: '1', GIT_ALLOW_PROTOCOL: '', GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0' })")>]
+[<Emit("Object.assign({}, $0, { GIT_NO_LAZY_FETCH: '1', GIT_ALLOW_PROTOCOL: '', GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0', LC_ALL: 'C', LANG: 'C' })")>]
 let private localOnlyEnvironment (_environment: obj) : obj = jsNative
 
 let private isWindows () = processPlatform () = "win32"
@@ -501,9 +505,28 @@ type TextDiffSupervisor internal (instanceDirectory: string, gitExecutable: stri
         do! NodePositionalFile.removeWithRetry instanceDirectory 5 40
     }
 
+/// Fails when a folder that already exists in the temp root belongs to another user or is not a plain folder.
+/// Another local user could plant such a folder and read the spooled content. A negative user id skips the check.
+let checkFolderOwner (userId: int) (folder: string) (stats: NodePositionalFile.PositionalFileStats) : unit =
+    if userId >= 0 then
+        if stats.IsSymbolicLink || not stats.IsDirectory then
+            failwith $"The text diff folder {folder} exists and is not a plain folder. Use a temp root that the current user owns."
+        elif stats.Uid <> string userId then
+            failwith $"The text diff folder {folder} belongs to user {stats.Uid} and the current user is {userId}. Use a temp root that the current user owns."
+
 let create (options: TextDiffSupervisorOptions) : JS.Promise<TextDiffSupervisor> = promise {
     let! gitExecutable = resolveGitExecutable options.GitExecutable
     let parentDirectory = NodePath.join [| options.TempRoot; "text-diff" |]
+
+    let! existing = promise {
+        try
+            let! stats = NodePositionalFile.lstat parentDirectory
+            return Some stats
+        with _ ->
+            return None
+    }
+
+    existing |> Option.iter (checkFolderOwner (currentUserId ()) parentDirectory)
     do! NodePositionalFile.mkdirRecursive parentDirectory
     let! siblingNames = NodeFileSystem.readdirAsync parentDirectory
 

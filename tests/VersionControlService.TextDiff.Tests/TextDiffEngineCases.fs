@@ -112,6 +112,24 @@ module TextDiffEngineCases =
 
     let private classify (data: byte[]) = Classification.classify (int64 data.Length) [| sample data |]
 
+    /// Three 64 KiB samples with 4 bytes of padding, laid out like the ones the Git worker reads from a large file.
+    let private threeSamples (data: byte[]) =
+        let length = int64 data.Length
+        let sampleLength = 65_536L
+        let middle = max sampleLength (min (length - 2L * sampleLength) ((length / 2L - sampleLength / 2L) / 4L * 4L))
+        [| 0L; middle; length - sampleLength |]
+        |> Array.map (fun start ->
+            let padStart = min 4L start
+            let padEnd = min 4L (length - (start + sampleLength))
+            let first = int (start - padStart)
+            let count = int (padStart + sampleLength + padEnd)
+            {
+                BufferOffset = int64 first
+                Bytes = Array.sub data first count
+                SampleOffset = int padStart
+                SampleLength = 65_536
+            })
+
     let private expectClassified (expected: ClassificationResult) (encoding: TextEncoding) (hasBom: bool) (bomLength: int) =
         match expected with
         | Classified(actual, actualBom, actualLength) ->
@@ -467,6 +485,7 @@ module TextDiffEngineCases =
             bmp[0] <- 0x42uy
             bmp[1] <- 0x4Duy
             bmp[2] <- 26uy
+            bmp[14] <- 40uy
             let examples = [|
                 "ZIP", bytes [ 0x50; 0x4B; 3; 4; 20; 0 ]
                 "PDF", ascii "%PDF-1.7"
@@ -589,6 +608,25 @@ module TextDiffEngineCases =
         "a byte order mark fixes the chosen encoding", fun () -> async {
             let data = bytes [ 0xEF; 0xBB; 0xBF; 0x41 ]
             expectClassified (Classification.classifyWithChoice (int64 data.Length) [| sample data |] TextEncoding.Windows1252) TextEncoding.Utf8 true 3
+            return ()
+        }
+        "a lone multi-byte character cut at a sample edge classifies as UTF-8 without a choice", fun () -> async {
+            let data = Array.create 300_000 0x61uy
+            data[65_535] <- 0xC3uy
+            data[65_536] <- 0xA4uy
+            expectClassified (Classification.classify (int64 data.Length) (threeSamples data)) TextEncoding.Utf8 false 0
+            return ()
+        }
+        "one control character in a short sampled piece of a window does not make a file binary", fun () -> async {
+            let length = 10 * 65_536 + 65_500
+            let data = Array.create length 0x61uy
+            data[length - 65_536 + 10] <- 0x0Buy
+            expectClassified (Classification.classify (int64 length) (threeSamples data)) TextEncoding.Utf8 false 0
+            return ()
+        }
+        "a text file that starts with BM is not a bitmap", fun () -> async {
+            let data = ascii "BMI;Height;Weight\n70;180;75\n"
+            expectClassified (Classification.classify 2_000_000_000L [| sample data |]) TextEncoding.Utf8 false 0
             return ()
         }
         "allocation reservations enforce caps and release leases", fun () -> async {

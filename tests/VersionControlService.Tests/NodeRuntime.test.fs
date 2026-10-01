@@ -47,6 +47,19 @@ let private bufferBase64 (_buffer: obj) : string = jsNative
 """)>]
 let private cancelAfterChildExit (_cancel: unit -> unit) : unit -> unit = jsNative
 
+[<Import("EventEmitter", "node:events")>]
+let private eventEmitterClass: obj = jsNative
+
+/// A child as Node returns it after an EMFILE failure: no pid and no stdio streams.
+[<Emit("(() => { const child = new $0(); child.pid = undefined; child.stdout = null; child.stderr = null; return child; })()")>]
+let private streamlessChild (_emitterClass: obj) : NodeProcess.TypedChildProcess = jsNative
+
+[<Emit("$0.emit('error', new Error($1))")>]
+let private emitSpawnError (_child: obj) (_message: string) : unit = jsNative
+
+[<Emit("$0.emit('close', -1, null)")>]
+let private emitClose (_child: obj) : unit = jsNative
+
 let private createTempDirectoryAsync () : JS.Promise<string> =
     let prefix = NodePath.join [| osDynamic?tmpdir () |> unbox<string>; "vcs-node-runtime-" |]
     fsPromisesDynamic?mkdtemp (prefix) |> unbox<JS.Promise<string>>
@@ -601,6 +614,65 @@ Vitest.describe (
                         return raise error
 
                     do! NodePositionalFile.close fd
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+)
+
+Vitest.describe (
+    "Node process spawn failures",
+    fun () ->
+        Vitest.test (
+            "reports a spawn error for a bounded child without stdio streams",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let child = streamlessChild eventEmitterClass
+
+                let pending =
+                    NodeProcess.runBoundedWithSpawn
+                        (fun _ -> child)
+                        "git"
+                        [||]
+                        "."
+                        (createObj [])
+                        1024
+                        1024
+                        (fun _ _ -> ())
+
+                emitSpawnError child "spawn EMFILE"
+                emitClose child
+                let! result = pending
+                Vitest.expect(result.Error.IsSome && result.Error.Value.Contains "EMFILE").toBe true
+            }
+        )
+
+        Vitest.test (
+            "reports a spawn error for a file-writing child without stdio streams",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root = createTempDirectoryAsync ()
+
+                try
+                    let child = streamlessChild eventEmitterClass
+                    let! descriptor = NodePositionalFile.openCreateExclusive (NodePath.join [| root; "out.bin" |])
+
+                    let! handle =
+                        NodeProcess.spawnToFileTrackedWith
+                            (fun _ -> child)
+                            "git"
+                            [||]
+                            "."
+                            (createObj [])
+                            descriptor
+                            (fun _ _ -> ())
+
+                    emitSpawnError child "spawn EMFILE"
+                    emitClose child
+                    let! exit = handle.Closed
+                    Vitest.expect(exit.SpawnError.IsSome && exit.SpawnError.Value.Contains "EMFILE").toBe true
                     do! removeDirectoryAsync root
                 with error ->
                     do! removeDirectoryAsync root

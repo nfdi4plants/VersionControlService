@@ -37,6 +37,9 @@ module Classification =
     let private utf32BeBom = [| 0x00uy; 0x00uy; 0xFEuy; 0xFFuy |]
     let private hdf5Signature = [| 0x89uy; 0x48uy; 0x44uy; 0x46uy; 0x0Duy; 0x0Auy; 0x1Auy; 0x0Auy |]
 
+    /// The sizes of the bitmap header that follows the 14-byte file header.
+    let private bmpHeaderSizes = [| 12u; 40u; 52u; 56u; 108u; 124u |]
+
     let private properStart (sample: ClassificationSample) =
         max 0 (min sample.Bytes.Length sample.SampleOffset)
 
@@ -96,7 +99,9 @@ module Classification =
         elif starts (ascii "GIF87a") || starts (ascii "GIF89a") then Some "GIF image"
         elif starts [| 0x49uy; 0x49uy; 0x2Auy; 0x00uy |] || starts [| 0x4Duy; 0x4Duy; 0x00uy; 0x2Auy |] then Some "TIFF image"
         elif starts (ascii "BM") &&
-             (readU32Le samples 2L |> Option.exists (fun size -> size >= 26u && int64 size <= sourceLength)) then Some "BMP image"
+             (readU32Le samples 2L |> Option.exists (fun size -> size >= 26u && int64 size <= sourceLength)) &&
+             readU32Le samples 6L = Some 0u &&
+             (readU32Le samples 14L |> Option.exists (fun header -> bmpHeaderSizes |> Array.contains header)) then Some "BMP image"
         elif starts [| 0x1Fuy; 0x8Buy; 0x08uy |] && (tryByteAt samples 3L |> Option.exists (fun flags -> (flags &&& 0xE0uy) = 0uy)) then Some "gzip stream"
         elif starts [| 0x42uy; 0x5Auy; 0x68uy |] && (tryByteAt samples 3L |> Option.exists (fun level -> level >= 0x31uy && level <= 0x39uy)) then Some "bzip2 stream"
         elif starts [| 0xFDuy; 0x37uy; 0x7Auy; 0x58uy; 0x5Auy; 0x00uy |] then Some "xz stream"
@@ -205,9 +210,16 @@ module Classification =
         let mutable controlKey = -1L
         let mutable nulAt = 0L
         let mutable hasNul = false
+        let mutable firstAt = 0L
 
-        let closeWindow () =
-            if scalars > 0 && controls * 100 > scalars && controlKey < 0L then controlKey <- windowKey
+        /// A window counts toward the control ratio when the samples cover at least 4 KiB of it. A sampled
+        /// piece of a larger window is too short to judge, so a single control character in it says nothing.
+        /// A window that is itself shorter than 4 KiB is always judged. The last scalar is at most 4 bytes wide.
+        let closeWindow (lastAt: int64) =
+            if scalars > 0 && controls * 100 > scalars && controlKey < 0L then
+                let coveredBytes = lastAt - firstAt + 4L
+                let windowBytes = min windowEndOffset sourceLength - windowKey
+                if coveredBytes >= 4096L || windowBytes < 4096L then controlKey <- windowKey
 
         member _.Begin(sampleOffset: int64) =
             baseOffset <- sampleOffset
@@ -220,10 +232,12 @@ module Classification =
         /// Records the scalar that starts at byte `index` of the sample. `kind` comes from `controlKind`.
         member _.Scalar(index: int, kind: int) =
             if index > highIndex then
+                let previousIndex = highIndex
                 highIndex <- index
                 if index >= windowEndIndex then
-                    closeWindow ()
+                    closeWindow (baseOffset + int64 previousIndex)
                     windowKey <- windowStart sourceLength (baseOffset + int64 index)
+                    firstAt <- baseOffset + int64 index
                     windowEndOffset <- windowEnd sourceLength windowKey
                     windowEndIndex <-
                         if windowEndOffset = Int64.MaxValue then Int32.MaxValue
@@ -242,7 +256,7 @@ module Classification =
         member _.HasNul = hasNul
 
         member _.Evidence() =
-            closeWindow ()
+            closeWindow highWater
             if hasNul then Some(sprintf "NUL character at byte %d" nulAt)
             elif controlKey >= 0L then Some(sprintf "control ratio above 1%% in window at byte %d" controlKey)
             else None
@@ -416,9 +430,12 @@ module Classification =
         next
 
     /// Decodes every sample the way `evaluate` walks them, for an encoding that evaluated without an error.
+    /// Windows-1252 uses the UTF-8 sample ranges, so a character cut at a sample edge drops out of both texts
+    /// and the two candidates compare over the same bytes.
     let private decodedText sourceLength samples encoding =
         let ordered = orderedSamples samples
-        let ranges = ordered |> Array.map (sampleRange sourceLength encoding 0)
+        let rangeEncoding = if encoding = TextEncoding.Windows1252 then TextEncoding.Utf8 else encoding
+        let ranges = ordered |> Array.map (sampleRange sourceLength rangeEncoding 0)
         let capacity = ranges |> Array.sumBy (fun (start, stop) -> stop - start)
         let units = Array.zeroCreate<uint16> capacity
         let mutable count = 0
