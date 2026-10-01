@@ -41,12 +41,6 @@ module Native =
     [<Emit("$0[$1] = $2")>]
     let writeFloat (values: float[]) (index: int) (value: float) : unit = jsNative
 
-    [<Emit("$0[$1]")>]
-    let readUnit (units: uint16[]) (index: int) : int = jsNative
-
-    [<Emit("$0[$1] = $2")>]
-    let writeUnit (units: uint16[]) (index: int) (value: int) : unit = jsNative
-
     [<Emit("(($left, $leftStart, $right, $rightStart, $count) => { let matched = 0; while (matched < $count && $left[$leftStart + matched] === $right[$rightStart + matched]) matched++; return matched; })($0, $1, $2, $3, $4)")>]
     let equalUnitPrefix (left: uint16[]) (leftStart: int) (right: uint16[]) (rightStart: int) (count: int) : int = jsNative
 
@@ -152,10 +146,6 @@ module Native =
     let inline readFloat (values: float[]) (index: int) = values[index]
 
     let inline writeFloat (values: float[]) (index: int) (value: float) = values[index] <- value
-
-    let inline readUnit (units: uint16[]) (index: int) = int units[index]
-
-    let inline writeUnit (units: uint16[]) (index: int) (value: int) = units[index] <- uint16 value
 
     let equalUnitPrefix (left: uint16[]) (leftStart: int) (right: uint16[]) (rightStart: int) (count: int) =
         let mutable matched = 0

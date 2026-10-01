@@ -3288,10 +3288,7 @@ type TextDiffSession internal (
             cursor.Waiting <- false
             cursor.Complete <- cursor.Complete || cursor.State.IsComplete
             let mutable running = not cursor.Complete
-            let mutable iterations = 0
             while running && not (Meter.overBudget meter) && not (cancel ()) do
-                iterations <- iterations + 1
-                if iterations > 10_000 then invalidOp "A seek request did not advance."
                 cursor.Batch.StopAtFull <- true
 
                 let onLines (lines: LineBatch) =
@@ -3484,10 +3481,7 @@ type TextDiffSession internal (
 
     let advanceExpansion (pending: PendingExpansion) (meter: Meter) (cancel: unit -> bool) = async {
         let mutable continueWork = not (cancel ())
-        let mutable iterations = 0
         while continueWork && not (Meter.overBudget meter) do
-            iterations <- iterations + 1
-            if iterations > 1_000 then invalidOp "An expansion request did not advance."
             match pending.Search with
             | None -> continueWork <- false
             | Some cursor ->
@@ -4085,23 +4079,15 @@ type TextDiffSession internal (
         let meter = Meter.create host.Clock config.Limits
         let mutable finished = pending.Search.IsNone && pending.PreviousLines.IsSome && pending.CurrentLines.IsSome
         let mutable waiting = false
-        let mutable stalled = false
-        let mutable iterations = 0
         while not finished && not waiting && not (Meter.overBudget meter) && not (cancel ()) && invalidDetail.IsNone && failure.IsNone do
-            iterations <- iterations + 1
-            if iterations > 1_000 then
-                stalled <- true
-                finished <- true
-            else
-                let! _ = advanceExpansion pending meter cancel
-                finished <- pending.Search.IsNone && pending.PreviousLines.IsSome && pending.CurrentLines.IsSome
-                waiting <- pending.Search |> Option.exists (fun cursor -> cursor.Waiting)
-                if hdf5Due () then do! probeHdf5 ()
-                if Meter.quantumDue meter && not finished && not (Meter.overBudget meter) then
-                    do! host.Yield()
-                    Meter.beginNextQuantum meter
-        if stalled then return failWorker "An expansion request did not advance."
-        elif cancel () then return EngineResult.Canceled
+            let! _ = advanceExpansion pending meter cancel
+            finished <- pending.Search.IsNone && pending.PreviousLines.IsSome && pending.CurrentLines.IsSome
+            waiting <- pending.Search |> Option.exists (fun cursor -> cursor.Waiting)
+            if hdf5Due () then do! probeHdf5 ()
+            if Meter.quantumDue meter && not finished && not (Meter.overBudget meter) then
+                do! host.Yield()
+                Meter.beginNextQuantum meter
+        if cancel () then return EngineResult.Canceled
         elif invalidDetail.IsSome then return failContent ()
         elif failure.IsSome then
             let code, message = failure.Value

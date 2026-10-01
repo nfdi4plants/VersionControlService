@@ -163,7 +163,6 @@ type private SideClass = { Enc: TextEncoding; BomLen: int; Chosen: bool }
 
 type private ClassOutcome =
     | Settled of SideClass
-    | Ambiguous of EncodingCandidate[]
     | Evidence of string
 
 /// The Git child that fills the spool of one blob side.
@@ -694,7 +693,6 @@ let private classifySide (slot: Slot) (host: WorkerHost) (meter: Meter) (side: D
                     match result with
                     | Classified(encoding, _, bomLength) ->
                         slot.SetOutcome(side, Settled { Enc = encoding; BomLen = bomLength; Chosen = chosen.IsSome })
-                    | Candidates candidates -> slot.SetOutcome(side, Ambiguous candidates)
                     | BinaryEvidence evidence -> slot.SetOutcome(side, Evidence evidence)
 
                     return true
@@ -800,10 +798,7 @@ let private encodingMismatchCandidates (worker: Worker) (slot: Slot) (detail: Di
 }
 
 let private classifyStep
-    (worker: Worker)
     (host: WorkerHost)
-    (request: OpenDiffRequest)
-    (owner: TextDiffOwner)
     (slot: Slot)
     (meter: Meter)
     (previousChoice: TextEncoding option)
@@ -821,8 +816,6 @@ let private classifyStep
             match slot.PreviousOutcome.Value, slot.CurrentOutcome.Value with
             | Evidence evidence, _ -> return Finish(Ok(Resumable.Ready(OpenDiffResult.NotDiffable(DiffBlocker.Binary(DiffSide.Previous, evidence)))))
             | _, Evidence evidence -> return Finish(Ok(Resumable.Ready(OpenDiffResult.NotDiffable(DiffBlocker.Binary(DiffSide.Current, evidence)))))
-            | Ambiguous candidates, _ -> return requireEncoding worker request owner slot DiffSide.Previous candidates
-            | _, Ambiguous candidates -> return requireEncoding worker request owner slot DiffSide.Current candidates
             | Settled _, Settled _ -> return Proceed
     }
 
@@ -983,7 +976,7 @@ let private runOpen
 
                 match opened with
                 | Proceed ->
-                    let! classified = classifyStep worker host request owner slot meter previousChoice currentChoice
+                    let! classified = classifyStep host slot meter previousChoice currentChoice
 
                     match classified with
                     | Proceed -> return! createStep worker host request owner slot

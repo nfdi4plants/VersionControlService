@@ -284,49 +284,10 @@ module private JournalCodec =
                 Body = body
             }
 
-    let private writePending (writer: JournalWriter) (value: PendingPreview option) =
-        match value with
-        | None -> writer.WriteBool false
-        | Some preview ->
-            writer.WriteBool true
-            let writeSide = function
-                | PendingSide.NoActiveLine -> writer.WriteByte 0
-                | PendingSide.Exhausted count -> writer.WriteByte 1; writer.WriteInt64 count
-                | PendingSide.Snippet snippet ->
-                    writer.WriteByte 2
-                    writer.WriteInt64 snippet.Line
-                    writer.WriteInt64 snippet.OffsetUtf16
-                    writer.WriteString snippet.Text
-                    writer.WriteByte(match snippet.End with | SnippetEnd.Truncated -> 0 | SnippetEnd.MoreTextPending -> 1 | SnippetEnd.LineEnd -> 2 | SnippetEnd.EndOfFile -> 3)
-            writeSide preview.Previous
-            writeSide preview.Current
-            writer.WriteBool preview.Mismatch.IsSome
-            preview.Mismatch |> Option.iter (fun mismatch -> writer.WriteInt64 mismatch.PreviousOffsetUtf16; writer.WriteInt64 mismatch.CurrentOffsetUtf16)
-
-    let private readPending (reader: JournalReader) =
-        if not (reader.ReadBool()) then None
-        else
-            let readSide () =
-                match reader.ReadByte() with
-                | 1 -> PendingSide.Exhausted(reader.ReadInt64())
-                | 2 ->
-                    let line = reader.ReadInt64()
-                    let offset = reader.ReadInt64()
-                    let text = reader.ReadString()
-                    let ending =
-                        match reader.ReadByte() with
-                        | 1 -> SnippetEnd.MoreTextPending
-                        | 2 -> SnippetEnd.LineEnd
-                        | 3 -> SnippetEnd.EndOfFile
-                        | _ -> SnippetEnd.Truncated
-                    PendingSide.Snippet { Line = line; OffsetUtf16 = offset; Text = text; End = ending }
-                | _ -> PendingSide.NoActiveLine
-            let previous = readSide ()
-            let current = readSide ()
-            let mismatch =
-                if reader.ReadBool() then Some { PreviousOffsetUtf16 = reader.ReadInt64(); CurrentOffsetUtf16 = reader.ReadInt64() }
-                else None
-            Some { Previous = previous; Current = current; Mismatch = mismatch }
+    /// Pages carry a pending-preview flag that is always false, because replays never show a preview.
+    let private readPending (reader: JournalReader) : PendingPreview option =
+        reader.ReadBool() |> ignore
+        None
 
     let encode (value: JournalValue) =
         let writer = JournalWriter()
@@ -343,12 +304,12 @@ module private JournalCodec =
                 for part in page.Parts do writePart writer part
                 writeProgress writer page.Progress
                 writer.WriteBool page.OutputComplete
-                writePending writer None
+                writer.WriteBool false
             | Resumable.Scanning(progress, continuation, _) ->
                 writer.WriteByte 1
                 writeProgress writer progress
                 writer.WriteString continuation
-                writePending writer None
+                writer.WriteBool false
         | JournalValue.Expansion result ->
             writer.WriteByte 1
             match result with
@@ -554,12 +515,6 @@ type private JournalCache(ledger: Ledger, capBytes: int) =
     member _.Add(sequence: int64, record: byte[]) =
         let cost = record.Length
         if cost <= capBytes then
-            match entries.TryGetValue sequence with
-            | true, existing ->
-                entries.Remove sequence |> ignore
-                used <- used - existing.Cost
-                ledger.Release(AllocationCategory.ResponseData, int64 existing.Cost)
-            | _ -> ()
             let mutable room = true
             while room && used + cost > capBytes do
                 room <- evictOldest ()

@@ -12,7 +12,6 @@ type ClassificationSample = {
 
 type ClassificationResult =
     | Classified of TextEncoding * hasBom: bool * bomLength: int
-    | Candidates of EncodingCandidate[]
     | BinaryEvidence of string
 
 module Classification =
@@ -21,13 +20,6 @@ module Classification =
         Encoding: TextEncoding
         Error: string option
         ControlEvidence: string option
-    }
-
-    /// The decoded text of one candidate, built only when two candidates must be compared or previewed.
-    type private DecodedText = {
-        Units: uint16[]
-        Count: int
-        FirstSampleCount: int
     }
 
     let private utf8Bom = [| 0xEFuy; 0xBBuy; 0xBFuy |]
@@ -376,101 +368,6 @@ module Classification =
             sampleIndex <- sampleIndex + 1
         { Encoding = encoding; Error = decodeFailure; ControlEvidence = tally.Evidence() }
 
-    /// Writes the code units of a range that is known to be valid UTF-8 and returns the new unit count.
-    let private writeUtf8Units (bytes: byte[]) start stop (units: uint16[]) count =
-        let mutable index = start
-        let mutable next = count
-        while index < stop do
-            let lead = Native.readByte bytes index
-            if lead < 0x80 then
-                Native.writeUnit units next lead
-                next <- next + 1
-                index <- index + 1
-            elif lead < 0xE0 then
-                Native.writeUnit units next (((lead &&& 0x1F) <<< 6) ||| (Native.readByte bytes (index + 1) &&& 0x3F))
-                next <- next + 1
-                index <- index + 2
-            elif lead < 0xF0 then
-                let scalar =
-                    ((lead &&& 0x0F) <<< 12)
-                    ||| ((Native.readByte bytes (index + 1) &&& 0x3F) <<< 6)
-                    ||| (Native.readByte bytes (index + 2) &&& 0x3F)
-                Native.writeUnit units next scalar
-                next <- next + 1
-                index <- index + 3
-            else
-                let scalar =
-                    ((lead &&& 0x07) <<< 18)
-                    ||| ((Native.readByte bytes (index + 1) &&& 0x3F) <<< 12)
-                    ||| ((Native.readByte bytes (index + 2) &&& 0x3F) <<< 6)
-                    ||| (Native.readByte bytes (index + 3) &&& 0x3F)
-                let offset = scalar - 0x10000
-                Native.writeUnit units next (0xD800 + (offset >>> 10))
-                Native.writeUnit units (next + 1) (0xDC00 + (offset &&& 0x3FF))
-                next <- next + 2
-                index <- index + 4
-        next
-
-    let private writeWindows1252Units (bytes: byte[]) start stop (units: uint16[]) count =
-        let mutable next = count
-        for index = start to stop - 1 do
-            Native.writeUnit units next (Native.readInt Decoders.windows1252 (Native.readByte bytes index))
-            next <- next + 1
-        next
-
-    let private writeUtf16Units (bytes: byte[]) start stop littleEndian (units: uint16[]) count =
-        let mutable index = start
-        let mutable next = count
-        while index + 1 < stop do
-            let first = Native.readByte bytes index
-            let second = Native.readByte bytes (index + 1)
-            Native.writeUnit units next (if littleEndian then first ||| (second <<< 8) else (first <<< 8) ||| second)
-            next <- next + 1
-            index <- index + 2
-        next
-
-    /// Decodes every sample the way `evaluate` walks them, for an encoding that evaluated without an error.
-    /// Windows-1252 uses the UTF-8 sample ranges, so a character cut at a sample edge drops out of both texts
-    /// and the two candidates compare over the same bytes.
-    let private decodedText sourceLength samples encoding =
-        let ordered = orderedSamples samples
-        let rangeEncoding = if encoding = TextEncoding.Windows1252 then TextEncoding.Utf8 else encoding
-        let ranges = ordered |> Array.map (sampleRange sourceLength rangeEncoding 0)
-        let capacity = ranges |> Array.sumBy (fun (start, stop) -> stop - start)
-        let units = Array.zeroCreate<uint16> capacity
-        let mutable count = 0
-        let mutable firstSampleCount = 0
-        for sampleIndex = 0 to ordered.Length - 1 do
-            let start, stop = ranges[sampleIndex]
-            let bytes = ordered[sampleIndex].Bytes
-            if stop > start then
-                count <-
-                    match encoding with
-                    | TextEncoding.Utf8 -> writeUtf8Units bytes start stop units count
-                    | TextEncoding.Windows1252 -> writeWindows1252Units bytes start stop units count
-                    | TextEncoding.Utf16LE -> writeUtf16Units bytes start stop true units count
-                    | TextEncoding.Utf16BE -> writeUtf16Units bytes start stop false units count
-                    | _ -> count
-            if sampleIndex = 0 then firstSampleCount <- count
-        { Units = units; Count = count; FirstSampleCount = firstSampleCount }
-
-    let private sameText (left: DecodedText) (right: DecodedText) =
-        let mutable equal = left.Count = right.Count
-        let mutable index = 0
-        while equal && index < left.Count do
-            equal <- Native.readUnit left.Units index = Native.readUnit right.Units index
-            index <- index + 1
-        equal
-
-    /// The first up to 2048 units of the first sample, without splitting a surrogate pair.
-    let private previewOf (text: DecodedText) =
-        let taken = min text.FirstSampleCount 2049
-        let length =
-            if taken <= 2048 then taken
-            elif Decoders.isHighSurrogate (Native.readUnit text.Units 2047) then 2047
-            else 2048
-        Native.utf16Decode text.Units length
-
     let private parityCandidate samples oddOffsets =
         let mutable zeros = 0
         let mutable parityZeros = 0
@@ -489,22 +386,6 @@ module Classification =
                         zeros <- zeros + 1
                         if (((baseOdd + i) &&& 1) = 1) = oddOffsets then parityZeros <- parityZeros + 1
         total > 0 && zeros * 10 >= total && parityZeros * 10 >= zeros * 9
-
-    /// True when a sampled range holds a lead byte of a multi-byte UTF-8 sequence. The caller has already
-    /// checked that the ranges are valid UTF-8, so a byte from 0xC0 up starts a sequence.
-    let private hasMultiByteSequence sourceLength samples =
-        let ordered = orderedSamples samples
-        let mutable found = false
-        let mutable sampleIndex = 0
-        while not found && sampleIndex < ordered.Length do
-            let start, stop = sampleRange sourceLength TextEncoding.Utf8 0 ordered[sampleIndex]
-            let bytes = ordered[sampleIndex].Bytes
-            let mutable index = start
-            while not found && index < stop do
-                if Native.readByte bytes index >= 0xC0 then found <- true
-                index <- index + 1
-            sampleIndex <- sampleIndex + 1
-        found
 
     let classifyWithChoice sourceLength samples encoding =
         match detectBom samples with
@@ -546,21 +427,6 @@ module Classification =
                     | Some error, _, _, _ -> BinaryEvidence error
                     | _, _, Some error, _ -> BinaryEvidence error
                     | _ -> BinaryEvidence "no supported text encoding"
-                elif accepted.Count = 1 then Classified(accepted[0].Encoding, false, 0)
-                elif utf8.Error.IsNone && utf8.ControlEvidence.IsNone && hasMultiByteSequence sourceLength samples then
-                    // Text in another single-byte encoding is almost never valid UTF-8 with multi-byte sequences.
-                    Classified(TextEncoding.Utf8, false, 0)
                 else
-                    let distinct = ResizeArray<Evaluation>()
-                    let texts = ResizeArray<DecodedText>()
-                    for evaluation in accepted do
-                        let text = decodedText sourceLength samples evaluation.Encoding
-                        if not (texts |> Seq.exists (fun existing -> sameText existing text)) then
-                            distinct.Add evaluation
-                            texts.Add text
-                    if distinct.Count = 1 then Classified(distinct[0].Encoding, false, 0)
-                    else
-                        let candidates =
-                            Array.init distinct.Count (fun index ->
-                                ({ Encoding = Decoders.name distinct[index].Encoding; Preview = previewOf texts[index] }: EncodingCandidate))
-                        Candidates candidates
+                    // When UTF-8 and Windows-1252 are both accepted, UTF-8 comes first, so valid UTF-8 wins without asking.
+                    Classified(accepted[0].Encoding, false, 0)
