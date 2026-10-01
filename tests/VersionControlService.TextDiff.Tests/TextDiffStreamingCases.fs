@@ -441,6 +441,38 @@ module TextDiffStreamingCases =
                     do! session.Close()
             return ()
         }
+        "edits followed by more lines than the largest window stay aligned", fun () -> async {
+            let sourceLine text = { Text = text; Ending = LineEnding.LF }
+            let lineCount = 70_000
+            let editIndex = 102
+            let edited (lines: SourceLine[]) =
+                let copy = Array.copy lines
+                copy[editIndex] <- sourceLine (copy[editIndex].Text + " edited")
+                copy
+            let prose = Array.init lineCount (fun index -> sourceLine (if index % 2 = 1 then "" else $"Paragraph {index} has some words in it."))
+            let column = Array.init lineCount (fun index -> sourceLine (match index % 3 with 0 -> "low" | 1 -> "mid" | _ -> "high"))
+            let table = Array.init lineCount (fun index -> sourceLine (if index % 50 = 0 then $"block {index}" else "0\t0\t0\t0\tNA"))
+            let inserted = Array.concat [ table[.. editIndex - 1]; Array.create 2_000 (sourceLine "0\t0\t0\t0\tNA"); table[editIndex ..] ]
+            for name, previous, current, expectedAdded in [
+                "prose", prose, edited prose, 0
+                "column", column, edited column, 0
+                "table", table, edited table, 0
+                "table insertion", table, inserted, 2_000
+            ] do
+                let! session = openSession (Ledger()) (SessionConfig.defaults ("far-" + name)) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+                let! pages, _ = readAll session
+                checkOracle previous current pages
+                Check.equal (expectedAdded, 0, 0, 0) (diffCounts pages) $"The {name} input has no unaligned lines and only its own changes."
+                let changed =
+                    allParts pages
+                    |> Array.collect (function DiffPart.Hunk { Body = HunkBody.AlignedRows values } -> values | _ -> Array.empty)
+                    |> Array.filter (fun row -> row.Kind = DiffRowKind.Replaced)
+                    |> Array.map (fun row -> row.Previous.Value.Number, row.Current.Value.Number)
+                let expectedReplaced = if expectedAdded = 0 then [| int64 editIndex, int64 editIndex |] else Array.empty
+                Check.sequence expectedReplaced changed $"The {name} input pairs the edited line with its new text."
+                do! session.Close()
+            return ()
+        }
         "window storage stays within its configured line bound", fun () -> async {
             let previous = makeLines 50_000 "line-"
             let current = Array.copy previous

@@ -489,6 +489,7 @@ type TextDiffSession internal (
     let mutable feedCurrent = 0
     let mutable regionStarted = false
     let mutable preserveWindowAfterCommit = false
+    let mutable windowUniqueLines = 0
     let mutable pBase = float previousSpec.BomLength
     let mutable cBase = float currentSpec.BomLength
     let mutable partialAlign = false
@@ -980,20 +981,39 @@ type TextDiffSession internal (
         preserveWindowAfterCommit <- false
         let mutable lastAnchored = -1
         let mutable lastPrefixAnchor = -1
+        let mutable lastEqual = -1
         let mutable previousEnd = 0
         let mutable currentEnd = 0
         for index = 0 to ops.Length - 1 do
             let operation = ops[index]
-            if operation.Anchored && (operation.Kind = OperationKind.Equal || operation.Kind = OperationKind.EndingChanged) then
-                lastAnchored <- index
-                if operation.PrefixAnchor then lastPrefixAnchor <- index
-                previousEnd <- operation.PreviousIndex + operation.PreviousCount
-                currentEnd <- operation.CurrentIndex + operation.CurrentCount
-        // A window commits up to its last anchored equal run only when few lines follow that run. A far
-        // anchor at the window end may be a repeated line that matched by chance after a large insertion,
-        // so the window rather grows or keeps only its aligned start.
-        let anchorTail = max (previousTable.Count - previousEnd) (currentTable.Count - currentEnd)
-        let anchorTailSmall = anchorTail <= 64
+            if operation.Kind = OperationKind.Equal || operation.Kind = OperationKind.EndingChanged then
+                lastEqual <- index
+                if operation.Anchored then
+                    lastAnchored <- index
+                    if operation.PrefixAnchor then lastPrefixAnchor <- index
+                    previousEnd <- operation.PreviousIndex + operation.PreviousCount
+                    currentEnd <- operation.CurrentIndex + operation.CurrentCount
+        // A window commits up to its last anchored equal run only when few lines follow that run. The lines
+        // are counted on a side whose window stopped at its limit. A side that reached the end of its source
+        // holds everything that is left, so its count says nothing about the anchor. When both windows
+        // stopped at their limit, the side with fewer lines after the anchor is the one whose window ended
+        // there. The other side then holds the lines of an insertion or deletion.
+        let previousTail = previousTable.Count - previousEnd
+        let currentTail = currentTable.Count - currentEnd
+        let anchorTail =
+            if previousSide.Finished && not currentSide.Finished then currentTail
+            elif currentSide.Finished && not previousSide.Finished then previousTail
+            else min previousTail currentTail
+        // When many lines follow the anchor on one side only, the window holds an insertion or deletion, and the
+        // anchor may be a line that occurs once in each window only by chance, such as a repeated value inside
+        // the inserted records. Such an anchor sits in a short run between changed lines, so the window settles
+        // on it only when its equal run is long.
+        let mutable anchorRunLines = 0
+        let mutable runIndex = lastAnchored
+        while runIndex >= 0 && (ops[runIndex].Kind = OperationKind.Equal || ops[runIndex].Kind = OperationKind.EndingChanged) do
+            anchorRunLines <- anchorRunLines + ops[runIndex].PreviousCount
+            runIndex <- runIndex - 1
+        let anchorTailSmall = anchorTail <= 64 && (max previousTail currentTail <= 64 || anchorRunLines >= 64)
         let growWindow () =
             windowLimit <- min config.WindowMaxLines (windowLimit * 2)
             previousSide.SetLimits(windowLimit, config.WindowMaxBytes)
@@ -1030,6 +1050,11 @@ type TextDiffSession internal (
             elif canGrow then
                 // The window may hold an insertion or deletion larger than itself, so it grows first.
                 growWindow ()
+            elif windowUniqueLines = 0 && lastEqual >= 0 then
+                // No line occurs once in each window, so the forward search finds nothing better to line up
+                // on. The window keeps its alignment up to its last equal run.
+                commitCount <- lastEqual + 1
+                beginFeeding ()
             else
                 // At its largest size without an anchor the diff continues with a forward search.
                 startResync ()
@@ -1113,6 +1138,7 @@ type TextDiffSession internal (
                 else startCompare previousIndex currentIndex count
             | AlignStep.Complete completed ->
                 ops <- completed
+                windowUniqueLines <- active.UniqueLines
                 replayLog.Clear()
                 replayPosition <- 0
                 active.Dispose()

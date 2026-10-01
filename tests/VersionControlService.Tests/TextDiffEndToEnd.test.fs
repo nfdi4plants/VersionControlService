@@ -915,7 +915,7 @@ Vitest.describe (
             TestOptions(timeout = 180000),
             fun () -> promise {
                 let! repository = newRepository ()
-                let previousLines = Array.init 1024 (fun index -> $"line-{index:D5}")
+                let previousLines = Array.init 1024 (fun index -> $"line-{(string index).PadLeft(5, '0')}")
                 let currentLines = Array.copy previousLines
                 currentLines[8] <- "changed-near-start"
                 currentLines[1015] <- "changed-near-end"
@@ -1042,7 +1042,7 @@ Vitest.describe (
             fun () -> promise {
                 let! repository = newRepository ()
                 let lineCount = 20_000
-                let previousLines = Array.init lineCount (fun index -> $"shared-line-{index:D5}")
+                let previousLines = Array.init lineCount (fun index -> $"shared-line-{(string index).PadLeft(5, '0')}")
                 let currentLines = Array.copy previousLines
                 currentLines[0] <- "changed-first-line"
                 currentLines[lineCount - 1] <- "changed-last-line"
@@ -1351,7 +1351,7 @@ Vitest.describe (
                 let elapsed = performanceNow () - started
                 let handle, _, _, first = opened
                 let! spoolSize = largestSpool (currentFixture ()).Supervisor.InstanceDirectory
-                writeLog $"Large blob first page: {elapsed:F1} ms, largest spool at first page: {spoolSize} of {largeSize} bytes."
+                writeLog $"Large blob first page: %.1f{elapsed} ms, largest spool at first page: {spoolSize} of {largeSize} bytes."
                 Vitest.expect(pageHasChange first).toBe true
                 Vitest.expect(spoolSize > 0L).toBe true
                 Vitest.expect(spoolSize < largeSize).toBe true
@@ -1491,7 +1491,7 @@ Vitest.describe (
                 match result with
                 | Failed failure ->
                     Vitest.expect(failure.Code).toBe TextDiffFailureCodes.WorkerFailed
-                    writeLog $"Worker termination during ReadPage: {elapsed:F1} ms."
+                    writeLog $"Worker termination during ReadPage: %.1f{elapsed} ms."
                 | Succeeded _
                 | PartiallySucceeded _ -> failwith "ReadPage completed after the worker terminated."
 

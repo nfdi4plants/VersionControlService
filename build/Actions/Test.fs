@@ -20,8 +20,8 @@ let TextDiff () =
 /// and leaves the pinned tool of this repository alone.
 let private swateFableVersion = "5.0.0-alpha.21"
 
-/// Compiles the text-diff engine cases and the three worker test files with the compiler Swate uses and
-/// runs them in Vitest. The suites write to their usual output folders, which the Vitest configuration requires.
+/// Compiles the text-diff engine cases and the text-diff test files of the main suite with the compiler Swate
+/// uses and runs them in Vitest. The suites write to their usual output folders, which the Vitest configuration requires.
 let TextDiffSwateFable () =
     let compile projectPath =
         cleanGeneratedOutput projectPath
@@ -45,6 +45,10 @@ let TextDiffSwateFable () =
             "output/TextDiffEndToEnd.test.js"
             "output/TextDiffWorkerThread.test.js"
             "output/TextDiffPool.test.js"
+            "output/TextDiffResolver.test.js"
+            "output/TextDiffSupervisor.test.js"
+            "output/TextDiffProtocol.test.js"
+            "output/TextDiffLfsPointer.test.js"
             "--configLoader"
             "native"
         ]

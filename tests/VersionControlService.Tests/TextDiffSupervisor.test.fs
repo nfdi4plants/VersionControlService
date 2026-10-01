@@ -447,7 +447,7 @@ Vitest.describe (
                     let releaseElapsed = performanceNow () - releaseStarted
                     match goneAfter with
                     | Some milliseconds ->
-                        writeLog ($"Worker child termination latency: {milliseconds:F1} ms")
+                        writeLog ($"Worker child termination latency: %.1f{milliseconds} ms")
                         Vitest.expect(milliseconds <= 2000.0).toBe true
                     | None -> failwith "The blob child remained alive for more than two seconds after worker release."
 

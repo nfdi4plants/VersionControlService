@@ -130,7 +130,8 @@ type internal DiffOperation = {
     PreviousCount: int
     CurrentCount: int
     /// The equal run can settle a window. Its lines were confirmed as a unique match, or at least two
-    /// anchored equal lines follow it directly.
+    /// anchored equal lines follow it directly, or it follows changed lines directly and is long or holds a
+    /// line that occurs once in each window.
     Anchored: bool
     /// The run belongs to the equal lines at the window start that line up position for position.
     PrefixAnchor: bool
@@ -206,7 +207,9 @@ type private AlignPhase =
     | RecoverChain
     | AnchorConfirm
     | Gaps
+    | CountUnique
     | Convert
+    | MarkRuns
     | Finished
 
 /// Aligns the lines of two windows without ever holding line text. Line keys (two hash halves and the
@@ -216,6 +219,7 @@ type private AlignPhase =
 type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap: int, sameSourceLength: bool, ledger: Ledger) =
     let stepChunk = 512
     let lookaheadLines = 2
+    let longRunLines = 64
     let raw = ResizeArray<DiffOperation>()
     let mutable phase = AlignPhase.Prefix
     let previousCount = previous.Count
@@ -289,22 +293,83 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
     let mutable groupCurrentCount = 0
     let mutable result = Array.empty<DiffOperation>
 
+    // How often each line key occurs in each window, capped at two. The table is built once per window after
+    // the gaps are aligned. A holder below previousCount is a previous line, a larger one is a current line.
+    let mutable uniqueMask = 0
+    let mutable uniqueHolder = Array.empty<int>
+    let mutable uniquePreviousCount = Array.empty<byte>
+    let mutable uniqueCurrentCount = Array.empty<byte>
+    let mutable uniqueReserved = 0L
+    let mutable uniqueCursor = 0
+    let mutable uniqueLines = 0
+    let mutable markIndex = 0
+    let mutable markAfterChange = false
+
     let keysEqual (p: int) (c: int) =
         previous.HashLow p = current.HashLow c
         && previous.HashHigh p = current.HashHigh c
         && previous.Length p = current.Length c
 
-    let uniqueLine (table: LineTable) index =
+    let holderMatches (holder: int) (table: LineTable) index =
+        if holder < previousCount then
+            previous.HashLow holder = table.HashLow index
+            && previous.HashHigh holder = table.HashHigh index
+            && previous.Length holder = table.Length index
+        else
+            let line = holder - previousCount
+            current.HashLow line = table.HashLow index
+            && current.HashHigh line = table.HashHigh index
+            && current.Length line = table.Length index
+
+    let uniqueSlot (table: LineTable) index =
         let low = table.HashLow index
         let high = table.HashHigh index
-        let length = table.Length index
-        let mutable matches = 0
-        let mutable candidate = 0
-        while candidate < table.Count && matches < 2 do
-            if table.HashLow candidate = low && table.HashHigh candidate = high && table.Length candidate = length then
-                matches <- matches + 1
-            candidate <- candidate + 1
-        matches = 1
+        let mixed = Native.imul low 0x9E3779B1 ^^^ Native.imul high 0x85EBCA6B ^^^ int (table.Length index)
+        let mutable slot = (mixed ^^^ (mixed >>> 15)) &&& uniqueMask
+        let mutable searching = true
+        while searching do
+            let holder = Native.readInt uniqueHolder slot
+            if holder < 0 || holderMatches holder table index then searching <- false
+            else slot <- (slot + 1) &&& uniqueMask
+        slot
+
+    let reserveUnique () =
+        let mutable slots = 16
+        while slots < (previousCount + currentCount) * 2 do slots <- slots * 2
+        let estimate = int64 slots * 6L + 4096L
+        if ledger.TryReserve(AllocationCategory.AlignmentScratch, estimate) then
+            uniqueReserved <- estimate
+            uniqueMask <- slots - 1
+            uniqueHolder <- Array.create slots -1
+            uniquePreviousCount <- Array.zeroCreate slots
+            uniqueCurrentCount <- Array.zeroCreate slots
+            true
+        else false
+
+    let releaseUnique () =
+        if uniqueReserved > 0L then
+            ledger.Release(AllocationCategory.AlignmentScratch, uniqueReserved)
+            uniqueReserved <- 0L
+        uniqueHolder <- Array.empty
+        uniquePreviousCount <- Array.empty
+        uniqueCurrentCount <- Array.empty
+
+    let isUnique slot =
+        Native.readByte uniquePreviousCount slot = 1 && Native.readByte uniqueCurrentCount slot = 1
+
+    let countLine (table: LineTable) index (holder: int) (counts: byte[]) =
+        let slot = uniqueSlot table index
+        if Native.readInt uniqueHolder slot < 0 then Native.writeInt uniqueHolder slot holder
+        let before = isUnique slot
+        let seen = Native.readByte counts slot
+        if seen < 2 then Native.writeByte counts slot (seen + 1)
+        let after = isUnique slot
+        if before <> after then uniqueLines <- uniqueLines + (if after then 1 else -1)
+
+    /// True when the key of a previous line occurs exactly once in each window.
+    let uniqueInBoth (previousIndex: int) = isUnique (uniqueSlot previous previousIndex)
+
+    let isEqualKind kind = kind = OperationKind.Equal || kind = OperationKind.EndingChanged
 
     let slotFor (table: LineTable) index =
         let low = table.HashLow index
@@ -332,14 +397,18 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
         gapCurrentStart <- middleCurrentStart
         phase <- AlignPhase.Gaps
 
+    /// Counts the line keys of both windows before the operations are converted.
     let beginConvert () =
         releaseScratch ()
+        uniqueCursor <- 0
+        uniqueLines <- 0
+        phase <- AlignPhase.CountUnique
+
+    let appendSuffix () =
         let suffixCount = previousCount - suffixPrevious
         let mutable uniqueSuffix = suffixCount >= lookaheadLines
         for offset = 0 to lookaheadLines - 1 do
-            let previousIndex = previousCount - 1 - offset
-            let currentIndex = currentCount - 1 - offset
-            if uniqueSuffix && (not (uniqueLine previous previousIndex) || not (uniqueLine current currentIndex)) then
+            if uniqueSuffix && not (uniqueInBoth (previousCount - 1 - offset)) then
                 uniqueSuffix <- false
         let suffixAnchored = suffixCount >= lookaheadLines && (uniqueSuffix || positionalConfirmed)
         if suffixCount > 0 then
@@ -432,16 +501,9 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
             gapIndex <- gapIndex + 1
         else beginConvert ()
 
-    let confirmOrCompareAnchor () =
-        if anchorPrevious = anchorCurrent && anchorPrevious + anchorLength <= prefixConfirmedLength then
-            spanPrevious.Add anchorPrevious
-            spanCurrent.Add anchorCurrent
-            spanLength.Add anchorLength
-            anchorLength <- 0
-            AlignStep.Running
-        else
-            anchorPending <- true
-            AlignStep.NeedRun(anchorPrevious, anchorCurrent, anchorLength)
+    let confirmAnchor () =
+        anchorPending <- true
+        AlignStep.NeedRun(anchorPrevious, anchorCurrent, anchorLength)
 
     let markLookaheadAnchors () =
         let mutable followingPrevious = -1
@@ -512,7 +574,12 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
                     )
                 )
 
-    member _.Dispose() = releaseScratch ()
+    member _.Dispose() =
+        releaseScratch ()
+        releaseUnique ()
+
+    /// The number of line keys that occur exactly once in each window. It is known once the alignment completes.
+    member _.UniqueLines = uniqueLines
 
     member _.ResolveRun(matched: int) =
         match phase with
@@ -726,7 +793,7 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
             AlignStep.Running
         | AlignPhase.AnchorConfirm ->
             if anchorPending then AlignStep.NeedRun(anchorPrevious, anchorCurrent, anchorLength)
-            elif anchorLength > 0 then confirmOrCompareAnchor ()
+            elif anchorLength > 0 then confirmAnchor ()
             elif anchorIndex < 0 then
                 beginGaps ()
                 AlignStep.Running
@@ -745,7 +812,7 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
                         anchorIndex <- anchorIndex - 1
                     else extending <- false
                 Meter.charge meter (anchorLength / 8)
-                confirmOrCompareAnchor ()
+                confirmAnchor ()
         | AlignPhase.Gaps ->
             match stepper with
             | Some active ->
@@ -785,6 +852,19 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
                     AlignStep.Running
             | None ->
                 startGap meter
+                AlignStep.Running
+        | AlignPhase.CountUnique ->
+            if uniqueReserved = 0L && not (reserveUnique ()) then AlignStep.Waiting
+            else
+                let total = previousCount + currentCount
+                let mutable count = 0
+                while uniqueCursor < total && count < stepChunk do
+                    if uniqueCursor < previousCount then countLine previous uniqueCursor uniqueCursor uniquePreviousCount
+                    else countLine current (uniqueCursor - previousCount) uniqueCursor uniqueCurrentCount
+                    uniqueCursor <- uniqueCursor + 1
+                    count <- count + 1
+                Meter.charge meter (count / 8)
+                if uniqueCursor >= total then appendSuffix ()
                 AlignStep.Running
         | AlignPhase.Convert ->
             let mutable budget = 4096
@@ -843,8 +923,48 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
             if convertIndex >= raw.Count then
                 flushGroup ()
                 result <- output.ToArray()
+                markIndex <- 0
+                markAfterChange <- false
+                phase <- AlignPhase.MarkRuns
+            AlignStep.Running
+        | AlignPhase.MarkRuns ->
+            // An equal run right after changed lines can settle the window when it holds a line that occurs once
+            // in each window, or when it is long. A repeated line that matched by chance after a large insertion
+            // is short and occurs more than once, so it stays unanchored.
+            let mutable budget = 4096
+            while budget > 0 && markIndex < result.Length do
+                if isEqualKind result[markIndex].Kind then
+                    let mutable runEnd = markIndex
+                    let mutable lines = 0
+                    while runEnd < result.Length && isEqualKind result[runEnd].Kind do
+                        lines <- lines + result[runEnd].PreviousCount
+                        runEnd <- runEnd + 1
+                    if markAfterChange then
+                        let mutable anchored = lines >= longRunLines
+                        let mutable index = markIndex
+                        while not anchored && index < runEnd do
+                            let operation = result[index]
+                            let mutable offset = 0
+                            while not anchored && offset < operation.PreviousCount do
+                                anchored <- uniqueInBoth (operation.PreviousIndex + offset)
+                                offset <- offset + 1
+                            index <- index + 1
+                        if anchored then
+                            for index = markIndex to runEnd - 1 do
+                                result[index] <- { result[index] with Anchored = true }
+                        budget <- budget - min lines longRunLines
+                    budget <- budget - (runEnd - markIndex)
+                    markIndex <- runEnd
+                    markAfterChange <- false
+                else
+                    markAfterChange <- true
+                    markIndex <- markIndex + 1
+                    budget <- budget - 1
+            Meter.charge meter ((4096 - budget) / 64)
+            if markIndex >= result.Length then
                 markLookaheadAnchors ()
                 markAlignedPrefix ()
+                releaseUnique ()
                 phase <- AlignPhase.Finished
             AlignStep.Running
         | AlignPhase.Finished -> AlignStep.Complete result

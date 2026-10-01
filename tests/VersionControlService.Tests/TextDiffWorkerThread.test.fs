@@ -388,7 +388,7 @@ Vitest.describe (
                     source.Cancel()
                     let! result = opening
                     let elapsed = performanceNow () - started
-                    writeLog $"Worker cancel latency: {elapsed:F1} ms"
+                    writeLog $"Worker cancel latency: %.1f{elapsed} ms"
 
                     match result with
                     | Failed failure -> Vitest.expect(failure.Code).toBe "operation_canceled"
@@ -427,7 +427,7 @@ Vitest.describe (
                     let elapsed = performanceNow () - started
 
                     match goneAfter with
-                    | Some _ -> writeLog $"Worker termination to child exit: {elapsed:F1} ms"
+                    | Some _ -> writeLog $"Worker termination to child exit: %.1f{elapsed} ms"
                     | None -> failwith "The blob child stayed alive for more than two seconds after the worker was terminated."
 
                     let findEvent predicate =

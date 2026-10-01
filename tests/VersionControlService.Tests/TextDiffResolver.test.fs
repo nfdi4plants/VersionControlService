@@ -548,7 +548,7 @@ Vitest.describe (
                 let started = performanceNow ()
                 let! outcome, results = resolveWithLog clone "a.txt" None
                 let elapsed = performanceNow () - started
-                writeLog $"Missing blob resolution with a promisor remote: {elapsed:F1} ms"
+                writeLog $"Missing blob resolution with a promisor remote: %.1f{elapsed} ms"
                 expectBlocked (DiffBlocker.LocalContentUnavailable(DiffSide.Previous, Some oid)) outcome
                 Vitest.expect(elapsed < 5000.0).toBe true
 

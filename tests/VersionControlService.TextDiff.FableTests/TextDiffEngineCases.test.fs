@@ -134,13 +134,13 @@ module TextDiffEngineCasesTests =
 
     let private reportScan label encoding retainLimit (data: byte[]) =
         let result, rate = scanThroughput encoding retainLimit data
-        Vitest.log ($"{label}: {rate:F1} MB/s")
+        Vitest.log ($"{label}: %.1f{rate} MB/s")
         if result.Status <> EndOfInput then failwith $"{label} did not finish the 64 MiB input."
         Async.StartAsPromise(async.Return())
 
     let private reportCommonRun label (data: byte[]) =
         let _, rate = commonRunThroughput TextEncoding.Utf8 data (Array.copy data)
-        Vitest.log ($"{label}: {rate:F1} MB/s")
+        Vitest.log ($"{label}: %.1f{rate} MB/s")
         Async.StartAsPromise(async.Return())
 
     /// Three 64 KiB samples taken from the start, the middle and the end of a 256 MiB source.
@@ -169,7 +169,7 @@ module TextDiffEngineCasesTests =
         | BinaryEvidence evidence -> failwith $"{label} was classified as binary: {evidence}."
         | _ -> ()
 
-        Vitest.log ($"{label}: {first:F2} ms for the first run, {best:F2} ms best of the rest, for three 64 KiB samples")
+        Vitest.log ($"{label}: %.2f{first} ms for the first run, %.2f{best} ms best of the rest, for three 64 KiB samples")
         Async.StartAsPromise(async.Return())
 
     let private benchmarkSessionConfig sessionId contextLines pageRows chunkBytes = {
@@ -337,7 +337,7 @@ module TextDiffEngineCasesTests =
             let elapsed = max 1.0 (BrowserClock.nowMs() - started)
             if not page.OutputComplete then failwith "The identical scan did not complete on its first page."
             let rate = 2.0 * float size / 1_000_000.0 * 1_000.0 / elapsed
-            Vitest.log ($"Identical 64 MiB session scan: {rate:F1} MB/s across both sources")
+            Vitest.log ($"Identical 64 MiB session scan: %.1f{rate} MB/s across both sources")
             do! session.Close()
         })
     )
@@ -358,7 +358,7 @@ module TextDiffEngineCasesTests =
             do! finishSessionOutput session page
             let elapsed = max 1.0 (BrowserClock.nowMs() - started)
             let mebibytes = size / (1024 * 1024)
-            Vitest.log ($"{mebibytes} MiB single-line change: first page {firstPageMs:F1} ms, total {elapsed:F1} ms")
+            Vitest.log ($"{mebibytes} MiB single-line change: first page %.1f{firstPageMs} ms, total %.1f{elapsed} ms")
             do! session.Close()
         })
 
@@ -377,7 +377,7 @@ module TextDiffEngineCasesTests =
             let! page = startRequest (finishFirstPage session first)
             let elapsed = max 0.0 (BrowserClock.nowMs() - started)
             if page.Parts.Length = 0 then failwith "The first page has no edit rows."
-            Vitest.log ($"1 MiB file with three edits, first page: {elapsed:F1} ms")
+            Vitest.log ($"1 MiB file with three edits, first page: %.1f{elapsed} ms")
             do! session.Close()
         })
     )
@@ -399,7 +399,7 @@ module TextDiffEngineCasesTests =
             do! finishSessionOutput session page
             let elapsed = max 1.0 (BrowserClock.nowMs() - started)
             let rate = 2.0 * float size / 1_000_000.0 * 1_000.0 / elapsed
-            Vitest.log ($"64 MiB file with three early edits: {elapsed:F1} ms, {rate:F1} MB/s across both sources")
+            Vitest.log ($"64 MiB file with three early edits: %.1f{elapsed} ms, %.1f{rate} MB/s across both sources")
             do! session.Close()
         })
     )
@@ -430,7 +430,7 @@ module TextDiffEngineCasesTests =
             let equalAfterInsertion = float (previous.Length - cutLine * lineBytes)
             if ledger.CommonRunBytes < 0.9 * equalAfterInsertion then
                 failwith $"The equal-byte phase consumed {ledger.CommonRunBytes} of {equalAfterInsertion} equal bytes after the insertion."
-            Vitest.log ($"64 MiB file with an 8 MiB insertion near the start: {elapsed:F1} ms, {rate:F1} MB/s across both sources")
+            Vitest.log ($"64 MiB file with an 8 MiB insertion near the start: %.1f{elapsed} ms, %.1f{rate} MB/s across both sources")
             do! session.Close()
         })
     )
@@ -450,7 +450,7 @@ module TextDiffEngineCasesTests =
                         promiseThen (finishSessionOutputPromise observe session page) (fun () ->
                             let elapsed = max 1.0 (BrowserClock.nowMs() - started)
                             checkLedger ledger
-                            Vitest.log ($"{label}: first page {firstPageMs:F1} ms, total {elapsed:F1} ms")
+                            Vitest.log ($"{label}: first page %.1f{firstPageMs} ms, total %.1f{elapsed} ms")
                             promiseThen (Async.StartAsPromise(session.Close())) (fun () -> promiseResolveUnit ())
                         )
                 )
