@@ -156,43 +156,29 @@ type private FileSourceCore(
         if offset < 0 || count < 0 || offset > buffer.Length - count then
             invalidArg (nameof offset) "The destination range is invalid."
 
-        let! () = validateIdentities ()
+        ensureOpen ()
 
-        if count = 0 then
-            let! () = validateIdentities ()
-            return ReadOutcome.Bytes 0
-        elif position >= knownLength then
-            let! () = validateIdentities ()
-            return ReadOutcome.EndOfSource
-        else
-            let wanted = int (min (int64 count) (knownLength - position))
-            let! readResult =
-                async {
-                    try
-                        let! amount = NodePositionalFile.readAt descriptor buffer offset wanted position |> Async.AwaitPromise
-                        return Choice1Of2 amount
-                    with error ->
-                        return Choice2Of2 error
-                }
+        // The identity checks run once per request in the worker. A source that already failed keeps failing.
+        match terminalFailure with
+        | Some failure -> return raiseFailure failure
+        | None ->
+            if count = 0 then
+                return ReadOutcome.Bytes 0
+            elif position >= knownLength then
+                return ReadOutcome.EndOfSource
+            else
+                let wanted = int (min (int64 count) (knownLength - position))
 
-            let! identityResult =
-                async {
-                    try
-                        do! validateIdentities ()
-                        return Choice1Of2 ()
-                    with error ->
-                        return Choice2Of2 error
-                }
+                try
+                    let! amount = NodePositionalFile.readAt descriptor buffer offset wanted position |> Async.AwaitPromise
 
-            match identityResult with
-            | Choice2Of2 error -> return raise error
-            | Choice1Of2 () ->
-                match readResult with
-                | Choice2Of2 error ->
-                    return raiseFailure (report (readFailure (NodeInterop.errorMessage (box error))))
-                | Choice1Of2 amount when amount > 0 -> return ReadOutcome.Bytes amount
-                | Choice1Of2 _ ->
-                    return raiseFailure (report (readFailure $"Reading {path} made no progress."))
+                    if amount > 0 then
+                        return ReadOutcome.Bytes amount
+                    else
+                        return raiseFailure (report (readFailure $"Reading {path} made no progress."))
+                with
+                | :? TextDiffSourceException as error -> return raise error
+                | error -> return raiseFailure (report (readFailure (NodeInterop.errorMessage (box error))))
     }
 
     member this.Dispose() : JS.Promise<unit> =

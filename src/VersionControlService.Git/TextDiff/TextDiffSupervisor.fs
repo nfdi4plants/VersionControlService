@@ -59,21 +59,8 @@ module TextDiffSupervisorOptions =
         OnEvent = None
     }
 
-[<AllowNullLiteral>]
-type private NodeStat =
-    abstract member isFile: unit -> bool
-
-[<Import("access", "node:fs/promises")>]
-let private accessAsync (path: string) (mode: int) : JS.Promise<unit> = jsNative
-
-[<Import("stat", "node:fs/promises")>]
-let private statAsync (path: string) : JS.Promise<NodeStat> = jsNative
-
 [<Emit("process.pid")>]
 let private processId () : int = jsNative
-
-[<Emit("process.platform")>]
-let private processPlatform () : string = jsNative
 
 /// The id of the current user, or -1 where the platform has none (Windows).
 [<Emit("(typeof process.getuid === 'function' ? process.getuid() : -1)")>]
@@ -84,14 +71,6 @@ let private performanceNow () : float = jsNative
 
 [<Emit("Object.assign({}, $0, { GIT_NO_LAZY_FETCH: '1', GIT_ALLOW_PROTOCOL: '', GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0', LC_ALL: 'C', LANG: 'C' })")>]
 let private localOnlyEnvironment (_environment: obj) : obj = jsNative
-
-let private isWindows () = processPlatform () = "win32"
-
-let private isWrapperPath (path: string) =
-    match NodePath.extname(path).ToLowerInvariant() with
-    | ".cmd"
-    | ".bat" -> true
-    | _ -> false
 
 /// A full Git object id in the lower case hex that Git prints, as a SHA-1 or SHA-256 id.
 let internal isObjectId (value: string) =
@@ -122,67 +101,6 @@ let private isAllowedShortCommand (arguments: string[]) =
     | [| "cat-file"; "-s"; oid |]
     | [| "cat-file"; "blob"; oid |] -> isObjectId oid
     | _ -> false
-
-let private checkRegularFile (path: string) : JS.Promise<bool> = promise {
-    try
-        do! accessAsync path 1
-        let! stats = statAsync path
-        return stats.isFile ()
-    with _ ->
-        return false
-}
-
-let private checkExecutable (path: string) : JS.Promise<bool> = promise {
-    let! isFile = checkRegularFile path
-    return isFile && not (isWrapperPath path)
-}
-
-let private resolveGitExecutable (configured: string option) : JS.Promise<string> = promise {
-    match configured with
-    | Some executable ->
-        if not (NodePath.isAbsolute executable) then
-            return raise (InvalidOperationException("GitExecutable must be an absolute path to a real Git executable."))
-        elif isWrapperPath executable then
-            return raise (InvalidOperationException("GitExecutable points to a .cmd or .bat wrapper. Configure the real Git executable."))
-        else
-            let! isExecutable = checkExecutable executable
-
-            if isExecutable then
-                return executable
-            else
-                return raise (InvalidOperationException($"GitExecutable is not an accessible file: {executable}"))
-    | None ->
-        let environment = GitExecution.resolvedEnvironment ()
-        let separator = if isWindows () then ';' else ':'
-        let directories = GitExecution.environmentPath environment
-        let entries = directories.Split([| separator |], StringSplitOptions.RemoveEmptyEntries)
-        let mutable found: string option = None
-        let mutable wrapperFound = false
-
-        for directory in entries do
-            if found.IsNone then
-                let names = if isWindows () then [| "git.exe"; "git.cmd"; "git.bat" |] else [| "git" |]
-
-                for name in names do
-                    if found.IsNone then
-                        let candidate = NodePath.resolve [| directory; name |]
-
-                        if isWrapperPath candidate then
-                            let! isAccessible = checkRegularFile candidate
-                            wrapperFound <- wrapperFound || isAccessible
-                        else
-                            let! isExecutable = checkExecutable candidate
-
-                            if isExecutable then
-                                found <- Some candidate
-
-        match found with
-        | Some executable -> return executable
-        | None when wrapperFound ->
-            return raise (InvalidOperationException("Git was found only as a .cmd or .bat wrapper. Install Git with a real executable and make it available on PATH."))
-        | None ->
-            return raise (InvalidOperationException("A real Git executable was not found on PATH."))
-}
 
 let private tryGetInstanceOwnerPid (name: string) =
     match name.Split([| '-' |], StringSplitOptions.None) with
@@ -468,7 +386,7 @@ let checkFolderOwner (userId: int) (folder: string) (stats: NodePositionalFile.P
             failwith $"The text diff folder {folder} belongs to user {stats.Uid} and the current user is {userId}. Use a temp root that the current user owns."
 
 let create (options: TextDiffSupervisorOptions) : JS.Promise<TextDiffSupervisor> = promise {
-    let! gitExecutable = resolveGitExecutable options.GitExecutable
+    let gitExecutable = defaultArg options.GitExecutable "git"
     let parentDirectory = NodePath.join [| options.TempRoot; "text-diff" |]
 
     let! existing = promise {

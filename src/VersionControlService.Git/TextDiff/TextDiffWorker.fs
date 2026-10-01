@@ -1018,6 +1018,18 @@ let private ensureSweeper (worker: Worker) =
         worker.Sweeping <- true
         startInterval (fun () -> sweep worker) (int (max 1.0 (min 30000.0 (worker.IdleMs / 3.0)))) |> ignore
 
+/// Raises the first failure a mutable source reports, or when its file no longer matches the one that was opened.
+let private checkSources (slot: Slot) : Async<unit> = async {
+    for state in [| slot.Previous; slot.Current |] do
+        match state with
+        | SideState.SideOpen side -> do! side.Check()
+        | _ -> ()
+
+    match slot.Failure with
+    | Some value -> raise (TextDiffSourceException(value.Code, value.Message))
+    | None -> ()
+}
+
 let private openRequest
     (worker: Worker)
     (host: WorkerHost)
@@ -1074,7 +1086,14 @@ let private openRequest
 
             let! result = async {
                 try
+                    // A new slot has no sources yet. A resumed one holds the sources of the earlier step.
+                    do! checkSources slot
                     let! step = runOpen worker host request owner slot meter
+
+                    // Reads do not check identity, so an edit during the step surfaces here.
+                    match step with
+                    | Finish(Error _) -> ()
+                    | _ -> do! checkSources slot
 
                     match step with
                     | Finish outcome -> return outcome
@@ -1123,18 +1142,6 @@ let private findActive (worker: Worker) (host: WorkerHost) (handle: DiffHandle) 
         | SlotPhase.Invalid problem -> Error problem
         | _ -> Error(closedFailure ())
     | _ -> Error(closedFailure ())
-
-/// Raises the first failure a mutable source reports, or when its file no longer matches the one that was opened.
-let private checkSources (slot: Slot) : Async<unit> = async {
-    for state in [| slot.Previous; slot.Current |] do
-        match state with
-        | SideState.SideOpen side -> do! side.Check()
-        | _ -> ()
-
-    match slot.Failure with
-    | Some value -> raise (TextDiffSourceException(value.Code, value.Message))
-    | None -> ()
-}
 
 /// Maps an engine answer and invalidates the session when the answer says its content or sources are gone.
 let private settle (worker: Worker) (slot: Slot) (result: EngineResult<'T>) : Async<Result<'T, OperationFailure>> = async {

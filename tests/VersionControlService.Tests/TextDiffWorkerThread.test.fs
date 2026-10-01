@@ -352,6 +352,38 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "answers source_changed to the continuation of an Open whose working file changed",
+            TestOptions(timeout = 120000),
+            fun () ->
+                withWorkerPool "slow-preparation" (ResizeArray()) (fun pool _ _ -> promise {
+                    let repository = currentFixture().Repository
+                    let filePath = NodePath.join [| repository; "changing.txt" |]
+                    do! writeLargeTextFile filePath (2L * 1024L * 1024L)
+                    do! runGitOk repository [| "add"; "--"; "changing.txt" |]
+                    do! runGitOk repository [| "commit"; "-q"; "-m"; "changing blob" |]
+                    NodeFileSystem.writeFileSync filePath "changed after commit\n" NodeFileSystem.TextEncoding.Utf8
+                    let service = pool.Service(owner ())
+                    let request = { openRequest with Path = path "changing.txt" }
+                    let! initial = service.Open request (OperationContext.detached "changing-open") |> Async.StartAsPromise
+
+                    let continuation =
+                        match initial with
+                        | Succeeded { Value = Resumable.Scanning(_, continuation, _) } -> continuation
+                        | other -> failwith $"Expected a Scanning answer, got %A{other}"
+
+                    NodeFileSystem.writeFileSync filePath "changed again while scanning\n" NodeFileSystem.TextEncoding.Utf8
+
+                    let! result =
+                        service.Open { request with Continuation = Some continuation } (OperationContext.detached "changing-continue")
+                        |> Async.StartAsPromise
+
+                    match result with
+                    | Failed failure -> Vitest.expect(failure.Code).toBe TextDiffFailureCodes.SourceChanged
+                    | other -> failwith $"Expected source_changed, got %A{other}"
+                })
+        )
+
+        Vitest.test (
             "answers a session closed failure for a continuation without a preparation slot",
             TestOptions(timeout = 120000),
             fun () ->
