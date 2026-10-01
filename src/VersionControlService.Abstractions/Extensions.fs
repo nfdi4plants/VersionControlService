@@ -183,6 +183,9 @@ type ReadLineRequest = {
 type SourceInfoRequest = { Handle: DiffHandle }
 
 /// Reads and expands paged diffs with resumable work.
+/// A handle belongs to the workspace and to the owner that the hosting provider derives from the calling
+/// operation (Swate uses the window). A call with a handle of another owner answers
+/// `TextDiffFailureCodes.SessionClosed` ("diff_session_closed"), and `Close` of another owner's handle changes nothing.
 type TextDiffService = {
     Open: OpenDiffRequest -> OperationContext -> Async<OperationResult<Resumable<OpenDiffResult>>>
     ReadPage: ReadPageRequest -> OperationContext -> Async<OperationResult<Resumable<DiffPage>>>
