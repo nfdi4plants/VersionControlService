@@ -145,14 +145,14 @@ type internal ScanSide(
                     else return ReadWaiting
                 else
                     let remaining = spec.ByteLength - position
-                    let consumedWindowBytes = int (scanner.NextOffset - windowStart)
-                    let rawRoom = max 1 (windowByteLimit - consumedWindowBytes)
+                    let consumedWindowBytes = scanner.NextOffset - windowStart
+                    let rawRoom = max 1.0 (float windowByteLimit - consumedWindowBytes)
                     let readLimit =
-                        if consumedWindowBytes >= windowByteLimit && scanner.LineLengthUtf16 > 0.0 then maximum
-                        else min maximum rawRoom
+                        if consumedWindowBytes >= float windowByteLimit && scanner.LineLengthUtf16 > 0.0 then float maximum
+                        else min (float maximum) rawRoom
                     let boundary = (Math.Floor(scanner.NextOffset / checkpointIntervalBytes) + 1.0) * checkpointIntervalBytes
                     let boundaryRoom = max 1.0 (boundary - scanner.NextOffset)
-                    let count = min buffer.Length (int (min boundaryRoom (min (float readLimit) (float remaining))))
+                    let count = int (max 0.0 (min (float buffer.Length) (min boundaryRoom (min readLimit (float remaining)))))
                     let! outcome = source.ReadAt position buffer 0 count
                     match outcome with
                     | ReadOutcome.NotYetAvailable -> return ReadWaiting

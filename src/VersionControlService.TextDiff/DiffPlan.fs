@@ -129,6 +129,13 @@ type internal DiffOperation = {
     CurrentIndex: int
     PreviousCount: int
     CurrentCount: int
+    /// The equal run can settle a window. Its lines were confirmed as a unique match, or at least two
+    /// anchored equal lines follow it directly.
+    Anchored: bool
+    /// The run belongs to the equal lines at the window start that line up position for position.
+    PrefixAnchor: bool
+    /// The fast equal-byte scan may continue after this run.
+    ReenterAnchor: bool
 }
 
 [<RequireQualifiedAccess>]
@@ -146,7 +153,13 @@ module internal DiffOperations =
         CurrentIndex = currentIndex
         PreviousCount = previousCount
         CurrentCount = currentCount
+        Anchored = false
+        PrefixAnchor = false
+        ReenterAnchor = false
     }
+
+    let makeAnchored kind previousIndex currentIndex previousCount currentCount =
+        { make kind previousIndex currentIndex previousCount currentCount with Anchored = true; ReenterAnchor = true }
 
     /// Adds an operation and merges it into the last one when both are contiguous runs of the same kind.
     let appendRaw (operations: ResizeArray<DiffOperation>) (operation: DiffOperation) =
@@ -160,6 +173,9 @@ module internal DiffOperations =
                      | OperationKind.Removed, OperationKind.Removed
                      | OperationKind.Added, OperationKind.Added -> true
                      | _ -> false)
+                    && tail.Anchored = operation.Anchored
+                    && tail.PrefixAnchor = operation.PrefixAnchor
+                    && tail.ReenterAnchor = operation.ReenterAnchor
                     && (match operation.Kind with
                         | OperationKind.Equal ->
                             tail.PreviousIndex + tail.PreviousCount = operation.PreviousIndex
@@ -182,6 +198,7 @@ type private AlignPhase =
     | Suffix
     | SuffixConfirm
     | MiddleStart
+    | PositionalConfirm
     | BuildSlots
     | ProbeCurrent
     | FindCandidates
@@ -196,8 +213,9 @@ type private AlignPhase =
 /// UTF-16 length) select candidates, and the caller confirms every claimed run of equal lines against the
 /// source bytes through NeedRun and ResolveRun. The work is split into steps that each do a bounded amount
 /// of work and charge the meter.
-type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap: int, ledger: Ledger) =
+type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap: int, sameSourceLength: bool, ledger: Ledger) =
     let stepChunk = 512
+    let lookaheadLines = 2
     let raw = ResizeArray<DiffOperation>()
     let mutable phase = AlignPhase.Prefix
     let previousCount = previous.Count
@@ -208,12 +226,21 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
     let mutable suffixLength = 0
     let mutable suffixPrevious = previousCount
     let mutable suffixCurrent = currentCount
+    let mutable prefixScanLength = 0
+    let mutable prefixConfirmedLength = 0
     let mutable pendingLength = 0
 
     let mutable middlePreviousStart = 0
     let mutable middlePreviousEnd = 0
     let mutable middleCurrentStart = 0
     let mutable middleCurrentEnd = 0
+    let positionalOperations = ResizeArray<DiffOperation>()
+    let mutable positionalPrevious = 0
+    let mutable positionalCurrent = 0
+    let mutable positionalRemaining = 0
+    let mutable positionalMismatches = 0
+    let mutable positionalAttempted = false
+    let mutable positionalConfirmed = false
 
     let mutable slotMask = 0
     let mutable slotPrevious = Array.empty<int>
@@ -267,6 +294,18 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
         && previous.HashHigh p = current.HashHigh c
         && previous.Length p = current.Length c
 
+    let uniqueLine (table: LineTable) index =
+        let low = table.HashLow index
+        let high = table.HashHigh index
+        let length = table.Length index
+        let mutable matches = 0
+        let mutable candidate = 0
+        while candidate < table.Count && matches < 2 do
+            if table.HashLow candidate = low && table.HashHigh candidate = high && table.Length candidate = length then
+                matches <- matches + 1
+            candidate <- candidate + 1
+        matches = 1
+
     let slotFor (table: LineTable) index =
         let low = table.HashLow index
         let high = table.HashHigh index
@@ -296,8 +335,19 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
     let beginConvert () =
         releaseScratch ()
         let suffixCount = previousCount - suffixPrevious
+        let mutable uniqueSuffix = suffixCount >= lookaheadLines
+        for offset = 0 to lookaheadLines - 1 do
+            let previousIndex = previousCount - 1 - offset
+            let currentIndex = currentCount - 1 - offset
+            if uniqueSuffix && (not (uniqueLine previous previousIndex) || not (uniqueLine current currentIndex)) then
+                uniqueSuffix <- false
+        let suffixAnchored = suffixCount >= lookaheadLines && (uniqueSuffix || positionalConfirmed)
         if suffixCount > 0 then
-            DiffOperations.appendRaw raw (DiffOperations.make OperationKind.Equal suffixPrevious suffixCurrent suffixCount suffixCount)
+            let suffix =
+                if uniqueSuffix then DiffOperations.makeAnchored OperationKind.Equal suffixPrevious suffixCurrent suffixCount suffixCount
+                elif suffixAnchored then { DiffOperations.make OperationKind.Equal suffixPrevious suffixCurrent suffixCount suffixCount with Anchored = true }
+                else DiffOperations.make OperationKind.Equal suffixPrevious suffixCurrent suffixCount suffixCount
+            DiffOperations.appendRaw raw suffix
         convertIndex <- 0
         phase <- AlignPhase.Convert
 
@@ -334,6 +384,35 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
                 true
             else false
 
+    let tryStartPositionalConfirm () =
+        let previousMiddle = suffixPrevious - prefixEnd
+        let currentMiddle = suffixCurrent - prefixEnd
+        positionalAttempted <- true
+        let mutable candidate =
+            sameSourceLength
+            && previousMiddle > 0
+            && previousMiddle = currentMiddle
+            && previous.LineBase = current.LineBase
+            && prefixEnd < previousCount
+            && prefixEnd < currentCount
+            && previous.Start(prefixEnd) = current.Start(prefixEnd)
+        let mutable keyMismatches = 0
+        let mutable offset = 0
+        while candidate && offset < previousMiddle do
+            if not (keysEqual (prefixEnd + offset) (prefixEnd + offset)) then
+                keyMismatches <- keyMismatches + 1
+                if keyMismatches > lookaheadLines * 4 then candidate <- false
+            offset <- offset + 1
+        if candidate then
+            positionalPrevious <- prefixEnd
+            positionalCurrent <- prefixEnd
+            positionalRemaining <- previousMiddle
+            positionalMismatches <- 0
+            positionalOperations.Clear()
+            phase <- AlignPhase.PositionalConfirm
+            true
+        else false
+
     let equalOracle (p: int) (c: int) =
         if not (keysEqual p c) then Some false
         else
@@ -347,11 +426,65 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
             let p = spanPrevious[gapIndex]
             let c = spanCurrent[gapIndex]
             let n = spanLength[gapIndex]
-            DiffOperations.appendRaw raw (DiffOperations.make OperationKind.Equal p c n n)
+            DiffOperations.appendRaw raw (DiffOperations.makeAnchored OperationKind.Equal p c n n)
             gapPreviousStart <- p + n
             gapCurrentStart <- c + n
             gapIndex <- gapIndex + 1
         else beginConvert ()
+
+    let confirmOrCompareAnchor () =
+        if anchorPrevious = anchorCurrent && anchorPrevious + anchorLength <= prefixConfirmedLength then
+            spanPrevious.Add anchorPrevious
+            spanCurrent.Add anchorCurrent
+            spanLength.Add anchorLength
+            anchorLength <- 0
+            AlignStep.Running
+        else
+            anchorPending <- true
+            AlignStep.NeedRun(anchorPrevious, anchorCurrent, anchorLength)
+
+    let markLookaheadAnchors () =
+        let mutable followingPrevious = -1
+        let mutable followingCurrent = -1
+        let mutable followingEqualLines = 0
+        for index = result.Length - 1 downto 0 do
+            let operation = result[index]
+            if operation.Kind = OperationKind.Equal || operation.Kind = OperationKind.EndingChanged then
+                let previousEnd = operation.PreviousIndex + operation.PreviousCount
+                let currentEnd = operation.CurrentIndex + operation.CurrentCount
+                if followingEqualLines = 0 || previousEnd <> followingPrevious || currentEnd <> followingCurrent then
+                    followingEqualLines <- 0
+                if operation.Anchored then
+                    followingEqualLines <- followingEqualLines + operation.PreviousCount
+                elif operation.Kind = OperationKind.Equal && followingEqualLines >= lookaheadLines then
+                    result[index] <- { operation with Anchored = true }
+                    followingEqualLines <- followingEqualLines + operation.PreviousCount
+                else
+                    followingEqualLines <- 0
+                followingPrevious <- operation.PreviousIndex
+                followingCurrent <- operation.CurrentIndex
+            else
+                followingEqualLines <- 0
+                followingPrevious <- -1
+                followingCurrent <- -1
+
+    let markAlignedPrefix () =
+        let mutable openPrefix = true
+        let mutable previousEnd = 0
+        let mutable currentEnd = 0
+        for index = 0 to result.Length - 1 do
+            let operation = result[index]
+            if openPrefix
+               && operation.Anchored
+               && (operation.Kind = OperationKind.Equal || operation.Kind = OperationKind.EndingChanged)
+               && operation.PreviousIndex = previousEnd
+               && operation.CurrentIndex = currentEnd
+               && previousEnd = currentEnd then
+                result[index] <- { operation with PrefixAnchor = true }
+                previousEnd <- previousEnd + operation.PreviousCount
+                currentEnd <- currentEnd + operation.CurrentCount
+            else
+                openPrefix <- false
 
     let startGap (meter: Meter) =
         gapCache.Clear()
@@ -384,8 +517,10 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
     member _.ResolveRun(matched: int) =
         match phase with
         | AlignPhase.PrefixConfirm ->
-            DiffOperations.appendRaw raw (DiffOperations.make OperationKind.Equal 0 0 matched matched)
+            DiffOperations.appendRaw raw (DiffOperations.makeAnchored OperationKind.Equal 0 0 matched matched)
             prefixEnd <- matched
+            prefixScanLength <- scanned
+            prefixConfirmedLength <- matched
             scanned <- 0
             phase <- AlignPhase.Suffix
         | AlignPhase.SuffixConfirm ->
@@ -402,6 +537,31 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
                     suffixCurrent <- currentCount
                     suffixLength <- 0
                     phase <- AlignPhase.MiddleStart
+        | AlignPhase.PositionalConfirm ->
+            let available = positionalRemaining
+            let confirmed = min available matched
+            if confirmed > 0 then
+                positionalOperations.Add(
+                    { DiffOperations.make OperationKind.Equal positionalPrevious positionalCurrent confirmed confirmed with Anchored = true }
+                )
+                positionalPrevious <- positionalPrevious + confirmed
+                positionalCurrent <- positionalCurrent + confirmed
+                positionalRemaining <- positionalRemaining - confirmed
+            if confirmed < available then
+                positionalMismatches <- positionalMismatches + 1
+                positionalOperations.Add(DiffOperations.make OperationKind.Removed positionalPrevious -1 1 0)
+                positionalOperations.Add(DiffOperations.make OperationKind.Added -1 positionalCurrent 0 1)
+                positionalPrevious <- positionalPrevious + 1
+                positionalCurrent <- positionalCurrent + 1
+                positionalRemaining <- positionalRemaining - 1
+            if positionalMismatches > lookaheadLines * 4 then
+                positionalOperations.Clear()
+                positionalConfirmed <- false
+                phase <- AlignPhase.MiddleStart
+            elif positionalRemaining = 0 then
+                for operation in positionalOperations do DiffOperations.appendRaw raw operation
+                positionalConfirmed <- true
+                beginConvert ()
         | AlignPhase.AnchorConfirm ->
             if matched > 0 then
                 spanPrevious.Add anchorPrevious
@@ -440,7 +600,7 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
                 AlignStep.Running
         | AlignPhase.PrefixConfirm -> AlignStep.NeedRun(0, 0, pendingLength)
         | AlignPhase.Suffix ->
-            let limit = min previousCount currentCount - prefixEnd
+            let limit = min previousCount currentCount - max prefixEnd (max prefixScanLength prefixConfirmedLength)
             let mutable count = 0
             while scanned < limit && count < stepChunk && keysEqual (previousCount - 1 - scanned) (currentCount - 1 - scanned) do
                 scanned <- scanned + 1
@@ -455,7 +615,11 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
                 phase <- if scanned > 0 then AlignPhase.SuffixConfirm else AlignPhase.MiddleStart
                 AlignStep.Running
         | AlignPhase.SuffixConfirm -> AlignStep.NeedRun(suffixPrevious, suffixCurrent, pendingLength)
-        | AlignPhase.MiddleStart -> if startMiddle () then AlignStep.Running else AlignStep.Waiting
+        | AlignPhase.MiddleStart ->
+            if not positionalAttempted && tryStartPositionalConfirm () then AlignStep.Running
+            elif startMiddle () then AlignStep.Running
+            else AlignStep.Waiting
+        | AlignPhase.PositionalConfirm -> AlignStep.NeedRun(positionalPrevious, positionalCurrent, positionalRemaining)
         | AlignPhase.BuildSlots ->
             let mutable count = 0
             while cursor < middlePreviousEnd && count < stepChunk do
@@ -562,9 +726,7 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
             AlignStep.Running
         | AlignPhase.AnchorConfirm ->
             if anchorPending then AlignStep.NeedRun(anchorPrevious, anchorCurrent, anchorLength)
-            elif anchorLength > 0 then
-                anchorPending <- true
-                AlignStep.NeedRun(anchorPrevious, anchorCurrent, anchorLength)
+            elif anchorLength > 0 then confirmOrCompareAnchor ()
             elif anchorIndex < 0 then
                 beginGaps ()
                 AlignStep.Running
@@ -583,8 +745,7 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
                         anchorIndex <- anchorIndex - 1
                     else extending <- false
                 Meter.charge meter (anchorLength / 8)
-                anchorPending <- true
-                AlignStep.NeedRun(anchorPrevious, anchorCurrent, anchorLength)
+                confirmOrCompareAnchor ()
         | AlignPhase.Gaps ->
             match stepper with
             | Some active ->
@@ -655,7 +816,7 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
                         budget <- budget - 1
                     let kind = if same then OperationKind.Equal else OperationKind.EndingChanged
                     output.Add(
-                        DiffOperations.make kind (operation.PreviousIndex + start) (operation.CurrentIndex + start) (index - start) (index - start)
+                        { DiffOperations.make kind (operation.PreviousIndex + start) (operation.CurrentIndex + start) (index - start) (index - start) with Anchored = operation.Anchored; ReenterAnchor = operation.ReenterAnchor }
                     )
                     if index >= n then
                         equalOffset <- 0
@@ -682,6 +843,8 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
             if convertIndex >= raw.Count then
                 flushGroup ()
                 result <- output.ToArray()
+                markLookaheadAnchors ()
+                markAlignedPrefix ()
                 phase <- AlignPhase.Finished
             AlignStep.Running
         | AlignPhase.Finished -> AlignStep.Complete result

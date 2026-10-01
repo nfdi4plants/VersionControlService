@@ -36,11 +36,11 @@ type private SeekCursor = {
     State: ScannerState
     mutable Buffer: byte[]
     mutable Batch: LineBatch
+    mutable BatchCapacity: int
     FoundLines: ResizeArray<ScannedLine>
     mutable LineNumber: float
     mutable Position: float
     mutable Complete: bool
-    mutable Rebatch: bool
     mutable Waiting: bool
 }
 
@@ -114,7 +114,7 @@ type private PendingLineRead = {
     mutable BytePosition: float
     mutable Buffer: byte[]
     mutable Units: uint16[]
-    mutable SavedUnits: string
+    mutable SavedUnits: uint16[]
     mutable UnitCount: int
     mutable UnitPosition: float
     mutable PreviousUnit: uint16 option
@@ -463,7 +463,8 @@ type TextDiffSession internal (
     let mutable bufB = Array.empty<byte>
     let mutable bufferLease: IDisposable option = None
 
-    // Equal-byte phase. The positions below belong to the previous side. The current side sits at the same
+    // Equal-byte phase.
+    // The positions below belong to the previous side. The current side sits at the same
     // position plus delta, which is nonzero after an insertion or deletion.
     let mutable pos = float (max previousSpec.BomLength currentSpec.BomLength)
     let mutable delta = 0.0
@@ -487,6 +488,7 @@ type TextDiffSession internal (
     let mutable feedPrevious = 0
     let mutable feedCurrent = 0
     let mutable regionStarted = false
+    let mutable preserveWindowAfterCommit = false
     let mutable pBase = float previousSpec.BomLength
     let mutable cBase = float currentSpec.BomLength
     let mutable partialAlign = false
@@ -499,7 +501,8 @@ type TextDiffSession internal (
     let replayLog = ResizeArray<int>()
     let mutable replayPosition = 0
 
-    // Spilled state. The snapshot lives in its own temp store and is read back in bounded steps.
+    // Spill and restore.
+    // The snapshot lives in its own temp store and is read back in bounded steps.
     let mutable spilled = false
     let mutable spillStore: ITempStore option = None
     let mutable restoreStage = 0
@@ -519,6 +522,7 @@ type TextDiffSession internal (
     let mutable scratch: WorkerScratch option = None
     let mutable holder: IScratchHolder option = None
 
+    // Page building.
     // Text decoding scratch for page building.
     let textUnits = Array.zeroCreate<uint16> 8_192
     let mutable textCount = 0
@@ -971,27 +975,40 @@ type TextDiffSession internal (
         let bothFinished = previousSide.Finished && currentSide.Finished
         let emptyTable = previousTable.Count = 0 || currentTable.Count = 0
         let canGrow = windowLimit < config.WindowMaxLines && not previousSide.ByteFull && not currentSide.ByteFull
+        preserveWindowAfterCommit <- false
+        let mutable lastAnchored = -1
+        let mutable lastPrefixAnchor = -1
+        let mutable previousEnd = 0
+        let mutable currentEnd = 0
+        for index = 0 to ops.Length - 1 do
+            let operation = ops[index]
+            if operation.Anchored && (operation.Kind = OperationKind.Equal || operation.Kind = OperationKind.EndingChanged) then
+                lastAnchored <- index
+                if operation.PrefixAnchor then lastPrefixAnchor <- index
+                previousEnd <- operation.PreviousIndex + operation.PreviousCount
+                currentEnd <- operation.CurrentIndex + operation.CurrentCount
+        // A window commits up to its last anchored equal run only when few lines follow that run. A far
+        // anchor at the window end may be a repeated line that matched by chance after a large insertion,
+        // so the window rather grows or keeps only its aligned start.
+        let anchorTail = max (previousTable.Count - previousEnd) (currentTable.Count - currentEnd)
+        let anchorTailSmall = anchorTail <= 64
+        let growWindow () =
+            windowLimit <- min config.WindowMaxLines (windowLimit * 2)
+            previousSide.SetLimits(windowLimit, config.WindowMaxBytes)
+            currentSide.SetLimits(windowLimit, config.WindowMaxBytes)
+            ops <- Array.empty
+            windowState <- WindowState.Loading
         if partialAlign then
             // Growing sources stall before the window fills. Only settled operations are committed and the
-            // window keeps its size so the next bytes extend the same lines.
+            // window keeps its size so the next bytes extend the same lines. A partial alignment starts only
+            // while a side can still grow, so the finished case is a guard.
             partialAlign <- false
-            let mutable last = -1
-            for index = 0 to ops.Length - 1 do
-                if ops[index].Kind = OperationKind.Equal || ops[index].Kind = OperationKind.EndingChanged then last <- index
-            if last >= 0 then
-                commitCount <- last + 1
+            if lastAnchored >= 0 && anchorTailSmall then
+                commitCount <- lastAnchored + 1
                 beginFeeding ()
             elif bothFinished then
-                // A partial alignment starts only while a side can still grow, so both sides cannot be
-                // finished here. The branch is a guard in case that changes.
-                if canGrow then
-                    windowLimit <- min config.WindowMaxLines (windowLimit * 2)
-                    previousSide.SetLimits(windowLimit, config.WindowMaxBytes)
-                    currentSide.SetLimits(windowLimit, config.WindowMaxBytes)
-                    ops <- Array.empty
-                    windowState <- WindowState.Loading
-                else
-                    startResync ()
+                commitCount <- ops.Length
+                beginFeeding ()
             else
                 ops <- Array.empty
                 windowState <- WindowState.Loading
@@ -999,28 +1016,20 @@ type TextDiffSession internal (
             commitCount <- ops.Length
             beginFeeding ()
         else
-            // The window commits up to its last matching line. The operations after it stay unsettled, and so
-            // does a trailing unaligned region: the alignment of a gap stops at its step budget and reports the
-            // whole gap as unaligned, which says nothing about where the sources line up again.
-            let mutable last = -1
-            for index = 0 to ops.Length - 1 do
-                if ops[index].Kind = OperationKind.Equal || ops[index].Kind = OperationKind.EndingChanged then last <- index
-            let anchored = last >= 0
-            // A window without any matching line may hold an insertion or deletion that is larger than the
-            // window, so it grows before it is given up. A largest window without a matching line continues
-            // with the forward search.
-            if anchored then
-                commitCount <- last + 1
+            if lastAnchored >= 0 && anchorTailSmall then
+                commitCount <- lastAnchored + 1
+                beginFeeding ()
+            elif lastPrefixAnchor >= 0 then
+                // Only the aligned start is certain. It is committed and the window keeps its size, so the
+                // rest is aligned again with the following lines.
+                commitCount <- lastPrefixAnchor + 1
+                preserveWindowAfterCommit <- true
                 beginFeeding ()
             elif canGrow then
-                windowLimit <- min config.WindowMaxLines (windowLimit * 2)
-                previousSide.SetLimits(windowLimit, config.WindowMaxBytes)
-                currentSide.SetLimits(windowLimit, config.WindowMaxBytes)
-                ops <- Array.empty
-                windowState <- WindowState.Loading
+                // The window may hold an insertion or deletion larger than itself, so it grows first.
+                growWindow ()
             else
-                // The window is at its largest size and no operation anchors it, so the diff continues with a
-                // forward search for the next matching lines.
+                // At its largest size without an anchor the diff continues with a forward search.
                 startResync ()
 
     let startAlign () =
@@ -1035,7 +1044,7 @@ type TextDiffSession internal (
         else
             replayLog.Clear()
             replayPosition <- 0
-            aligner <- Some(WindowAligner(previousTable, currentTable, config.MyersStepsPerGap, ledger))
+            aligner <- Some(WindowAligner(previousTable, currentTable, config.MyersStepsPerGap, previousSpec.ByteLength = currentSpec.ByteLength, ledger))
             windowState <- WindowState.Aligning
 
     let loadSide (side: ScanSide) (buffer: byte[]) (meter: Meter) = async {
@@ -1196,13 +1205,13 @@ type TextDiffSession internal (
         let currentTable = currentSide.Table
         let mutable previousLines = 0
         let mutable currentLines = 0
-        let mutable fedEqual = false
+        let mutable fedAnchor = false
         for index = 0 to commitCount - 1 do
             let operation: DiffOperation = ops[index]
             previousLines <- previousLines + operation.PreviousCount
             currentLines <- currentLines + operation.CurrentCount
-            if operation.Kind = OperationKind.Equal || operation.Kind = OperationKind.EndingChanged then fedEqual <- true
-        let endsEqual = commitCount > 0 && ops[commitCount - 1].Kind = OperationKind.Equal
+            if operation.Anchored && (operation.Kind = OperationKind.Equal || operation.Kind = OperationKind.EndingChanged) then fedAnchor <- true
+        let endsEqual = commitCount > 0 && ops[commitCount - 1].Kind = OperationKind.Equal && ops[commitCount - 1].ReenterAnchor
         let previousCursor = if previousLines = 0 then pBase else previousTable.Finish(previousLines - 1)
         let currentCursor = if currentLines = 0 then cBase else currentTable.Finish(currentLines - 1)
         let previousDone = previousSide.Finished && previousLines = previousTable.Count
@@ -1216,7 +1225,7 @@ type TextDiffSession internal (
         opIndex <- 0
         partialPrevious <- -1
         partialCurrent <- -1
-        if fedEqual then windowLimit <- initialWindowLines
+        if fedAnchor && not preserveWindowAfterCommit then windowLimit <- initialWindowLines
         windowState <- WindowState.Loading
         if previousDone && currentDone then
             builder.Finish()
@@ -1231,8 +1240,9 @@ type TextDiffSession internal (
             else currentSide.SetCursor(currentCursor, currentFirst, windowLimit, config.WindowMaxBytes)
             pBase <- previousCursor
             cBase <- currentCursor
-            if canStartCommon && endsEqual && builder.IsIdle && previousCursor < previousLength && currentCursor < currentLength then
+            if canStartCommon && endsEqual && builder.IsIdle && not preserveWindowAfterCommit && previousCursor < previousLength && currentCursor < currentLength then
                 reenterCommon previousCursor currentCursor
+            preserveWindowAfterCommit <- false
 
     let feedStep (meter: Meter) =
         if opIndex >= commitCount then finishWindow ()
@@ -1508,7 +1518,7 @@ type TextDiffSession internal (
             replayPosition <- 0
             mode <- Mode.Window
             if restoreAligning then
-                aligner <- Some(WindowAligner(previousSide.Table, currentSide.Table, config.MyersStepsPerGap, ledger))
+                aligner <- Some(WindowAligner(previousSide.Table, currentSide.Table, config.MyersStepsPerGap, previousSpec.ByteLength = currentSpec.ByteLength, ledger))
                 windowState <- WindowState.Aligning
         restoreReader <- None
         restoreSlots <- Array.empty
@@ -1621,7 +1631,8 @@ type TextDiffSession internal (
             | Mode.Done -> Meter.charge meter 1
     }
 
-    // Page building. Stage one reads row text and builds the parts without changing any state. Stage two records
+    // Page construction.
+    // Stage one reads row text and builds the parts without changing any state. Stage two records
     // the page and removes the consumed queue content.
 
     let rowBuffer = Array.zeroCreate<byte> 32_768
@@ -2037,7 +2048,10 @@ type TextDiffSession internal (
                     pairedNumber |> Option.iter (fun number -> selected[sideIndex] <- completed[sideIndex] number)
                 | None -> ()
         if selected[0].IsNone && selected[1].IsNone then
-            return reservePendingPreview None
+            if exhausted[0].IsSome && exhausted[1].IsSome then return reservePendingPreview None
+            else
+                let side = function Some count -> PendingSide.Exhausted count | None -> PendingSide.NoActiveLine
+                return reservePendingPreview (Some { Previous = side exhausted[0]; Current = side exhausted[1]; Mismatch = None })
         else
             let mutable knownMismatch = None
             let offsets = [| 0L; 0L |]
@@ -3208,6 +3222,14 @@ type TextDiffSession internal (
 
     let specAt sideIndex = if sideIndex = 0 then previousSpec else currentSpec
     let encodingAt sideIndex = if sideIndex = 0 then previousEncoding else currentEncoding
+    let mutable seekBatchAllocations = 0
+    let mutable largestSeekBatchCapacity = 0
+
+    let allocateSeekBatch capacity =
+        seekBatchAllocations <- seekBatchAllocations + 1
+        largestSeekBatchCapacity <- max largestSeekBatchCapacity capacity
+        LineBatch capacity
+
     let scanSideAt sideIndex = if sideIndex = 0 then previousSide else currentSide
 
     let beginSeek (sideIndex: int) (byLine: bool) (target: float) (startLine: float) (endLine: float) = async {
@@ -3219,7 +3241,9 @@ type TextDiffSession internal (
                 match hit with
                 | Some found -> found.State, found.Line
                 | None -> Scanner.create (encodingAt sideIndex) (int64 spec.BomLength) None, 0.0
-            let batch = LineBatch(256)
+            let remaining = if byLine then endLine - firstLine + 1.0 else 1.0
+            let batchCapacity = max 1 (int (max 1.0 (min 4_096.0 remaining)))
+            let batch = allocateSeekBatch batchCapacity
             return Some {
                 SideIndex = sideIndex
                 ByLine = byLine
@@ -3229,20 +3253,29 @@ type TextDiffSession internal (
                 State = state
                 Buffer = Array.zeroCreate<byte> 65_536
                 Batch = batch
+                BatchCapacity = batchCapacity
                 FoundLines = ResizeArray<ScannedLine>()
                 LineNumber = firstLine
                 Position = state.NextOffset
                 Complete = false
-                Rebatch = false
                 Waiting = false
-            }
+        }
     }
+
+    let releaseSeekBuffers (cursor: SeekCursor) =
+        cursor.Buffer <- Array.empty
+        cursor.Batch <- allocateSeekBatch 1
+
+    let restoreSeekBuffers (cursor: SeekCursor) =
+        if cursor.Buffer.Length = 0 then cursor.Buffer <- Array.zeroCreate<byte> 65_536
+        if cursor.Batch.Capacity <> cursor.BatchCapacity then cursor.Batch <- allocateSeekBatch cursor.BatchCapacity
 
     let advanceSeek (cursor: SeekCursor) (meter: Meter) (cancel: unit -> bool) = async {
         let spec = specAt cursor.SideIndex
         match spec.Source with
         | None -> cursor.Complete <- true
         | Some source ->
+            restoreSeekBuffers cursor
             cursor.Waiting <- false
             cursor.Complete <- cursor.Complete || cursor.State.IsComplete
             let mutable running = not cursor.Complete
@@ -3250,14 +3283,7 @@ type TextDiffSession internal (
             while running && not (Meter.overBudget meter) && not (cancel ()) do
                 iterations <- iterations + 1
                 if iterations > 10_000 then invalidOp "A seek request did not advance."
-                if cursor.Batch.Count = 0 then
-                    let remaining = max 1 (int (cursor.EndLine - cursor.LineNumber + 1.0))
-                    let lineBudget = max 1 (meter.MaxUnits - meter.Units)
-                    let capacity = if cursor.ByLine then min remaining lineBudget else 1
-                    if cursor.Rebatch || cursor.Batch.Capacity <> capacity then
-                        cursor.Batch <- LineBatch capacity
-                    cursor.Batch.StopAtFull <- true
-                    cursor.Rebatch <- false
+                cursor.Batch.StopAtFull <- true
 
                 let onLines (lines: LineBatch) =
                     for index = 0 to lines.Count - 1 do
@@ -3272,10 +3298,6 @@ type TextDiffSession internal (
                         if (cursor.ByLine && currentLine >= cursor.EndLine) || (not cursor.ByLine && selected) then
                             cursor.Complete <- true
                             lines.StopRequested <- true
-                    if cursor.ByLine && not cursor.Complete && cursor.EndLine - cursor.LineNumber + 1.0 < float lines.Capacity then
-                        cursor.Rebatch <- true
-                        lines.StopRequested <- true
-
                 let sideState = scanSideAt cursor.SideIndex
                 let validatedBefore = sideState.Coverage
                 let evidence (_: ScannerEvidence) = ()
@@ -3495,14 +3517,16 @@ type TextDiffSession internal (
             | Some cursor ->
                 do! advanceSeek cursor meter cancel
                 if cursor.Complete then
-                    if cursor.FoundLines.Count <> pending.TakeCount then
+                    let foundLines = cursor.FoundLines.ToArray()
+                    releaseSeekBuffers cursor
+                    if foundLines.Length <> pending.TakeCount then
                         sourceChanged ()
                         continueWork <- false
                     elif pending.PreviousLines.IsNone then
-                        pending.PreviousLines <- Some(cursor.FoundLines.ToArray())
+                        pending.PreviousLines <- Some foundLines
                         do! startExpansionSearch pending 1
                     else
-                        pending.CurrentLines <- Some(cursor.FoundLines.ToArray())
+                        pending.CurrentLines <- Some foundLines
                         pending.Search <- None
                 elif cursor.Waiting || cancel () || Meter.overBudget meter then continueWork <- false
         return not continueWork || pending.Search.IsNone
@@ -3567,7 +3591,7 @@ type TextDiffSession internal (
             BytePosition = 0.0
             Buffer = Array.zeroCreate<byte> 65_536
             Units = Array.zeroCreate<uint16> 8_192
-            SavedUnits = ""
+            SavedUnits = Array.empty
             UnitCount = 0
             UnitPosition = 0.0
             PreviousUnit = None
@@ -3676,11 +3700,11 @@ type TextDiffSession internal (
         | None -> ()
         for cursor in [| pending.Search; pending.PairSearch |] do
             match cursor with
-            | Some value -> value.Buffer <- Array.empty; value.Batch <- LineBatch(1)
+            | Some value -> releaseSeekBuffers value
             | None -> ()
         pending.Buffer <- Array.empty
         pending.Units <- Array.empty
-        pending.SavedUnits <- ""
+        pending.SavedUnits <- Array.empty
 
     /// Shrinks the arrays of a suspended pair analysis to the units that are still needed. The ledger stops
     /// counting them when the reservation is released.
@@ -3742,10 +3766,10 @@ type TextDiffSession internal (
             analysis.CurrentReverse.Buffer <- Array.empty
         | None -> ()
         if pending.Units.Length > 0 then
-            pending.SavedUnits <- Native.utf16Decode pending.Units pending.UnitCount
+            pending.SavedUnits <- Array.sub pending.Units 0 pending.UnitCount
         for cursor in [| pending.Search; pending.PairSearch |] do
             match cursor with
-            | Some value -> value.Buffer <- Array.empty; value.Batch <- LineBatch(1)
+            | Some value -> releaseSeekBuffers value
             | None -> ()
         pending.Buffer <- Array.empty
         pending.Units <- Array.empty
@@ -3755,14 +3779,12 @@ type TextDiffSession internal (
         if pending.Units.Length = 0 then
             pending.Units <- Array.zeroCreate<uint16> (max 0 pending.TakeMaxUtf16)
             let count = min pending.UnitCount pending.SavedUnits.Length
-            for index = 0 to count - 1 do pending.Units[index] <- uint16 pending.SavedUnits[index]
-            pending.SavedUnits <- ""
+            Array.blit pending.SavedUnits 0 pending.Units 0 count
+            pending.SavedUnits <- Array.empty
         for cursor in [| pending.Search; pending.PairSearch |] do
             match cursor with
-            | Some value when value.Buffer.Length = 0 ->
-                value.Buffer <- Array.zeroCreate<byte> 65_536
-                value.Batch <- LineBatch(256)
-            | _ -> ()
+            | Some value -> restoreSeekBuffers value
+            | None -> ()
         match pending.PairAnalysis with
         | Some analysis when reservePairAnalysis analysis -> expandPairAnalysis analysis
         | _ -> ()
@@ -4083,7 +4105,7 @@ type TextDiffSession internal (
         return pending
     }
 
-    let runExpansionRequest (pending: PendingExpansion) sequence (cancel: unit -> bool) = async {
+    let runExpansionRequestCore (pending: PendingExpansion) sequence (cancel: unit -> bool) = async {
         let meter = Meter.create host.Clock config.Limits
         let mutable finished = pending.Search.IsNone && pending.PreviousLines.IsSome && pending.CurrentLines.IsSome
         let mutable waiting = false
@@ -4128,10 +4150,18 @@ type TextDiffSession internal (
                 let code, message = failure.Value
                 return EngineResult.Failed(code, message, None)
             else
-              let result = Resumable.Scanning(progress (), continuation, None)
-              do! journal.Append(journalKey 1L sequence, JournalValue.Expansion result)
-              pending.RequestSequence <- nextSequence
-              return EngineResult.Ok(Resumable.Scanning(progress (), continuation, preview))
+                let result = Resumable.Scanning(progress (), continuation, None)
+                do! journal.Append(journalKey 1L sequence, JournalValue.Expansion result)
+                pending.RequestSequence <- nextSequence
+                return EngineResult.Ok(Resumable.Scanning(progress (), continuation, preview))
+    }
+
+    let runExpansionRequest (pending: PendingExpansion) sequence (cancel: unit -> bool) = async {
+        try return! runExpansionRequestCore pending sequence cancel
+        finally
+            match pending.Search with
+            | Some cursor -> releaseSeekBuffers cursor
+            | None -> ()
     }
 
     let runLineReadRequestCore (pending: PendingLineRead) sequence (cancel: unit -> bool) = async {
@@ -4513,6 +4543,7 @@ type TextDiffSession internal (
             return EngineResult.Failed(code, message, None)
         elif invalidDetail.IsSome then return failContent ()
         elif line < 0L || offsetUtf16 < 0L then return failMismatch ()
+        elif (specAt (if side = DiffSide.Previous then 0 else 1)).Source.IsNone then return failMismatch ()
         else
             let! acquired = acquire cancel
             if not acquired then return EngineResult.Canceled
@@ -4569,6 +4600,9 @@ type TextDiffSession internal (
         match failure with
         | Some(code, message) -> EngineResult.Failed(code, message, None)
         | None -> EngineResult.Ok lastPendingPreview
+
+    member internal _.SeekBatchAllocationCount = seekBatchAllocations
+    member internal _.LargestSeekBatchCapacity = largestSeekBatchCapacity
 
     /// Writes the suspended step to the spill store and releases its scratch memory. The next request restores it.
     member _.Spill() = spillSession ()

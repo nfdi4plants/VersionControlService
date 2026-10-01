@@ -24,6 +24,29 @@ module TextDiffEngineCases =
 
     let private ascii (value: string) = value |> Seq.map (fun character -> byte character) |> Seq.toArray
 
+    type private SparseByteSource(length: int64) =
+        let mutable lastPosition = -1L
+        let mutable lastCount = -1
+
+        member _.LastPosition = lastPosition
+        member _.LastCount = lastCount
+
+        interface IByteSource with
+            member _.KnownLength = Some length
+            member _.AvailableLength() = length
+            member _.IsComplete() = true
+            member _.ReadAt position buffer offset count = async {
+                if position < 0L then invalidArg (nameof position) "The position cannot be negative."
+                if isNull buffer then nullArg (nameof buffer)
+                if offset < 0 || count < 0 || offset > buffer.Length - count then
+                    invalidArg (nameof offset) "The destination range is invalid."
+                lastPosition <- position
+                lastCount <- count
+                for index = offset to offset + count - 1 do
+                    buffer[index] <- 0x61uy
+                return ReadOutcome.Bytes count
+            }
+
     let private createMeter () =
         let clock = ManualClock 0.0
         let limits = { Limits.defaults with RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 }
@@ -237,6 +260,45 @@ module TextDiffEngineCases =
             Check.equal ReadOutcome.EndOfSource eof "EndOfSource follows producer completion."
             return ()
         }
+        "scan-side reads stay bounded above 2 GiB", fun () -> async {
+            let position = 2_147_483_648L
+            let length = position + 65_536L
+            let source = SparseByteSource(length)
+            let spec = {
+                Source = Some(source :> IByteSource)
+                Encoding = "utf-8"
+                BomLength = 0
+                ByteLength = length
+            }
+            let report _ _ _ = ()
+            let side =
+                ScanSide(
+                    spec,
+                    TextEncoding.Utf8,
+                    AllocationCategory.PreviousWindows,
+                    DiffSide.Previous,
+                    Ledger(),
+                    ControlRatioTally(DiffSide.Previous, 0, length, report),
+                    None,
+                    report,
+                    65_536.0,
+                    ignore)
+            side.SetLimits(4_096, 32 * 1024 * 1024)
+            side.Scanner.NextOffset <- float position
+            side.Scanner.LineLengthUtf16 <- float position
+            side.Scanner.LineHasText <- true
+            let buffer = Array.zeroCreate<byte> 4_096
+            let! result = side.ReadInto(buffer, buffer.Length)
+            match result with
+            | ReadData(count, endOfSource) ->
+                Check.equal buffer.Length count "The scan-side read uses the available buffer."
+                Check.true' (not endOfSource) "The sparse source has data after the read."
+            | other -> failwith $"Expected scan data, got {other}."
+            Check.equal position source.LastPosition "The source read starts at the scanner offset."
+            Check.equal buffer.Length source.LastCount "The source receives a bounded read count."
+            side.Dispose()
+            return ()
+        }
         "memory temporary storage supports append, positional writes, reads, and disposal", fun () -> async {
             let store = MemoryTempStore() :> ITempStore
             let first = bytes [ 1; 2; 3 ]
@@ -423,8 +485,6 @@ module TextDiffEngineCases =
             let hdf = Array.create 520 0uy
             Array.blit (bytes [ 0x89; 0x48; 0x44; 0x46; 13; 10; 26; 10 ]) 0 hdf 512 8
             expectBinary "HDF5" (classify hdf)
-            let beyond = Classification.hdf5OffsetsBeyondPrefix (2L * 1024L * 1024L)
-            Check.sequence [| 131_072L; 262_144L; 524_288L; 1_048_576L |] beyond "Later HDF5 offsets grow by powers of two."
             return ()
         }
         "PE, ELF, and Mach-O checks use their structural fields", fun () -> async {

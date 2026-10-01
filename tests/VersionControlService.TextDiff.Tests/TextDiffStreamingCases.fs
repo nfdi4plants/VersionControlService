@@ -375,6 +375,72 @@ module TextDiffStreamingCases =
                 do! session.Close()
             return ()
         }
+        "repeated lines keep large insertions and deletions exact as source bytes arrive", fun () -> async {
+            let sourceLine text = { Text = text; Ending = LineEnding.LF }
+            let prose prefix count =
+                Array.init count (fun index -> sourceLine (if index % 2 = 1 then "" else sprintf "%s paragraph %d with some words." prefix index))
+            let jsonRecords prefix count finalRecord =
+                Array.init count (fun index ->
+                    [| sourceLine "  {"
+                       sourceLine (sprintf "    \"id\": \"%s-%d\"," prefix index)
+                       sourceLine (sprintf "    \"value\": %d" (if prefix = "old" then index * 7 else 1_000_000 + index))
+                       sourceLine (if finalRecord && index = count - 1 then "  }" else "  },") |])
+                |> Array.concat
+            let splice (lines: SourceLine[]) index (inserted: SourceLine[]) = Array.concat [ lines[.. index - 1]; inserted; lines[index ..] ]
+            let proseBase = prose "old" 1_000
+            let jsonBase = Array.concat [ [| sourceLine "[" |]; jsonRecords "old" 512 true; [| sourceLine "]" |] ]
+            let cases = ResizeArray<string * SourceLine[] * SourceLine[] * int * int>()
+            for kind, baseLines, makeInserted, lineStride in [
+                "prose", proseBase, (fun amount -> prose "new" amount), 2
+                "json", jsonBase, (fun amount -> jsonRecords "new" (amount / 4) false), 4
+            ] do
+                for amount in [| 600; 2_000 |] do
+                    for positionName, recordIndex in [ "start", 10; "middle", (if kind = "prose" then 250 else 256) ] do
+                        let lineIndex = if kind = "prose" then recordIndex * lineStride else 1 + recordIndex * lineStride
+                        let inserted = makeInserted amount
+                        Check.equal amount inserted.Length $"The {kind} {amount}-line edit has its requested size."
+                        let extended = splice baseLines lineIndex inserted
+                        cases.Add($"{kind}-{amount}-{positionName}-insert", baseLines, extended, amount, 0)
+                        cases.Add($"{kind}-{amount}-{positionName}-delete", extended, baseLines, 0, amount)
+
+            for name, previous, current, expectedAdded, expectedRemoved in cases do
+                let previousBytes = encodeLines previous
+                let currentBytes = encodeLines current
+                let sessionConfig = SessionConfig.defaults ("repeat-" + name)
+                let! baseline = openSession (Ledger()) sessionConfig (sourceSpec previousBytes) (sourceSpec currentBytes)
+                let! baselinePages, _ = readAll baseline
+                checkOracle previous current baselinePages
+                let baselineCounts = diffCounts baselinePages
+                Check.equal (expectedAdded, expectedRemoved, 0, 0) baselineCounts $"The {name} input has only the requested line changes."
+                let rows = allParts baselinePages |> Array.collect (function DiffPart.Hunk { Body = HunkBody.AlignedRows values } -> values | _ -> Array.empty)
+                for row in rows do
+                    match row.Kind with
+                    | DiffRowKind.Context ->
+                        let previousLine = row.Previous.Value
+                        let currentLine = row.Current.Value
+                        Check.equal previousLine.Slice.Text currentLine.Slice.Text $"The {name} input keeps context text equal."
+                        Check.equal previousLine.Ending currentLine.Ending $"The {name} input keeps context endings equal."
+                    | DiffRowKind.Added
+                    | DiffRowKind.Removed -> ()
+                    | other -> failwith $"The {name} input returned unexpected row kind {other}."
+                let replacedRows = rows |> Array.filter (fun row -> row.Kind = DiffRowKind.Replaced)
+                Check.equal 0 replacedRows.Length $"The {name} input has no replaced rows."
+                let baselineParts = allParts baselinePages
+                do! baseline.Close()
+
+                for growth in [| 256; 1_024; 4_096 |] do
+                    let previousSource = GrowingByteSource(previousBytes, growth, 1) :> IByteSource
+                    let currentSource = GrowingByteSource(currentBytes, growth, 1) :> IByteSource
+                    let previousSpec = sourceSpecWith previousSource previousBytes
+                    let currentSpec = sourceSpecWith currentSource currentBytes
+                    let! session = openSession (Ledger()) sessionConfig previousSpec currentSpec
+                    let! pages, _ = readAll session
+                    checkOracle previous current pages
+                    Check.equal baselineCounts (diffCounts pages) $"Growth by {growth} bytes preserves the {name} counts."
+                    Check.true' (Unchecked.equals baselineParts (allParts pages)) $"Growth by {growth} bytes preserves the {name} output."
+                    do! session.Close()
+            return ()
+        }
         "window storage stays within its configured line bound", fun () -> async {
             let previous = makeLines 50_000 "line-"
             let current = Array.copy previous
@@ -407,7 +473,7 @@ module TextDiffStreamingCases =
                 | EngineResult.Failed(code, message, _) -> failwith $"The first request failed with {code}: {message}."
                 | EngineResult.Canceled -> failwith "The first request was canceled."
             Check.true' page.NextCursor.IsSome "The first page leaves later lines for a continuation."
-            Check.true' (page.Progress.ValidatedBytes * 10L < page.Progress.TotalBytes) "The first page validates less than one tenth of both files."
+            Check.true' (page.Progress.ValidatedBytes * 10L < page.Progress.TotalBytes) $"The first page validates less than one tenth of both files. Validated {page.Progress.ValidatedBytes} of {page.Progress.TotalBytes} bytes."
             Check.true' (page.Parts |> Array.exists (function DiffPart.Hunk _ -> true | _ -> false)) "The early edit appears on the first page."
             do! session.Close()
             return ()

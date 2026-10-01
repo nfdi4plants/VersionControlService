@@ -885,41 +885,32 @@ module Scanner =
         let mutable error: DecodeError option = None
         let mutable status = InputConsumed
         let mutable stopped = false
-        let mutable checkedMeter = false
-
         while consumed < count && not stopped && error.IsNone do
-            if not checkedMeter then
-                checkedMeter <- true
+            let windowRemaining = WindowByteCount - state.CurrentWindow.Bytes
+            let segmentCount = min SegmentBytes (min (count - consumed) windowRemaining)
+            let linesBefore = batch.Pushed
+            let actual, segmentError = scanSegment state batch onLines emitEvidence bytes (offset + consumed) segmentCount
+            // One unit per line plus one per 4096 bytes, charged once per segment.
+            Meter.charge meter (int (batch.Pushed - linesBefore))
+            if actual > 0 then
+                Meter.chargeBytes meter actual
+                advanceWindowsBy state actual emitEvidence
+                consumed <- consumed + actual
+            if batch.StopRequested then
+                batch.StopRequested <- false
+                status <- LineBoundaryReached
+                stopped <- true
+            match segmentError with
+            | Some decodeError ->
+                state.ValidatedBytes <- min state.ValidatedBytes (float decodeError.Offset - float state.StartOffset)
+                error <- Some decodeError
+            | None ->
                 if Meter.overBudget meter then
                     status <- BudgetReached
                     stopped <- true
-                // A request with remaining work budget scans one segment before a due quantum suspends it.
-            if not stopped then
-                let windowRemaining = WindowByteCount - state.CurrentWindow.Bytes
-                let segmentCount = min SegmentBytes (min (count - consumed) windowRemaining)
-                let linesBefore = batch.Pushed
-                let actual, segmentError = scanSegment state batch onLines emitEvidence bytes (offset + consumed) segmentCount
-                // One unit per line plus one per 4096 bytes, charged once per segment.
-                Meter.charge meter (int (batch.Pushed - linesBefore))
-                if actual > 0 then
-                    Meter.chargeBytes meter actual
-                    advanceWindowsBy state actual emitEvidence
-                    consumed <- consumed + actual
-                if batch.StopRequested then
-                    batch.StopRequested <- false
-                    status <- LineBoundaryReached
+                elif Meter.quantumDue meter then
+                    status <- QuantumReached
                     stopped <- true
-                match segmentError with
-                | Some decodeError ->
-                    state.ValidatedBytes <- min state.ValidatedBytes (float decodeError.Offset - float state.StartOffset)
-                    error <- Some decodeError
-                | None ->
-                    if Meter.overBudget meter then
-                        status <- BudgetReached
-                        stopped <- true
-                    elif Meter.quantumDue meter then
-                        status <- QuantumReached
-                        stopped <- true
 
         match error with
         | Some _ -> status <- DecodeFailure

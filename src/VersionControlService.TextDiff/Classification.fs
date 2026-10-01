@@ -547,12 +547,3 @@ module Classification =
                             Array.init distinct.Count (fun index ->
                                 ({ Encoding = Decoders.name distinct[index].Encoding; Preview = previewOf texts[index] }: EncodingCandidate))
                         Candidates candidates
-
-    let hdf5OffsetsBeyondPrefix sourceLength =
-        let offsets = ResizeArray<int64>()
-        let mutable offset = 512L
-        while offset <= 65536L do offset <- offset * 2L
-        while offset < sourceLength do
-            offsets.Add offset
-            if offset > Int64.MaxValue / 2L then offset <- sourceLength else offset <- offset * 2L
-        offsets.ToArray()

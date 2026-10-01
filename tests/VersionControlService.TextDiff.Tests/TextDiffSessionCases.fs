@@ -760,7 +760,7 @@ module TextDiffSessionCases =
             return ()
         }
         "pending expansion continuations bind their gap fields and a fresh request replaces pending work", fun () -> async {
-            let expected = Array.init 64 (fun index -> { Text = "line-" + string index; Ending = LineEnding.LF })
+            let expected = Array.init 64 (fun index -> { Text = "line-" + string index + String('x', 256); Ending = LineEnding.LF })
             let source = sourceSpec (encodeLines expected)
             let limits = { Limits.defaults with MaxUnits = 1; RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 }
             let! session = openSession (config 1 1_000 1_024 4_096 limits) source source
@@ -1294,6 +1294,16 @@ module TextDiffSessionCases =
             let! _, removedParts = collectPages removedSession (fun () -> false)
             Check.true' (rows removedParts |> Array.exists (fun row -> row.Kind = DiffRowKind.Removed)) "The absent current side produces removals."
             do! removedSession.Close()
+            return ()
+        }
+        "line reads reject an absent side without a continuation", fun () -> async {
+            let limits = { Limits.defaults with MaxUnits = 1; RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 }
+            let! session = openSession { defaultConfig () with Limits = limits } absentSpec (sourceSpec (encodeLines [| { Text = "present"; Ending = LineEnding.LF } |]))
+            let! result = session.ReadLine(DiffSide.Previous, 0L, 0L, 32, None, fun () -> false)
+            match result with
+            | EngineResult.Failed(code, _, _) -> Check.equal TextDiffFailureCodes.ContinuationMismatch code "An absent side returns a line mismatch immediately."
+            | other -> failwith $"The absent side returned {other}."
+            do! session.Close()
             return ()
         }
         "small pages split a hunk and replay stable results", fun () -> async {
@@ -1839,6 +1849,60 @@ module TextDiffSessionCases =
             do! session.Close()
             return ()
         }
+        "late expansions and line reads keep bounded scanner batches", fun () -> async {
+            let lines = Array.init 200_000 (fun _ -> { Text = String('x', 64); Ending = LineEnding.LF })
+            let bytes = encodeLines lines
+            let source = sourceSpec bytes
+            let limits = { Limits.defaults with MaxUnits = 100_000; RequestMs = 1e12; QuantumMs = 1e12 }
+            let sessionConfig = { config 0 1_000 65_536 4_096 limits with CheckpointIntervalBytes = 64 * 1024 * 1024 |> float }
+            let! session = openSession sessionConfig source source
+            let! pages = readAll session (fun () -> false)
+            let gap = allParts pages |> Array.pick (function DiffPart.HiddenEqual value -> Some value | _ -> None)
+            let readExpansion count = async {
+                let! initial = session.Expand(gap.GapId, false, count, None, fun () -> false)
+                let mutable result = initial
+                let mutable parts = None
+                let mutable requests = 1
+                while parts.IsNone do
+                    match result with
+                    | EngineResult.Ok(Resumable.Ready value) -> parts <- Some value
+                    | EngineResult.Ok(Resumable.Scanning(_, continuation, _)) ->
+                        requests <- requests + 1
+                        let! next = session.Expand(gap.GapId, false, count, Some continuation, fun () -> false)
+                        result <- next
+                    | EngineResult.Failed(code, message, detail) -> failwith $"The late expansion failed with {code}: {message}. Detail: {detail}."
+                    | EngineResult.Canceled -> failwith "The late expansion canceled an uncanceled request."
+                return parts.Value, requests
+            }
+            let beforeExpansion = session.SeekBatchAllocationCount
+            let! expanded, expansionRequests = readExpansion 64
+            Check.true' (expanded |> Array.exists (function DiffPart.ExpandedContext(_, rows) -> rows.Length = 64 | _ -> false)) "The expansion returns the last 64 lines."
+            let expansionAllocations = session.SeekBatchAllocationCount - beforeExpansion
+            Check.true' (expansionRequests <= 8) $"The expansion finishes in {expansionRequests} requests."
+            Check.true' (expansionAllocations <= expansionRequests * 6 + 4) $"The expansion allocated {expansionAllocations} seek batches across {expansionRequests} requests."
+
+            let beforeLine = session.SeekBatchAllocationCount
+            let! initialLine = session.ReadLine(DiffSide.Previous, int64 lines.Length - 1L, 0L, 8, None, fun () -> false)
+            let mutable result = initialLine
+            let mutable line = None
+            let mutable lineRequests = 1
+            while line.IsNone do
+                match result with
+                | EngineResult.Ok(Resumable.Ready value) -> line <- Some value
+                | EngineResult.Ok(Resumable.Scanning(_, continuation, _)) ->
+                    lineRequests <- lineRequests + 1
+                    let! next = session.ReadLine(DiffSide.Previous, int64 lines.Length - 1L, 0L, 8, Some continuation, fun () -> false)
+                    result <- next
+                | EngineResult.Failed(code, message, detail) -> failwith $"The late line read failed with {code}: {message}. Detail: {detail}."
+                | EngineResult.Canceled -> failwith "The late line read canceled an uncanceled request."
+            Check.equal (String('x', 8)) line.Value.Slice.Text "The line read returns the final line."
+            let lineAllocations = session.SeekBatchAllocationCount - beforeLine
+            Check.true' (lineRequests <= 8) $"The line read finishes in {lineRequests} requests."
+            Check.true' (lineAllocations <= lineRequests * 6 + 4) $"The line read allocated {lineAllocations} seek batches across {lineRequests} requests."
+            Check.true' (session.LargestSeekBatchCapacity <= 4_096) $"A seek batch reached {session.LargestSeekBatchCapacity} slots."
+            do! session.Close()
+            return ()
+        }
         "source info learns a line count when a seek reaches eof", fun () -> async {
             let lines = Array.init 200 (fun index -> { Text = string index + String('x', 96); Ending = LineEnding.LF })
             let bytes = encodeLines lines
@@ -1919,6 +1983,35 @@ module TextDiffSessionCases =
                 do! session.Close()
             return ()
         }
+        "suspended line reads preserve a surrogate pair at the slice edge", fun () -> async {
+            let prefix = String('a', 8_191)
+            let suffix = String('b', 16_000)
+            let previous = [| { Text = prefix + "😀" + suffix + "p"; Ending = LineEnding.LF } |]
+            let current = [| { Text = prefix + "😀" + suffix + "q"; Ending = LineEnding.LF } |]
+            let limits = { Limits.defaults with MaxUnits = 20; RequestMs = 1e12; QuantumMs = 1e12 }
+            let sessionConfig = { defaultConfig () with Limits = limits }
+            let! session = openSession sessionConfig (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+            let! pages = readAll session (fun () -> false)
+            let! initial = session.ReadLine(DiffSide.Previous, 0L, 0L, 9_000, None, fun () -> false)
+            let mutable result = initial
+            let mutable line = None
+            let mutable requests = 1
+            while line.IsNone do
+                if requests > 1_000 then failwith "The suspended line read did not finish within its request bound."
+                match result with
+                | EngineResult.Ok(Resumable.Ready value) -> line <- Some value
+                | EngineResult.Ok(Resumable.Scanning(_, continuation, _)) ->
+                    requests <- requests + 1
+                    let! next = session.ReadLine(DiffSide.Previous, 0L, 0L, 9_000, Some continuation, fun () -> false)
+                    result <- next
+                | EngineResult.Failed(code, message, detail) -> failwith $"The line read failed with {code}: {message}. Detail: {detail}."
+                | EngineResult.Canceled -> failwith "The line read canceled an uncanceled request."
+            Check.true' (requests > 1) "The line read returns continuations while it builds paired highlights."
+            Check.equal prefix line.Value.Slice.Text "The slice ends before the incomplete surrogate pair."
+            Check.equal 0L line.Value.Slice.OffsetUtf16 "The slice keeps its requested offset."
+            do! session.Close()
+            return ()
+        }
         "start middle and end edits preserve lines across window edges", fun () -> async {
             let previous = Array.init 48 (fun index -> { Text = "line-" + string index; Ending = LineEnding.LF })
             let current = Array.copy previous
@@ -1929,7 +2022,14 @@ module TextDiffSessionCases =
             let! pages = readAll session (fun () -> false)
             checkOracle previous current pages
             let changed = rows (allParts pages) |> Array.filter (fun row -> row.Kind <> DiffRowKind.Context)
-            Check.true' (changed |> Array.exists (fun row -> row.Previous |> Option.exists (fun line -> line.Number = 0L))) "The first line edit appears in the page stream."
+            let changedShape =
+                changed
+                |> Array.map (fun row ->
+                    row.Kind,
+                    row.Previous |> Option.map (fun line -> line.Number, line.Slice.Text),
+                    row.Current |> Option.map (fun line -> line.Number, line.Slice.Text))
+                |> sprintf "%A"
+            Check.true' (changed |> Array.exists (fun row -> row.Previous |> Option.exists (fun line -> line.Number = 0L))) $"The first line edit appears in the page stream. Rows: {changedShape}"
             Check.true' (changed |> Array.exists (fun row -> row.Current |> Option.exists (fun line -> line.Number = 47L && line.Ending = LineEnding.NoEnding))) "The final line edit keeps its missing terminator."
             do! session.Close()
             return ()
@@ -2139,14 +2239,40 @@ module TextDiffSessionCases =
                     | _ -> Array.empty)
             let normalRows = rowShape normalPages
             do! normal.Close()
-            for delay in [| 11.0; 50.0 |] do
+            let readWithinLimit (session: TextDiffSession) = async {
+                let! first = session.FirstPage(fun () -> false)
+                let pages = ResizeArray<DiffPage>()
+                let mutable result = first
+                let mutable complete = false
+                let mutable requests = 1
+                while not complete && requests < 64 do
+                    match result with
+                    | EngineResult.Ok(Resumable.Ready page) ->
+                        pages.Add page
+                        match page.NextCursor with
+                        | None -> complete <- page.OutputComplete
+                        | Some cursor ->
+                            requests <- requests + 1
+                            let! next = session.ReadPage cursor (fun () -> false)
+                            result <- next
+                    | EngineResult.Ok(Resumable.Scanning(_, continuation, _)) ->
+                        requests <- requests + 1
+                        let! next = session.ReadPage continuation (fun () -> false)
+                        result <- next
+                    | EngineResult.Failed(code, message, detail) ->
+                        failwith $"The slow diff failed with {code}: {message}. Detail: {detail}."
+                    | EngineResult.Canceled -> failwith "The slow diff canceled an uncanceled request."
+                Check.true' complete "The slow diff finishes within its request bound."
+                return pages.ToArray()
+            }
+            for delay in [| 450.0; 1_000.0 |] do
                 let clock = ManualClock 0.0
                 let host = Host.createInMemory (clock :> IClock)
-                let sessionConfig = { defaultConfig () with Limits = { Limits.defaults with RequestMs = 1e12; QuantumMs = 10.0 } }
+                let sessionConfig = defaultConfig ()
                 let previous = { sourceSpec previousBytes with Source = Some(DelayedByteSource(previousBytes, clock, delay) :> IByteSource) }
                 let current = { sourceSpec currentBytes with Source = Some(DelayedByteSource(currentBytes, clock, delay) :> IByteSource) }
                 let! session = TextDiffSession.create host (Ledger()) sessionConfig (fun _ -> 1) previous current
-                let! pages = readAll session (fun () -> false)
+                let! pages = readWithinLimit session
                 Check.sequence normalRows (rowShape pages) "Slow reads preserve the normal diff rows."
                 do! session.Close()
             return ()
