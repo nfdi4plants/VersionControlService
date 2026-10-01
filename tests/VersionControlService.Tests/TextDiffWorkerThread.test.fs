@@ -14,6 +14,7 @@ module NodeProcess = VersionControlService.Runtime.Node.Process
 module NodePositionalFile = VersionControlService.Runtime.Node.PositionalFile
 module TextDiffSupervisor = VersionControlService.Git.TextDiff.TextDiffSupervisor
 module TextDiffPool = VersionControlService.Git.TextDiff.TextDiffPool
+module TextDiffWorker = VersionControlService.Git.TextDiff.TextDiffWorker
 
 [<Import("mkdtemp", "node:fs/promises")>]
 let private mkdtemp (prefix: string) : JS.Promise<string> = jsNative
@@ -490,5 +491,46 @@ Vitest.describe (
                         Vitest.expect(spool < worker).toBe true
                     | _ -> failwith $"Missing cleanup events: %A{events}"
                 })
+        )
+)
+
+/// Counts the setTimeout calls without a delay until it is restored.
+type private TimerSpy =
+    abstract ZeroDelayCalls: int
+    abstract Restore: unit -> unit
+
+[<Emit("(() => { const original = globalThis.setTimeout; let zero = 0; globalThis.setTimeout = function (callback, delay, ...rest) { if (!delay) zero++; return original.call(this, callback, delay, ...rest); }; return { get ZeroDelayCalls() { return zero; }, Restore() { globalThis.setTimeout = original; } }; })()")>]
+let private spyOnZeroDelayTimeouts () : TimerSpy = jsNative
+
+// The hijack lives on the prototype of the trampoline that every running async carries in its context.
+[<Emit("(ctx) => { ctx.onSuccess(Object.getPrototypeOf(ctx.trampoline).hijack); }")>]
+let private currentHijack: Async<obj> = jsNative
+
+[<Emit("(ctx) => { Object.getPrototypeOf(ctx.trampoline).hijack = $0; ctx.onSuccess(); }")>]
+let private restoreHijack (_hijack: obj) : Async<unit> = jsNative
+
+let rec private bindLoop (remaining: int) : Async<unit> = async {
+    if remaining > 0 then
+        let! _ = async.Return remaining
+        return! bindLoop (remaining - 1)
+}
+
+Vitest.describe (
+    "Text diff worker trampoline",
+    fun () ->
+        Vitest.test (
+            "long bind chains hop through setImmediate and schedule no zero-delay timeout",
+            fun () -> promise {
+                let! original = Async.StartAsPromise currentHijack
+                let spy = spyOnZeroDelayTimeouts ()
+
+                try
+                    TextDiffWorker.switchTrampolineToSetImmediate ()
+                    do! Async.StartAsPromise(bindLoop 20000)
+                    Vitest.expect(spy.ZeroDelayCalls).toBe 0
+                finally
+                    spy.Restore()
+                    Async.StartImmediate(restoreHijack original)
+            }
         )
 )
