@@ -280,12 +280,14 @@ type private FileSourceCore(
         member _.IsComplete() = not disposed && terminalFailure.IsNone
         member this.ReadAt position buffer offset count = this.ReadAt position buffer offset count
 
-type WorkingFileSource private (core: FileSourceCore) =
-    static member Open(
+/// Reads a local file positionally and checks that the file is unchanged. For an LFS object it also checks
+/// that the pointer file is unchanged.
+type FileSource private (core: FileSourceCore) =
+    static member OpenWorkingFile(
         path: string,
         expectedIdentity: FileIdentity,
         ?onFailure: TextDiffSourceFailureCallback
-    ) : JS.Promise<WorkingFileSource> =
+    ) : JS.Promise<FileSource> =
         let callback = defaultArg onFailure (fun _ -> ())
 
         async {
@@ -300,41 +302,18 @@ type WorkingFileSource private (core: FileSourceCore) =
                 )
                 |> Async.AwaitPromise
 
-            return WorkingFileSource(source)
+            return FileSource(source)
         }
         |> Async.StartAsPromise
 
-    member _.Path = core.Path
-
-    member _.KnownLength = Some core.KnownLength
-
-    member _.AvailableLength() = core.AvailableLength()
-
-    member _.IsComplete() = core.IsComplete()
-
-    member this.ReadAt position buffer offset count = core.ReadAt position buffer offset count
-
-    member _.Failure = core.Failure
-
-    member _.CheckIdentity() = core.CheckIdentity()
-
-    member _.Dispose() = core.Dispose()
-
-    interface IByteSource with
-        member _.KnownLength = Some core.KnownLength
-        member _.AvailableLength() = core.AvailableLength()
-        member _.IsComplete() = core.IsComplete()
-        member _.ReadAt position buffer offset count = core.ReadAt position buffer offset count
-
-type LfsObjectSource private (core: FileSourceCore) =
-    static member Open(
+    static member OpenLfsObject(
         objectPath: string,
         expectedLength: int64,
         objectIdentity: FileIdentity,
         pointerPath: string option,
         pointerIdentity: FileIdentity option,
         ?onFailure: TextDiffSourceFailureCallback
-    ) : JS.Promise<LfsObjectSource> =
+    ) : JS.Promise<FileSource> =
         let callback = defaultArg onFailure (fun _ -> ())
 
         async {
@@ -349,7 +328,7 @@ type LfsObjectSource private (core: FileSourceCore) =
                 )
                 |> Async.AwaitPromise
 
-            return LfsObjectSource(source)
+            return FileSource(source)
         }
         |> Async.StartAsPromise
 

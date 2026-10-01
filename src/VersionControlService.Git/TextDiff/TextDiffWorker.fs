@@ -560,7 +560,7 @@ let private openSide
 
                 return Proceed
             | ResolvedSide.WorkingFile(path, identity) ->
-                let! source = WorkingFileSource.Open(path, identity, onFailure = onFailure) |> Async.AwaitPromise
+                let! source = FileSource.OpenWorkingFile(path, identity, onFailure = onFailure) |> Async.AwaitPromise
 
                 slot.SetState(
                     side,
@@ -581,7 +581,7 @@ let private openSide
                     |> Option.map (fun _ -> NodePath.join [| slot.Owner.WorkspaceRoot; RepositoryPath.value request.Path |])
 
                 let! source =
-                    LfsObjectSource.Open(objectPath, size, objectIdentity, pointerPath, pointerIdentity, onFailure = onFailure)
+                    FileSource.OpenLfsObject(objectPath, size, objectIdentity, pointerPath, pointerIdentity, onFailure = onFailure)
                     |> Async.AwaitPromise
 
                 slot.SetState(

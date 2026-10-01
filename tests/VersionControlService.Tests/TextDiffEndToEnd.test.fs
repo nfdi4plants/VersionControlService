@@ -735,7 +735,7 @@ Vitest.describe (
                     Ino = stats.Ino
                     Dev = stats.Dev
                 }
-                let! source = TextDiffSources.WorkingFileSource.Open(filePath, identity)
+                let! source = TextDiffSources.FileSource.OpenWorkingFile(filePath, identity)
                 NodeFileSystem.unlinkSync filePath
                 let mutable failureCode = None
 
