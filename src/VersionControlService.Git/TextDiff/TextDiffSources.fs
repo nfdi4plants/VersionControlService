@@ -175,10 +175,14 @@ type private FileSourceCore(
                     if amount > 0 then
                         return ReadOutcome.Bytes amount
                     else
+                        // A file saved shorter in place reads zero bytes. Report that as a changed source.
+                        do! validateIdentities ()
                         return raiseFailure (report (readFailure $"Reading {path} made no progress."))
                 with
                 | :? TextDiffSourceException as error -> return raise error
-                | error -> return raiseFailure (report (readFailure (NodeInterop.errorMessage (box error))))
+                | error ->
+                    do! validateIdentities ()
+                    return raiseFailure (report (readFailure (NodeInterop.errorMessage (box error))))
     }
 
     member this.Dispose() : JS.Promise<unit> =
@@ -268,7 +272,8 @@ type private FileSourceCore(
         member this.ReadAt position buffer offset count = this.ReadAt position buffer offset count
 
 /// Reads a local file positionally and checks that the file is unchanged. For an LFS object it also checks
-/// that the pointer file is unchanged.
+/// that the pointer file is unchanged. ReadAt rethrows a failure that was already reported. Callers check the
+/// file (and for an LFS object its pointer) with CheckIdentity before and after each request.
 type FileSource private (core: FileSourceCore) =
     static member OpenWorkingFile(
         path: string,
@@ -331,6 +336,8 @@ type FileSource private (core: FileSourceCore) =
 
     member _.Failure = core.Failure
 
+    /// Raises the source_changed failure when the file (or the LFS pointer) differs from the opened state, and
+    /// rethrows a failure that was already reported.
     member _.CheckIdentity() = core.CheckIdentity()
 
     member _.Dispose() = core.Dispose()

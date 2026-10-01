@@ -46,7 +46,7 @@ let private errorCode (_error: obj) : string = jsNative
 
 let private removeDirectory (path: string) = promise {
     try
-        do! NodeFileSystem.rmAsync path (NodeFileSystem.RmOptions(recursive = true, force = true, maxRetries = 19, retryDelay = 100))
+        do! NodeFileSystem.rmAsync path (NodeFileSystem.RmOptions(recursive = true, force = true, maxRetries = 5, retryDelay = 100))
     with _ -> ()
 }
 
@@ -366,6 +366,47 @@ Vitest.describe (
 
                 match outcome with
                 | ResolveOutcome.ReadError _ -> ()
+                | other -> failwith $"Expected a read error, got %A{other}"
+            }
+        )
+
+        Vitest.test (
+            "names the spawn error when Git cannot be started",
+            TestOptions(timeout = 60000),
+            fun () -> promise {
+                let! repository = newRepository ()
+                do! commitFile repository "a.txt" "one\n"
+                let missingGit = NodePath.join [| currentFixture().Root; "missing-git-executable" |]
+
+                let runMissing arguments =
+                    async {
+                        let! result =
+                            NodeProcess.runBounded missingGit arguments repository (processEnvironment ()) (4 * 1024 * 1024) 65536
+                            |> Async.AwaitPromise
+
+                        let short: GitShort = {
+                            ExitCode = result.ExitCode
+                            Stdout = result.Stdout
+                            Stderr = result.Stderr
+                            Error = result.Error
+                        }
+
+                        return short
+                    }
+
+                let input = {
+                    RepositoryRoot = repository
+                    LfsMediaDirectory = mediaDirectory repository
+                    Path = "a.txt"
+                    PreviousPath = None
+                }
+
+                let! outcome = resolve (TextDiffWorker.localFileHost runMissing) input |> Async.StartAsPromise
+
+                match outcome with
+                | ResolveOutcome.ReadError message ->
+                    Vitest.expect(message.StartsWith "git rev-parse failed:").toBe true
+                    Vitest.expect(message.Contains "does not resolve to a commit").toBe false
                 | other -> failwith $"Expected a read error, got %A{other}"
             }
         )

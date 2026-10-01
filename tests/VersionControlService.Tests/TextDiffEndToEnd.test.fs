@@ -171,7 +171,7 @@ let private writePatternFile (filePath: string) (size: int64) (firstLine: string
 
 let private removeDirectory (directory: string) = promise {
     try
-        do! NodeFileSystem.rmAsync directory (NodeFileSystem.RmOptions(recursive = true, force = true, maxRetries = 19, retryDelay = 100))
+        do! NodeFileSystem.rmAsync directory (NodeFileSystem.RmOptions(recursive = true, force = true, maxRetries = 5, retryDelay = 100))
     with _ -> ()
 }
 
@@ -734,6 +734,42 @@ Vitest.describe (
 
                 do! source.Dispose()
                 Vitest.expect(failureCode).toEqual(Some TextDiffFailureCodes.SourceChanged)
+            }
+        )
+
+        Vitest.test (
+            "reports a working file saved shorter in place as changed instead of a read failure",
+            fun () -> promise {
+                let filePath = NodePath.join [| (currentFixture ()).Root; "truncated-working-file.txt" |]
+                do! writeText filePath (new System.String('a', 100000))
+                let! stats = NodePositionalFile.lstat filePath
+                let identity: TextDiffSourceResolver.FileIdentity = {
+                    Size = stats.Size
+                    MtimeNs = stats.MtimeNs
+                    Ino = stats.Ino
+                    Dev = stats.Dev
+                }
+                let! source = TextDiffSources.FileSource.OpenWorkingFile(filePath, identity)
+                let buffer = Array.zeroCreate<byte> 4096
+                let! _ = source.ReadAt 0L buffer 0 4096 |> Async.StartAsPromise
+                NodeFileSystem.writeFileSync filePath "0123456789" NodeFileSystem.Utf8
+                let mutable readCode = None
+                let mutable checkCode = None
+
+                try
+                    let! _ = source.ReadAt 50000L buffer 0 4096 |> Async.StartAsPromise
+                    ()
+                with :? TextDiffSources.TextDiffSourceException as error ->
+                    readCode <- Some error.Code
+
+                try
+                    do! source.CheckIdentity() |> Async.StartAsPromise
+                with :? TextDiffSources.TextDiffSourceException as error ->
+                    checkCode <- Some error.Code
+
+                do! source.Dispose()
+                Vitest.expect(readCode).toEqual(Some TextDiffFailureCodes.SourceChanged)
+                Vitest.expect(checkCode).toEqual(Some TextDiffFailureCodes.SourceChanged)
             }
         )
 

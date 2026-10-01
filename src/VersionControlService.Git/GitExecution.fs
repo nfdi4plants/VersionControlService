@@ -9,7 +9,7 @@ open Fable.Core.JsInterop
 let private copyProcessEnvironment () : obj = jsNative
 
 [<Emit("$0?.PATH || $0?.Path || $0?.path || ''")>]
-let environmentPath (_environment: obj) : string = jsNative
+let private environmentPath (_environment: obj) : string = jsNative
 
 [<Emit("Object.assign($0, { LC_ALL: 'C' })")>]
 let forceEnglishDiagnostics (_environment: obj) : obj = jsNative

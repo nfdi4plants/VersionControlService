@@ -53,7 +53,7 @@ let private createTempDirectory () : JS.Promise<string> =
 
 let private removeDirectory (path: string) = promise {
     try
-        do! NodeFileSystem.rmAsync path (NodeFileSystem.RmOptions(recursive = true, force = true, maxRetries = 19, retryDelay = 100))
+        do! NodeFileSystem.rmAsync path (NodeFileSystem.RmOptions(recursive = true, force = true, maxRetries = 5, retryDelay = 100))
     with _ -> ()
 }
 

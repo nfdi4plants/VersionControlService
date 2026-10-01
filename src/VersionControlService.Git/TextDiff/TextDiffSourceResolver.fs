@@ -142,11 +142,15 @@ let private resolveHead (host: IResolverHost) : Async<Step<string option>> = asy
 
     if succeeded revParse && Supervisor.isObjectId commitId then
         return Continue(Some commitId)
+    elif revParse.Error.IsSome then
+        return Stop(commandFailure "rev-parse" revParse)
     else
         let! symbolicRef = awaitHost host (host.RunGit [| "symbolic-ref"; "-q"; "HEAD" |])
         let refName = (utf8 symbolicRef.Stdout).Trim()
 
-        if not (succeeded symbolicRef) || String.IsNullOrEmpty refName then
+        if symbolicRef.Error.IsSome then
+            return Stop(commandFailure "symbolic-ref" symbolicRef)
+        elif not (succeeded symbolicRef) || String.IsNullOrEmpty refName then
             return Stop(ResolveOutcome.ReadError "HEAD does not resolve to a commit and is not a symbolic reference.")
         else
             let! forEachRef = awaitHost host (host.RunGit [| "for-each-ref"; "--format=%(refname)"; "--"; refName |])
