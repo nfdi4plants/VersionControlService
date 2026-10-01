@@ -728,7 +728,12 @@ let private encodeFailure (failure: OperationFailure) =
                 failure.RevisionEvidence
         "diffDetail"
         ==> encodeOption
-                (fun (detail: DiffContentBlocked) -> createObj [ "side" ==> encodeSide detail.Side; "evidence" ==> detail.Evidence ])
+                (fun (detail: DiffContentBlocked) ->
+                    createObj [
+                        "side" ==> encodeSide detail.Side
+                        "evidence" ==> detail.Evidence
+                        "invalidSequenceOffset" ==> encodeOption encodeInt64 detail.InvalidSequenceOffset
+                    ])
                 failure.DiffDetail
     ]
 
@@ -774,7 +779,8 @@ let private decodeFailure: Decoder<OperationFailure> =
                     decodeObject (fun detail -> decode {
                         let! side = field "side" decodeSide detail
                         let! evidence = field "evidence" decodeString detail
-                        return { DiffContentBlocked.Side = side; Evidence = evidence }
+                        let! invalidSequenceOffset = field "invalidSequenceOffset" (decodeOption decodeInt64) detail
+                        return { DiffContentBlocked.Side = side; Evidence = evidence; InvalidSequenceOffset = invalidSequenceOffset }
                     })
                 ))
                 value

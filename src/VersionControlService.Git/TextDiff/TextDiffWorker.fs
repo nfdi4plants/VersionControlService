@@ -747,18 +747,6 @@ let private requireEncoding
     request.Preparation |> Option.iter worker.Tokens.Release
     Finish(Ok(Resumable.Ready(OpenDiffResult.NotDiffable(DiffBlocker.EncodingRequired(side, token, candidates)))))
 
-/// The byte offset of an invalid UTF-8 sequence that the engine reports as "invalid utf-8 sequence: ... at byte N".
-let private invalidUtf8Offset (evidence: string) : int64 option =
-    let marker = " at byte "
-    let at = evidence.LastIndexOf(marker, StringComparison.Ordinal)
-
-    if at < 0 || not (evidence.StartsWith("invalid " + Decoders.name TextEncoding.Utf8 + " sequence", StringComparison.Ordinal)) then
-        None
-    else
-        match Int64.TryParse(evidence.Substring(at + marker.Length)) with
-        | true, offset -> Some offset
-        | _ -> None
-
 /// Bytes on each side of an invalid sequence that the encoding previews show.
 [<Literal>]
 let private MismatchPreviewBytes = 512
@@ -829,7 +817,7 @@ let private windows1252Text (bytes: byte[]) (start: int) : string =
 /// without a byte order mark or a choice of the caller, and that Windows-1252 can decode. It answers the two
 /// candidates with previews of the text around the sequence, or none for any other failure.
 let private encodingMismatchCandidates (worker: Worker) (slot: Slot) (detail: DiffContentBlocked) : Async<EncodingCandidate[] option> = async {
-    match invalidUtf8Offset detail.Evidence, slot.OutcomeOf detail.Side, slot.StateOf detail.Side with
+    match detail.InvalidSequenceOffset, slot.OutcomeOf detail.Side, slot.StateOf detail.Side with
     | Some offset, Some(Settled settled), SideState.SideOpen opened when
         settled.Enc = TextEncoding.Utf8 && not settled.Chosen && settled.BomLen = 0 && offset >= 0L && offset < opened.SideLength
         ->

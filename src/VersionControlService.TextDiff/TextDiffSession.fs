@@ -552,15 +552,17 @@ type TextDiffSession internal (
         if previousSpec.Source.IsNone then knownLineCounts[0] <- Some 0L
         if currentSpec.Source.IsNone then knownLineCounts[1] <- Some 0L
 
-    let report (side: DiffSide) (kind: string) (offset: int64) =
+    let report (side: DiffSide) (kind: string) (offset: int64) (invalidSequenceOffset: int64 option) =
         if invalidDetail.IsNone then
             let evidence =
                 if kind = "nul" then "NUL character at byte " + string offset
                 else kind + " at byte " + string offset
-            invalidDetail <- Some { Side = side; Evidence = evidence }
+            invalidDetail <- Some { Side = side; Evidence = evidence; InvalidSequenceOffset = invalidSequenceOffset }
 
-    let previousEvidence = ControlRatioTally(DiffSide.Previous, previousSpec.BomLength, previousSpec.ByteLength, report)
-    let currentEvidence = ControlRatioTally(DiffSide.Current, currentSpec.BomLength, currentSpec.ByteLength, report)
+    let reportTallyEvidence side kind offset = report side kind offset None
+
+    let previousEvidence = ControlRatioTally(DiffSide.Previous, previousSpec.BomLength, previousSpec.ByteLength, reportTallyEvidence)
+    let currentEvidence = ControlRatioTally(DiffSide.Current, currentSpec.BomLength, currentSpec.ByteLength, reportTallyEvidence)
 
     let previousSide =
         ScanSide(previousSpec, previousEncoding, AllocationCategory.PreviousWindows, DiffSide.Previous, ledger, previousEvidence, config.HashMaskForTesting, report, config.CheckpointIntervalBytes, setKnownLineCount 0)
@@ -697,7 +699,7 @@ type TextDiffSession internal (
         else
             let side = if sideIndex = 0 then DiffSide.Previous else DiffSide.Current
             let encoding = if sideIndex = 0 then previousEncoding else currentEncoding
-            report side ("invalid " + Decoders.name encoding + " sequence: " + error.Reason) error.Offset
+            report side ("invalid " + Decoders.name encoding + " sequence: " + error.Reason) error.Offset (Some error.Offset)
 
     let ensureBuffers () =
         if bufA.Length = 0 then
@@ -1611,7 +1613,7 @@ type TextDiffSession internal (
                         let mutable same = true
                         for index = 0 to 7 do
                             if Native.readByte hdf5Buffer index <> int hdf5Signature[index] then same <- false
-                        if same then report (if side = 0 then DiffSide.Previous else DiffSide.Current) "HDF5 signature" (int64 nextHdf5[side])
+                        if same then report (if side = 0 then DiffSide.Previous else DiffSide.Current) "HDF5 signature" (int64 nextHdf5[side]) None
                         nextHdf5[side] <- nextHdf5[side] * 2.0
                     else waiting <- true
     }
@@ -3325,7 +3327,7 @@ type TextDiffSession internal (
                         if result.Status = DecodeFailure then
                             match result.Error with
                             | Some error when float error.Offset >= validatedBefore ->
-                                report (if cursor.SideIndex = 0 then DiffSide.Previous else DiffSide.Current) ("invalid " + Decoders.name (encodingAt cursor.SideIndex) + " sequence: " + error.Reason) error.Offset
+                                report (if cursor.SideIndex = 0 then DiffSide.Previous else DiffSide.Current) ("invalid " + Decoders.name (encodingAt cursor.SideIndex) + " sequence: " + error.Reason) error.Offset (Some error.Offset)
                             | Some _ -> sourceChanged ()
                             | None -> ()
                             cursor.Complete <- true

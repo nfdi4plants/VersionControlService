@@ -1755,16 +1755,27 @@ module TextDiffSessionCases =
             do! session.Close()
             return ()
         }
-        "binary evidence before the first page reports its source", fun () -> async {
-            let bytes = Encoding.UTF8.GetBytes("text\u0000tail\n")
-            let! session = openSession (defaultConfig ()) (sourceSpec bytes) (sourceSpec bytes)
-            let! result = session.FirstPage(fun () -> false)
-            match result with
+        "binary evidence before the first page carries an offset only for invalid encoding sequences", fun () -> async {
+            let nulBytes = Encoding.UTF8.GetBytes("text\u0000tail\n")
+            let! nulSession = openSession (defaultConfig ()) (sourceSpec nulBytes) (sourceSpec nulBytes)
+            let! nulResult = nulSession.FirstPage(fun () -> false)
+            match nulResult with
             | EngineResult.Failed(code, _, Some detail) ->
                 Check.equal TextDiffFailureCodes.ContentNotText code "Initial evidence reports the text failure code."
                 Check.true' (detail.Evidence.Length > 0) "The failure detail includes the evidence."
+                Check.equal None detail.InvalidSequenceOffset "NUL evidence has no invalid sequence offset."
             | other -> failwith $"Initial binary evidence returned {other}."
-            do! session.Close()
+            do! nulSession.Close()
+
+            let invalidBytes = Array.concat [ Encoding.UTF8.GetBytes("text"); [| 0xFFuy |]; Encoding.UTF8.GetBytes("tail\n") ]
+            let! invalidSession = openSession (defaultConfig ()) (sourceSpec invalidBytes) (sourceSpec invalidBytes)
+            let! invalidResult = invalidSession.FirstPage(fun () -> false)
+            match invalidResult with
+            | EngineResult.Failed(code, _, Some detail) ->
+                Check.equal TextDiffFailureCodes.ContentNotText code "Invalid encoding reports the text failure code."
+                Check.equal (Some 4L) detail.InvalidSequenceOffset "The detail reports the first invalid byte offset."
+            | other -> failwith $"Invalid UTF-8 evidence returned {other}."
+            do! invalidSession.Close()
             return ()
         }
         "late binary evidence invalidates a ready session", fun () -> async {
@@ -2324,6 +2335,7 @@ module TextDiffSessionCases =
                 let marker = detail.Evidence.LastIndexOf("byte ", StringComparison.Ordinal)
                 let offset = Int64.Parse(detail.Evidence.Substring(marker + 5))
                 Check.true' (offset >= 131_072L && offset < 196_608L) "The current side reports the window that contains its controls."
+                Check.equal None detail.InvalidSequenceOffset "Control ratio evidence has no invalid sequence offset."
             | other -> failwith $"The shifted control window did not fail on the current side: {other}."
             do! deltaSession.Close()
 

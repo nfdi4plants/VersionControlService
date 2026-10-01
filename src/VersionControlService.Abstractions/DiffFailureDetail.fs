@@ -10,4 +10,7 @@ type DiffSide =
 type DiffContentBlocked = {
     Side: DiffSide
     Evidence: string
+    /// The byte offset of the first sequence that is invalid in the encoding the side was read with.
+    /// None when the evidence is something else, such as a NUL character, a control ratio or a signature.
+    InvalidSequenceOffset: int64 option
 }

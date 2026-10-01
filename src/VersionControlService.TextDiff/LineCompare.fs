@@ -66,7 +66,7 @@ type internal ScanSide(
     ledger: Ledger,
     evidenceTally: ControlRatioTally,
     hashMask: (uint32 * uint32) option,
-    reportEvidence: DiffSide -> string -> int64 -> unit,
+    reportEvidence: DiffSide -> string -> int64 -> int64 option -> unit,
     checkpointIntervalBytes: float,
     recordLineCount: int64 -> unit
 ) =
@@ -166,7 +166,7 @@ type internal ScanSide(
         let emitLineBatch batch = table.AppendBatch batch
         let emitEvidence (evidence: ScannerEvidence) =
             if evidence.Kind <> "control ratio" && evidence.Kind <> "nul" then
-                reportEvidence side evidence.Kind evidence.Offset
+                reportEvidence side evidence.Kind evidence.Offset None
         let bufferPosition = scanner.NextOffset
         let pendingValue = scanner.PendingValue
         let pendingCount = scanner.PendingCount
@@ -206,7 +206,7 @@ type internal ScanSide(
         coverage <- max coverage (float scanner.StartOffset + scanner.ValidatedBytes)
         evidenceTally.AdvanceThrough(float scanner.StartOffset + scanner.ValidatedBytes)
         match result.Error with
-        | Some error -> reportEvidence side ("invalid " + Decoders.name encoding + " sequence: " + error.Reason) error.Offset
+        | Some error -> reportEvidence side ("invalid " + Decoders.name encoding + " sequence: " + error.Reason) error.Offset (Some error.Offset)
         | None -> ()
         if result.Status = EndOfInput then
             finished <- true

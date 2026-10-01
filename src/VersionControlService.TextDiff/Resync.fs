@@ -60,7 +60,7 @@ type internal ResyncEngine
         builder: HunkBuilder,
         specs: SourceSpec[],
         encodings: TextEncoding[],
-        report: DiffSide -> string -> int64 -> unit,
+        report: DiffSide -> string -> int64 -> int64 option -> unit,
         changed: unit -> unit,
         coverage: int -> float -> unit,
         recordLineCount: int -> int64 -> unit,

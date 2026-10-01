@@ -289,6 +289,7 @@ module TextDiffEngineCases =
                 ByteLength = length
             }
             let report _ _ _ = ()
+            let reportEvidence _ _ _ _ = ()
             let side =
                 ScanSide(
                     spec,
@@ -298,7 +299,7 @@ module TextDiffEngineCases =
                     Ledger(),
                     ControlRatioTally(DiffSide.Previous, 0, length, report),
                     None,
-                    report,
+                    reportEvidence,
                     65_536.0,
                     ignore)
             side.SetLimits(4_096, 32 * 1024 * 1024)

@@ -194,7 +194,7 @@ let private fullFailure = {
         RecoveryAction = Some { Code = "reopen"; Instructions = Some "Open the diff again." }
         Details = [| "detail 1"; "detail 2" |]
         RevisionEvidence = [| "expected_target", revision "abc"; "observed_target", revision "def" |]
-        DiffDetail = Some { Side = DiffSide.Current; Evidence = "invalid UTF-8 at byte 9" }
+        DiffDetail = Some { Side = DiffSide.Current; Evidence = "invalid UTF-8 at byte 9"; InvalidSequenceOffset = Some 2147483657L }
 }
 
 Vitest.describe (
@@ -314,7 +314,7 @@ Vitest.describe (
                 expectRoundTrip (TextDiffMessage.Error("r1", 1, fullFailure))
 
                 expectRoundTrip (
-                    TextDiffMessage.Error("r1", 1, { fullFailure with DiffDetail = Some { Side = DiffSide.Previous; Evidence = "" } })
+                    TextDiffMessage.Error("r1", 1, { fullFailure with DiffDetail = Some { Side = DiffSide.Previous; Evidence = ""; InvalidSequenceOffset = None } })
                 )
 
                 expectRoundTrip (
