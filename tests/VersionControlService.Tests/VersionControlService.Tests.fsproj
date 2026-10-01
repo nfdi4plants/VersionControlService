@@ -29,6 +29,7 @@
     <Compile Include="TextDiffSupervisor.test.fs" />
     <Compile Include="TextDiffProtocol.test.fs" />
     <Compile Include="TextDiffPool.test.fs" />
+    <Compile Include="TextDiffTestSupport.fs" />
     <Compile Include="TextDiffTestWorker.fs" />
     <Compile Include="TextDiffWorkerThread.test.fs" />
     <Compile Include="TextDiffEndToEnd.test.fs" />

@@ -28,10 +28,6 @@ let private ProgressIntervalMs = 225
 [<Literal>]
 let private PageEnvelopeLimit = 524288
 
-/// The largest response envelope of a line slice.
-[<Literal>]
-let private LineEnvelopeLimit = 65536
-
 [<Literal>]
 let private SampleLength = 65536
 
@@ -335,16 +331,6 @@ let private startTicker (host: WorkerHost) (progress: unit -> int64 * int64) : u
             ProgressIntervalMs
 
     fun () -> stopInterval timer
-
-let private guardEnvelope (host: WorkerHost) (limit: int) (payload: ResultPayload) (value: 'T) : Result<'T, OperationFailure> =
-    let length =
-        envelopeByteLength (encode (TextDiffMessage.Result(host.RequestId, host.Generation, payload)))
-
-    if length > limit then
-        Error(failure TextDiffFailureCodes.WorkerFailed "The response exceeds the size limit of the protocol.")
-    else
-        Ok value
-
 
 type private OpenStep =
     | Proceed
@@ -955,15 +941,10 @@ let private createStep (worker: Worker) (host: WorkerHost) (request: OpenDiffReq
 
         match first with
         | EngineResult.Ok page ->
-            let result = Resumable.Ready(OpenDiffResult.Opened(handle, previousInfo, currentInfo, page))
-
-            match guardEnvelope host PageEnvelopeLimit (ResultPayload.Open result) result with
-            | Ok opened ->
-                slot.Phase <- SlotPhase.Active
-                slot.Continuation <- None
-                request.Preparation |> Option.iter worker.Tokens.Release
-                return Finish(Ok opened)
-            | Error problem -> return Finish(Error problem)
+            slot.Phase <- SlotPhase.Active
+            slot.Continuation <- None
+            request.Preparation |> Option.iter worker.Tokens.Release
+            return Finish(Ok(Resumable.Ready(OpenDiffResult.Opened(handle, previousInfo, currentInfo, page))))
         | EngineResult.Failed(code, _, Some detail) when code = TextDiffFailureCodes.ContentNotText ->
             let! candidates = encodingMismatchCandidates worker slot detail
 
@@ -1233,8 +1214,6 @@ let private readingCall
     (worker: Worker)
     (host: WorkerHost)
     (handle: DiffHandle)
-    (limit: int)
-    (payload: 'T -> ResultPayload)
     (call: TextDiffSession -> Async<EngineResult<'T>>)
     : JS.Promise<Result<'T, OperationFailure>> =
     callOn worker host handle (fun slot -> async {
@@ -1245,11 +1224,7 @@ let private readingCall
             slot.SpoolWaitYield <- false
             let! result = call session
             do! checkSources slot
-            let! settled = settle worker slot result
-
-            match settled with
-            | Ok value -> return guardEnvelope host limit (payload value) value
-            | Error problem -> return Error problem
+            return! settle worker slot result
     })
 
 let private createHandler
@@ -1273,7 +1248,7 @@ let private createHandler
             openRequest worker host request owner |> Async.StartAsPromise
 
         member _.ReadPage(host, request) =
-            readingCall worker host request.Handle PageEnvelopeLimit ResultPayload.ReadPage (fun session ->
+            readingCall worker host request.Handle (fun session ->
                 session.ReadPage request.Cursor host.IsCanceled)
 
         member _.ReplayPage(host, request) =
@@ -1282,15 +1257,11 @@ let private createHandler
                 | None -> return Error(closedFailure ())
                 | Some session ->
                     let! result = session.ReplayPage request.PageId
-                    let! settled = settle worker slot result
-
-                    match settled with
-                    | Ok page -> return guardEnvelope host PageEnvelopeLimit (ResultPayload.ReplayPage page) page
-                    | Error problem -> return Error problem
+                    return! settle worker slot result
             })
 
         member _.Expand(host, request) =
-            readingCall worker host request.Handle PageEnvelopeLimit ResultPayload.Expand (fun session ->
+            readingCall worker host request.Handle (fun session ->
                 session.Expand(
                     request.GapId,
                     request.FromStart,
@@ -1300,7 +1271,7 @@ let private createHandler
                 ))
 
         member _.ReadLine(host, request) =
-            readingCall worker host request.Handle LineEnvelopeLimit ResultPayload.ReadLine (fun session ->
+            readingCall worker host request.Handle (fun session ->
                 session.ReadLine(
                     request.Side,
                     request.Line,
@@ -1326,7 +1297,7 @@ let private createHandler
 
         member _.Close(host, handle) =
             match worker.Slots.TryGetValue host.Generation with
-            | true, slot when handle.Id = "" || slot.Version = handle.Version ->
+            | true, slot when handle |> Option.forall (fun requested -> slot.Version = requested.Version) ->
                 async {
                     do! disposeSlot worker slot
                     host.ReleaseSession()

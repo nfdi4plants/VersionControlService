@@ -49,16 +49,6 @@ let private mismatch () =
         TextDiffFailureCodes.PreparationMismatch
         "The preparation token does not match the requested sources."
 
-/// A polynomial checksum of the random part as ten decimal digits. A token id whose checksum does not
-/// match was not issued here.
-let private checksum (value: string) =
-    let mutable hash = 0L
-
-    for character in value do
-        hash <- (hash * 31L + int64 character) % 4294967291L
-
-    (string hash).PadLeft(10, '0')
-
 /// The encoding an earlier Open settled for one side, so a later Open with the token does not classify it again.
 type KeptClassification = {
     Side: DiffSide
@@ -92,22 +82,17 @@ type PreparationTokenStore(now: unit -> float) =
 
     member _.Issue(binding: PreparationBinding, windowOwner: string) : PreparationToken =
         pruneExpired ()
-        let random = NodeInterop.randomUuid().Replace("-", "").ToLowerInvariant()
-        let id = random + checksum random
+        let id = NodeInterop.randomUuid().Replace("-", "").ToLowerInvariant()
         tokens[id] <- { Binding = binding; WindowOwner = windowOwner; IssuedAt = now (); Kept = [||] }
         { Id = id }
 
     /// Fails with preparation_mismatch when the token is unknown, expired, bound to other sources or owned by another window.
     member _.Validate(token: PreparationToken, binding: PreparationBinding, windowOwner: string) : Result<unit, OperationFailure> =
         pruneExpired ()
-        let id = token.Id
 
-        if id.Length <> 42 || checksum (id.Substring(0, 32)) <> id.Substring 32 then
-            Error(mismatch ())
-        else
-            match tokens.TryGetValue id with
-            | true, entry when entry.WindowOwner = windowOwner && entry.Binding = binding -> Ok()
-            | _ -> Error(mismatch ())
+        match tokens.TryGetValue token.Id with
+        | true, entry when entry.WindowOwner = windowOwner && entry.Binding = binding -> Ok()
+        | _ -> Error(mismatch ())
 
     /// Stores the classified sides of an Open that ended with EncodingRequired.
     member _.Keep(token: PreparationToken, kept: KeptClassification[]) =

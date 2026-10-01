@@ -90,7 +90,7 @@ type ITextDiffRequestHandler =
     abstract member Expand: host: WorkerHost * request: ExpandRequest -> JS.Promise<Result<Resumable<DiffPart[]>, OperationFailure>>
     abstract member ReadLine: host: WorkerHost * request: ReadLineRequest -> JS.Promise<Result<Resumable<DiffLine>, OperationFailure>>
     abstract member GetSourceInfo: host: WorkerHost * request: SourceInfoRequest -> JS.Promise<Result<DiffSourceInfo * DiffSourceInfo, OperationFailure>>
-    abstract member Close: host: WorkerHost * handle: DiffHandle -> JS.Promise<unit>
+    abstract member Close: host: WorkerHost * handle: DiffHandle option -> JS.Promise<unit>
     abstract member Cancel: requestId: string -> unit
 
 let canceledFailure () =
@@ -215,11 +215,7 @@ type TextDiffWorkerDispatcher(post: obj -> unit, close: unit -> unit, handler: I
         if not stopped then
             match decodeMessage message with
             | Ok decoded -> receive decoded
-            | Error reason ->
-                match tryRequestKey message with
-                | Some(requestId, generation) ->
-                    send (TextDiffMessage.Error(requestId, generation, OperationFailure.create Validation TextDiffFailureCodes.WorkerFailed reason))
-                | None -> send (TextDiffMessage.WorkerFailure reason)
+            | Error reason -> send (TextDiffMessage.WorkerFailure reason)
 
 /// Creates a dispatcher that posts through `post` and returns the function that receives messages for it.
 let attachDispatcher (post: obj -> unit, close: unit -> unit, handler: ITextDiffRequestHandler) : obj -> unit =

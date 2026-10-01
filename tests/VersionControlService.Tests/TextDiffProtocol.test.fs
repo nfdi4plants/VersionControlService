@@ -262,7 +262,8 @@ Vitest.describe (
                     )
 
                 expectRoundTrip (TextDiffMessage.Request("r7", 2, RequestBody.SourceInfo { Handle = handle }))
-                expectRoundTrip (TextDiffMessage.Request("r8", 2, RequestBody.Close handle))
+                expectRoundTrip (TextDiffMessage.Request("r8", 2, RequestBody.Close(Some handle)))
+                expectRoundTrip (TextDiffMessage.Request("r9", 2, RequestBody.Close None))
         )
 
         Vitest.test (
@@ -392,22 +393,18 @@ Vitest.describe (
                 Vitest.expect(decodeMessage (box "text") |> Result.isError).toBe true
                 expectRejected "[]"
                 expectRejected """{"t":"shutdown"}"""
-                expectRejected """{"v":2,"t":"shutdown"}"""
-                expectRejected """{"v":1,"t":"unknown"}"""
-                expectRejected """{"v":1,"t":"cancel","requestId":"r1"}"""
-                expectRejected """{"v":1,"t":"cancel","requestId":"r1","generation":1.5}"""
-                expectRejected """{"v":1,"t":"progress","requestId":"r1","generation":1,"validatedBytes":5,"totalBytes":"5"}"""
-                expectRejected """{"v":1,"t":"progress","requestId":"r1","generation":1,"validatedBytes":"9223372036854775808","totalBytes":"5"}"""
-                expectRejected """{"v":1,"t":"progress","requestId":"r1","generation":1,"validatedBytes":"1e3","totalBytes":"5"}"""
-                expectRejected """{"v":1,"t":"result","requestId":"r1","generation":1,"payload":{"tag":"Missing"}}"""
-                expectRejected """{"v":1,"t":"close","requestId":"r1","generation":1}"""
-                expectRejected """{"v":1,"t":"spawnResult","callId":1,"outcome":{"tag":"Short","exitCode":0,"stdout":"not base64!","stderr":"","error":null}}"""
+                expectRejected """{"v":3,"t":"shutdown"}"""
+                expectRejected """{"v":2,"t":"unknown"}"""
+                expectRejected """{"v":2,"t":"cancel","requestId":"r1"}"""
+                expectRejected """{"v":2,"t":"cancel","requestId":"r1","generation":1.5}"""
+                expectRejected """{"v":2,"t":"progress","requestId":"r1","generation":1,"validatedBytes":5,"totalBytes":"5"}"""
+                expectRejected """{"v":2,"t":"progress","requestId":"r1","generation":1,"validatedBytes":"9223372036854775808","totalBytes":"5"}"""
+                expectRejected """{"v":2,"t":"progress","requestId":"r1","generation":1,"validatedBytes":"1e3","totalBytes":"5"}"""
+                expectRejected """{"v":2,"t":"result","requestId":"r1","generation":1,"payload":{"tag":"Missing"}}"""
+                expectRejected """{"v":2,"t":"spawnResult","callId":1,"outcome":{"tag":"Short","exitCode":0,"stdout":"not base64!","stderr":"","error":null}}"""
 
                 expectRejected
-                    """{"v":1,"t":"sourceInfo","requestId":"r1","generation":1,"handle":{"id":"a","version":"1"},"request":{"handle":{"id":"b","version":"1"}}}"""
-
-                expectRejected
-                    """{"v":1,"t":"open","requestId":"r1","generation":1,"request":{"path":"../escape","previousPath":null,"preparation":null,"previousEncoding":null,"currentEncoding":null,"contextLines":3,"continuation":null},"owner":{"workspaceRoot":"r","lfsMediaDirectory":"m","windowOwner":"k"}}"""
+                    """{"v":2,"t":"open","requestId":"r1","generation":1,"request":{"path":"../escape","previousPath":null,"preparation":null,"previousEncoding":null,"currentEncoding":null,"contextLines":3,"continuation":null},"owner":{"workspaceRoot":"r","lfsMediaDirectory":"m","windowOwner":"k"}}"""
         )
 
         Vitest.test (
@@ -415,7 +412,7 @@ Vitest.describe (
             fun () ->
                 let reason = "\u00e4\u20ac\U0001D11E"
                 let message = encode (TextDiffMessage.WorkerFailure reason)
-                let expected = Encoding.UTF8.GetBytes("""{"v":1,"t":"workerFailure","reason":""}""" + reason).Length
+                let expected = Encoding.UTF8.GetBytes("""{"v":2,"t":"workerFailure","reason":""}""" + reason).Length
                 Vitest.expect(envelopeByteLength message).toBe expected
                 Vitest.expect(expected).toBe (39 + 9)
         )

@@ -245,14 +245,19 @@ let private sessionWith (textDiff: GitTextDiffService.GitTextDiffOptions option)
         RevisionPolicyStrategy.automatic
         (bindingFor repository)
 
-let private openDiff (session: WorkspaceSession) (value: string) = promise {
-    let service =
-        match session.TextDiff with
-        | Some service -> service
-        | None -> failwith "The session has no text diff service."
+let private textDiffOf (session: WorkspaceSession) =
+    match session.TextDiff with
+    | Some service -> service
+    | None -> failwith "The session has no text diff service."
 
-    return! service.Open (openRequest value) (OperationContext.detached "open-diff") |> Async.StartAsPromise
+let private openDiff (session: WorkspaceSession) (value: string) = promise {
+    return!
+        (textDiffOf session).Open (openRequest value) (OperationContext.detached "open-diff")
+        |> Async.StartAsPromise
 }
+
+let private openDiffReady (session: WorkspaceSession) (value: string) =
+    TextDiffTestSupport.openUntilReady (textDiffOf session) (openRequest value) (OperationContext.detached "open-diff")
 
 let private expectOpenResult (expected: OpenDiffResult) (result: OperationResult<Resumable<OpenDiffResult>>) =
     match result with
@@ -585,13 +590,10 @@ Vitest.describe (
                 let mutable failure = None
 
                 try
-                    let! modified = openDiff session "a.txt"
+                    let! modified = openDiffReady session "a.txt"
 
                     match modified with
-                    | Succeeded outcome ->
-                        match outcome.Value with
-                        | Resumable.Ready(OpenDiffResult.Opened _) -> ()
-                        | other -> failwith $"Expected an opened diff, got %A{other}"
+                    | OpenDiffResult.Opened _ -> ()
                     | other -> failwith $"Expected an opened diff, got %A{other}"
 
                     let! lfs = openDiff session "data.bin"

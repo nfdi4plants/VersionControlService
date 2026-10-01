@@ -262,14 +262,12 @@ Vitest.describe (
             TestOptions(timeout = 60000),
             fun () ->
                 withWorkerPool "default" (ResizeArray()) (fun pool _ _ -> promise {
-                    let! result = (pool.Service(owner ())).Open openRequest (OperationContext.detached "open") |> Async.StartAsPromise
+                    let! opened =
+                        TextDiffTestSupport.openUntilReady (pool.Service(owner ())) openRequest (OperationContext.detached "open")
 
-                    match result with
-                    | Succeeded outcome ->
-                        match outcome.Value with
-                        | Resumable.Ready(OpenDiffResult.Opened _) -> ()
-                        | other -> failwith $"Expected an opened diff, got %A{other}"
-                    | other -> failwith $"Open failed: %A{other}"
+                    match opened with
+                    | OpenDiffResult.Opened _ -> ()
+                    | other -> failwith $"Expected an opened diff, got %A{other}"
                 })
         )
 
@@ -279,31 +277,28 @@ Vitest.describe (
             fun () ->
                 withWorkerPool "default" (ResizeArray()) (fun pool _ transports -> promise {
                     let service = pool.Service(owner ())
-                    let! result = service.Open openRequest (OperationContext.detached "open") |> Async.StartAsPromise
+                    let! opened = TextDiffTestSupport.openUntilReady service openRequest (OperationContext.detached "open")
 
-                    match result with
-                    | Succeeded outcome ->
-                        match outcome.Value with
-                        | Resumable.Ready(OpenDiffResult.Opened(handle, _, _, _)) ->
-                            transports[0].Post(
-                                encode(
-                                    TextDiffMessage.Request(
-                                        "active-slot-mismatch",
-                                        1,
-                                        RequestBody.Open({ openRequest with Continuation = Some "invalid-continuation" }, owner ())
-                                    )
+                    match opened with
+                    | OpenDiffResult.Opened(handle, _, _, _) ->
+                        transports[0].Post(
+                            encode(
+                                TextDiffMessage.Request(
+                                    "active-slot-mismatch",
+                                    1,
+                                    RequestBody.Open({ openRequest with Continuation = Some "invalid-continuation" }, owner ())
                                 )
                             )
+                        )
 
-                            let! sourceInfo =
-                                service.GetSourceInfo
-                                    { SourceInfoRequest.Handle = handle }
-                                    (OperationContext.detached "source-info-after-mismatch")
-                                |> Async.StartAsPromise
+                        let! sourceInfo =
+                            service.GetSourceInfo
+                                { SourceInfoRequest.Handle = handle }
+                                (OperationContext.detached "source-info-after-mismatch")
+                            |> Async.StartAsPromise
 
-                            Vitest.expect(sourceInfo.IsSucceeded).toBe true
-                        | other -> failwith $"Expected an opened diff, got %A{other}"
-                    | other -> failwith $"Open failed: %A{other}"
+                        Vitest.expect(sourceInfo.IsSucceeded).toBe true
+                    | other -> failwith $"Expected an opened diff, got %A{other}"
                 })
         )
 

@@ -239,20 +239,8 @@ let private operationValue operationName result =
         failwith $"{operationName} returned partial success: {failure.Code} {outcome.Value}"
     | Failed failure -> failwith $"{operationName} failed: {failure.Code} {failure.Message}"
 
-let private openUntilReady (service: TextDiffService) (initial: OpenDiffRequest) (operationName: string) = promise {
-    let mutable request = initial
-    let mutable value = None
-
-    while value.IsNone do
-        let! result = service.Open request (context operationName) |> Async.StartAsPromise
-        let outcome = operationValue "Open" result
-
-        match outcome with
-        | Resumable.Ready opened -> value <- Some opened
-        | Resumable.Scanning(_, continuation, _) -> request <- { request with Continuation = Some continuation }
-
-    return value.Value
-}
+let private openUntilReady (service: TextDiffService) (initial: OpenDiffRequest) (operationName: string) =
+    TextDiffTestSupport.openUntilReady service initial (context operationName)
 
 let private readPageReady
     (service: TextDiffService)

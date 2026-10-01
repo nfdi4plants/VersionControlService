@@ -119,9 +119,6 @@ let private attempt (work: unit -> JS.Promise<'T>) : JS.Promise<'T> =
     with error ->
         Promise.reject error
 
-/// The handle that tells the worker to close whatever its session holds.
-let private anyHandle: DiffHandle = { Id = ""; Version = "" }
-
 /// Resolves when the work settles or after the given time, whichever comes first. A failure counts as settled.
 let private waitAtMost (milliseconds: int) (work: JS.Promise<unit>) : JS.Promise<unit> =
     Promise.create (fun resolve _ ->
@@ -264,7 +261,10 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
     and failWorker (worker: PoolWorker) (reason: string) =
         if abandonWorker worker reason then
             promise {
-                do! waitAtMost 2000 (attempt (fun () -> worker.Transport.Terminate()))
+                try
+                    do! worker.Transport.Terminate()
+                with _ -> ()
+
                 do! attempt (fun () -> supervisor.ReleaseWorker worker.WorkerId)
             }
             |> fun cleanup -> observe cleanup ignore ignore
@@ -292,15 +292,11 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
                     session.Phase <- Closing
                     forgetSession session
 
-                    let closeHandle =
-                        match result with
-                        | Ok(ResultPayload.Open(Resumable.Ready(OpenDiffResult.Opened(handle, _, _, _)))) -> Some handle
-                        | Ok(ResultPayload.Open(Resumable.Scanning _)) -> Some anyHandle
-                        | _ -> None
-
-                    match closeHandle with
-                    | Some handle -> observe (closeAndRelease true session handle) ignore ignore
-                    | None -> observe (releaseSlot session) ignore ignore
+                    match result with
+                    | Ok(ResultPayload.Open(Resumable.Ready(OpenDiffResult.Opened(handle, _, _, _)))) ->
+                        observe (closeAndRelease true session (Some handle)) ignore ignore
+                    | Ok(ResultPayload.Open(Resumable.Scanning _)) -> observe (closeAndRelease true session None) ignore ignore
+                    | _ -> observe (releaseSlot session) ignore ignore
                 | _ -> ()
             else
                 settle request result
@@ -341,27 +337,18 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
                 | TextDiffMessage.Result(requestId, generation, payload) -> completeRunning worker requestId generation (Ok payload)
                 | TextDiffMessage.Error(requestId, generation, failure) -> completeRunning worker requestId generation (Error failure)
                 | TextDiffMessage.SpawnShort(callId, owner, cwd, arguments) ->
-                    if owner.WorkerId <> worker.WorkerId then
-                        answerSpawn worker callId (SpawnOutcome.Failed "The spawn owner does not belong to this worker.")
-                    else
-                        observe
-                            (attempt (fun () -> supervisor.RunShort(owner, cwd, arguments)))
-                            (fun result -> answerSpawn worker callId (SpawnOutcome.Short result))
-                            (spawnFailed worker callId)
+                    observe
+                        (attempt (fun () -> supervisor.RunShort(owner, cwd, arguments)))
+                        (fun result -> answerSpawn worker callId (SpawnOutcome.Short result))
+                        (spawnFailed worker callId)
                 | TextDiffMessage.SpawnBlob(callId, owner, cwd, oid, spoolPath) ->
-                    if owner.WorkerId <> worker.WorkerId then
-                        answerSpawn worker callId (SpawnOutcome.Failed "The spawn owner does not belong to this worker.")
-                    else
-                        observe
-                            (attempt (fun () -> supervisor.StartBlobToSpool(owner, cwd, oid, spoolPath)))
-                            (fun child -> observe child.Closed (fun exit -> answerSpawn worker callId (SpawnOutcome.Blob exit)) (spawnFailed worker callId))
-                            (spawnFailed worker callId)
-                | TextDiffMessage.ReleaseRequest owner ->
-                    if owner.WorkerId = worker.WorkerId then
-                        observe (attempt (fun () -> supervisor.ReleaseRequest owner)) ignore ignore
+                    observe
+                        (attempt (fun () -> supervisor.StartBlobToSpool(owner, cwd, oid, spoolPath)))
+                        (fun child -> observe child.Closed (fun exit -> answerSpawn worker callId (SpawnOutcome.Blob exit)) (spawnFailed worker callId))
+                        (spawnFailed worker callId)
+                | TextDiffMessage.ReleaseRequest owner -> observe (attempt (fun () -> supervisor.ReleaseRequest owner)) ignore ignore
                 | TextDiffMessage.ReleaseSession(workerId, sessionId) ->
-                    if workerId = worker.WorkerId then
-                        observe (attempt (fun () -> supervisor.ReleaseSession(workerId, sessionId))) ignore ignore
+                    observe (attempt (fun () -> supervisor.ReleaseSession(workerId, sessionId))) ignore ignore
                 | TextDiffMessage.SessionExpired generation ->
                     match worker.Sessions |> Seq.tryFind (fun session -> session.Generation = generation) with
                     | Some session when session.Phase = Opened || session.Phase = Scanning ->
@@ -533,7 +520,7 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
                     settle request (Error(canceled ()))
                 | _ -> ()
 
-    and closeAndRelease (atFront: bool) (session: PoolSession) (handle: DiffHandle) : JS.Promise<unit> = promise {
+    and closeAndRelease (atFront: bool) (session: PoolSession) (handle: DiffHandle option) : JS.Promise<unit> = promise {
         let! _ = enqueueAt atFront session (RequestBody.Close handle) (OperationContext.detached "text-diff-close")
         do! releaseSlot session
     }
@@ -545,7 +532,7 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
         | Scanning ->
             session.Phase <- Closing
             forgetSession session
-            closeAndRelease false session (session.WorkerHandle |> Option.defaultValue anyHandle)
+            closeAndRelease false session session.WorkerHandle
         | Opening
         | Closing
         | Closed -> Promise.lift ()
@@ -589,7 +576,7 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
             forgetSession session
 
             if not (canceledOpenStillRunning session) then
-                observe (closeAndRelease true session anyHandle) ignore ignore
+                observe (closeAndRelease true session None) ignore ignore
         | Opened
         | Closing
         | Closed -> ()

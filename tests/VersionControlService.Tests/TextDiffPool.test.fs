@@ -105,7 +105,7 @@ let private testHandler (control: Control) =
         member _.GetSourceInfo(_, _) = sessionClosed ()
 
         member _.Close(_, handle) =
-            control.Closed.Add handle.Id
+            control.Closed.Add(handle |> Option.map _.Id |> Option.defaultValue "")
             Promise.lift ()
 
         member _.Cancel requestId = control.Canceled.Add requestId
@@ -382,7 +382,7 @@ let private lastPostedIsClose (transport: ManualTransport) =
 
 /// Runs two workers with one session each. The first Open is canceled while it runs, so the next Open has to start the
 /// second worker, and a third Open waits until the canceled Open's slot is released by its late answer.
-let private verifyLateOpenCleanup (lateAnswer: string -> int -> TextDiffMessage) (expectedCloseHandle: DiffHandle option) =
+let private verifyLateOpenCleanup (lateAnswer: string -> int -> TextDiffMessage) (expectedCloseHandle: DiffHandle option option) =
     let transports = System.Collections.Generic.Dictionary<int, ManualTransport>()
 
     let factory: TextDiffWorkerFactory =
@@ -901,18 +901,17 @@ Vitest.describe (
                 let lateOpen = Resumable.Ready(OpenDiffResult.Opened(workerHandle, sourceInfo, sourceInfo, Resumable.Ready page))
                 verifyLateOpenCleanup
                     (fun requestId generation -> TextDiffMessage.Result(requestId, generation, ResultPayload.Open lateOpen))
-                    (Some workerHandle)
+                    (Some(Some workerHandle))
         )
 
         Vitest.test (
-            "closes a late Scanning result with an empty handle",
+            "closes a late Scanning result without a handle",
             TestOptions(timeout = 60000),
             fun () ->
-                let emptyHandle = { DiffHandle.Id = ""; Version = "" }
                 let lateOpen = Resumable.Scanning(page.Progress, "late-continuation", None)
                 verifyLateOpenCleanup
                     (fun requestId generation -> TextDiffMessage.Result(requestId, generation, ResultPayload.Open lateOpen))
-                    (Some emptyHandle)
+                    (Some None)
         )
 
         Vitest.test (
@@ -1047,7 +1046,7 @@ Vitest.describe (
                             | _ -> None)
                         |> Seq.last
 
-                    Vitest.expect(closeHandle).toEqual { DiffHandle.Id = ""; Version = "" }
+                    Vitest.expect(closeHandle).toEqual None
                     transport.Inject(encode (TextDiffMessage.Result(closeRequestId, closeGeneration, ResultPayload.Close)))
                 })
         )

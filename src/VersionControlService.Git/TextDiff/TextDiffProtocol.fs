@@ -12,7 +12,7 @@ module NodeProcess = VersionControlService.Runtime.Node.Process
 module Supervisor = VersionControlService.Git.TextDiff.TextDiffSupervisor
 
 [<Literal>]
-let ProtocolVersion = 1
+let ProtocolVersion = 2
 
 /// The workspace and window that own a diff session. Handles of one owner are never usable by another.
 /// The worker reads LFS objects from the media directory.
@@ -31,7 +31,8 @@ type RequestBody =
     | Expand of ExpandRequest
     | ReadLine of ReadLineRequest
     | SourceInfo of SourceInfoRequest
-    | Close of DiffHandle
+    /// Closes the session. None closes whatever handle the worker's session holds.
+    | Close of DiffHandle option
 
 /// The successful value of a request, tagged by the call that produced it.
 [<RequireQualifiedAccess>]
@@ -852,16 +853,15 @@ let private decodeOwner: Decoder<TextDiffOwner> =
         }
     })
 
-let private encodeRequestBody (body: RequestBody) : string * DiffHandle option * (string * obj) list =
+let private encodeRequestBody (body: RequestBody) : string * (string * obj) list =
     match body with
-    | RequestBody.Open(request, owner) -> "open", None, [ "request" ==> encodeOpenRequest request; "owner" ==> encodeOwner owner ]
+    | RequestBody.Open(request, owner) -> "open", [ "request" ==> encodeOpenRequest request; "owner" ==> encodeOwner owner ]
     | RequestBody.ReadPage request ->
-        "readPage", Some request.Handle, [ "request" ==> createObj [ "handle" ==> encodeHandle request.Handle; "cursor" ==> request.Cursor ] ]
+        "readPage", [ "request" ==> createObj [ "handle" ==> encodeHandle request.Handle; "cursor" ==> request.Cursor ] ]
     | RequestBody.ReplayPage request ->
-        "replayPage", Some request.Handle, [ "request" ==> createObj [ "handle" ==> encodeHandle request.Handle; "pageId" ==> request.PageId ] ]
+        "replayPage", [ "request" ==> createObj [ "handle" ==> encodeHandle request.Handle; "pageId" ==> request.PageId ] ]
     | RequestBody.Expand request ->
         "expand",
-        Some request.Handle,
         [
             "request"
             ==> createObj [
@@ -874,7 +874,6 @@ let private encodeRequestBody (body: RequestBody) : string * DiffHandle option *
         ]
     | RequestBody.ReadLine request ->
         "readLine",
-        Some request.Handle,
         [
             "request"
             ==> createObj [
@@ -886,22 +885,12 @@ let private encodeRequestBody (body: RequestBody) : string * DiffHandle option *
                 "continuation" ==> encodeOption box request.Continuation
             ]
         ]
-    | RequestBody.SourceInfo request -> "sourceInfo", Some request.Handle, [ "request" ==> createObj [ "handle" ==> encodeHandle request.Handle ] ]
-    | RequestBody.Close handle -> "close", Some handle, []
+    | RequestBody.SourceInfo request -> "sourceInfo", [ "request" ==> createObj [ "handle" ==> encodeHandle request.Handle ] ]
+    | RequestBody.Close handle -> "close", [ "handle" ==> encodeOption encodeHandle handle ]
 
 let private requestField (value: obj) (body: Decoder<'T>) = field "request" (decodeObject body) value
 
 let private decodeRequestBody (messageType: string) (value: obj) : Result<RequestBody, string> option =
-    let sameHandle (handle: DiffHandle) (request: 'T) (build: 'T -> RequestBody) =
-        decode {
-            let! envelopeHandle = field "handle" decodeHandle value
-
-            if envelopeHandle = handle then
-                return build request
-            else
-                return! Error "handle: does not match the request handle"
-        }
-
     match messageType with
     | "open" ->
         Some(decode {
@@ -918,7 +907,7 @@ let private decodeRequestBody (messageType: string) (value: obj) : Result<Reques
                     return { ReadPageRequest.Handle = handle; Cursor = cursor }
                 })
 
-            return! sameHandle request.Handle request RequestBody.ReadPage
+            return RequestBody.ReadPage request
         })
     | "replayPage" ->
         Some(decode {
@@ -929,7 +918,7 @@ let private decodeRequestBody (messageType: string) (value: obj) : Result<Reques
                     return { ReplayPageRequest.Handle = handle; PageId = pageId }
                 })
 
-            return! sameHandle request.Handle request RequestBody.ReplayPage
+            return RequestBody.ReplayPage request
         })
     | "expand" ->
         Some(decode {
@@ -950,7 +939,7 @@ let private decodeRequestBody (messageType: string) (value: obj) : Result<Reques
                     }
                 })
 
-            return! sameHandle request.Handle request RequestBody.Expand
+            return RequestBody.Expand request
         })
     | "readLine" ->
         Some(decode {
@@ -973,14 +962,14 @@ let private decodeRequestBody (messageType: string) (value: obj) : Result<Reques
                     }
                 })
 
-            return! sameHandle request.Handle request RequestBody.ReadLine
+            return RequestBody.ReadLine request
         })
     | "sourceInfo" ->
         Some(decode {
             let! request = requestField value (fun request -> field "handle" decodeHandle request |> Result.map (fun handle -> { SourceInfoRequest.Handle = handle }))
-            return! sameHandle request.Handle request RequestBody.SourceInfo
+            return RequestBody.SourceInfo request
         })
-    | "close" -> Some(field "handle" decodeHandle value |> Result.map RequestBody.Close)
+    | "close" -> Some(field "handle" (decodeOption decodeHandle) value |> Result.map RequestBody.Close)
     | _ -> None
 
 
@@ -1092,14 +1081,8 @@ let encode (message: TextDiffMessage) : obj =
     | TextDiffMessage.Shutdown -> envelope "shutdown" []
     | TextDiffMessage.Cancel(requestId, generation) -> envelope "cancel" [ "requestId" ==> requestId; "generation" ==> generation ]
     | TextDiffMessage.Request(requestId, generation, body) ->
-        let messageType, handle, fields = encodeRequestBody body
-
-        let handleField =
-            match handle with
-            | Some value -> [ "handle" ==> encodeHandle value ]
-            | None -> []
-
-        envelope messageType ([ "requestId" ==> requestId; "generation" ==> generation ] @ handleField @ fields)
+        let messageType, fields = encodeRequestBody body
+        envelope messageType ([ "requestId" ==> requestId; "generation" ==> generation ] @ fields)
     | TextDiffMessage.Progress(requestId, generation, validated, total) ->
         envelope "progress" [
             "requestId" ==> requestId
@@ -1223,13 +1206,3 @@ let decodeMessage (value: obj) : Result<TextDiffMessage, string> =
             match field "t" decodeString value with
             | Error message -> Error message
             | Ok messageType -> decodeEnvelope messageType value
-
-/// Reads the request id and generation of a message that failed to decode, when both are present and valid.
-let tryRequestKey (value: obj) : (string * int) option =
-    if isPlainObject value then
-        match field "requestId" decodeString value, field "generation" decodeInt value with
-        | Ok requestId, Ok generation -> Some(requestId, generation)
-        | Ok requestId, Error _ -> Some(requestId, 0)
-        | _ -> None
-    else
-        None
