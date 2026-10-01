@@ -73,9 +73,7 @@ type internal ResyncEngine
 
     let makeSides () =
         Array.init 2 (fun side ->
-            let scan = ScanSide(specs[side], encodings[side], categories[side], sides[side], ledger, evidenceTallies[side], config.HashMaskForTesting, report, config.CheckpointIntervalBytes, recordLineCount side)
-            scan.RecordPeaks <- false
-            scan)
+            ScanSide(specs[side], encodings[side], categories[side], sides[side], ledger, evidenceTallies[side], config.HashMaskForTesting, report, config.CheckpointIntervalBytes, recordLineCount side))
 
     let disc = makeSides ()
     do

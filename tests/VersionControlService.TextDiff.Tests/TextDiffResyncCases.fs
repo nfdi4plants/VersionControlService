@@ -246,7 +246,7 @@ module TextDiffResyncCases =
 
     /// Every line of a source, found with one uninterrupted scan.
     let private scanAll (bytes: byte[]) =
-        let state = Scanner.create TextEncoding.Utf8 0L None
+        let state = Scanner.create TextEncoding.Utf8 0L
         let found = ResizeArray<ScannedLine>()
         let batch = LineBatch(256)
         let meter = Meter.create (ManualClock 0.0 :> IClock) { Limits.defaults with MaxUnits = Int32.MaxValue; RequestMs = 1e15; QuantumMs = 1e15 }
@@ -255,24 +255,34 @@ module TextDiffResyncCases =
         Scanner.scanChunk state bytes 0 bytes.Length true meter batch onLines ignore |> ignore
         found.ToArray()
 
+    /// Reads one line to completion through the public line read, following its continuations.
+    let private readWholeLine (session: TextDiffSession) side (number: int64) = async {
+        let mutable result = EngineResult.Canceled
+        let! initial = session.ReadLine(side, number, 0L, 1_000, None, fun () -> false)
+        result <- initial
+        let mutable line = None
+        while line.IsNone do
+            match result with
+            | EngineResult.Ok(Resumable.Ready value) -> line <- Some value
+            | EngineResult.Ok(Resumable.Scanning(_, continuation, _)) ->
+                let! next = session.ReadLine(side, number, 0L, 1_000, Some continuation, fun () -> false)
+                result <- next
+            | other -> failwith $"The line read returned {other}."
+        return line.Value
+    }
+
     let private seekCases: (string * (unit -> Async<unit>)) list = [
-        "seeking a line or an offset matches a full scan", fun () -> async {
+        "reading a line returns the text of that source line on both sides", fun () -> async {
             let previous = lines "line-" 0 500
             let current = Array.concat [ previous[.. 99]; lines "new-" 0 300; previous[100 .. 399]; lines "other-" 0 50; previous[450 ..] ]
             let host = Host.createInMemory (ManualClock 0.0 :> IClock)
             let! session = TextDiffSession.create host (Ledger()) (smallConfig "seek") (fun _ -> 1) (spec (encode previous)) (spec (encode current))
             let! _ = readAll session noHook
-            for side, source in [ DiffSide.Previous, encode previous; DiffSide.Current, encode current ] do
-                let expected = scanAll source
-                for number in [ 0; 1; 63; 64; 65; 99; 100; 250; 399; 400; expected.Length - 1 ] do
-                    let! found = session.SeekLine(side, int64 number)
-                    Check.equal (EngineResult.Ok(Some expected[number])) found "A line seek matches the full scan."
-                for number in [ 0; 7; 1_000; 2_047; 2_048; 4_096; source.Length - 1 ] do
-                    let! found = session.SeekOffset(side, int64 number)
-                    let wanted = expected |> Array.find (fun line -> int64 number < line.EndOffset)
-                    Check.equal (EngineResult.Ok(Some wanted)) found "An offset seek matches the full scan."
-                let! past = session.SeekLine(side, int64 expected.Length)
-                Check.equal (EngineResult.Ok None) past "A line past the end has no result."
+            for side, source in [ DiffSide.Previous, previous; DiffSide.Current, current ] do
+                for number in [ 0; 1; 63; 64; 65; 99; 100; 250; 399; 400; source.Length - 1 ] do
+                    let! found = readWholeLine session side (int64 number)
+                    Check.equal source[number].Text found.Slice.Text "A line read matches the source line."
+                    Check.equal (int64 number) found.Number "A line read reports the requested line number."
             do! session.Close()
         }
     ]

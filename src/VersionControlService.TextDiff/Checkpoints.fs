@@ -72,7 +72,7 @@ type internal Checkpoints(ledger: Ledger, intervalBytes: float, residentBytes: i
 
     member _.ObserveLine(side: int, offset: float, line: float) =
         if offset >= nextDue[side] then
-            let state = Scanner.create encodings[side] (int64 offset) None
+            let state = Scanner.create encodings[side] (int64 offset)
             let fits = residentUsed + recordCost <= residentBytes && ledger.TryReserve(AllocationCategory.ResidentCheckpoints, int64 recordCost)
             let entry = {
                 Offset = offset

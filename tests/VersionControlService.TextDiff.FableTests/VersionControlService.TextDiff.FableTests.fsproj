@@ -4,6 +4,7 @@
     <IsPackable>false</IsPackable>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="..\VersionControlService.TextDiff.Tests\TestHost.fs" Link="TestHost.fs" />
     <Compile Include="..\VersionControlService.TextDiff.Tests\TextDiffEngineCases.fs" Link="TextDiffEngineCases.fs" />
     <Compile Include="..\VersionControlService.TextDiff.Tests\WorkerScratchCases.fs" Link="WorkerScratchCases.fs" />
     <Compile Include="..\VersionControlService.TextDiff.Tests\TextDiffSessionCases.fs" Link="TextDiffSessionCases.fs" />

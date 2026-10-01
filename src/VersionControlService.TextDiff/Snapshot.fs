@@ -197,10 +197,9 @@ type internal SnapshotReader(store: ITempStore, scratch: byte[]) =
             return amount * width
     }
 
-/// Copies the fields of a scanner state that has no retained text to and from scalar values.
+/// Copies the fields of a scanner state to and from scalar values.
 module internal ScannerStateCodec =
     let write (header: HeaderBuilder) (state: ScannerState) =
-        if state.RetainLimit.IsSome then invalidArg (nameof state) "A scanner with retained text cannot be spilled."
         header.Number(float state.StartOffset)
         header.Number state.NextOffset
         header.Number state.ValidatedBytes
@@ -234,7 +233,7 @@ module internal ScannerStateCodec =
 
     let read (encoding: TextEncoding) (header: HeaderReader) : ScannerState =
         let startOffset = header.Number()
-        let state = Scanner.create encoding (int64 startOffset) None
+        let state = Scanner.create encoding (int64 startOffset)
         state.NextOffset <- header.Number()
         state.ValidatedBytes <- header.Number()
         state.PendingValue <- header.Int()

@@ -3,7 +3,7 @@ namespace VersionControlService.TextDiff
 open System
 
 /// The equal prefix of two byte ranges that share an encoding and both start on a scalar boundary at
-/// the same absolute offset, with its line count and evidence. No line keys are computed for it.
+/// the same absolute offset, with its line count. No line keys are computed for it.
 type CommonRunResult = {
     /// Byte length of the prefix. It ends on a scalar boundary. After a mismatch it ends after the last
     /// line ending before the first differing byte. After a validation error it ends at the error.
@@ -17,12 +17,6 @@ type CommonRunResult = {
     LastLineStart: int64
     /// True when the prefix ends with a CR whose ending depends on the byte after it.
     PendingCR: bool
-    /// NUL evidence, and control-ratio evidence for the windows that the prefix settles by itself,
-    /// grouped by window in offset order.
-    Evidence: ScannerEvidence[]
-    /// Counts for the windows at the prefix edges. Their ratio depends on bytes outside the prefix,
-    /// so the caller adds them to its own window counts. Bytes counts only the bytes of the prefix.
-    Windows: ObservationWindow[]
     Error: DecodeError option
 }
 
@@ -196,37 +190,6 @@ module CommonRun =
                 if value = 0x0D then pending <- true
             index <- index + size
         lines, lastStart, pending
-
-    /// Creates one observation per window that bytes [0, length) touch, with byte counts only.
-    let private touchedWindows (position: float) (length: int) =
-        let windows = ResizeArray<ObservationWindow>()
-        let finish = position + float length
-        let mutable start = Scanner.windowStartOf position
-        while start < finish do
-            let first = max start position
-            let last = min (start + 65_536.0) finish
-            windows.Add(Scanner.newWindow start (int (last - first)))
-            start <- start + 65_536.0
-        windows.ToArray()
-
-    let private countByteControls (data: byte[]) (first: int) (last: int) (windowOrigin: int) (window: ObservationWindow) =
-        let flags = Scanner.controlFlags
-        let mutable controls = 0
-        let mutable firstControl = window.FirstControl
-        for index in first .. last - 1 do
-            let value = Native.readByte data index
-            if value < 0x20 || value = 0x7F then
-                if Native.readByte flags value <> 0 then
-                    controls <- controls + 1
-                    if firstControl < 0 then firstControl <- index - windowOrigin
-        window.Controls <- window.Controls + controls
-        window.FirstControl <- firstControl
-
-    let private countUtf8Scalars (data: byte[]) (first: int) (last: int) =
-        let mutable scalars = 0
-        for index in first .. last - 1 do
-            if not (Decoders.isUtf8Continuation (Native.readByte data index)) then scalars <- scalars + 1
-        scalars
 
     /// Counts one side's scalars and controls inside a byte window without calling back from the byte loop.
     let private countObservationSegment
@@ -449,7 +412,6 @@ module CommonRun =
         (position: float)
         (currentPosition: float)
         (pendingCR: bool)
-        (reportObservations: bool)
         (previousHighWater: float)
         (currentHighWater: float)
         (observePrevious: float -> int -> int -> int -> float -> float -> unit)
@@ -500,216 +462,21 @@ module CommonRun =
                 Lines = 0
                 LastLineStart = int64 position
                 PendingCR = pendingCR
-                Evidence = Array.empty
-                Windows = Array.empty
                 Error = error
             }
         else
-            let result (evidence: ScannerEvidence[]) (windows: ObservationWindow[]) =
-                {
-                    Length = length
-                    Mismatch = mismatch
-                    DifferenceOffset = if mismatch then Some difference else None
-                    Lines = lines
-                    LastLineStart = int64 (start + float lastStart)
-                    PendingCR = pendingOut
-                    Evidence = evidence
-                    Windows = windows
-                    Error = error
-                }
+            let sharedWindows =
+                (currentPosition - start) % 65_536.0 = 0.0
+                && currentHighWater - previousHighWater = currentPosition - start
+            observeRange encoding data 0 start start (start + float length) previousHighWater (fun segmentStart segmentBytes controls scalars firstControl firstNul ->
+                observePrevious segmentStart segmentBytes controls scalars firstControl firstNul
+                if sharedWindows then
+                    observeCurrent (segmentStart + currentPosition - start) segmentBytes controls scalars
+                        (if firstControl < 0.0 then -1.0 else firstControl + currentPosition - start)
+                        (if firstNul < 0.0 then -1.0 else firstNul + currentPosition - start))
 
-            if reportObservations then
-                let sharedWindows =
-                    (currentPosition - start) % 65_536.0 = 0.0
-                    && currentHighWater - previousHighWater = currentPosition - start
-                observeRange encoding data 0 start start (start + float length) previousHighWater (fun segmentStart segmentBytes controls scalars firstControl firstNul ->
-                    observePrevious segmentStart segmentBytes controls scalars firstControl firstNul
-                    if sharedWindows then
-                        observeCurrent (segmentStart + currentPosition - start) segmentBytes controls scalars
-                            (if firstControl < 0.0 then -1.0 else firstControl + currentPosition - start)
-                            (if firstNul < 0.0 then -1.0 else firstNul + currentPosition - start))
-
-                if not sharedWindows then
-                    observeRange encoding data 0 currentPosition currentPosition (currentPosition + float length) currentHighWater observeCurrent
-                result Array.empty Array.empty
-            else
-                let windows = touchedWindows start length
-                let keep = Array.create windows.Length false
-                let lastIndex = windows.Length - 1
-                if windows[0].Start < start then keep[0] <- true
-                keep[lastIndex] <- true
-                if lastIndex > 0 && windows[lastIndex].Bytes < Scanner.SmallFinalWindowBytes then keep[lastIndex - 1] <- true
-
-                let nulOffsets = ResizeArray<float>()
-                if size = 1 then
-                    let mutable found = Native.indexOfByte data 0 0 length
-                    while found >= 0 do
-                        nulOffsets.Add(start + float found)
-                        found <- Native.indexOfByte data 0 (found + 1) length
-                else
-                    let mutable index = 0
-                    while index < length do
-                        let value = readCodeUnit size (isLittleEndian encoding) data index
-                        if value = 0 then nulOffsets.Add(start + float index)
-                        index <- index + (if size = 2 && Decoders.isHighSurrogate value then 4 else size)
-
-                if size = 1 then
-                    for windowIndex in 0 .. lastIndex do
-                        let window = windows[windowIndex]
-                        let windowOrigin = int (window.Start - start)
-                        let first = max 0 windowOrigin
-                        let last = first + window.Bytes
-                        countByteControls data first last windowOrigin window
-                        if encoding = TextEncoding.Windows1252 then
-                            window.Scalars <- window.Bytes
-                        elif keep[windowIndex] || window.Controls > 0 then
-                            window.Scalars <- countUtf8Scalars data first last
-                else
-                    let littleEndian = isLittleEndian encoding
-                    let mutable windowIndex = 0
-                    let mutable index = 0
-                    while index < length do
-                        let absolute = start + float index
-                        while absolute >= windows[windowIndex].Start + 65_536.0 do
-                            windowIndex <- windowIndex + 1
-                        let window = windows[windowIndex]
-                        let value = readCodeUnit size littleEndian data index
-                        window.Scalars <- window.Scalars + 1
-                        if value < 0x80 then
-                            if Native.readByte Scanner.controlFlags value <> 0 then
-                                window.Controls <- window.Controls + 1
-                                if window.FirstControl < 0 then window.FirstControl <- int (absolute - window.Start)
-                        // A surrogate pair belongs to the window where its high surrogate starts.
-                        index <- index + (if size = 2 && Decoders.isHighSurrogate value then 4 else size)
-
-                let evidence = ResizeArray<ScannerEvidence>()
-                let kept = ResizeArray<ObservationWindow>()
-                let mutable nulIndex = 0
-                for windowIndex in 0 .. lastIndex do
-                    let window = windows[windowIndex]
-                    let windowEnd = window.Start + 65_536.0
-                    while nulIndex < nulOffsets.Count && nulOffsets[nulIndex] < windowEnd do
-                        evidence.Add {
-                            Offset = int64 nulOffsets[nulIndex]
-                            Kind = "nul"
-                            WindowStart = int64 window.Start
-                        }
-                        nulIndex <- nulIndex + 1
-                    if keep[windowIndex] then kept.Add window
-                    else Scanner.finalizeWindow window evidence.Add
-
-                result (evidence.ToArray()) (kept.ToArray())
-
-    /// Compares left[leftOffset ..] with right[rightOffset ..] over at most `count` bytes, capped at
-    /// MaxRunBytes. Both inputs start at the same absolute offset.
-    let find
-        (encoding: TextEncoding)
-        (position: int64)
-        (pendingCR: bool)
-        (left: byte[])
-        (leftOffset: int)
-        (right: byte[])
-        (rightOffset: int)
-        (count: int)
-        : CommonRunResult =
-        if isNull left then nullArg (nameof left)
-        if isNull right then nullArg (nameof right)
-        if position < 0L then invalidArg (nameof position) "The position cannot be negative."
-        if count < 0 || leftOffset < 0 || leftOffset > left.Length - count then
-            invalidArg (nameof leftOffset) "The left byte range is outside its buffer."
-        if rightOffset < 0 || rightOffset > right.Length - count then
-            invalidArg (nameof rightOffset) "The right byte range is outside its buffer."
-
-        let start = float position
-        let limit = min count MaxRunBytes
-        let difference = firstDifference left leftOffset right rightOffset limit
-        let mismatch = difference < limit
-        let candidate = trimToBoundary encoding left leftOffset difference
-        let data = Native.view left leftOffset candidate
-        let validEnd, error =
-            if isValid encoding data candidate then candidate, None
-            else
-                match firstError encoding position data candidate with
-                | Some decodeError -> int (float decodeError.Offset - start), Some decodeError
-                | None -> candidate, None
-
-        let size = unitBytes encoding
-        let lines, lastStart, pendingOut =
-            if size = 1 then countByteLines data validEnd pendingCR
-            else countUnitLines size (isLittleEndian encoding) data validEnd pendingCR
-        let length, pendingOut =
-            if error.IsNone && mismatch then lastStart, false else validEnd, pendingOut
-
-        if length = 0 then
-            {
-                Length = 0
-                Mismatch = mismatch
-                DifferenceOffset = if mismatch then Some difference else None
-                Lines = 0
-                LastLineStart = position
-                PendingCR = pendingCR
-                Evidence = Array.empty
-                Windows = Array.empty
-                Error = error
-            }
-        else
-            let windows = touchedWindows start length
-            let keep = Array.create windows.Length false
-            let lastIndex = windows.Length - 1
-            if windows[0].Start < start then keep[0] <- true
-            keep[lastIndex] <- true
-            if lastIndex > 0 && windows[lastIndex].Bytes < Scanner.SmallFinalWindowBytes then keep[lastIndex - 1] <- true
-
-            let nulOffsets = ResizeArray<float>()
-            if size = 1 then
-                let mutable found = Native.indexOfByte data 0 0 length
-                while found >= 0 do
-                    nulOffsets.Add(start + float found)
-                    found <- Native.indexOfByte data 0 (found + 1) length
-                for windowIndex in 0 .. lastIndex do
-                    let window = windows[windowIndex]
-                    let windowOrigin = int (window.Start - start)
-                    let first = max 0 windowOrigin
-                    let last = first + window.Bytes
-                    countByteControls data first last windowOrigin window
-                    if encoding = TextEncoding.Windows1252 then
-                        window.Scalars <- window.Bytes
-                    elif keep[windowIndex] || window.Controls > 0 then
-                        window.Scalars <- countUtf8Scalars data first last
-            else
-                let littleEndian = isLittleEndian encoding
-                let mutable windowIndex = 0
-                let mutable index = 0
-                while index < length do
-                    let absolute = start + float index
-                    while absolute >= windows[windowIndex].Start + 65_536.0 do
-                        windowIndex <- windowIndex + 1
-                    let window = windows[windowIndex]
-                    let value = readCodeUnit size littleEndian data index
-                    window.Scalars <- window.Scalars + 1
-                    if value < 0x80 then
-                        if Native.readByte Scanner.controlFlags value <> 0 then
-                            window.Controls <- window.Controls + 1
-                            if window.FirstControl < 0 then window.FirstControl <- int (absolute - window.Start)
-                        elif value = 0 then
-                            nulOffsets.Add absolute
-                    index <- index + (if size = 2 && Decoders.isHighSurrogate value then 4 else size)
-
-            let evidence = ResizeArray<ScannerEvidence>()
-            let kept = ResizeArray<ObservationWindow>()
-            let mutable nulIndex = 0
-            for windowIndex in 0 .. lastIndex do
-                let window = windows[windowIndex]
-                let windowEnd = window.Start + 65_536.0
-                while nulIndex < nulOffsets.Count && nulOffsets[nulIndex] < windowEnd do
-                    evidence.Add {
-                        Offset = int64 nulOffsets[nulIndex]
-                        Kind = "nul"
-                        WindowStart = int64 window.Start
-                    }
-                    nulIndex <- nulIndex + 1
-                if keep[windowIndex] then kept.Add window
-                else Scanner.finalizeWindow window evidence.Add
+            if not sharedWindows then
+                observeRange encoding data 0 currentPosition currentPosition (currentPosition + float length) currentHighWater observeCurrent
 
             {
                 Length = length
@@ -718,7 +485,5 @@ module CommonRun =
                 Lines = lines
                 LastLineStart = int64 (start + float lastStart)
                 PendingCR = pendingOut
-                Evidence = evidence.ToArray()
-                Windows = kept.ToArray()
                 Error = error
             }

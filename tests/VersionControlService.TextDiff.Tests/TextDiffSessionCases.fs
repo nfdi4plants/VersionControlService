@@ -1803,7 +1803,7 @@ module TextDiffSessionCases =
             do! session.Close()
             return ()
         }
-        "late seek paths validate UTF-16 content beyond a checkpoint", fun () -> async {
+        "late line reads validate UTF-16 content beyond a checkpoint", fun () -> async {
             let line = String('A', 5_000)
             let content = String.concat "\n" (Array.create 40 line) + "\n"
             let utf16 = Array.append [| 0xFFuy; 0xFEuy |] (Encoding.Unicode.GetBytes content)
@@ -1829,17 +1829,27 @@ module TextDiffSessionCases =
                         result <- next
                 | other -> failwith $"The equal UTF-16 sources returned {other} before the seek."
             Check.true' (progress >= 40_000L && progress < 131_072L) "The session pauses after an earlier checkpoint and before the signature."
-            let! seek = session.SeekOffset(DiffSide.Previous, 180_000L)
-            match seek with
+            let mutable read = EngineResult.Canceled
+            let! firstRead = session.ReadLine(DiffSide.Previous, 35L, 0L, 8, None, fun () -> false)
+            read <- firstRead
+            let mutable readAttempts = 0
+            while (match read with EngineResult.Ok(Resumable.Scanning _) -> true | _ -> false) && readAttempts < 1_000 do
+                readAttempts <- readAttempts + 1
+                match read with
+                | EngineResult.Ok(Resumable.Scanning(_, continuation, _)) ->
+                    let! next = session.ReadLine(DiffSide.Previous, 35L, 0L, 8, Some continuation, fun () -> false)
+                    read <- next
+                | _ -> ()
+            match read with
             | EngineResult.Failed(code, _, Some detail) ->
-                Check.equal TextDiffFailureCodes.ContentNotText code "The seek reports late content evidence."
-                Check.equal DiffSide.Previous detail.Side "The seek identifies the source that contains the signature."
+                Check.equal TextDiffFailureCodes.ContentNotText code "The line read reports late content evidence."
+                Check.equal DiffSide.Previous detail.Side "The line read identifies the source that contains the signature."
                 Check.true' (detail.Evidence.Contains("131072", StringComparison.Ordinal)) "The evidence names the signature offset."
-            | other -> failwith $"The seek returned {other}."
+            | other -> failwith $"The line read returned {other}."
             do! session.Close()
             return ()
         }
-        "line checkpoints keep seeks near the end within one interval", fun () -> async {
+        "line checkpoints keep line reads near the end within one interval", fun () -> async {
             let lines = Array.init 40_000 (fun _ -> { Text = "x"; Ending = LineEnding.LF })
             let bytes = encodeLines lines
             let previousSource = CountingByteSource bytes
@@ -1850,17 +1860,16 @@ module TextDiffSessionCases =
             let! session = openSession sessionConfig previous current
             let! _ = readAll session (fun () -> false)
             previousSource.Reset()
-            let! seek = session.SeekLine(DiffSide.Previous, int64 lines.Length - 1L)
-            match seek with
-            | EngineResult.Ok(Some line) ->
-                Check.equal 1L line.Utf16Length "The seek found the final line."
-                Check.equal (int64 bytes.Length) line.EndOffset "The final line reaches the source end."
-            | other -> failwith $"The late line seek returned {other}."
-            Check.true' (previousSource.BytesRead <= 32_770L) $"The seek read {previousSource.BytesRead} bytes after the counter reset."
+            let lastLine = int64 lines.Length - 1L
+            let! initial = session.ReadLine(DiffSide.Previous, lastLine, 0L, 8, None, fun () -> false)
+            let! line = resolveLine session DiffSide.Previous lastLine 0L 8 initial
+            Check.equal "x" line.Slice.Text "The line read found the final line."
+            Check.equal lastLine line.Number "The line read reports the final line number."
+            Check.true' (previousSource.BytesRead <= 32_770L) $"The line read read {previousSource.BytesRead} bytes after the counter reset."
             do! session.Close()
             return ()
         }
-        "late expansions and line reads keep bounded scanner batches", fun () -> async {
+        "late expansions and line reads finish in a few requests", fun () -> async {
             let lines = Array.init 200_000 (fun _ -> { Text = String('x', 64); Ending = LineEnding.LF })
             let bytes = encodeLines lines
             let source = sourceSpec bytes
@@ -1885,14 +1894,10 @@ module TextDiffSessionCases =
                     | EngineResult.Canceled -> failwith "The late expansion canceled an uncanceled request."
                 return parts.Value, requests
             }
-            let beforeExpansion = session.SeekBatchAllocationCount
             let! expanded, expansionRequests = readExpansion 64
             Check.true' (expanded |> Array.exists (function DiffPart.ExpandedContext(_, rows) -> rows.Length = 64 | _ -> false)) "The expansion returns the last 64 lines."
-            let expansionAllocations = session.SeekBatchAllocationCount - beforeExpansion
             Check.true' (expansionRequests <= 8) $"The expansion finishes in {expansionRequests} requests."
-            Check.true' (expansionAllocations <= expansionRequests * 6 + 4) $"The expansion allocated {expansionAllocations} seek batches across {expansionRequests} requests."
 
-            let beforeLine = session.SeekBatchAllocationCount
             let! initialLine = session.ReadLine(DiffSide.Previous, int64 lines.Length - 1L, 0L, 8, None, fun () -> false)
             let mutable result = initialLine
             let mutable line = None
@@ -1907,14 +1912,11 @@ module TextDiffSessionCases =
                 | EngineResult.Failed(code, message, detail) -> failwith $"The late line read failed with {code}: {message}. Detail: {detail}."
                 | EngineResult.Canceled -> failwith "The late line read canceled an uncanceled request."
             Check.equal (String('x', 8)) line.Value.Slice.Text "The line read returns the final line."
-            let lineAllocations = session.SeekBatchAllocationCount - beforeLine
             Check.true' (lineRequests <= 8) $"The line read finishes in {lineRequests} requests."
-            Check.true' (lineAllocations <= lineRequests * 6 + 4) $"The line read allocated {lineAllocations} seek batches across {lineRequests} requests."
-            Check.true' (session.LargestSeekBatchCapacity <= 4_096) $"A seek batch reached {session.LargestSeekBatchCapacity} slots."
             do! session.Close()
             return ()
         }
-        "source info learns a line count when a seek reaches eof", fun () -> async {
+        "source info learns a line count when a line read reaches eof", fun () -> async {
             let lines = Array.init 200 (fun index -> { Text = string index + String('x', 96); Ending = LineEnding.LF })
             let bytes = encodeLines lines
             let previous = sourceSpec bytes
@@ -1928,10 +1930,20 @@ module TextDiffSessionCases =
             | other -> failwith $"The first scan completed before the source line count was known: {other}."
             let initialInfo, _ = session.SourceInfo
             Check.equal None initialInfo.LineCount "Source info has no line count before the source reaches eof."
-            let! seek = session.SeekLine(DiffSide.Previous, int64 lines.Length + 10L)
-            Check.equal (EngineResult.Ok None) seek "The seek ends past the last line."
+            let pastEnd = int64 lines.Length + 10L
+            let mutable read = EngineResult.Canceled
+            let! firstRead = session.ReadLine(DiffSide.Previous, pastEnd, 0L, 8, None, fun () -> false)
+            read <- firstRead
+            let mutable readAttempts = 0
+            while (match read with EngineResult.Ok(Resumable.Scanning _) -> true | _ -> false) && readAttempts < 1_000 do
+                readAttempts <- readAttempts + 1
+                match read with
+                | EngineResult.Ok(Resumable.Scanning(_, continuation, _)) ->
+                    let! next = session.ReadLine(DiffSide.Previous, pastEnd, 0L, 8, Some continuation, fun () -> false)
+                    read <- next
+                | _ -> ()
             let previousInfo, _ = session.SourceInfo
-            Check.equal (Some(int64 lines.Length)) previousInfo.LineCount "Source info reports the count learned by the seek."
+            Check.equal (Some(int64 lines.Length)) previousInfo.LineCount "Source info reports the count learned by the line read."
             do! session.Close()
             return ()
         }
@@ -2340,7 +2352,7 @@ module TextDiffSessionCases =
             do! deltaSession.Close()
 
             let wholeHasEvidence (bytes: byte[]) =
-                let state = Scanner.create TextEncoding.Utf8 0L None
+                let state = Scanner.create TextEncoding.Utf8 0L
                 let evidence = ResizeArray<ScannerEvidence>()
                 let meter = Meter.create (ManualClock 0.0 :> IClock) { Limits.defaults with MaxUnits = Int32.MaxValue; RequestMs = 1e15; QuantumMs = 1e15 }
                 Scanner.scanChunk state bytes 0 bytes.Length true meter (LineBatch(4)) ignore evidence.Add |> ignore

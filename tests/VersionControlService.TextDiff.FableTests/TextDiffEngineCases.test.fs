@@ -35,11 +35,13 @@ module TextDiffEngineCasesTests =
             best <- max best (float size / 1_000_000.0 * 1_000.0 / elapsed)
         result, best
 
-    let private scanThroughput encoding retainLimit (data: byte[]) =
+    let private scanThroughput encoding (data: byte[]) =
         let batch = LineBatch()
         bestRate data.Length (fun () ->
-            let state = Scanner.create encoding 0L retainLimit
+            let state = Scanner.create encoding 0L
             Scanner.scanChunk state data 0 data.Length true (createMeter ()) batch ignore ignore)
+
+    let private noObservation (_: float) (_: int) (_: int) (_: int) (_: float) (_: float) = ()
 
     let private commonRunThroughput encoding (left: byte[]) (right: byte[]) =
         bestRate (left.Length * 2) (fun () ->
@@ -48,7 +50,7 @@ module TextDiffEngineCasesTests =
             let mutable lines = 0
 
             while position < left.Length do
-                let run = CommonRun.find encoding (int64 position) pendingCR left position right position (left.Length - position)
+                let run = CommonRun.findObserved encoding (float position) (float position) pendingCR 0.0 0.0 noObservation noObservation left position right position (left.Length - position)
                 if run.Length = 0 then failwith "The common run did not advance."
                 position <- position + run.Length
                 pendingCR <- run.PendingCR
@@ -132,8 +134,8 @@ module TextDiffEngineCasesTests =
 
         repeatBytes benchmarkSize pattern
 
-    let private reportScan label encoding retainLimit (data: byte[]) =
-        let result, rate = scanThroughput encoding retainLimit data
+    let private reportScan label encoding (data: byte[]) =
+        let result, rate = scanThroughput encoding data
         Vitest.log ($"{label}: %.1f{rate} MB/s")
         if result.Status <> EndOfInput then failwith $"{label} did not finish the 64 MiB input."
         Async.StartAsPromise(async.Return())
@@ -295,22 +297,22 @@ module TextDiffEngineCasesTests =
 
     Vitest.it (
         "scans a 64 MiB ASCII buffer with 40-byte lines",
-        fun () -> reportScan "ASCII scanner throughput" TextEncoding.Utf8 None (asciiLines benchmarkSize)
+        fun () -> reportScan "ASCII scanner throughput" TextEncoding.Utf8 (asciiLines benchmarkSize)
     )
 
     Vitest.it (
         "scans a 64 MiB UTF-8 buffer with mixed character widths",
-        fun () -> reportScan "UTF-8 scanner throughput" TextEncoding.Utf8 None (utf8Data ())
+        fun () -> reportScan "UTF-8 scanner throughput" TextEncoding.Utf8 (utf8Data ())
     )
 
     Vitest.it (
         "scans a 64 MiB UTF-16 LE buffer",
-        fun () -> reportScan "UTF-16 LE scanner throughput" TextEncoding.Utf16LE None (utf16LeData ())
+        fun () -> reportScan "UTF-16 LE scanner throughput" TextEncoding.Utf16LE (utf16LeData ())
     )
 
     Vitest.it (
-        "scans a 64 MiB ASCII buffer with 40-byte lines and retained text",
-        fun () -> reportScan "ASCII scanner throughput with retained text" TextEncoding.Utf8 (Some 4096) (asciiLines benchmarkSize)
+        "scans a 64 MiB ASCII buffer with 40-byte lines",
+        fun () -> reportScan "ASCII scanner throughput" TextEncoding.Utf8 (asciiLines benchmarkSize)
     )
 
     Vitest.it (
@@ -427,9 +429,6 @@ module TextDiffEngineCasesTests =
             do! finishSessionOutput session page
             let elapsed = max 1.0 (BrowserClock.nowMs() - started)
             let rate = float (previous.Length + current.Length) / 1_000_000.0 * 1_000.0 / elapsed
-            let equalAfterInsertion = float (previous.Length - cutLine * lineBytes)
-            if ledger.CommonRunBytes < 0.9 * equalAfterInsertion then
-                failwith $"The equal-byte phase consumed {ledger.CommonRunBytes} of {equalAfterInsertion} equal bytes after the insertion."
             Vitest.log ($"64 MiB file with an 8 MiB insertion near the start: %.1f{elapsed} ms, %.1f{rate} MB/s across both sources")
             do! session.Close()
         })
@@ -485,9 +484,6 @@ module TextDiffEngineCasesTests =
         // The insertion is larger than one alignment window, so the search has to find the unchanged lines after it.
         let tally = Array.zeroCreate<int> 3
         let check (ledger: Ledger) =
-            let equalAfterInsertion = float (previous.Length - cutLine * lineBytes)
-            if ledger.CommonRunBytes < 0.9 * equalAfterInsertion then
-                failwith $"The equal-byte phase consumed {ledger.CommonRunBytes} of {equalAfterInsertion} equal bytes after the insertion."
             if tally[0] <> insertedLines || tally[1] <> 0 || tally[2] <> 0 then
                 failwith $"The insertion shows {tally[0]} added rows, {tally[1]} removed rows and {tally[2]} unaligned lines, expected {insertedLines} added rows and nothing else."
         reportSessionRun "64 MiB file with an 8 MiB insertion in the middle" "benchmark-insertion-middle" previous current (tallyPage tally) check

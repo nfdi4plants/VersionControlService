@@ -5,6 +5,7 @@
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="TestHost.fs" />
     <Compile Include="TextDiffEngineCases.fs" />
     <Compile Include="WorkerScratchCases.fs" />
     <Compile Include="TextDiffSessionCases.fs" />

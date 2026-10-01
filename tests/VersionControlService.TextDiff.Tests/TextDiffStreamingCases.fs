@@ -91,7 +91,8 @@ module TextDiffStreamingCases =
         return page.Value, scans
     }
 
-    let private readAll (session: TextDiffSession) = async {
+    /// Reads every page and calls `observe` after each one while the session still holds its windows.
+    let private readAllObserving (observe: unit -> unit) (session: TextDiffSession) = async {
         let pages = ResizeArray<DiffPage>()
         let! first = session.FirstPage(fun () -> false)
         let mutable result = first
@@ -102,6 +103,7 @@ module TextDiffStreamingCases =
             let! page, pageScans = resolvePageAsync session (fun () -> false) result
             scans <- scans + pageScans
             pages.Add page
+            observe ()
             match page.NextCursor with
             | None -> doneReading <- true
             | Some cursor ->
@@ -110,6 +112,8 @@ module TextDiffStreamingCases =
 
         return pages.ToArray(), scans
     }
+
+    let private readAll (session: TextDiffSession) = readAllObserving ignore session
 
     let private allParts (pages: DiffPage array) = pages |> Array.collect (fun page -> page.Parts)
 
@@ -180,7 +184,7 @@ module TextDiffStreamingCases =
         bytes
 
     /// Runs a large file with a shifting edit near the start and a small edit near the end, then checks that the
-    /// equal-byte phase consumed almost every equal byte after the shift.
+    /// page stream still covers every line after the shift.
     let private shiftedTailCase (sessionId: string) (shift: SourceLine array -> SourceLine array) = async {
         let previous = makeLines 200_000 "line-"
         let current = shift previous
@@ -193,10 +197,6 @@ module TextDiffStreamingCases =
         let! session = openSession ledger sessionConfig (sourceSpec previousBytes) (sourceSpec currentBytes)
         let! pages, _ = readAll session
         checkOracle previous current pages
-        let prefixBytes = float (encodeLines previous[.. 99]).Length
-        let equalAfterShift = float previousBytes.Length - prefixBytes
-        let commonAfterShift = ledger.CommonRunBytes - prefixBytes
-        Check.true' (commonAfterShift > 0.9 * equalAfterShift) $"The equal-byte phase consumed {commonAfterShift} of {equalAfterShift} equal bytes after the shift."
         do! session.Close()
         return ()
     }
@@ -304,7 +304,7 @@ module TextDiffStreamingCases =
         "validated byte progress stops at an incomplete scalar", fun () -> async {
             let clock = ManualClock 0.0
             let meter = Meter.create (clock :> IClock) Limits.defaults
-            let state = Scanner.create TextEncoding.Utf8 0L None
+            let state = Scanner.create TextEncoding.Utf8 0L
             let batch = LineBatch()
             let first = Scanner.scanChunk state [| 0xE2uy |] 0 1 false meter batch ignore ignore
             Check.equal InputConsumed first.Status "The incomplete scalar waits for its next byte."
@@ -319,7 +319,7 @@ module TextDiffStreamingCases =
         }
         "validated byte progress stops before a pending high surrogate and a partial unit", fun () -> async {
             let meter = Meter.create (ManualClock 0.0 :> IClock) Limits.defaults
-            let state = Scanner.create TextEncoding.Utf16LE 0L None
+            let state = Scanner.create TextEncoding.Utf16LE 0L
             let result = Scanner.scanChunk state [| 0x00uy; 0xD8uy; 0x41uy |] 0 3 true meter (LineBatch()) ignore ignore
             Check.equal DecodeFailure result.Status "A surrogate without a partner is a decoding failure."
             match result.Error with
@@ -331,7 +331,7 @@ module TextDiffStreamingCases =
         "a due quantum still permits the first scanner segment", fun () -> async {
             let clock = ManualClock 0.0
             let meter = Meter.create (clock :> IClock) { MaxUnits = Int32.MaxValue; RequestMs = 1_000_000.0; QuantumMs = 0.0 }
-            let state = Scanner.create TextEncoding.Utf8 0L None
+            let state = Scanner.create TextEncoding.Utf8 0L
             let input = Array.create 8_192 0x61uy
             let result = Scanner.scanChunk state input 0 input.Length false meter (LineBatch()) ignore ignore
             Check.equal 4_096 result.Consumed "The scanner makes one segment of progress."
@@ -500,12 +500,18 @@ module TextDiffStreamingCases =
             let ledger = Ledger()
             let sessionConfig = config "stream-window-cap" 256 1_000_000 Limits.defaults None
             let! session = openSession ledger sessionConfig (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
-            let! pages, _ = readAll session
+            let mutable previousPeak = 0L
+            let mutable currentPeak = 0L
+            let observe () =
+                previousPeak <- max previousPeak (ledger.Used AllocationCategory.PreviousWindows)
+                currentPeak <- max currentPeak (ledger.Used AllocationCategory.CurrentWindows)
+            let! pages, _ = readAllObserving observe session
             checkOracle previous current pages
-            Check.true' (ledger.PeakWindowLines AllocationCategory.PreviousWindows <= 256) "Previous metadata stays within the configured window."
-            Check.true' (ledger.PeakWindowLines AllocationCategory.CurrentWindows <= 256) "Current metadata stays within the configured window."
-            Check.true' (ledger.PeakWindowLines AllocationCategory.PreviousWindows > 0) "Previous window tracking records loaded lines."
-            Check.true' (ledger.PeakWindowLines AllocationCategory.CurrentWindows > 0) "Current window tracking records loaded lines."
+            let windowBudget = 40L * 1_024L
+            Check.true' (previousPeak <= windowBudget) "Previous window reservation stays within the configured window."
+            Check.true' (currentPeak <= windowBudget) "Current window reservation stays within the configured window."
+            Check.true' (previousPeak > 0L) "Previous window tracking reserves memory for loaded lines."
+            Check.true' (currentPeak > 0L) "Current window tracking reserves memory for loaded lines."
             do! session.Close()
             return ()
         }

@@ -450,8 +450,6 @@ type TextDiffSession internal (
     let mutable nextLineAttempt = 0L
     let mutable lineReadUse = 0L
     let mutable pairedMismatch: (int64 * int64 * int64 option) option = None
-    let mutable pendingPreviewBytes = 0L
-    let mutable lastPendingPreview: PendingPreview option = None
     let pendingPreviewCursors: PendingPreviewCursor option[] = Array.create 2 None
     let pendingExpansions = Dictionary<int64, PendingExpansion>()
     let pendingLineReads = Dictionary<int64, PendingLineRead>()
@@ -851,9 +849,9 @@ type TextDiffSession internal (
     /// has no scanner state, so the checkpoint starts a fresh scanner at that line.
     let observeCommon () =
         if checkpoints.IsDue(0, lineStart) then
-            checkpoints.Observe(0, Scanner.create previousEncoding (int64 lineStart) None, builder.NextPrevious + commonLines)
+            checkpoints.Observe(0, Scanner.create previousEncoding (int64 lineStart), builder.NextPrevious + commonLines)
         if checkpoints.IsDue(1, lineStart + delta) then
-            checkpoints.Observe(1, Scanner.create currentEncoding (int64 (lineStart + delta)) None, builder.NextCurrent + commonLines)
+            checkpoints.Observe(1, Scanner.create currentEncoding (int64 (lineStart + delta)), builder.NextCurrent + commonLines)
 
     let commonStep (meter: Meter) = async {
         if backActive then return! backtrackStep meter
@@ -895,7 +893,6 @@ type TextDiffSession internal (
                             oldPos
                             (oldPos + delta)
                             pendingCR
-                            true
                             previousEvidence.HighWater
                             currentEvidence.HighWater
                             (fun start bytes controls scalars firstControl firstNul -> previousEvidence.ObserveCounts(start, bytes, controls, scalars, firstControl, firstNul))
@@ -910,7 +907,6 @@ type TextDiffSession internal (
                     if run.Length > 0 then
                         Meter.chargeBytes meter run.Length
                         Meter.charge meter run.Lines
-                        ledger.RecordCommonRunBytes(float run.Length)
                         pos <- pos + float run.Length
                         if run.Lines > 0 then lineStart <- float run.LastLineStart
                         commonLines <- commonLines + float run.Lines
@@ -2046,22 +2042,14 @@ type TextDiffSession internal (
         return { Line = view.Number; OffsetUtf16 = offset; Text = text; End = endState }
     }
 
-    let reservePendingPreview (value: PendingPreview option) =
-        if pendingPreviewBytes > 0L then ledger.Release(AllocationCategory.ResponseData, pendingPreviewBytes)
-        pendingPreviewBytes <- 0L
-        lastPendingPreview <- None
+    let boundPendingPreview (value: PendingPreview option) =
         match value with
         | None -> None
         | Some preview ->
             let stringCost =
                 [| preview.Previous; preview.Current |]
                 |> Array.sumBy (function PendingSide.Snippet snippet -> int64 snippet.Text.Length * 2L | _ -> 0L)
-            let cost = stringCost + 64L
-            if cost > 16L * 1024L || not (ledger.TryReserve(AllocationCategory.ResponseData, cost)) then None
-            else
-                pendingPreviewBytes <- cost
-                lastPendingPreview <- Some preview
-                lastPendingPreview
+            if stringCost + 64L > 16L * 1024L then None else Some preview
 
     let makePendingPreview (active: PendingLineView option[]) (completed: (int64 -> PendingLineView option)[]) (exhausted: int64 option[]) (mismatchLines: (int64 * int64 * int64 option) option) = async {
         let selected = Array.copy active
@@ -2078,10 +2066,10 @@ type TextDiffSession internal (
                     pairedNumber |> Option.iter (fun number -> selected[sideIndex] <- completed[sideIndex] number)
                 | None -> ()
         if selected[0].IsNone && selected[1].IsNone then
-            if exhausted[0].IsSome && exhausted[1].IsSome then return reservePendingPreview None
+            if exhausted[0].IsSome && exhausted[1].IsSome then return boundPendingPreview None
             else
                 let side = function Some count -> PendingSide.Exhausted count | None -> PendingSide.NoActiveLine
-                return reservePendingPreview (Some { Previous = side exhausted[0]; Current = side exhausted[1]; Mismatch = None })
+                return boundPendingPreview (Some { Previous = side exhausted[0]; Current = side exhausted[1]; Mismatch = None })
         else
             let mutable knownMismatch = None
             let offsets = [| 0L; 0L |]
@@ -2129,8 +2117,8 @@ type TextDiffSession internal (
                 mismatch <- Some { PreviousOffsetUtf16 = unitOffset; CurrentOffsetUtf16 = unitOffset }
             | _ -> ()
             let preview = { Previous = previousSide; Current = currentSideValue; Mismatch = mismatch }
-            if invalidDetail.IsSome || failure.IsSome then return reservePendingPreview None
-            else return reservePendingPreview (Some preview)
+            if invalidDetail.IsSome || failure.IsSome then return boundPendingPreview None
+            else return boundPendingPreview (Some preview)
     }
 
     let pagePreviewCandidates () =
@@ -2217,7 +2205,6 @@ type TextDiffSession internal (
                 let pending = if partBytes + previewBytes + 512 <= config.PageMaxBytes then preview else None
                 return EngineResult.Ok(Resumable.Ready { page with Pending = pending })
         | EngineResult.Ok(Resumable.Ready page) ->
-            reservePendingPreview None |> ignore
             releasePendingPreviewCursor 0
             releasePendingPreviewCursor 1
             return EngineResult.Ok(Resumable.Ready { page with Pending = None })
@@ -3252,14 +3239,6 @@ type TextDiffSession internal (
 
     let specAt sideIndex = if sideIndex = 0 then previousSpec else currentSpec
     let encodingAt sideIndex = if sideIndex = 0 then previousEncoding else currentEncoding
-    let mutable seekBatchAllocations = 0
-    let mutable largestSeekBatchCapacity = 0
-
-    let allocateSeekBatch capacity =
-        seekBatchAllocations <- seekBatchAllocations + 1
-        largestSeekBatchCapacity <- max largestSeekBatchCapacity capacity
-        LineBatch capacity
-
     let scanSideAt sideIndex = if sideIndex = 0 then previousSide else currentSide
 
     let beginSeek (sideIndex: int) (byLine: bool) (target: float) (startLine: float) (endLine: float) = async {
@@ -3270,10 +3249,10 @@ type TextDiffSession internal (
             let state, firstLine =
                 match hit with
                 | Some found -> found.State, found.Line
-                | None -> Scanner.create (encodingAt sideIndex) (int64 spec.BomLength) None, 0.0
+                | None -> Scanner.create (encodingAt sideIndex) (int64 spec.BomLength), 0.0
             let remaining = if byLine then endLine - firstLine + 1.0 else 1.0
             let batchCapacity = max 1 (int (max 1.0 (min 4_096.0 remaining)))
-            let batch = allocateSeekBatch batchCapacity
+            let batch = LineBatch batchCapacity
             return Some {
                 SideIndex = sideIndex
                 ByLine = byLine
@@ -3294,11 +3273,11 @@ type TextDiffSession internal (
 
     let releaseSeekBuffers (cursor: SeekCursor) =
         cursor.Buffer <- Array.empty
-        cursor.Batch <- allocateSeekBatch 1
+        cursor.Batch <- LineBatch 1
 
     let restoreSeekBuffers (cursor: SeekCursor) =
         if cursor.Buffer.Length = 0 then cursor.Buffer <- Array.zeroCreate<byte> 65_536
-        if cursor.Batch.Capacity <> cursor.BatchCapacity then cursor.Batch <- allocateSeekBatch cursor.BatchCapacity
+        if cursor.Batch.Capacity <> cursor.BatchCapacity then cursor.Batch <- LineBatch cursor.BatchCapacity
 
     let advanceSeek (cursor: SeekCursor) (meter: Meter) (cancel: unit -> bool) = async {
         let spec = specAt cursor.SideIndex
@@ -3373,39 +3352,6 @@ type TextDiffSession internal (
                     do! host.Yield()
                     Meter.beginNextQuantum meter
             if cursor.Complete && cursor.FoundLines.Count = 0 && cursor.EndLine < cursor.LineNumber then ()
-    }
-
-    /// Finds the line that a line number or a byte offset names. The scan resumes from the nearest checkpoint at
-    /// or before the target and checks any newly consumed content.
-    let seekScan (sideIndex: int) (byLine: bool) (target: float) : Async<ScannedLine option> = async {
-        let spec = specAt sideIndex
-        if spec.Source.IsNone then return None
-        else
-            let! started = beginSeek sideIndex byLine target target target
-            match started with
-            | None -> return None
-            | Some cursor ->
-                let meter = Meter.create host.Clock { config.Limits with MaxUnits = Int32.MaxValue; RequestMs = 1e15; QuantumMs = 1e15 }
-                let mutable waiting = false
-                while not cursor.Complete && not waiting && invalidDetail.IsNone && failure.IsNone do
-                    do! advanceSeek cursor meter (fun () -> false)
-                    waiting <- cursor.Waiting
-                if checkpoints.HasPending then do! checkpoints.Flush()
-                return if cursor.FoundLines.Count > 0 then Some cursor.FoundLines[0] else None
-    }
-
-    let seek (side: DiffSide) (byLine: bool) (target: float) : Async<EngineResult<ScannedLine option>> = async {
-        if closed || closing then return failClosed ()
-        elif target < 0.0 then return EngineResult.Ok None
-        else
-            try
-                let! result = seekScan (if side = DiffSide.Previous then 0 else 1) byLine target
-                if invalidDetail.IsSome then return failContent ()
-                elif failure.IsSome then
-                    let code, message = failure.Value
-                    return EngineResult.Failed(code, message, None)
-                else return EngineResult.Ok result
-            with error -> return failWorker error.Message
     }
 
     let expansionBinding gapId fromStart count =
@@ -4626,22 +4572,8 @@ type TextDiffSession internal (
                 finally busy <- false
     }
 
-    member _.PendingPreview() =
-        match failure with
-        | Some(code, message) -> EngineResult.Failed(code, message, None)
-        | None -> EngineResult.Ok lastPendingPreview
-
-    member internal _.SeekBatchAllocationCount = seekBatchAllocations
-    member internal _.LargestSeekBatchCapacity = largestSeekBatchCapacity
-
     /// Writes the suspended step to the spill store and releases its scratch memory. The next request restores it.
     member _.Spill() = spillSession ()
-
-    /// Returns the line with the given zero-based number, or None past the end of the source.
-    member _.SeekLine(side: DiffSide, line: int64) = seek side true (float line)
-
-    /// Returns the line that contains the given byte offset, or None past the end of the source.
-    member _.SeekOffset(side: DiffSide, offset: int64) = seek side false (float offset)
 
     /// Registers the session with the coordinator of its worker.
     member internal this.Attach(coordinator: WorkerScratch) =
@@ -4673,7 +4605,6 @@ type TextDiffSession internal (
                 pendingLineReads.Clear()
                 releasePendingLongPair ()
                 releaseBuffers ()
-                reservePendingPreview None |> ignore
                 releasePendingPreviewCursor 0
                 releasePendingPreviewCursor 1
                 do! pairings.Dispose()

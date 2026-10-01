@@ -71,14 +71,13 @@ type internal ScanSide(
     recordLineCount: int64 -> unit
 ) =
     let table = LineTable(category, ledger, hashMask)
-    let mutable scanner = Scanner.create encoding (int64 spec.BomLength) None
+    let mutable scanner = Scanner.create encoding (int64 spec.BomLength)
     let mutable finished = spec.Source.IsNone
     let mutable coverage = float spec.BomLength
     let mutable windowStart = float spec.BomLength
     let mutable windowLineLimit = Int32.MaxValue
     let mutable windowByteLimit = Int32.MaxValue
     let mutable windowAccountedBytes = 0.0
-    let mutable recordPeaks = true
     let mutable observer: ScannerState -> float -> unit = fun _ _ -> ()
     let mutable lineObserver: float -> float -> float = fun _ _ -> checkpointIntervalBytes
     let mutable hasLineObserver = false
@@ -121,7 +120,7 @@ type internal ScanSide(
     /// Restarts scanning at a line start.
     member _.SetCursor(offset: float, firstLine: int64, maxLines: int, maxBytes: int) =
         table.ReleaseWindow()
-        scanner <- Scanner.create encoding (int64 offset) None
+        scanner <- Scanner.create encoding (int64 offset)
         finished <- spec.Source.IsNone
         windowLineLimit <- max 1 maxLines
         windowByteLimit <- max 1 maxBytes
@@ -201,7 +200,6 @@ type internal ScanSide(
             let offset = table.Finish last
             if offset >= lineCheckpointDue then
                 lineCheckpointDue <- lineObserver offset (float table.LineBase + float table.Count)
-        if recordPeaks then ledger.RecordWindowLines(category, table.Count)
         observer scanner (float table.LineBase + float table.Count)
         coverage <- max coverage (float scanner.StartOffset + scanner.ValidatedBytes)
         evidenceTally.AdvanceThrough(float scanner.StartOffset + scanner.ValidatedBytes)
@@ -219,9 +217,6 @@ type internal ScanSide(
         evidenceTally.AdvanceThrough value
         if value >= float spec.ByteLength && (spec.Source |> Option.forall (fun source -> source.IsComplete())) then
             evidenceTally.Finish()
-
-    /// False for helper sides whose window sizes do not count toward the session peaks.
-    member _.RecordPeaks with get () = recordPeaks and set value = recordPeaks <- value
 
     /// Called after every consumed chunk with the scanner and the number of lines that ended before its position.
     member _.Observer with get () = observer and set value = observer <- value

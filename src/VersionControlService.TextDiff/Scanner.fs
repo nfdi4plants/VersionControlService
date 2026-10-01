@@ -16,7 +16,6 @@ type ScannedLine = {
     KeyLo: uint32
     KeyHi: uint32
     Utf16Length: int64
-    Text: string option
 }
 
 type ScannerStatus =
@@ -75,7 +74,6 @@ type LineBatch(capacity: int) =
     let keysHi = Array.zeroCreate<int> capacity
     let utf16Lengths = Array.zeroCreate<float> capacity
     let endings = Array.zeroCreate<byte> capacity
-    let texts = Array.zeroCreate<string> capacity
     let mutable count = 0
     let mutable pushed = 0.0
     let mutable stopAtFull = false
@@ -103,10 +101,7 @@ type LineBatch(capacity: int) =
     member _.Utf16Lengths = utf16Lengths
     member _.Endings = endings
 
-    /// Retained line text, or null when the scanner keeps no text.
-    member _.Texts = texts
-
-    member _.Push(startOffset: float, endOffset: float, ending: int, keyLo: int, keyHi: int, utf16Length: float, text: string) =
+    member _.Push(startOffset: float, endOffset: float, ending: int, keyLo: int, keyHi: int, utf16Length: float) =
         if count = capacity then invalidOp "The line batch is full."
         Native.writeFloat startOffsets count startOffset
         Native.writeFloat endOffsets count endOffset
@@ -114,7 +109,6 @@ type LineBatch(capacity: int) =
         Native.writeInt keysHi count keyHi
         Native.writeFloat utf16Lengths count utf16Length
         Native.writeByte endings count ending
-        texts[count] <- text
         count <- count + 1
         pushed <- pushed + 1.0
 
@@ -128,7 +122,6 @@ type LineBatch(capacity: int) =
             KeyLo = uint32 (Native.readInt keysLo index)
             KeyHi = uint32 (Native.readInt keysHi index)
             Utf16Length = int64 (Native.readFloat utf16Lengths index)
-            Text = Option.ofObj texts[index]
         }
 
 /// Resumable scanner state. Absolute offsets are floats so that the loops avoid 64-bit integer
@@ -150,10 +143,6 @@ type ScannerState = {
     mutable LineHasText: bool
     mutable KeyLo: int
     mutable KeyHi: int
-    RetainLimit: int option
-    Retained: uint16[]
-    mutable RetainedCount: int
-    mutable RetainStopped: bool
     mutable PendingCR: bool
     mutable PendingCREnd: float
     mutable CurrentWindow: ObservationWindow
@@ -195,18 +184,11 @@ module Scanner =
         FirstControl = -1
     }
 
-    let create encoding startOffset retainLimit =
+    let create encoding startOffset =
         if startOffset < 0L then invalidArg (nameof startOffset) "The starting byte offset cannot be negative."
-        match retainLimit with
-        | Some value when value < 0 -> invalidArg (nameof retainLimit) "The retained text limit cannot be negative."
-        | _ -> ()
 
         let start = float startOffset
         let windowStart = windowStartOf start
-        let retained =
-            match retainLimit with
-            | Some value -> Array.zeroCreate<uint16> value
-            | None -> Array.zeroCreate<uint16> 0
 
         {
             Encoding = encoding
@@ -225,10 +207,6 @@ module Scanner =
             LineHasText = false
             KeyLo = Hash.OffsetLo
             KeyHi = Hash.OffsetHi
-            RetainLimit = retainLimit
-            Retained = retained
-            RetainedCount = 0
-            RetainStopped = false
             PendingCR = false
             PendingCREnd = 0.0
             CurrentWindow = newWindow windowStart (int (start - windowStart))
@@ -246,7 +224,6 @@ module Scanner =
 
     let copyState (state: ScannerState) = {
         state with
-            Retained = Array.copy state.Retained
             CurrentWindow = copyWindow state.CurrentWindow
             PreviousWindow = state.PreviousWindow |> Option.map copyWindow
     }
@@ -285,29 +262,18 @@ module Scanner =
                 if state.CurrentWindow.Bytes >= SmallFinalWindowBytes then
                     settlePrevious state emitEvidence
 
-    let inline private retainLimitOf (state: ScannerState) =
-        match state.RetainLimit with
-        | Some value -> value
-        | None -> -1
-
     let private resetLine (state: ScannerState) (start: float) =
         state.LineStart <- start
         state.LineLengthUtf16 <- 0.0
         state.LineHasText <- false
         state.KeyLo <- Hash.OffsetLo
         state.KeyHi <- Hash.OffsetHi
-        state.RetainedCount <- 0
-        state.RetainStopped <- false
 
     let private emitLine (state: ScannerState) (batch: LineBatch) (onLines: LineBatch -> unit) (endOffset: float) (ending: int) =
         if batch.Count = batch.Capacity then
             onLines batch
             batch.Count <- 0
-        let text =
-            match state.RetainLimit with
-            | Some _ -> Native.utf16Decode state.Retained state.RetainedCount
-            | None -> null
-        batch.Push(state.LineStart, endOffset, ending, state.KeyLo, state.KeyHi, state.LineLengthUtf16, text)
+        batch.Push(state.LineStart, endOffset, ending, state.KeyLo, state.KeyHi, state.LineLengthUtf16)
         if batch.StopAtFull && batch.Count = batch.Capacity then
             onLines batch
             batch.Count <- 0
@@ -318,38 +284,6 @@ module Scanner =
         if state.PendingCR then
             state.PendingCR <- false
             emitLine state batch onLines state.PendingCREnd LineEndingCode.CR
-
-    /// Keeps whole scalars only. Once a scalar does not fit, the rest of the line is dropped as well.
-    let inline private retainUnits (state: ScannerState) (limit: int) (units: int) (first: int) (second: int) =
-        if not state.RetainStopped then
-            if state.RetainedCount + units <= limit then
-                Native.writeUnit state.Retained state.RetainedCount first
-                if units = 2 then Native.writeUnit state.Retained (state.RetainedCount + 1) second
-                state.RetainedCount <- state.RetainedCount + units
-            else
-                state.RetainStopped <- true
-
-    let inline private retainScalar (state: ScannerState) (limit: int) (scalar: int) =
-        if scalar <= 0xFFFF then
-            retainUnits state limit 1 scalar 0
-        else
-            let value = scalar - 0x10000
-            retainUnits state limit 2 (0xD800 + (value >>> 10)) (0xDC00 + (value &&& 0x3FF))
-
-    /// Retains `count` ASCII characters read from data[first], data[first + step], ...
-    let private retainAscii (state: ScannerState) (limit: int) (data: byte[]) (first: int) (count: int) (step: int) =
-        if not state.RetainStopped then
-            let room = limit - state.RetainedCount
-            let taken = if count < room then count else room
-            let retained = state.Retained
-            let mutable target = state.RetainedCount
-            let mutable source = first
-            for _ in 1..taken do
-                Native.writeUnit retained target (Native.readByte data source)
-                target <- target + 1
-                source <- source + step
-            state.RetainedCount <- target
-            if taken < count then state.RetainStopped <- true
 
     let private hashByteInto (state: ScannerState) (value: int) =
         let mixed = state.KeyLo ^^^ value
@@ -363,7 +297,6 @@ module Scanner =
         (batch: LineBatch)
         (onLines: LineBatch -> unit)
         (emitEvidence: ScannerEvidence -> unit)
-        (limit: int)
         (scalar: int)
         (start: float)
         (finish: float)
@@ -404,7 +337,6 @@ module Scanner =
                 state.LineHasText <- true
                 Hash.forEachUtf8Byte scalar (fun value -> hashByteInto state value)
                 state.LineLengthUtf16 <- state.LineLengthUtf16 + (if scalar > 0xFFFF then 2.0 else 1.0)
-                if limit >= 0 then retainScalar state limit scalar
 
     let private finishSegment (state: ScannerState) (origin: float) (index: int) (error: DecodeError option) =
         let nextOffset = origin + float index
@@ -428,7 +360,6 @@ module Scanner =
     let private scanUtf8 (state: ScannerState) (batch: LineBatch) onLines emitEvidence (data: byte[]) (offset: int) (count: int) =
         let origin = state.NextOffset - float offset
         let stop = offset + count
-        let limit = retainLimitOf state
         let mutable lo = state.KeyLo
         let mutable hi = state.KeyHi
         let mutable scalars = 0
@@ -459,7 +390,7 @@ module Scanner =
                         expectedCount <- 0
                         state.KeyLo <- lo
                         state.KeyHi <- hi
-                        acceptScalar state batch onLines emitEvidence limit nextValue state.PendingStart (origin + float index)
+                        acceptScalar state batch onLines emitEvidence nextValue state.PendingStart (origin + float index)
                         lo <- state.KeyLo
                         hi <- state.KeyHi
             elif value >= 0x20 && value < 0x7F then
@@ -481,11 +412,10 @@ module Scanner =
                 scalars <- scalars + length
                 state.LineHasText <- true
                 state.LineLengthUtf16 <- state.LineLengthUtf16 + float length
-                if limit >= 0 then retainAscii state limit data runStart length 1
             elif value < 0x80 then
                 state.KeyLo <- lo
                 state.KeyHi <- hi
-                acceptScalar state batch onLines emitEvidence limit value (origin + float index) (origin + float (index + 1))
+                acceptScalar state batch onLines emitEvidence value (origin + float index) (origin + float (index + 1))
                 lo <- state.KeyLo
                 hi <- state.KeyHi
                 index <- index + 1
@@ -518,7 +448,6 @@ module Scanner =
                         scalars <- scalars + 1
                         state.LineHasText <- true
                         state.LineLengthUtf16 <- state.LineLengthUtf16 + (if scalar > 0xFFFF then 2.0 else 1.0)
-                        if limit >= 0 then retainScalar state limit scalar
                     else
                         // The sequence is cut by the segment end or is invalid. The continuation branch
                         // takes it byte by byte, which reports errors exactly as for a split sequence.
@@ -540,7 +469,6 @@ module Scanner =
     let private scanWindows1252 (state: ScannerState) (batch: LineBatch) onLines emitEvidence (data: byte[]) (offset: int) (count: int) =
         let origin = state.NextOffset - float offset
         let stop = offset + count
-        let limit = retainLimitOf state
         let mutable lo = state.KeyLo
         let mutable hi = state.KeyHi
         let mutable scalars = 0
@@ -568,7 +496,6 @@ module Scanner =
                 scalars <- scalars + length
                 state.LineHasText <- true
                 state.LineLengthUtf16 <- state.LineLengthUtf16 + float length
-                if limit >= 0 then retainAscii state limit data runStart length 1
             else
                 let scalar = Decoders.windows1252Scalar value
                 if scalar < 0 then
@@ -576,7 +503,7 @@ module Scanner =
                 else
                     state.KeyLo <- lo
                     state.KeyHi <- hi
-                    acceptScalar state batch onLines emitEvidence limit scalar (origin + float index) (origin + float (index + 1))
+                    acceptScalar state batch onLines emitEvidence scalar (origin + float index) (origin + float (index + 1))
                     lo <- state.KeyLo
                     hi <- state.KeyHi
                     index <- index + 1
@@ -595,7 +522,6 @@ module Scanner =
         let lowByte = if littleEndian then 0 else 1
         let origin = state.NextOffset - float offset
         let stop = offset + count
-        let limit = retainLimitOf state
         let mutable lo = state.KeyLo
         let mutable hi = state.KeyHi
         let mutable scalars = 0
@@ -637,11 +563,10 @@ module Scanner =
                 scalars <- scalars + length
                 state.LineHasText <- true
                 state.LineLengthUtf16 <- state.LineLengthUtf16 + float length
-                if limit >= 0 then retainAscii state limit data (runStart + lowByte) length 2
             elif codeUnit >= 0 && codeUnit < 0x80 then
                 state.KeyLo <- lo
                 state.KeyHi <- hi
-                acceptScalar state batch onLines emitEvidence limit codeUnit (origin + float index) (origin + float (index + 2))
+                acceptScalar state batch onLines emitEvidence codeUnit (origin + float index) (origin + float (index + 2))
                 lo <- state.KeyLo
                 hi <- state.KeyHi
                 index <- index + 2
@@ -673,7 +598,6 @@ module Scanner =
                 scalars <- scalars + 1
                 state.LineHasText <- true
                 state.LineLengthUtf16 <- state.LineLengthUtf16 + 1.0
-                if limit >= 0 then retainUnits state limit 1 codeUnit 0
                 index <- index + 2
             else
                 // Byte by byte for units split by a boundary and for surrogates.
@@ -699,7 +623,7 @@ module Scanner =
                             pendingHigh <- 0
                             state.KeyLo <- lo
                             state.KeyHi <- hi
-                            acceptScalar state batch onLines emitEvidence limit scalar state.PendingHighStart unitEnd
+                            acceptScalar state batch onLines emitEvidence scalar state.PendingHighStart unitEnd
                             lo <- state.KeyLo
                             hi <- state.KeyHi
                         else
@@ -713,7 +637,7 @@ module Scanner =
                     else
                         state.KeyLo <- lo
                         state.KeyHi <- hi
-                        acceptScalar state batch onLines emitEvidence limit partial unitStart unitEnd
+                        acceptScalar state batch onLines emitEvidence partial unitStart unitEnd
                         lo <- state.KeyLo
                         hi <- state.KeyHi
 
@@ -734,7 +658,6 @@ module Scanner =
             | _ -> false
         let origin = state.NextOffset - float offset
         let stop = offset + count
-        let limit = retainLimitOf state
         let mutable lo = state.KeyLo
         let mutable hi = state.KeyHi
         let mutable scalars = 0
@@ -771,11 +694,10 @@ module Scanner =
                         scalars <- scalars + 1
                         state.LineHasText <- true
                         state.LineLengthUtf16 <- state.LineLengthUtf16 + 1.0
-                        if limit >= 0 then retainUnits state limit 1 scalar 0
                     else
                         state.KeyLo <- lo
                         state.KeyHi <- hi
-                        acceptScalar state batch onLines emitEvidence limit scalar unitStart (origin + float index)
+                        acceptScalar state batch onLines emitEvidence scalar unitStart (origin + float index)
                         lo <- state.KeyLo
                         hi <- state.KeyHi
             else
@@ -805,7 +727,7 @@ module Scanner =
                             else (second <<< 16) ||| (third <<< 8) ||| value
                         state.KeyLo <- lo
                         state.KeyHi <- hi
-                        acceptScalar state batch onLines emitEvidence limit scalar state.PendingStart (origin + float index)
+                        acceptScalar state batch onLines emitEvidence scalar state.PendingStart (origin + float index)
                         lo <- state.KeyLo
                         hi <- state.KeyHi
 
