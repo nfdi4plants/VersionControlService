@@ -377,6 +377,62 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "refuses a blob spool whose session is released while the worker directory is created",
+            TestOptions(timeout = 180000),
+            fun () -> promise {
+                let! root = createTempDirectory ()
+                let repo = NodePath.join [| root; "repo" |]
+                let events = ResizeArray<TextDiffSupervisor.SupervisorEvent>()
+                let mutable supervisor: TextDiffSupervisor.TextDiffSupervisor option = None
+
+                try
+                    do! initializeRepository repo
+                    NodeFileSystem.writeFileSync (NodePath.join [| repo; "small.txt" |]) "small blob\n" NodeFileSystem.Utf8
+                    do! runGitOk repo [| "add"; "--"; "small.txt" |]
+                    do! runGitOk repo [| "commit"; "-q"; "-m"; "small blob" |]
+                    let! oidText = runGit repo [| "rev-parse"; "HEAD:small.txt" |]
+                    let oid = oidText.Trim()
+                    let! created = createSupervisor root (Some events)
+                    supervisor <- Some created
+                    let owner: TextDiffSupervisor.ChildOwner = { WorkerId = "worker-race"; SessionId = "session-race"; RequestId = "request-race" }
+                    let spoolPath = NodePath.join [| created.InstanceDirectory; owner.WorkerId; "blob.spool" |]
+                    let start = created.StartBlobToSpool(owner, repo, oid, spoolPath)
+                    let release = created.ReleaseSession(owner.WorkerId, owner.SessionId)
+                    let mutable refused = false
+
+                    try
+                        let! _ = start
+                        ()
+                    with _ ->
+                        refused <- true
+
+                    do! release
+                    Vitest.expect(refused).toBe true
+
+                    let childSpawned =
+                        events
+                        |> Seq.exists (fun event ->
+                            match event.Kind with
+                            | TextDiffSupervisor.ChildSpawned _ -> true
+                            | _ -> false)
+
+                    Vitest.expect(childSpawned).toBe false
+                    Vitest.expect(pathExists spoolPath).toBe false
+                    do! created.Dispose ()
+                    supervisor <- None
+                with error ->
+                    match supervisor with
+                    | Some created -> do! created.Dispose ()
+                    | None -> ()
+
+                    do! removeDirectory root
+                    return raise error
+
+                do! removeDirectory root
+            }
+        )
+
+        Vitest.test (
             "keeps a missing promisor object lookup local",
             TestOptions(timeout = 120000),
             fun () -> promise {

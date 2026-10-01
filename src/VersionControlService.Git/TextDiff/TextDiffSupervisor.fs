@@ -222,16 +222,23 @@ let private tryGetInstanceOwnerPid (name: string) =
 
 let private isOwnerWithin (scope: ChildOwner -> bool) (owner: ChildOwner) = scope owner
 
+/// The sessions and requests released on one worker. Releasing the whole worker removes this entry.
+type internal ReleasedWorker = {
+    Sessions: HashSet<string>
+    Requests: HashSet<ChildOwner>
+}
+
+let private releasedOwnerMessage = "The worker request is being released and cannot start another Git child."
+
 type TextDiffSupervisor internal (instanceDirectory: string, gitExecutable: string, options: TextDiffSupervisorOptions) =
     let children = Dictionary<int, ChildOwner * JS.Promise<NodeProcess.ChildExit>>()
     let spoolOwners = Dictionary<string, ChildOwner>()
     let workerDirectories = HashSet<string>()
-    let activeOperations = Dictionary<int, ChildOwner * JS.Promise<unit>>()
-    let blockedRequests = HashSet<ChildOwner>()
-    let blockedSessions = HashSet<string * string>()
-    let blockedWorkers = HashSet<string>()
+    let released = Dictionary<string, ReleasedWorker>()
+    // Worker ids stay here after their release, so a start that resumes after ReleaseWorker is still refused.
+    // A pool adds one id per worker start.
+    let releasedWorkers = HashSet<string>()
     let mutable disposed = false
-    let mutable nextOperationId = 0
 
     let emit kind =
         options.OnEvent
@@ -253,29 +260,21 @@ type TextDiffSupervisor internal (instanceDirectory: string, gitExecutable: stri
         validateWorkerId workerId
         NodePath.join [| instanceDirectory; workerId |]
 
-    let requestBlocked (owner: ChildOwner) =
+    let releasedEntry workerId =
+        match released.TryGetValue workerId with
+        | true, entry -> entry
+        | _ ->
+            let entry = { Sessions = HashSet<string>(); Requests = HashSet<ChildOwner>() }
+            released[workerId] <- entry
+            entry
+
+    /// True when the owner's request, session or worker was released, or the supervisor was disposed.
+    let ownerReleased (owner: ChildOwner) : bool =
         disposed
-        || blockedRequests.Contains owner
-        || blockedSessions.Contains(owner.WorkerId, owner.SessionId)
-        || blockedWorkers.Contains owner.WorkerId
-
-    let ensureOwnerMaySpawn owner =
-        validateWorkerId owner.WorkerId
-
-        if requestBlocked owner then
-            invalidOp "The worker request is being released and cannot start another Git child."
-
-    let trackOperation (owner: ChildOwner) (operation: JS.Promise<'T>) : JS.Promise<'T> =
-        let operationId = nextOperationId
-        nextOperationId <- nextOperationId + 1
-
-        let completion =
-            JS.Constructors.Promise.Create(fun resolve _ ->
-                NodeInterop.observePromise operation (fun _ -> resolve ()) (fun _ -> resolve ()))
-
-        activeOperations[operationId] <- owner, completion
-        NodeInterop.observePromise completion (fun () -> activeOperations.Remove operationId |> ignore) ignore
-        operation
+        || releasedWorkers.Contains owner.WorkerId
+        || (match released.TryGetValue owner.WorkerId with
+            | true, entry -> entry.Sessions.Contains owner.SessionId || entry.Requests.Contains owner
+            | _ -> false)
 
     let registerChild (owner: ChildOwner) (pid: int) (closed: JS.Promise<NodeProcess.ChildExit>) =
         children[pid] <- owner, closed
@@ -304,19 +303,6 @@ type TextDiffSupervisor internal (instanceDirectory: string, gitExecutable: stri
             if isOwnerWithin scope owner then Some(entry.Key, closed) else None)
         |> Seq.toArray
 
-    let pendingOperationsWithin scope =
-        activeOperations
-        |> Seq.choose (fun entry ->
-            let owner, completion = entry.Value
-            if isOwnerWithin scope owner then Some completion else None)
-        |> Seq.toArray
-
-    let waitForOperations (operations: JS.Promise<unit>[]) = promise {
-        for operation in operations do
-            let! () = operation
-            ()
-    }
-
     let killChildrenThenWait (childrenToStop: (int * JS.Promise<NodeProcess.ChildExit>)[]) = promise {
         for pid, _ in childrenToStop do
             do! NodeProcess.killProcessTreeAsync pid
@@ -339,8 +325,6 @@ type TextDiffSupervisor internal (instanceDirectory: string, gitExecutable: stri
 
     let releaseScope mark scope deleteWorkerDirectory = promise {
         mark ()
-        let operationSnapshot = pendingOperationsWithin scope
-        do! waitForOperations operationSnapshot
         let childSnapshot = trackedChildrenWithin scope
         let spoolSnapshot = registeredSpoolsWithin scope
         do! killChildrenThenWait childSnapshot
@@ -361,33 +345,27 @@ type TextDiffSupervisor internal (instanceDirectory: string, gitExecutable: stri
     member _.WorkerDirectory(workerId: string) : JS.Promise<string> =
         let owner = { WorkerId = workerId; SessionId = ""; RequestId = "" }
 
-        let operation = promise {
-            ensureOwnerMaySpawn owner
+        promise {
             let directory = workerDirectoryPath workerId
             workerDirectories.Add directory |> ignore
             do! NodePositionalFile.mkdirRecursive directory
 
-            if blockedWorkers.Contains workerId || disposed then
+            if ownerReleased owner then
                 return raise (InvalidOperationException("The worker is being released and cannot create a directory."))
             else
                 return directory
         }
 
-        trackOperation owner operation
-
     member _.RunShort(owner: ChildOwner, cwd: string, arguments: string[]) : JS.Promise<ShortResult> =
-        // A release waits for the spawn step only. Once the child is registered the release kills it.
-        let mutable markSpawned: unit -> unit = ignore
-        let spawning = JS.Constructors.Promise.Create(fun resolve _ -> markSpawned <- fun () -> resolve ())
-
-        let operation = promise {
-            ensureOwnerMaySpawn owner
-
+        promise {
             let validCommand = isAllowedShortCommand arguments
 
             if not validCommand then
                 return raise (InvalidOperationException("The Git command is not allowed for a text diff request."))
             else
+                if ownerReleased owner then
+                    invalidOp releasedOwnerMessage
+
                 let gitArguments = Microsoft.FSharp.Collections.Array.concat [| [| "--literal-pathspecs"; "-c"; "protocol.allow=never" |]; arguments |]
                 let environment = GitExecution.resolvedEnvironment () |> localOnlyEnvironment
 
@@ -399,9 +377,7 @@ type TextDiffSupervisor internal (instanceDirectory: string, gitExecutable: stri
                         environment
                         65536
                         65536
-                        (fun pid closed ->
-                            registerChild owner pid closed
-                            markSpawned ())
+                        (fun pid closed -> registerChild owner pid closed)
 
                 return {
                     ExitCode = result.ExitCode
@@ -411,13 +387,8 @@ type TextDiffSupervisor internal (instanceDirectory: string, gitExecutable: stri
                 }
         }
 
-        NodeInterop.observePromise operation (fun _ -> markSpawned ()) (fun _ -> markSpawned ())
-        trackOperation owner spawning |> ignore
-        operation
-
     member this.StartBlobToSpool(owner: ChildOwner, cwd: string, oid: string, spoolPath: string) : JS.Promise<SpoolChild> =
-        let operation = promise {
-            ensureOwnerMaySpawn owner
+        promise {
             if not (isObjectId oid) then
                 return raise (InvalidOperationException("A blob object id must contain 40 or 64 hexadecimal characters."))
             else
@@ -432,12 +403,16 @@ type TextDiffSupervisor internal (instanceDirectory: string, gitExecutable: stri
                    || relativePath.StartsWith("..\\", StringComparison.Ordinal) then
                     return raise (InvalidOperationException("The spool path must be inside the worker directory."))
                 else
-                    ensureOwnerMaySpawn owner
+                    if ownerReleased owner then
+                        invalidOp releasedOwnerMessage
+
                     let! descriptor = NodePositionalFile.openCreateExclusive targetPath
                     let mutable descriptorTransferred = false
 
                     try
-                        ensureOwnerMaySpawn owner
+                        if ownerReleased owner then
+                            invalidOp releasedOwnerMessage
+
                         spoolOwners[targetPath] <- owner
                         let arguments = [| "--literal-pathspecs"; "-c"; "protocol.allow=never"; "cat-file"; "blob"; oid |]
                         let environment = GitExecution.resolvedEnvironment () |> localOnlyEnvironment
@@ -467,31 +442,26 @@ type TextDiffSupervisor internal (instanceDirectory: string, gitExecutable: stri
                         return raise error
         }
 
-        trackOperation owner operation
-
     member _.ReleaseRequest(owner: ChildOwner) : JS.Promise<unit> =
         releaseScope
-            (fun () -> blockedRequests.Add owner |> ignore)
+            (fun () -> (releasedEntry owner.WorkerId).Requests.Add owner |> ignore)
             (fun candidate -> candidate = owner)
             None
 
     member _.ReleaseSession(workerId: string, sessionId: string) : JS.Promise<unit> =
         releaseScope
-            (fun () -> blockedSessions.Add(workerId, sessionId) |> ignore)
+            (fun () -> (releasedEntry workerId).Sessions.Add sessionId |> ignore)
             (fun candidate -> candidate.WorkerId = workerId && candidate.SessionId = sessionId)
             None
 
     member _.ReleaseWorker(workerId: string) : JS.Promise<unit> = promise {
-        validateWorkerId workerId
-        blockedWorkers.Add workerId |> ignore
         let directory = workerDirectoryPath workerId
-        do! releaseScope ignore (fun candidate -> candidate.WorkerId = workerId) (Some directory)
+        do! releaseScope (fun () -> releasedWorkers.Add workerId |> ignore) (fun candidate -> candidate.WorkerId = workerId) (Some directory)
+        released.Remove workerId |> ignore
     }
 
     member _.Dispose() : JS.Promise<unit> = promise {
         disposed <- true
-        let operationSnapshot = pendingOperationsWithin (fun _ -> true)
-        do! waitForOperations operationSnapshot
         let childSnapshot = trackedChildrenWithin (fun _ -> true)
         let spoolSnapshot = registeredSpoolsWithin (fun _ -> true)
         do! killChildrenThenWait childSnapshot
