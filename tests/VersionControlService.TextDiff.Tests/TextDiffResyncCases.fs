@@ -252,7 +252,7 @@ module TextDiffResyncCases =
         let meter = Meter.create (ManualClock 0.0 :> IClock) { Limits.defaults with MaxUnits = Int32.MaxValue; RequestMs = 1e15; QuantumMs = 1e15 }
         let onLines (lines: LineBatch) =
             for index = 0 to lines.Count - 1 do found.Add(lines.Line index)
-        Scanner.scanChunk state bytes 0 bytes.Length true meter batch onLines ignore |> ignore
+        Scanner.scanChunk state bytes 0 bytes.Length true meter batch onLines |> ignore
         found.ToArray()
 
     /// Reads one line to completion through the public line read, following its continuations.

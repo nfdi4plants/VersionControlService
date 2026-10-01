@@ -306,10 +306,10 @@ module TextDiffStreamingCases =
             let meter = Meter.create (clock :> IClock) Limits.defaults
             let state = Scanner.create TextEncoding.Utf8 0L
             let batch = LineBatch()
-            let first = Scanner.scanChunk state [| 0xE2uy |] 0 1 false meter batch ignore ignore
+            let first = Scanner.scanChunk state [| 0xE2uy |] 0 1 false meter batch ignore
             Check.equal InputConsumed first.Status "The incomplete scalar waits for its next byte."
             Check.equal 0.0 state.ValidatedBytes "An incomplete scalar does not advance validated progress."
-            let second = Scanner.scanChunk state [| 0x28uy |] 0 1 true meter batch ignore ignore
+            let second = Scanner.scanChunk state [| 0x28uy |] 0 1 true meter batch ignore
             Check.equal DecodeFailure second.Status "An invalid continuation stops the scan."
             match second.Error with
             | Some error -> Check.equal 0L error.Offset "The scanner reports the incomplete scalar start."
@@ -320,7 +320,7 @@ module TextDiffStreamingCases =
         "validated byte progress stops before a pending high surrogate and a partial unit", fun () -> async {
             let meter = Meter.create (ManualClock 0.0 :> IClock) Limits.defaults
             let state = Scanner.create TextEncoding.Utf16LE 0L
-            let result = Scanner.scanChunk state [| 0x00uy; 0xD8uy; 0x41uy |] 0 3 true meter (LineBatch()) ignore ignore
+            let result = Scanner.scanChunk state [| 0x00uy; 0xD8uy; 0x41uy |] 0 3 true meter (LineBatch()) ignore
             Check.equal DecodeFailure result.Status "A surrogate without a partner is a decoding failure."
             match result.Error with
             | Some error -> Check.equal 2L error.Offset "The failure is reported where the partial unit starts."
@@ -333,7 +333,7 @@ module TextDiffStreamingCases =
             let meter = Meter.create (clock :> IClock) { MaxUnits = Int32.MaxValue; RequestMs = 1_000_000.0; QuantumMs = 0.0 }
             let state = Scanner.create TextEncoding.Utf8 0L
             let input = Array.create 8_192 0x61uy
-            let result = Scanner.scanChunk state input 0 input.Length false meter (LineBatch()) ignore ignore
+            let result = Scanner.scanChunk state input 0 input.Length false meter (LineBatch()) ignore
             Check.equal 4_096 result.Consumed "The scanner makes one segment of progress."
             Check.equal QuantumReached result.Status "The scanner suspends after the first segment."
             return ()

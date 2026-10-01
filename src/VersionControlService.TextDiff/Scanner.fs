@@ -145,8 +145,6 @@ type ScannerState = {
     mutable KeyHi: int
     mutable PendingCR: bool
     mutable PendingCREnd: float
-    mutable CurrentWindow: ObservationWindow
-    mutable PreviousWindow: ObservationWindow option
     mutable IsComplete: bool
 }
 
@@ -156,9 +154,6 @@ module Scanner =
 
     [<Literal>]
     let SmallFinalWindowBytes = 4_096
-
-    [<Literal>]
-    let private WindowByteCount = 65_536
 
     [<Literal>]
     let private SegmentBytes = 4_096
@@ -188,7 +183,6 @@ module Scanner =
         if startOffset < 0L then invalidArg (nameof startOffset) "The starting byte offset cannot be negative."
 
         let start = float startOffset
-        let windowStart = windowStartOf start
 
         {
             Encoding = encoding
@@ -209,24 +203,10 @@ module Scanner =
             KeyHi = Hash.OffsetHi
             PendingCR = false
             PendingCREnd = 0.0
-            CurrentWindow = newWindow windowStart (int (start - windowStart))
-            PreviousWindow = None
             IsComplete = false
         }
 
-    let private copyWindow window = {
-        Start = window.Start
-        Bytes = window.Bytes
-        Scalars = window.Scalars
-        Controls = window.Controls
-        FirstControl = window.FirstControl
-    }
-
-    let copyState (state: ScannerState) = {
-        state with
-            CurrentWindow = copyWindow state.CurrentWindow
-            PreviousWindow = state.PreviousWindow |> Option.map copyWindow
-    }
+    let copyState (state: ScannerState) = { state with IsComplete = state.IsComplete }
 
     /// Emits control-ratio evidence when more than one percent of a finished window's scalars are controls.
     let finalizeWindow (window: ObservationWindow) emitEvidence =
@@ -237,30 +217,6 @@ module Scanner =
                     Kind = "control ratio"
                     WindowStart = int64 window.Start
                 }
-
-    let private settlePrevious (state: ScannerState) emitEvidence =
-        match state.PreviousWindow with
-        | Some previous ->
-            finalizeWindow previous emitEvidence
-            state.PreviousWindow <- None
-        | None -> ()
-
-    let private shiftWindow (state: ScannerState) emitEvidence =
-        settlePrevious state emitEvidence
-        let previous = state.CurrentWindow
-        state.PreviousWindow <- Some previous
-        state.CurrentWindow <- newWindow (previous.Start + 65_536.0) 0
-
-    let private advanceWindowsBy (state: ScannerState) count emitEvidence =
-        if count > 0 then
-            let byteCount = state.CurrentWindow.Bytes + count
-            if byteCount >= WindowByteCount then
-                state.CurrentWindow.Bytes <- WindowByteCount
-                shiftWindow state emitEvidence
-            else
-                state.CurrentWindow.Bytes <- byteCount
-                if state.CurrentWindow.Bytes >= SmallFinalWindowBytes then
-                    settlePrevious state emitEvidence
 
     let private resetLine (state: ScannerState) (start: float) =
         state.LineStart <- start
@@ -291,37 +247,14 @@ module Scanner =
         state.KeyLo <- Hash.mixLo mixed
 
     /// Handles one decoded scalar using the line state stored in `state`. The loops call it for line
-    /// endings, controls, NUL and the less common scalars, and handle printable text inline.
+    /// endings, other control characters and the less common scalars, and handle printable text inline.
     let private acceptScalar
         (state: ScannerState)
         (batch: LineBatch)
         (onLines: LineBatch -> unit)
-        (emitEvidence: ScannerEvidence -> unit)
         (scalar: int)
-        (start: float)
         (finish: float)
         =
-        // A scalar belongs to the window of its first byte, which is the previous window when a
-        // sequence started just before the boundary.
-        let window =
-            if start < state.CurrentWindow.Start then
-                match state.PreviousWindow with
-                | Some previous -> previous
-                | None -> state.CurrentWindow
-            else
-                state.CurrentWindow
-        window.Scalars <- window.Scalars + 1
-        if scalar < 0x80 then
-            if Native.readByte controlFlags scalar <> 0 then
-                window.Controls <- window.Controls + 1
-                if window.FirstControl < 0 then window.FirstControl <- int (start - window.Start)
-            elif scalar = 0 then
-                emitEvidence {
-                    Offset = int64 start
-                    Kind = "nul"
-                    WindowStart = int64 window.Start
-                }
-
         if scalar = 0x0A then
             if state.PendingCR then
                 state.PendingCR <- false
@@ -357,12 +290,11 @@ module Scanner =
     // Each encoding has its own loop. The line hash lives in the locals lo and hi and is written to the
     // state around every call that reads or resets it. `origin` is the absolute offset of data[0].
 
-    let private scanUtf8 (state: ScannerState) (batch: LineBatch) onLines emitEvidence (data: byte[]) (offset: int) (count: int) =
+    let private scanUtf8 (state: ScannerState) (batch: LineBatch) onLines (data: byte[]) (offset: int) (count: int) =
         let origin = state.NextOffset - float offset
         let stop = offset + count
         let mutable lo = state.KeyLo
         let mutable hi = state.KeyHi
-        let mutable scalars = 0
         let mutable pendingValue = state.PendingValue
         let mutable pendingCount = state.PendingCount
         let mutable expectedCount = state.ExpectedCount
@@ -390,7 +322,7 @@ module Scanner =
                         expectedCount <- 0
                         state.KeyLo <- lo
                         state.KeyHi <- hi
-                        acceptScalar state batch onLines emitEvidence nextValue state.PendingStart (origin + float index)
+                        acceptScalar state batch onLines nextValue (origin + float index)
                         lo <- state.KeyLo
                         hi <- state.KeyHi
             elif value >= 0x20 && value < 0x7F then
@@ -409,13 +341,12 @@ module Scanner =
                     index <- index + 1
                     current <- if index < stop then Native.readByte data index else 0
                 let length = index - runStart
-                scalars <- scalars + length
                 state.LineHasText <- true
                 state.LineLengthUtf16 <- state.LineLengthUtf16 + float length
             elif value < 0x80 then
                 state.KeyLo <- lo
                 state.KeyHi <- hi
-                acceptScalar state batch onLines emitEvidence value (origin + float index) (origin + float (index + 1))
+                acceptScalar state batch onLines value (origin + float (index + 1))
                 lo <- state.KeyLo
                 hi <- state.KeyHi
                 index <- index + 1
@@ -445,7 +376,6 @@ module Scanner =
                             hi <- Hash.mixHi hi mixed
                             lo <- Hash.mixLo mixed
                             index <- index + 1
-                        scalars <- scalars + 1
                         state.LineHasText <- true
                         state.LineLengthUtf16 <- state.LineLengthUtf16 + (if scalar > 0xFFFF then 2.0 else 1.0)
                     else
@@ -462,16 +392,14 @@ module Scanner =
         state.PendingValue <- pendingValue
         state.PendingCount <- pendingCount
         state.ExpectedCount <- expectedCount
-        state.CurrentWindow.Scalars <- state.CurrentWindow.Scalars + scalars
         finishSegment state origin index error
         index - offset, error
 
-    let private scanWindows1252 (state: ScannerState) (batch: LineBatch) onLines emitEvidence (data: byte[]) (offset: int) (count: int) =
+    let private scanWindows1252 (state: ScannerState) (batch: LineBatch) onLines (data: byte[]) (offset: int) (count: int) =
         let origin = state.NextOffset - float offset
         let stop = offset + count
         let mutable lo = state.KeyLo
         let mutable hi = state.KeyHi
-        let mutable scalars = 0
         let mutable index = offset
         let mutable error: DecodeError option = None
 
@@ -493,7 +421,6 @@ module Scanner =
                     index <- index + 1
                     current <- if index < stop then Native.readByte data index else 0
                 let length = index - runStart
-                scalars <- scalars + length
                 state.LineHasText <- true
                 state.LineLengthUtf16 <- state.LineLengthUtf16 + float length
             else
@@ -503,18 +430,17 @@ module Scanner =
                 else
                     state.KeyLo <- lo
                     state.KeyHi <- hi
-                    acceptScalar state batch onLines emitEvidence scalar (origin + float index) (origin + float (index + 1))
+                    acceptScalar state batch onLines scalar (origin + float (index + 1))
                     lo <- state.KeyLo
                     hi <- state.KeyHi
                     index <- index + 1
 
         state.KeyLo <- lo
         state.KeyHi <- hi
-        state.CurrentWindow.Scalars <- state.CurrentWindow.Scalars + scalars
         finishSegment state origin index error
         index - offset, error
 
-    let private scanUtf16 (state: ScannerState) (batch: LineBatch) onLines emitEvidence (data: byte[]) (offset: int) (count: int) =
+    let private scanUtf16 (state: ScannerState) (batch: LineBatch) onLines (data: byte[]) (offset: int) (count: int) =
         let littleEndian =
             match state.Encoding with
             | TextEncoding.Utf16LE -> true
@@ -524,7 +450,6 @@ module Scanner =
         let stop = offset + count
         let mutable lo = state.KeyLo
         let mutable hi = state.KeyHi
-        let mutable scalars = 0
         let mutable pendingValue = state.PendingValue
         let mutable pendingCount = state.PendingCount
         let mutable expectedCount = state.ExpectedCount
@@ -560,13 +485,12 @@ module Scanner =
                         elif littleEndian then Native.readByte data index ||| (Native.readByte data (index + 1) <<< 8)
                         else (Native.readByte data index <<< 8) ||| Native.readByte data (index + 1)
                 let length = (index - runStart) >>> 1
-                scalars <- scalars + length
                 state.LineHasText <- true
                 state.LineLengthUtf16 <- state.LineLengthUtf16 + float length
             elif codeUnit >= 0 && codeUnit < 0x80 then
                 state.KeyLo <- lo
                 state.KeyHi <- hi
-                acceptScalar state batch onLines emitEvidence codeUnit (origin + float index) (origin + float (index + 2))
+                acceptScalar state batch onLines codeUnit (origin + float (index + 2))
                 lo <- state.KeyLo
                 hi <- state.KeyHi
                 index <- index + 2
@@ -595,7 +519,6 @@ module Scanner =
                     let mixed = lo ^^^ (0x80 ||| (codeUnit &&& 0x3F))
                     hi <- Hash.mixHi hi mixed
                     lo <- Hash.mixLo mixed
-                scalars <- scalars + 1
                 state.LineHasText <- true
                 state.LineLengthUtf16 <- state.LineLengthUtf16 + 1.0
                 index <- index + 2
@@ -623,7 +546,7 @@ module Scanner =
                             pendingHigh <- 0
                             state.KeyLo <- lo
                             state.KeyHi <- hi
-                            acceptScalar state batch onLines emitEvidence scalar state.PendingHighStart unitEnd
+                            acceptScalar state batch onLines scalar unitEnd
                             lo <- state.KeyLo
                             hi <- state.KeyHi
                         else
@@ -637,7 +560,7 @@ module Scanner =
                     else
                         state.KeyLo <- lo
                         state.KeyHi <- hi
-                        acceptScalar state batch onLines emitEvidence partial unitStart unitEnd
+                        acceptScalar state batch onLines partial unitEnd
                         lo <- state.KeyLo
                         hi <- state.KeyHi
 
@@ -647,11 +570,10 @@ module Scanner =
         state.PendingCount <- pendingCount
         state.ExpectedCount <- expectedCount
         state.PendingHigh <- pendingHigh
-        state.CurrentWindow.Scalars <- state.CurrentWindow.Scalars + scalars
         finishSegment state origin index error
         index - offset, error
 
-    let private scanUtf32 (state: ScannerState) (batch: LineBatch) onLines emitEvidence (data: byte[]) (offset: int) (count: int) =
+    let private scanUtf32 (state: ScannerState) (batch: LineBatch) onLines (data: byte[]) (offset: int) (count: int) =
         let littleEndian =
             match state.Encoding with
             | TextEncoding.Utf32LE -> true
@@ -660,7 +582,6 @@ module Scanner =
         let stop = offset + count
         let mutable lo = state.KeyLo
         let mutable hi = state.KeyHi
-        let mutable scalars = 0
         let mutable pendingValue = state.PendingValue
         let mutable pendingCount = state.PendingCount
         let mutable expectedCount = state.ExpectedCount
@@ -691,13 +612,12 @@ module Scanner =
                         let mixed = lo ^^^ scalar
                         hi <- Hash.mixHi hi mixed
                         lo <- Hash.mixLo mixed
-                        scalars <- scalars + 1
                         state.LineHasText <- true
                         state.LineLengthUtf16 <- state.LineLengthUtf16 + 1.0
                     else
                         state.KeyLo <- lo
                         state.KeyHi <- hi
-                        acceptScalar state batch onLines emitEvidence scalar unitStart (origin + float index)
+                        acceptScalar state batch onLines scalar (origin + float index)
                         lo <- state.KeyLo
                         hi <- state.KeyHi
             else
@@ -727,7 +647,7 @@ module Scanner =
                             else (second <<< 16) ||| (third <<< 8) ||| value
                         state.KeyLo <- lo
                         state.KeyHi <- hi
-                        acceptScalar state batch onLines emitEvidence scalar state.PendingStart (origin + float index)
+                        acceptScalar state batch onLines scalar (origin + float index)
                         lo <- state.KeyLo
                         hi <- state.KeyHi
 
@@ -736,18 +656,17 @@ module Scanner =
         state.PendingValue <- pendingValue
         state.PendingCount <- pendingCount
         state.ExpectedCount <- expectedCount
-        state.CurrentWindow.Scalars <- state.CurrentWindow.Scalars + scalars
         finishSegment state origin index error
         index - offset, error
 
-    let private scanSegment (state: ScannerState) batch onLines emitEvidence (data: byte[]) (offset: int) (count: int) =
+    let private scanSegment (state: ScannerState) batch onLines (data: byte[]) (offset: int) (count: int) =
         match state.Encoding with
-        | TextEncoding.Utf8 -> scanUtf8 state batch onLines emitEvidence data offset count
+        | TextEncoding.Utf8 -> scanUtf8 state batch onLines data offset count
         | TextEncoding.Utf16LE
-        | TextEncoding.Utf16BE -> scanUtf16 state batch onLines emitEvidence data offset count
+        | TextEncoding.Utf16BE -> scanUtf16 state batch onLines data offset count
         | TextEncoding.Utf32LE
-        | TextEncoding.Utf32BE -> scanUtf32 state batch onLines emitEvidence data offset count
-        | TextEncoding.Windows1252 -> scanWindows1252 state batch onLines emitEvidence data offset count
+        | TextEncoding.Utf32BE -> scanUtf32 state batch onLines data offset count
+        | TextEncoding.Windows1252 -> scanWindows1252 state batch onLines data offset count
 
     let private decoderState (state: ScannerState) : DecoderState = {
         Encoding = state.Encoding
@@ -761,29 +680,6 @@ module Scanner =
         PendingHighEnd = int64 state.PendingHighEnd
     }
 
-    let private finishWindows (state: ScannerState) emitEvidence =
-        let current = state.CurrentWindow
-        match state.PreviousWindow with
-        | Some previous when current.Bytes > 0 && current.Bytes < SmallFinalWindowBytes ->
-            let firstControl =
-                if previous.FirstControl >= 0 then previous.FirstControl
-                elif current.FirstControl >= 0 then WindowByteCount + current.FirstControl
-                else -1
-            let merged = {
-                Start = previous.Start
-                Bytes = previous.Bytes + current.Bytes
-                Scalars = previous.Scalars + current.Scalars
-                Controls = previous.Controls + current.Controls
-                FirstControl = firstControl
-            }
-            finalizeWindow merged emitEvidence
-            state.PreviousWindow <- None
-        | Some previous ->
-            finalizeWindow previous emitEvidence
-            finalizeWindow current emitEvidence
-            state.PreviousWindow <- None
-        | None -> finalizeWindow current emitEvidence
-
     /// Scans bytes[offset .. offset + count - 1]. Lines go into `batch`. When the batch is full, and once
     /// more before returning, the scanner calls `onLines` and then clears the batch.
     let scanChunk
@@ -795,7 +691,6 @@ module Scanner =
         (meter: Meter)
         (batch: LineBatch)
         (onLines: LineBatch -> unit)
-        (emitEvidence: ScannerEvidence -> unit)
         =
         if isNull bytes then nullArg (nameof bytes)
         if isNull (box batch) then nullArg (nameof batch)
@@ -808,15 +703,13 @@ module Scanner =
         let mutable status = InputConsumed
         let mutable stopped = false
         while consumed < count && not stopped && error.IsNone do
-            let windowRemaining = WindowByteCount - state.CurrentWindow.Bytes
-            let segmentCount = min SegmentBytes (min (count - consumed) windowRemaining)
+            let segmentCount = min SegmentBytes (count - consumed)
             let linesBefore = batch.Pushed
-            let actual, segmentError = scanSegment state batch onLines emitEvidence bytes (offset + consumed) segmentCount
+            let actual, segmentError = scanSegment state batch onLines bytes (offset + consumed) segmentCount
             // One unit per line plus one per 4096 bytes, charged once per segment.
             Meter.charge meter (int (batch.Pushed - linesBefore))
             if actual > 0 then
                 Meter.chargeBytes meter actual
-                advanceWindowsBy state actual emitEvidence
                 consumed <- consumed + actual
             if batch.StopRequested then
                 batch.StopRequested <- false
@@ -850,7 +743,6 @@ module Scanner =
                 if state.LineHasText then
                     emitLine state batch onLines state.NextOffset LineEndingCode.NoEnding
                 Meter.charge meter (int (batch.Pushed - linesBefore))
-                finishWindows state emitEvidence
                 state.IsComplete <- true
                 status <- EndOfInput
         | None when consumed = count && not stopped -> status <- InputConsumed

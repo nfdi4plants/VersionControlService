@@ -39,7 +39,7 @@ module TextDiffEngineCasesTests =
         let batch = LineBatch()
         bestRate data.Length (fun () ->
             let state = Scanner.create encoding 0L
-            Scanner.scanChunk state data 0 data.Length true (createMeter ()) batch ignore ignore)
+            Scanner.scanChunk state data 0 data.Length true (createMeter ()) batch ignore)
 
     let private noObservation (_: float) (_: int) (_: int) (_: int) (_: float) (_: float) = ()
 

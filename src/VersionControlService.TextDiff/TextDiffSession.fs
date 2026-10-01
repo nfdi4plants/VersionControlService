@@ -3306,11 +3306,10 @@ type TextDiffSession internal (
                             lines.StopRequested <- true
                 let sideState = scanSideAt cursor.SideIndex
                 let validatedBefore = sideState.Coverage
-                let evidence (_: ScannerEvidence) = ()
 
                 if cursor.Position >= float spec.ByteLength then
                     if source.IsComplete() then
-                        let result = Scanner.scanChunk cursor.State cursor.Buffer 0 0 true meter cursor.Batch onLines evidence
+                        let result = Scanner.scanChunk cursor.State cursor.Buffer 0 0 true meter cursor.Batch onLines
                         cursor.Position <- cursor.State.NextOffset
                         if result.Status = DecodeFailure then cursor.Complete <- true
                         elif cursor.State.IsComplete && not cursor.Complete then cursor.Complete <- true
@@ -3324,7 +3323,7 @@ type TextDiffSession internal (
                     | ReadOutcome.Bytes actual when actual > 0 ->
                         cursor.Waiting <- false
                         let atEnd = cursor.Position + float actual >= float spec.ByteLength && source.IsComplete()
-                        let result = Scanner.scanChunk cursor.State cursor.Buffer 0 actual atEnd meter cursor.Batch onLines evidence
+                        let result = Scanner.scanChunk cursor.State cursor.Buffer 0 actual atEnd meter cursor.Batch onLines
                         cursor.Position <- cursor.State.NextOffset
                         sideState.SetCoverage(float cursor.State.StartOffset + cursor.State.ValidatedBytes)
                         checkpoints.Observe(cursor.SideIndex, cursor.State, cursor.LineNumber)

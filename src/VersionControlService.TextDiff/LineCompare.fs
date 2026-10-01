@@ -163,9 +163,6 @@ type internal ScanSide(
 
     member _.Consume(buffer: byte[], count: int, endOfSource: bool, meter: Meter) =
         let emitLineBatch batch = table.AppendBatch batch
-        let emitEvidence (evidence: ScannerEvidence) =
-            if evidence.Kind <> "control ratio" && evidence.Kind <> "nul" then
-                reportEvidence side evidence.Kind evidence.Offset None
         let bufferPosition = scanner.NextOffset
         let pendingValue = scanner.PendingValue
         let pendingCount = scanner.PendingCount
@@ -177,7 +174,7 @@ type internal ScanSide(
         let batch = LineBatch(max 1 (min 4_096 remainingLines))
         batch.StopAtFull <- true
         let previousCount = table.Count
-        let result = Scanner.scanChunk scanner buffer 0 count endOfSource meter batch emitLineBatch emitEvidence
+        let result = Scanner.scanChunk scanner buffer 0 count endOfSource meter batch emitLineBatch
         let validatedEnd = float scanner.StartOffset + scanner.ValidatedBytes
         CommonRun.observeScannerRange
             encoding

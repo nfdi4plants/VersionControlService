@@ -59,19 +59,18 @@ module TextDiffEngineCases =
     let private scan (encoding: TextEncoding) (chunks: byte[][]) =
         let state = Scanner.create encoding 0L
         let lines = ResizeArray<ScannedLine>()
-        let evidence = ResizeArray<ScannerEvidence>()
         let meter = createMeter ()
         let batch = LineBatch()
 
         for index = 0 to chunks.Length - 1 do
             let chunk = chunks[index]
-            let result = Scanner.scanChunk state chunk 0 chunk.Length (index = chunks.Length - 1) meter batch (collect lines) evidence.Add
+            let result = Scanner.scanChunk state chunk 0 chunk.Length (index = chunks.Length - 1) meter batch (collect lines)
             Check.equal chunk.Length result.Consumed "The scanner consumed each input chunk."
             match result.Error with
             | Some error -> failwith $"The scanner rejected byte {error.Offset}: {error.Reason}"
             | None -> ()
 
-        lines.ToArray(), evidence.ToArray(), state, meter
+        lines.ToArray(), state, meter
 
     let private chunksOfSize size (data: byte[]) =
         if size >= data.Length then [| data |]
@@ -184,7 +183,27 @@ module TextDiffEngineCases =
     let private commonRun (encoding: TextEncoding) (position: int64) (pendingCR: bool) (left: byte[]) (right: byte[]) =
         CommonRun.findObserved encoding (float position) (float position) pendingCR 0.0 0.0 noObservation noObservation left 0 right 0 left.Length
 
-    let private evidenceKinds (evidence: ScannerEvidence seq) = evidence |> Seq.map (fun item -> item.Kind, item.Offset) |> Seq.toArray
+    /// Runs a whole input through the common-run observation path and a ControlRatioTally, and returns what the tally reports.
+    let private tallyEvidence (encoding: TextEncoding) (data: byte[]) =
+        let found = ResizeArray<string * int64>()
+        let tally = ControlRatioTally(DiffSide.Previous, 0, int64 data.Length, (fun _ kind offset -> found.Add((kind, offset))))
+        CommonRun.findObserved
+            encoding
+            0.0
+            0.0
+            false
+            0.0
+            0.0
+            (fun start bytes controls scalars firstControl firstNul -> tally.ObserveCounts(start, bytes, controls, scalars, firstControl, firstNul))
+            noObservation
+            data
+            0
+            (Array.copy data)
+            0
+            data.Length
+        |> ignore
+        tally.Finish()
+        found.ToArray()
 
     let cases: (string * (unit -> Async<unit>)) list = [
         "FNV-1a hashes canonical line text", fun () -> async {
@@ -350,7 +369,7 @@ module TextDiffEngineCases =
             return ()
         }
         "line endings cover LF, CRLF, CR, and a final unterminated line", fun () -> async {
-            let lines, _, _, _ = scan TextEncoding.Utf8 [| ascii "a\nb\r\nc\rd" |]
+            let lines, _, _ = scan TextEncoding.Utf8 [| ascii "a\nb\r\nc\rd" |]
             Check.sequence [| LineEnding.LF; LineEnding.CRLF; LineEnding.CR; LineEnding.NoEnding |] (lines |> Array.map _.Ending) "The scanner preserved each line ending."
             Check.sequence [| 2L; 5L; 7L; 8L |] (lines |> Array.map _.EndOffset) "The scanner ended each line after its ending."
             Check.sequence [| hashText "a"; hashText "b"; hashText "c"; hashText "d" |] (lines |> Array.map lineHash) "The scanner excluded endings from the line keys."
@@ -358,7 +377,7 @@ module TextDiffEngineCases =
             return ()
         }
         "CRLF is recognized when its bytes arrive in separate chunks", fun () -> async {
-            let lines, _, _, _ = scan TextEncoding.Utf8 [| ascii "first\r"; ascii "\nsecond" |]
+            let lines, _, _ = scan TextEncoding.Utf8 [| ascii "first\r"; ascii "\nsecond" |]
             Check.equal 2 lines.Length "The split CRLF produced one boundary."
             Check.equal LineEnding.CRLF lines[0].Ending "The split terminator is CRLF."
             Check.equal (hashText "first") (lineHash lines[0]) "The first line key is intact."
@@ -366,7 +385,7 @@ module TextDiffEngineCases =
             return ()
         }
         "empty input produces no line", fun () -> async {
-            let lines, _, _, _ = scan TextEncoding.Utf8 [| Array.empty |]
+            let lines, _, _ = scan TextEncoding.Utf8 [| Array.empty |]
             Check.equal 0 lines.Length "The empty source has no lines."
             return ()
         }
@@ -374,7 +393,7 @@ module TextDiffEngineCases =
             let utf8 = bytes [ 0x61; 0xE2; 0x82; 0xAC; 0xF0; 0x9F; 0x98; 0x80 ]
             let utf16 = bytes [ 0x61; 0; 0xAC; 0x20; 0x3D; 0xD8; 0; 0xDE ]
             let utf32 = bytes [ 0x61; 0; 0; 0; 0xAC; 0x20; 0; 0; 0; 0xF6; 1; 0 ]
-            let one encoding data = scan encoding [| data |] |> fun (lines, _, _, _) -> lineHash lines[0]
+            let one encoding data = scan encoding [| data |] |> fun (lines, _, _) -> lineHash lines[0]
             Check.equal (one TextEncoding.Utf8 utf8) (one TextEncoding.Utf16LE utf16) "UTF-16 text uses the same canonical key."
             Check.equal (one TextEncoding.Utf8 utf8) (one TextEncoding.Utf32LE utf32) "UTF-32 text uses the same canonical key."
             return ()
@@ -393,13 +412,10 @@ module TextDiffEngineCases =
                 let runs =
                     [| 1; 3; 4096; data.Length |]
                     |> Array.map (fun size ->
-                        let lines, evidence, _, _ = scan encoding (chunksOfSize size data)
-                        lines, evidence)
-                let expectedLines, expectedEvidence = runs[0]
+                        let lines, _, _ = scan encoding (chunksOfSize size data)
+                        lines)
                 for index = 1 to runs.Length - 1 do
-                    let lines, evidence = runs[index]
-                    Check.sequence expectedLines lines "Chunk sizes produce equal scanned lines and key hashes."
-                    Check.sequence expectedEvidence evidence "Chunk sizes produce equal scanner evidence."
+                    Check.sequence runs[0] runs[index] "Chunk sizes produce equal scanned lines and key hashes."
 
             verify TextEncoding.Utf8 utf8
             verify TextEncoding.Utf16LE utf16
@@ -411,24 +427,24 @@ module TextDiffEngineCases =
             above[99] <- 0x1Fuy
             let below = Array.create 200 0x61uy
             below[0] <- 0x01uy
-            let _, aboveEvidence, _, _ = scan TextEncoding.Utf8 [| above |]
-            let _, belowEvidence, _, _ = scan TextEncoding.Utf8 [| below |]
-            Check.true' (aboveEvidence |> Array.exists (fun item -> item.Kind = "control ratio")) "The control ratio above one percent is evidence."
-            Check.true' (belowEvidence |> Array.forall (fun item -> item.Kind <> "control ratio")) "The control ratio below one percent is allowed."
+            let aboveEvidence = tallyEvidence TextEncoding.Utf8 above
+            let belowEvidence = tallyEvidence TextEncoding.Utf8 below
+            Check.sequence [| "control ratio", 0L |] aboveEvidence "The control ratio above one percent is evidence."
+            Check.true' (belowEvidence |> Array.isEmpty) "The control ratio below one percent is allowed."
             return ()
         }
         "a short final observation window merges into the preceding window", fun () -> async {
             let first = Array.create 65_536 0x61uy
             for index = 0 to 659 do first[index] <- 0x01uy
             let tail = Array.create 3_000 0x61uy
-            let _, evidence, _, _ = scan TextEncoding.Utf8 [| first; tail |]
-            Check.true' (evidence |> Array.forall (fun item -> item.Kind <> "control ratio")) "The merged ratio stays below one percent."
+            let evidence = tallyEvidence TextEncoding.Utf8 (Array.append first tail)
+            Check.true' (evidence |> Array.isEmpty) "The merged ratio stays below one percent."
             return ()
         }
         "decoded NUL is evidence and UTF-16 zero bytes are ordinary text bytes", fun () -> async {
-            let _, nulEvidence, _, _ = scan TextEncoding.Utf16LE [| bytes [ 0; 0 ] |]
-            let _, utf16Evidence, _, _ = scan TextEncoding.Utf16LE [| bytes [ 0x41; 0; 0x0A; 0 ] |]
-            Check.true' (nulEvidence |> Array.exists (fun item -> item.Kind = "nul" && item.Offset = 0L)) "Decoded U+0000 is evidence."
+            let nulEvidence = tallyEvidence TextEncoding.Utf16LE (bytes [ 0; 0 ])
+            let utf16Evidence = tallyEvidence TextEncoding.Utf16LE (bytes [ 0x41; 0; 0x0A; 0 ])
+            Check.true' (nulEvidence |> Array.exists (fun (kind, offset) -> kind = "nul" && offset = 0L)) "Decoded U+0000 is evidence."
             Check.true' (utf16Evidence |> Array.isEmpty) "UTF-16 encoding zero bytes do not create evidence."
             return ()
         }
@@ -439,14 +455,13 @@ module TextDiffEngineCases =
             let meter = createMeter ()
             let batch = LineBatch()
             let ignoredLines _ = ()
-            let ignoredEvidence _ = ()
-            let first = Scanner.scanChunk state prefix 0 prefix.Length false meter batch ignoredLines ignoredEvidence
+            let first = Scanner.scanChunk state prefix 0 prefix.Length false meter batch ignoredLines
             Check.equal prefix.Length first.Consumed "The prefix was scanned."
             let resumed = Scanner.copyState state
             let originalLines = ResizeArray<ScannedLine>()
             let resumedLines = ResizeArray<ScannedLine>()
-            let originalEnd = Scanner.scanChunk state suffix 0 suffix.Length true meter batch (collect originalLines) ignoredEvidence
-            let resumedEnd = Scanner.scanChunk resumed suffix 0 suffix.Length true meter batch (collect resumedLines) ignoredEvidence
+            let originalEnd = Scanner.scanChunk state suffix 0 suffix.Length true meter batch (collect originalLines)
+            let resumedEnd = Scanner.scanChunk resumed suffix 0 suffix.Length true meter batch (collect resumedLines)
             Check.equal EndOfInput originalEnd.Status "The original state reached EOF."
             Check.equal EndOfInput resumedEnd.Status "The copied state reached EOF."
             Check.equal (lineHash originalLines[0]) (lineHash resumedLines[0]) "The copied scanner preserved its partial hash."
@@ -460,11 +475,11 @@ module TextDiffEngineCases =
             let input = Array.append (Array.create 8_192 0x61uy) (ascii "\n")
             let lines = ResizeArray<ScannedLine>()
             let batch = LineBatch()
-            let first = Scanner.scanChunk state input 0 input.Length true limited batch (collect lines) (fun _ -> ())
+            let first = Scanner.scanChunk state input 0 input.Length true limited batch (collect lines)
             Check.equal 4096 first.Consumed "The scanner stops after charging one unit."
             Check.equal BudgetReached first.Status "The scanner reports budget exhaustion."
             let resumedMeter = createMeter ()
-            let second = Scanner.scanChunk state input first.Consumed (input.Length - first.Consumed) true resumedMeter batch (collect lines) (fun _ -> ())
+            let second = Scanner.scanChunk state input first.Consumed (input.Length - first.Consumed) true resumedMeter batch (collect lines)
             Check.equal EndOfInput second.Status "The scanner resumes through EOF."
             Check.equal 1 lines.Count "The resumed scan emits its line once."
             Check.equal 8192L lines[0].Utf16Length "The resumed line length includes both chunks."
@@ -669,7 +684,7 @@ module TextDiffEngineCases =
             Check.equal (data.Length - split) second.Length "The equal second slice is one run."
             let state = Scanner.create TextEncoding.Utf8 position
             let lines = ResizeArray<ScannedLine>()
-            Scanner.scanChunk state data 0 data.Length false (createMeter ()) (LineBatch()) (collect lines) ignore |> ignore
+            Scanner.scanChunk state data 0 data.Length false (createMeter ()) (LineBatch()) (collect lines) |> ignore
             Check.equal lines.Count (first.Lines + second.Lines) "The runs count the lines that the scanner emits."
             Check.equal lines[lines.Count - 1].EndOffset second.LastLineStart "The open line starts where the scanner's last line ends."
             return ()
@@ -713,30 +728,12 @@ module TextDiffEngineCases =
             Check.true' run.Error.IsNone "A cut surrogate pair is not an error."
             return ()
         }
-        "a common run reports NUL and control evidence like the scanner", fun () -> async {
+        "a common run reports NUL and control evidence", fun () -> async {
             let data = Array.create 70_000 0x61uy
             data[10] <- 0uy
             for index = 100 to 799 do data[index] <- 0x01uy
-            let _, scanned, _, _ = scan TextEncoding.Utf8 [| data |]
-            let found = ResizeArray<string * int64>()
-            let tally = ControlRatioTally(DiffSide.Previous, 0, int64 data.Length, (fun _ kind offset -> found.Add((kind, offset))))
-            CommonRun.findObserved
-                TextEncoding.Utf8
-                0.0
-                0.0
-                false
-                0.0
-                0.0
-                (fun start bytes controls scalars firstControl firstNul -> tally.ObserveCounts(start, bytes, controls, scalars, firstControl, firstNul))
-                noObservation
-                data
-                0
-                (Array.copy data)
-                0
-                data.Length
-            |> ignore
-            tally.Finish()
-            Check.sequence (evidenceKinds scanned) found "The run counts yield the scanner's evidence."
+            let found = tallyEvidence TextEncoding.Utf8 data
+            Check.sequence [| "nul", 10L; "control ratio", 100L |] found "The run counts yield NUL and control ratio evidence."
             return ()
         }
         "observed common runs report counts for each window segment", fun () -> async {

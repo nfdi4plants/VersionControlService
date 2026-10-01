@@ -2351,12 +2351,11 @@ module TextDiffSessionCases =
             | other -> failwith $"The shifted control window did not fail on the current side: {other}."
             do! deltaSession.Close()
 
+            // The inputs are ASCII, so every byte is one scalar and both 64 KiB windows are complete.
             let wholeHasEvidence (bytes: byte[]) =
-                let state = Scanner.create TextEncoding.Utf8 0L
-                let evidence = ResizeArray<ScannerEvidence>()
-                let meter = Meter.create (ManualClock 0.0 :> IClock) { Limits.defaults with MaxUnits = Int32.MaxValue; RequestMs = 1e15; QuantumMs = 1e15 }
-                Scanner.scanChunk state bytes 0 bytes.Length true meter (LineBatch(4)) ignore evidence.Add |> ignore
-                evidence |> Seq.exists (fun item -> item.Kind = "control ratio")
+                bytes
+                |> Array.chunkBySize 65_536
+                |> Array.exists (fun window -> (window |> Array.filter (fun value -> value = 1uy) |> Array.length) * 100 > window.Length)
             for perMille in [| 0; 5; 12; 25 |] do
                 let random = RandomState(uint32 (100 + perMille))
                 let bytes = Array.init 131_072 (fun _ -> if random.Next(1_000) < perMille then 1uy else 0x61uy)

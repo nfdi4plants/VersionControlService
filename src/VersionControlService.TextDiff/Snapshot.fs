@@ -218,18 +218,6 @@ module internal ScannerStateCodec =
         header.Bool state.PendingCR
         header.Number state.PendingCREnd
         header.Bool state.IsComplete
-        let writeWindow (window: ObservationWindow) =
-            header.Number window.Start
-            header.Int window.Bytes
-            header.Int window.Scalars
-            header.Int window.Controls
-            header.Int window.FirstControl
-        writeWindow state.CurrentWindow
-        match state.PreviousWindow with
-        | Some window ->
-            header.Bool true
-            writeWindow window
-        | None -> header.Bool false
 
     let read (encoding: TextEncoding) (header: HeaderReader) : ScannerState =
         let startOffset = header.Number()
@@ -251,13 +239,4 @@ module internal ScannerStateCodec =
         state.PendingCR <- header.Bool()
         state.PendingCREnd <- header.Number()
         state.IsComplete <- header.Bool()
-        let readWindow () : ObservationWindow =
-            let start = header.Number()
-            let bytes = header.Int()
-            let scalars = header.Int()
-            let controls = header.Int()
-            let first = header.Int()
-            { Start = start; Bytes = bytes; Scalars = scalars; Controls = controls; FirstControl = first }
-        state.CurrentWindow <- readWindow ()
-        state.PreviousWindow <- if header.Bool() then Some(readWindow ()) else None
         state
