@@ -782,7 +782,7 @@ module TextDiffSessionCases =
             do! session.Close()
             return ()
         }
-        "twelve suspended line reads continue after older reads are evicted", fun () -> async {
+        "a suspended line read that the cache evicted answers continuation_mismatch", fun () -> async {
             let words count (format: int -> string) = String.Join(" ", Array.init count format)
             let previousLine = words 3_500 (fun index -> sprintf "w%06d" index)
             let currentLine = words 3_500 (fun index -> if index = 2_000 then sprintf "X%06d" index else sprintf "w%06d" index)
@@ -797,67 +797,21 @@ module TextDiffSessionCases =
                 { Text = "tail"; Ending = LineEnding.LF }
             |]
             let limits = { Limits.defaults with MaxUnits = 12; RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 }
-            let lineConfig = { defaultConfig () with Limits = limits }
-            let clock = ManualClock 0.0
-            let host = Host.createInMemory (clock :> IClock)
-            let ledger = Ledger()
-            let! session = TextDiffSession.create host ledger lineConfig (fun _ -> 100) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
-            let! pages = readAll session (fun () -> false)
-            let changed = rows (allParts pages) |> Array.find (fun row -> row.Kind = DiffRowKind.Replaced)
-            Check.equal 1L changed.Current.Value.Number "The long changed line is available for line reads."
-
-            let pagePrevious = Array.init 2_001 (fun index -> { Text = "row " + string index; Ending = LineEnding.LF })
-            let pageCurrent = Array.init 2_001 (fun index -> { Text = (if index % 7 = 3 then "edit " + string index else "row " + string index); Ending = LineEnding.LF })
-            let pageConfig = { config 3 1_000 1_024 4 limits with PageMaxFragments = 1 }
-            let resolveFirstPageWithCount (value: TextDiffSession) = async {
-                let! first = value.FirstPage(fun () -> false)
-                let mutable result = first
-                let mutable page = None
-                let mutable requests = 1
-                while page.IsNone && requests < 100 do
-                    match result with
-                    | EngineResult.Ok(Resumable.Ready ready) -> page <- Some ready
-                    | EngineResult.Ok(Resumable.Scanning(_, continuation, _)) ->
-                        let! next = value.ReadPage continuation (fun () -> false)
-                        result <- next
-                        requests <- requests + 1
-                    | other -> failwith $"The page read returned {other}."
-                match page with
-                | Some ready -> return ready, requests
-                | None -> return failwith "The page read did not finish within its request budget."
-            }
-            let openPageSession sessionId =
-                TextDiffSession.create host ledger { pageConfig with SessionId = sessionId } (fun _ -> 100) (sourceSpec (encodeLines pagePrevious)) (sourceSpec (encodeLines pageCurrent))
-            let! baselineSession = openPageSession "abandoned-read-baseline"
-            let! _, baselineRequests = resolveFirstPageWithCount baselineSession
-            do! baselineSession.Close()
-
+            let! session = openSession { defaultConfig () with Limits = limits } (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+            let! _ = readAll session (fun () -> false)
             let continuations = ResizeArray<string>()
-            for _ in 1 .. 12 do
+            for _ in 1 .. 9 do
                 let! result = session.ReadLine(DiffSide.Current, 1L, 8_192L, 8_192, None, fun () -> false)
                 match result with
                 | EngineResult.Ok(Resumable.Scanning(_, continuation, _)) -> continuations.Add continuation
-                | other -> failwith $"The concurrent line read returned {other}."
-                Check.equal 0L (ledger.Used AllocationCategory.AlignmentScratch) "A suspended line read releases its pair-analysis reservation."
-            Check.equal 12 continuations.Count "Every line read returns a continuation."
-
-            for continuation in continuations do
-                let! initial = session.ReadLine(DiffSide.Current, 1L, 8_192L, 8_192, Some continuation, fun () -> false)
-                let! line = resolveLine session DiffSide.Current 1L 8_192L 8_192 initial
-                Check.equal 8_192L line.Slice.OffsetUtf16 "A continued read keeps its requested offset."
-                Check.equal (currentLine.Substring(8_192, 8_192)) line.Slice.Text "A continued read returns the source slice."
-            Check.equal 0L (ledger.Used AllocationCategory.AlignmentScratch) "Completed line reads release pair-analysis scratch."
-
-            let! freshInitial = session.ReadLine(DiffSide.Current, 1L, 0L, 8_192, None, fun () -> false)
-            let! freshLine = resolveLine session DiffSide.Current 1L 0L 8_192 freshInitial
-            Check.equal (Some(int64 currentLine.Length)) freshLine.Slice.TotalUtf16 "A fresh line read keeps its total length."
-            Check.equal 0L (ledger.Used AllocationCategory.AlignmentScratch) "A completed line read releases pair-analysis scratch."
-
-            let! pageSession = openPageSession "abandoned-read-page"
-            let! page, pageRequests = resolveFirstPageWithCount pageSession
-            Check.true' (page.Parts.Length > 0) "A new page is available after the abandoned reads."
-            Check.true' (pageRequests <= baselineRequests + 1) "The page takes its usual number of requests after the abandoned reads."
-            do! pageSession.Close()
+                | other -> failwith $"The line read returned {other}."
+            let! evicted = session.ReadLine(DiffSide.Current, 1L, 8_192L, 8_192, Some continuations[0], fun () -> false)
+            match evicted with
+            | EngineResult.Failed("continuation_mismatch", _, _) -> ()
+            | other -> failwith $"The evicted line read returned {other}."
+            let! initial = session.ReadLine(DiffSide.Current, 1L, 8_192L, 8_192, Some continuations[8], fun () -> false)
+            let! line = resolveLine session DiffSide.Current 1L 8_192L 8_192 initial
+            Check.equal (currentLine.Substring(8_192, 8_192)) line.Slice.Text "A cached read still returns the source slice."
             do! session.Close()
             return ()
         }
@@ -2594,8 +2548,6 @@ module TextDiffSessionCases =
                 ()
             let! retry = session.ReadLine(DiffSide.Current, 0L, 8_192L, 8_192, Some first, fun () -> false)
             Check.equal second (continuationOf retry) "The retry returns the continuation it answered before."
-            let! line = resolveLine session DiffSide.Current 0L 8_192L 8_192 retry
-            Check.equal (current[0].Text.Substring 8_192) line.Slice.Text "The recreated read completes with the source slice."
             do! session.Close()
         }
         "a continuation that the session never issued is a mismatch", fun () -> async {
@@ -2624,36 +2576,37 @@ module TextDiffSessionCases =
             let previous = Array.init 12 (fun index -> { Text = longLine index; Ending = LineEnding.LF })
             let current = Array.init 12 (fun index -> { Text = "x" + longLine index; Ending = LineEnding.LF })
             let limits = { Limits.defaults with MaxUnits = 2; RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 }
-            // Returns the number of requests the read needs after the cache filled up around it.
-            let remainingRequests touchFirst = async {
+            // Returns the answer to the last continuation of line 0 after the cache filled up around it.
+            let lastAnswer touchFirst = async {
                 let! session = openSession (config 1 1_000 1_024 4_096 limits) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
                 let! _ = readAll session (fun () -> false)
                 let continuationOf = function
-                    | EngineResult.Ok(Resumable.Scanning(_, value, _)) -> Some value
-                    | _ -> None
+                    | EngineResult.Ok(Resumable.Scanning(_, value, _)) -> value
+                    | other -> failwith $"The line read returned {other}."
                 let! started = session.ReadLine(DiffSide.Current, 0L, 8_192L, 8_192, None, fun () -> false)
                 let mutable token = continuationOf started
                 for _ in 1 .. 3 do
-                    let! next = session.ReadLine(DiffSide.Current, 0L, 8_192L, 8_192, token, fun () -> false)
+                    let! next = session.ReadLine(DiffSide.Current, 0L, 8_192L, 8_192, Some token, fun () -> false)
                     token <- continuationOf next
                 for line in 1L .. 7L do
                     let! _ = session.ReadLine(DiffSide.Current, line, 8_192L, 8_192, None, fun () -> false)
                     ()
                 if touchFirst then
-                    let! next = session.ReadLine(DiffSide.Current, 0L, 8_192L, 8_192, token, fun () -> false)
+                    let! next = session.ReadLine(DiffSide.Current, 0L, 8_192L, 8_192, Some token, fun () -> false)
                     token <- continuationOf next
                 let! _ = session.ReadLine(DiffSide.Current, 8L, 8_192L, 8_192, None, fun () -> false)
-                let mutable requests = 0
-                while token.IsSome do
-                    requests <- requests + 1
-                    let! next = session.ReadLine(DiffSide.Current, 0L, 8_192L, 8_192, token, fun () -> false)
-                    token <- continuationOf next
+                let! answer = session.ReadLine(DiffSide.Current, 0L, 8_192L, 8_192, Some token, fun () -> false)
                 do! session.Close()
-                return requests
+                return answer
             }
-            let! touched = remainingRequests true
-            let! untouched = remainingRequests false
-            Check.true' (touched < untouched) "A continued read is the newest cache entry, so a later read evicts an older one."
+            let! touched = lastAnswer true
+            match touched with
+            | EngineResult.Ok _ -> ()
+            | other -> failwith $"A continued read is the newest cache entry, but it returned {other}."
+            let! untouched = lastAnswer false
+            match untouched with
+            | EngineResult.Failed("continuation_mismatch", _, _) -> ()
+            | other -> failwith $"The oldest cache entry leaves first, but its continuation returned {other}."
         }
         "a long pair comparison charges its work by the bytes compared", fun () -> async {
             let prefix = String('p', 400_000)

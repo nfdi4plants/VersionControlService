@@ -436,6 +436,9 @@ type TextDiffSession internal (
     let mutable firstPageReturned = false
     let mutable closed = false
     let mutable closing = false
+    // One request at a time. Every member that reads or writes the journal, the pairing index or the
+    // scanners holds this flag for its whole run, so those parts need no locks of their own. A host
+    // that issues several requests to one session must wait for each reply before it sends the next.
     let mutable busy = false
     let mutable requestSequence = 0L
     let mutable rowSequence = 0L
@@ -3638,13 +3641,6 @@ type TextDiffSession internal (
             releasePendingLineRead expired
             pendingLineReads.Remove expired.Attempt |> ignore
 
-    let recreateLineRead side line offset maxUtf16 attempt sequence = async {
-        let! pairedLine = pairings.Find(side, line)
-        let! pending = createLineRead side line offset maxUtf16 attempt sequence pairedLine
-        cacheLineRead pending
-        return pending
-    }
-
     let runExpansionRequestCore (pending: PendingExpansion) sequence (cancel: unit -> bool) = async {
         let meter = Meter.create host.Clock config.Limits
         let mutable finished = pending.Search.IsNone && pending.PreviousLines.IsSome && pending.CurrentLines.IsSome
@@ -3759,22 +3755,6 @@ type TextDiffSession internal (
             releasePendingLineRequest pending
     }
 
-    let runRecreatedLineReadRequest (pending: PendingLineRead) sequence (cancel: unit -> bool) = async {
-        let discard () =
-            releasePendingLineRead pending
-            pendingLineReads.Remove pending.Attempt |> ignore
-        try
-            let! result = runLineReadRequest pending sequence cancel
-            match result with
-            | EngineResult.Canceled
-            | EngineResult.Failed _ -> discard ()
-            | _ -> ()
-            return result
-        with error ->
-            discard ()
-            return failWorker error.Message
-    }
-
     let sourceInfo sideIndex =
         let spec = specAt sideIndex
         let side = scanSideAt sideIndex
@@ -3869,7 +3849,7 @@ type TextDiffSession internal (
     }
 
     member _.ReplayPage(pageId: string) = async {
-        if closed then return failClosed ()
+        if closed || closing then return failClosed ()
         elif failure.IsSome then
             let code, message = failure.Value
             return EngineResult.Failed(code, message, None)
@@ -3878,14 +3858,19 @@ type TextDiffSession internal (
             match readIdentifier "p" pageId with
             | None -> return failMismatch ()
             | Some sequence ->
-                try
-                    let! recorded = journal.Read(journalKey 0L sequence)
-                    match recorded with
-                    | Some(JournalValue.Page(Resumable.Ready page)) when page.PageId = pageId ->
-                        do! rememberPagePairs sequence page
-                        return EngineResult.Ok { page with Pending = None }
-                    | _ -> return failMismatch ()
-                with error -> return failWorker error.Message
+                let! acquired = acquire (fun () -> false)
+                if not acquired then return failClosed ()
+                else
+                    try
+                        try
+                            let! recorded = journal.Read(journalKey 0L sequence)
+                            match recorded with
+                            | Some(JournalValue.Page(Resumable.Ready page)) when page.PageId = pageId ->
+                                do! rememberPagePairs sequence page
+                                return EngineResult.Ok { page with Pending = None }
+                            | _ -> return failMismatch ()
+                        with error -> return failWorker error.Message
+                    finally busy <- false
     }
 
     member _.Expand(gapId: string, fromStart: bool, count: int, continuation: string option, cancel: unit -> bool) = async {
@@ -3997,9 +3982,6 @@ type TextDiffSession internal (
                                         | true, pending when pending.Side = side && pending.Line = line && pending.OffsetUtf16 = offsetUtf16 && pending.MaxUtf16 = maxUtf16 && pending.RequestSequence = sequence ->
                                             touchLineRead pending
                                             return! runLineReadRequest pending sequence cancel
-                                        | _ when lineReadContinuationWasIssued attempt sequence ->
-                                            let! pending = recreateLineRead side line offsetUtf16 maxUtf16 attempt sequence
-                                            return! runRecreatedLineReadRequest pending sequence cancel
                                         | _ -> return failMismatch ()
                             | None ->
                                 let attempt = allocateLineAttempt ()

@@ -431,46 +431,6 @@ module internal Shield =
         Async.FromContinuations(fun (resolve, reject, _) -> Async.StartWithContinuations(work, resolve, reject, ignore))
 #endif
 
-/// Admits one holder at a time. The holder runs inside a shielded computation, so no cancellation can
-/// leave the gate held.
-type private AsyncGate() =
-    let waiters = Queue<unit -> unit>()
-    let mutable held = false
-
-    let enter =
-        Async.FromContinuations(fun (resolve, _, _) ->
-            let proceed =
-                lock waiters (fun () ->
-                    if held then
-                        waiters.Enqueue(fun () -> resolve ())
-                        false
-                    else
-                        held <- true
-                        true)
-            if proceed then resolve ())
-
-    let leave () =
-        let next =
-            lock waiters (fun () ->
-                if waiters.Count > 0 then Some(waiters.Dequeue())
-                else
-                    held <- false
-                    None)
-        match next with
-        | Some resume -> resume ()
-        | None -> ()
-
-    member _.Run(work: Async<'T>) : Async<'T> =
-        Shield.run (
-            async {
-                do! enter
-                try
-                    return! work
-                finally
-                    leave ()
-            }
-        )
-
 /// A cached record keeps the encoded bytes. Every hit decodes a fresh value, so callers never share arrays
 /// with the cache or with each other.
 type private CachedRecord = {
@@ -545,7 +505,6 @@ type private JournalCache(ledger: Ledger, capBytes: int) =
 
 type internal Journal(store: ITempStore, ledger: Ledger, cacheBytes: int, createIndexStore: unit -> Async<ITempStore>) =
     let cache = JournalCache(ledger, cacheBytes)
-    let gate = AsyncGate()
     let mutable indexStore: ITempStore option = None
     let indexEntryBytes = 24L
     let mutable count = 0L
@@ -617,56 +576,47 @@ type internal Journal(store: ITempStore, ledger: Ledger, cacheBytes: int, create
             initialized <- true
     }
 
-    /// Records a result. The gate keeps readers from observing an entry while its record is being written.
-    member _.Append(sequence: int64, value: JournalValue) =
-        gate.Run(
-            async {
-                if sequence < 0L then invalidArg (nameof sequence) "The journal sequence cannot be negative."
-                if not initialized then invalidOp "The journal has not been initialized."
-                do! growIndex sequence
-                let record = JournalRecord.encode value
-                let! offset = store.Append record 0 record.Length
-                do! writeEntry sequence offset (int64 record.Length)
-                count <- max count (sequence + 1L)
-                cache.Add(sequence, record)
-            }
-        )
+    /// Records a result.
+    member _.Append(sequence: int64, value: JournalValue) = async {
+        if sequence < 0L then invalidArg (nameof sequence) "The journal sequence cannot be negative."
+        if not initialized then invalidOp "The journal has not been initialized."
+        do! growIndex sequence
+        let record = JournalRecord.encode value
+        let! offset = store.Append record 0 record.Length
+        do! writeEntry sequence offset (int64 record.Length)
+        count <- max count (sequence + 1L)
+        cache.Add(sequence, record)
+    }
 
     /// Returns a freshly decoded copy of a recorded result.
-    member _.Read(sequence: int64) =
-        gate.Run(
-            async {
-                match cache.TryGet sequence with
-                | Some record -> return Some(JournalRecord.decode record)
-                | None ->
-                    let! entry = readEntry sequence
-                    match entry with
-                    | None -> return None
-                    | Some(offset, length) ->
-                        if length > int64 Int32.MaxValue then invalidOp "The journal record is too large."
-                        let record = Array.zeroCreate<byte> (int length)
-                        do! readFully offset record record.Length
-                        let value = JournalRecord.decode record
-                        cache.Add(sequence, record)
-                        return Some value
-            }
-        )
+    member _.Read(sequence: int64) = async {
+        match cache.TryGet sequence with
+        | Some record -> return Some(JournalRecord.decode record)
+        | None ->
+            let! entry = readEntry sequence
+            match entry with
+            | None -> return None
+            | Some(offset, length) ->
+                if length > int64 Int32.MaxValue then invalidOp "The journal record is too large."
+                let record = Array.zeroCreate<byte> (int length)
+                do! readFully offset record record.Length
+                let value = JournalRecord.decode record
+                cache.Add(sequence, record)
+                return Some value
+    }
 
-    member _.Link(aliasSequence: int64, targetSequence: int64) =
-        gate.Run(
-            async {
-                if aliasSequence < 0L || targetSequence < 0L then invalidArg (nameof aliasSequence) "The journal key cannot be negative."
-                if not initialized then invalidOp "The journal has not been initialized."
-                do! growIndex aliasSequence
-                let! entry = readEntry targetSequence
-                match entry with
-                | Some(offset, length) ->
-                    do! writeEntry aliasSequence offset length
-                    count <- max count (aliasSequence + 1L)
-                    cache.Remove aliasSequence
-                | None -> invalidOp "The journal target does not exist."
-            }
-        )
+    member _.Link(aliasSequence: int64, targetSequence: int64) = async {
+        if aliasSequence < 0L || targetSequence < 0L then invalidArg (nameof aliasSequence) "The journal key cannot be negative."
+        if not initialized then invalidOp "The journal has not been initialized."
+        do! growIndex aliasSequence
+        let! entry = readEntry targetSequence
+        match entry with
+        | Some(offset, length) ->
+            do! writeEntry aliasSequence offset length
+            count <- max count (aliasSequence + 1L)
+            cache.Remove aliasSequence
+        | None -> invalidOp "The journal target does not exist."
+    }
 
     /// Bytes of cached records, which count against the ledger.
     member _.CachedBytes = cache.Used
