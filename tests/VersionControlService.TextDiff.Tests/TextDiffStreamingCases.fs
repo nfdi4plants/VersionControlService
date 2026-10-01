@@ -473,6 +473,25 @@ module TextDiffStreamingCases =
                 do! session.Close()
             return ()
         }
+        "insertions and deletions larger than the largest window stay exact in text with blank lines", fun () -> async {
+            let sourceLine text = { Text = text; Ending = LineEnding.LF }
+            let prose prefix count =
+                Array.init count (fun index -> sourceLine (if index % 2 = 1 then "" else $"{prefix} paragraph {index} has some words in it."))
+            let windowLines = 2_048
+            let original = prose "old" 12_000
+            let extended = Array.concat [ original[.. 999]; prose "new" (windowLines * 2 + 500); original[1_000 ..] ]
+            let sessionConfig = { SessionConfig.defaults "large-block" with WindowMaxLines = windowLines }
+            for name, previous, current, expectedAdded, expectedRemoved in [
+                "insertion", original, extended, extended.Length - original.Length, 0
+                "deletion", extended, original, 0, extended.Length - original.Length
+            ] do
+                let! session = openSession (Ledger()) sessionConfig (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+                let! pages, _ = readAll session
+                checkOracle previous current pages
+                Check.equal (expectedAdded, expectedRemoved, 0, 0) (diffCounts pages) $"The {name} shows exactly the block and no unaligned lines."
+                do! session.Close()
+            return ()
+        }
         "window storage stays within its configured line bound", fun () -> async {
             let previous = makeLines 50_000 "line-"
             let current = Array.copy previous

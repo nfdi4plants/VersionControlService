@@ -489,7 +489,7 @@ type TextDiffSession internal (
     let mutable feedCurrent = 0
     let mutable regionStarted = false
     let mutable preserveWindowAfterCommit = false
-    let mutable windowUniqueLines = 0
+    let mutable windowSelfUniqueLines = 0
     let mutable pBase = float previousSpec.BomLength
     let mutable cBase = float currentSpec.BomLength
     let mutable partialAlign = false
@@ -1004,10 +1004,10 @@ type TextDiffSession internal (
             if previousSide.Finished && not currentSide.Finished then currentTail
             elif currentSide.Finished && not previousSide.Finished then previousTail
             else min previousTail currentTail
-        // When many lines follow the anchor on one side only, the window holds an insertion or deletion, and the
-        // anchor may be a line that occurs once in each window only by chance, such as a repeated value inside
-        // the inserted records. Such an anchor sits in a short run between changed lines, so the window settles
-        // on it only when its equal run is long.
+        // Many lines after the anchor on one side only can mean an insertion or deletion that the window does
+        // not hold completely. The anchor may then be a line that occurs once in each window only by chance, such
+        // as a repeated value inside inserted records, and such an anchor sits in a short run between changed
+        // lines. The window settles on it in that case only when its equal run is long.
         let mutable anchorRunLines = 0
         let mutable runIndex = lastAnchored
         while runIndex >= 0 && (ops[runIndex].Kind = OperationKind.Equal || ops[runIndex].Kind = OperationKind.EndingChanged) do
@@ -1050,9 +1050,11 @@ type TextDiffSession internal (
             elif canGrow then
                 // The window may hold an insertion or deletion larger than itself, so it grows first.
                 growWindow ()
-            elif windowUniqueLines = 0 && lastEqual >= 0 then
-                // No line occurs once in each window, so the forward search finds nothing better to line up
-                // on. The window keeps its alignment up to its last equal run.
+            elif windowSelfUniqueLines = 0 && lastEqual >= 0 then
+                // Every line occurs at least twice within its own window, as in a file of identical rows. The
+                // window keeps its own alignment up to its last equal run there. A window that holds a line
+                // unique within itself may be part of an insertion or deletion larger than the window, and the
+                // forward search looks for the place where the sources meet again.
                 commitCount <- lastEqual + 1
                 beginFeeding ()
             else
@@ -1071,7 +1073,7 @@ type TextDiffSession internal (
         else
             replayLog.Clear()
             replayPosition <- 0
-            aligner <- Some(WindowAligner(previousTable, currentTable, config.MyersStepsPerGap, previousSpec.ByteLength = currentSpec.ByteLength, ledger))
+            aligner <- Some(WindowAligner(previousTable, currentTable, config.MyersStepsPerGap, previousSpec.ByteLength = currentSpec.ByteLength, not partialAlign, ledger))
             windowState <- WindowState.Aligning
 
     let loadSide (side: ScanSide) (buffer: byte[]) (meter: Meter) = async {
@@ -1138,7 +1140,7 @@ type TextDiffSession internal (
                 else startCompare previousIndex currentIndex count
             | AlignStep.Complete completed ->
                 ops <- completed
-                windowUniqueLines <- active.UniqueLines
+                windowSelfUniqueLines <- active.SelfUniqueLines
                 replayLog.Clear()
                 replayPosition <- 0
                 active.Dispose()
@@ -1546,7 +1548,7 @@ type TextDiffSession internal (
             replayPosition <- 0
             mode <- Mode.Window
             if restoreAligning then
-                aligner <- Some(WindowAligner(previousSide.Table, currentSide.Table, config.MyersStepsPerGap, previousSpec.ByteLength = currentSpec.ByteLength, ledger))
+                aligner <- Some(WindowAligner(previousSide.Table, currentSide.Table, config.MyersStepsPerGap, previousSpec.ByteLength = currentSpec.ByteLength, not partialAlign, ledger))
                 windowState <- WindowState.Aligning
         restoreReader <- None
         restoreSlots <- Array.empty

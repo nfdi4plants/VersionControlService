@@ -744,25 +744,28 @@ let readFirstLineSlice (service: TextDiffService) (handle: DiffHandle) (context:
 
 `Open` can return `NotDiffable` when initial classification recognizes binary content,
 including HDF5 signatures. Content that turns out not to be text during later scanning
-fails with `diff_content_not_text`, and `failure.DiffDetail` records the side and
-evidence. The evidence is a binary signature, a NUL byte, a control-character ratio
-above 1 percent in a window of the file, or a byte sequence that is invalid in the
-encoding. A recognized BOM selects its encoding. Valid UTF-8 that contains multi-byte
-sequences is selected without asking. Windows-1252 is the only single-byte candidate, so
+fails with `diff_content_not_text`, and `failure.DiffDetail` records the side, the
+evidence and, for a byte sequence that is invalid in the encoding, its byte offset in
+`InvalidSequenceOffset`. The evidence is a binary signature, a NUL byte, a
+control-character ratio above 1 percent in a window of the file, or a byte sequence that
+is invalid in the encoding. A recognized BOM selects its encoding. Valid UTF-8 that
+contains multi-byte sequences is selected without asking. Windows-1252 is the only single-byte candidate, so
 bytes that are invalid as UTF-8 open as Windows-1252 without asking. Other single-byte
-encodings such as Latin-2 and KOI8-R decode as Windows-1252 too. Shift-JIS text holds
-bytes such as 0x81 and 0x90 that Windows-1252 leaves undefined. It does not decode as
-Windows-1252, so its diff ends with `NotDiffable` from `Open` when classification samples
-such a byte, or with `diff_content_not_text` when the scan reaches one later.
+encodings such as Latin-2 and KOI8-R decode as Windows-1252 too. Shift-JIS text that
+holds none of the bytes 0x81, 0x8D, 0x8F, 0x90 and 0x9D classifies as Windows-1252 as
+well and shows the wrong characters. Windows-1252 leaves those five bytes undefined, so
+Shift-JIS text with one of them gets `NotDiffable` from `Open` when classification
+samples the byte, or fails with `diff_content_not_text` when the scan reaches it later.
 
 UTF-16 without a BOM never asks for a choice. A byte order qualifies only when nine in ten
 zero bytes sit at its offsets, so at most one byte order passes, and the zero bytes rule
 out UTF-8 and Windows-1252. `DiffBlocker.EncodingRequired` appears when a file that
 classification read as UTF-8 contains a sequence that is invalid in UTF-8 but valid in
-Windows-1252, and `Open` reaches that sequence before the first page. The candidates are then utf-8 and windows-1252. If the
-sequence comes after the first page, the session fails with `diff_encoding_mismatch` and
-`failure.DiffDetail` records the side and the evidence. Close the handle and open the diff
-again with the Windows-1252 encoding on that side. A caller that chose utf-8 gets
+Windows-1252, and `Open` reaches that sequence before the first page. The candidates are
+then utf-8 and windows-1252. If the sequence comes after the first page, the session
+fails with `diff_encoding_mismatch` and `failure.DiffDetail` records the side, the
+evidence and the offset of the sequence. Close the handle and open the diff again with
+the Windows-1252 encoding on that side. A caller that chose utf-8 gets
 `diff_content_not_text` for the same bytes. `EncodingRequired` returns a `PreparationToken`
 and `EncodingCandidate` values. Ask the user to choose a candidate, then retry the same
 open request with that token and the chosen encoding on the reported side.
@@ -784,7 +787,8 @@ recently used idle handle. The default pool has three workers with one session e
 this happens when a fourth diff opens. Open a new diff when the error occurs.
 `source_changed` means a pinned source changed while the handle was open, so close it
 and open the current sources again.
-For `diff_content_not_text` and `diff_encoding_mismatch`, inspect `failure.DiffDetail` for the blocked side and evidence.
+For `diff_content_not_text` and `diff_encoding_mismatch`, inspect `failure.DiffDetail`
+for the blocked side, the evidence and `InvalidSequenceOffset`.
 A `diff_read_failed` result means a source could not be read because of a file system or
 process error. Any call that reads a source can return it.
 For `preparation_mismatch`, discard the token and start `Open` again. A continuation is

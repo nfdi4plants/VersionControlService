@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 -   `VersionControlService.TextDiff` adds a streaming diff engine for files of any size. It bounds memory use and work per request and targets .NET and Fable.
 -   The Git provider can run text diffs in a worker pool supervised by `TextDiffSupervisor`. Hosts create a `TextDiffPool` with `TextDiffPoolOptions.create` and `TextDiffPool.create`, and use `TextDiffTransport.WorkerThreadTransport.create` to start a worker thread from their own worker file.
--   `DiffSide` and `DiffContentBlocked` describe which side of a diff could not be read as text and the evidence found. `OperationFailure.DiffDetail` carries a `DiffContentBlocked` for a `diff_content_not_text` or `diff_encoding_mismatch` failure.
+-   `DiffSide` and `DiffContentBlocked` describe which side of a diff could not be read as text and the evidence found. `DiffContentBlocked.InvalidSequenceOffset` holds the byte offset of a sequence that is invalid in the encoding of that side, and is `None` for other evidence. Code that builds the record sets it. `OperationFailure.DiffDetail` carries a `DiffContentBlocked` for a `diff_content_not_text` or `diff_encoding_mismatch` failure.
 -   `TextDiffFailureCodes.EncodingMismatch` (`diff_encoding_mismatch`) reports a source that classification read as UTF-8 and that later contains a byte sequence valid in Windows-1252 only. `Open` returns `DiffBlocker.EncodingRequired` for that side when it reaches the sequence before the first page, and the caller can choose Windows-1252.
 -   `TextDiffFailureCodes.ReadFailed` (`diff_read_failed`) names the code that any text diff call returns when a source cannot be read because of a file system or process error.
 

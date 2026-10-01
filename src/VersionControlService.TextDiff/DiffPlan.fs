@@ -215,8 +215,9 @@ type private AlignPhase =
 /// Aligns the lines of two windows without ever holding line text. Line keys (two hash halves and the
 /// UTF-16 length) select candidates, and the caller confirms every claimed run of equal lines against the
 /// source bytes through NeedRun and ResolveRun. The work is split into steps that each do a bounded amount
-/// of work and charge the meter.
-type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap: int, sameSourceLength: bool, ledger: Ledger) =
+/// of work and charge the meter. A window of a source that is still growing passes false for longRunAnchors,
+/// because a long equal run in repetitive text can line up at a shifted position until more lines arrive.
+type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap: int, sameSourceLength: bool, longRunAnchors: bool, ledger: Ledger) =
     let stepChunk = 512
     let lookaheadLines = 2
     let longRunLines = 64
@@ -301,7 +302,7 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
     let mutable uniqueCurrentCount = Array.empty<byte>
     let mutable uniqueReserved = 0L
     let mutable uniqueCursor = 0
-    let mutable uniqueLines = 0
+    let mutable selfUniqueLines = 0
     let mutable markIndex = 0
     let mutable markAfterChange = false
 
@@ -360,11 +361,10 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
     let countLine (table: LineTable) index (holder: int) (counts: byte[]) =
         let slot = uniqueSlot table index
         if Native.readInt uniqueHolder slot < 0 then Native.writeInt uniqueHolder slot holder
-        let before = isUnique slot
         let seen = Native.readByte counts slot
         if seen < 2 then Native.writeByte counts slot (seen + 1)
-        let after = isUnique slot
-        if before <> after then uniqueLines <- uniqueLines + (if after then 1 else -1)
+        if seen = 0 then selfUniqueLines <- selfUniqueLines + 1
+        elif seen = 1 then selfUniqueLines <- selfUniqueLines - 1
 
     /// True when the key of a previous line occurs exactly once in each window.
     let uniqueInBoth (previousIndex: int) = isUnique (uniqueSlot previous previousIndex)
@@ -401,7 +401,7 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
     let beginConvert () =
         releaseScratch ()
         uniqueCursor <- 0
-        uniqueLines <- 0
+        selfUniqueLines <- 0
         phase <- AlignPhase.CountUnique
 
     let appendSuffix () =
@@ -578,8 +578,9 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
         releaseScratch ()
         releaseUnique ()
 
-    /// The number of line keys that occur exactly once in each window. It is known once the alignment completes.
-    member _.UniqueLines = uniqueLines
+    /// The number of line keys that occur exactly once within the previous window, plus the number that occur
+    /// exactly once within the current window. It is known once the alignment completes.
+    member _.SelfUniqueLines = selfUniqueLines
 
     member _.ResolveRun(matched: int) =
         match phase with
@@ -940,7 +941,7 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
                         lines <- lines + result[runEnd].PreviousCount
                         runEnd <- runEnd + 1
                     if markAfterChange then
-                        let mutable anchored = lines >= longRunLines
+                        let mutable anchored = longRunAnchors && lines >= longRunLines
                         let mutable index = markIndex
                         while not anchored && index < runEnd do
                             let operation = result[index]
