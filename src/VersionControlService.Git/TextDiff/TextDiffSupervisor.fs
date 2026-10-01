@@ -222,7 +222,7 @@ let private tryGetInstanceOwnerPid (name: string) =
 
 let private isOwnerWithin (scope: ChildOwner -> bool) (owner: ChildOwner) = scope owner
 
-/// The sessions and requests released on one worker. Releasing the whole worker removes this entry.
+/// The sessions and requests released on one worker. They stay recorded until their worker is released.
 type internal ReleasedWorker = {
     Sessions: HashSet<string>
     Requests: HashSet<ChildOwner>
@@ -235,8 +235,8 @@ type TextDiffSupervisor internal (instanceDirectory: string, gitExecutable: stri
     let spoolOwners = Dictionary<string, ChildOwner>()
     let workerDirectories = HashSet<string>()
     let released = Dictionary<string, ReleasedWorker>()
-    // Worker ids stay here after their release, so a start that resumes after ReleaseWorker is still refused.
-    // A pool adds one id per worker start.
+    // The set holds one id per released worker, so a start that resumes after ReleaseWorker is still refused.
+    // The pool never reuses a worker id.
     let releasedWorkers = HashSet<string>()
     let mutable disposed = false
 
@@ -364,27 +364,27 @@ type TextDiffSupervisor internal (instanceDirectory: string, gitExecutable: stri
                 return raise (InvalidOperationException("The Git command is not allowed for a text diff request."))
             else
                 if ownerReleased owner then
-                    invalidOp releasedOwnerMessage
+                    return raise (InvalidOperationException(releasedOwnerMessage))
+                else
+                    let gitArguments = Microsoft.FSharp.Collections.Array.concat [| [| "--literal-pathspecs"; "-c"; "protocol.allow=never" |]; arguments |]
+                    let environment = GitExecution.resolvedEnvironment () |> localOnlyEnvironment
 
-                let gitArguments = Microsoft.FSharp.Collections.Array.concat [| [| "--literal-pathspecs"; "-c"; "protocol.allow=never" |]; arguments |]
-                let environment = GitExecution.resolvedEnvironment () |> localOnlyEnvironment
+                    let! result =
+                        NodeProcess.runBoundedWithLifecycle
+                            gitExecutable
+                            gitArguments
+                            cwd
+                            environment
+                            65536
+                            65536
+                            (fun pid closed -> registerChild owner pid closed)
 
-                let! result =
-                    NodeProcess.runBoundedWithLifecycle
-                        gitExecutable
-                        gitArguments
-                        cwd
-                        environment
-                        65536
-                        65536
-                        (fun pid closed -> registerChild owner pid closed)
-
-                return {
-                    ExitCode = result.ExitCode
-                    Stdout = result.Stdout
-                    Stderr = result.Stderr
-                    Error = result.Error
-                }
+                    return {
+                        ExitCode = result.ExitCode
+                        Stdout = result.Stdout
+                        Stderr = result.Stderr
+                        Error = result.Error
+                    }
         }
 
     member this.StartBlobToSpool(owner: ChildOwner, cwd: string, oid: string, spoolPath: string) : JS.Promise<SpoolChild> =
@@ -404,42 +404,42 @@ type TextDiffSupervisor internal (instanceDirectory: string, gitExecutable: stri
                     return raise (InvalidOperationException("The spool path must be inside the worker directory."))
                 else
                     if ownerReleased owner then
-                        invalidOp releasedOwnerMessage
+                        return raise (InvalidOperationException(releasedOwnerMessage))
+                    else
+                        let! descriptor = NodePositionalFile.openCreateExclusive targetPath
+                        let mutable descriptorTransferred = false
 
-                    let! descriptor = NodePositionalFile.openCreateExclusive targetPath
-                    let mutable descriptorTransferred = false
+                        try
+                            if ownerReleased owner then
+                                return raise (InvalidOperationException(releasedOwnerMessage))
+                            else
+                                spoolOwners[targetPath] <- owner
+                                let arguments = [| "--literal-pathspecs"; "-c"; "protocol.allow=never"; "cat-file"; "blob"; oid |]
+                                let environment = GitExecution.resolvedEnvironment () |> localOnlyEnvironment
+                                descriptorTransferred <- true
 
-                    try
-                        if ownerReleased owner then
-                            invalidOp releasedOwnerMessage
+                                let! child =
+                                    NodeProcess.spawnToFileTracked
+                                        gitExecutable
+                                        arguments
+                                        cwd
+                                        environment
+                                        descriptor
+                                        (fun pid closed -> registerChild owner pid closed)
 
-                        spoolOwners[targetPath] <- owner
-                        let arguments = [| "--literal-pathspecs"; "-c"; "protocol.allow=never"; "cat-file"; "blob"; oid |]
-                        let environment = GitExecution.resolvedEnvironment () |> localOnlyEnvironment
-                        descriptorTransferred <- true
+                                if child.Pid > 0 then
+                                    return { Pid = child.Pid; Closed = child.Closed }
+                                else
+                                    let! _ = child.Closed
+                                    return raise (InvalidOperationException("Git could not start the blob command."))
+                        with error ->
+                            if not descriptorTransferred then
+                                try
+                                    do! NodePositionalFile.close descriptor
+                                with _ -> ()
 
-                        let! child =
-                            NodeProcess.spawnToFileTracked
-                                gitExecutable
-                                arguments
-                                cwd
-                                environment
-                                descriptor
-                                (fun pid closed -> registerChild owner pid closed)
-
-                        if child.Pid > 0 then
-                            return { Pid = child.Pid; Closed = child.Closed }
-                        else
-                            let! _ = child.Closed
-                            return raise (InvalidOperationException("Git could not start the blob command."))
-                    with error ->
-                        if not descriptorTransferred then
-                            try
-                                do! NodePositionalFile.close descriptor
-                            with _ -> ()
-
-                        do! deleteOneSpool targetPath
-                        return raise error
+                            do! deleteOneSpool targetPath
+                            return raise error
         }
 
     member _.ReleaseRequest(owner: ChildOwner) : JS.Promise<unit> =

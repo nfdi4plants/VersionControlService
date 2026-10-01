@@ -337,18 +337,20 @@ Vitest.describe (
                             return None
                     }
 
-                    do! release
-                    let! _ = observedRun
-                    Vitest.expect(runSettled).toBe true
-
-                    let childClosed =
+                    let childClosed () =
                         events
                         |> Seq.exists (fun event ->
                             match event.Kind with
                             | TextDiffSupervisor.ChildClosed _ -> true
                             | _ -> false)
 
-                    Vitest.expect(childClosed).toBe true
+                    do! release
+                    // The release waits for the children it kills, so the close is recorded before it resolves.
+                    let closedWhenReleaseResolved = childClosed ()
+                    let! _ = observedRun
+                    Vitest.expect(runSettled).toBe true
+                    Vitest.expect(closedWhenReleaseResolved).toBe true
+                    Vitest.expect(childClosed ()).toBe true
                     let childPid =
                         events
                         |> Seq.tryPick (fun event ->
@@ -362,6 +364,42 @@ Vitest.describe (
                         Vitest.expect(goneAfter.IsSome).toBe true
                     | None -> failwith "The short command did not register a child process."
 
+                    do! created.Dispose ()
+                    supervisor <- None
+                with error ->
+                    match supervisor with
+                    | Some created -> do! created.Dispose ()
+                    | None -> ()
+
+                    do! removeDirectory root
+                    return raise error
+
+                do! removeDirectory root
+            }
+        )
+
+        Vitest.test (
+            "refuses a worker directory whose worker is released while the directory is created",
+            TestOptions(timeout = 180000),
+            fun () -> promise {
+                let! root = createTempDirectory ()
+                let mutable supervisor: TextDiffSupervisor.TextDiffSupervisor option = None
+
+                try
+                    let! created = createSupervisor root None
+                    supervisor <- Some created
+                    let directory = created.WorkerDirectory "worker-directory-race"
+                    let release = created.ReleaseWorker "worker-directory-race"
+                    let mutable refused = false
+
+                    try
+                        let! _ = directory
+                        ()
+                    with _ ->
+                        refused <- true
+
+                    do! release
+                    Vitest.expect(refused).toBe true
                     do! created.Dispose ()
                     supervisor <- None
                 with error ->
