@@ -10,12 +10,11 @@ type AllocationCategory =
     | ChunkScratch
     | AlignmentScratch
     | ResponseData
-    | ResidentCheckpoints
     | RetainedBlobs
 
 type Ledger() =
-    let used = Array.zeroCreate<int64> 8
-    let caps = [| 32L; 32L; 54L; 16L; 8L; 8L; 1L; 2L |] |> Array.map (fun value -> value * 1024L * 1024L)
+    let used = Array.zeroCreate<int64> 7
+    let caps = [| 32L; 32L; 54L; 16L; 8L; 8L; 2L |] |> Array.map (fun value -> value * 1024L * 1024L)
 
     let index = function
         | AllocationCategory.PreviousWindows -> 0
@@ -24,8 +23,7 @@ type Ledger() =
         | AllocationCategory.ChunkScratch -> 3
         | AllocationCategory.AlignmentScratch -> 4
         | AllocationCategory.ResponseData -> 5
-        | AllocationCategory.ResidentCheckpoints -> 6
-        | AllocationCategory.RetainedBlobs -> 7
+        | AllocationCategory.RetainedBlobs -> 6
 
     member _.TryReserve(category: AllocationCategory, bytes: int64) =
         if bytes < 0L then invalidArg (nameof bytes) "The reservation cannot be negative."

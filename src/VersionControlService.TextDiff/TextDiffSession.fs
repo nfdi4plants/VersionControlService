@@ -501,13 +501,7 @@ type TextDiffSession internal (
     let pairings = PairingIndex(ledger, fun () -> host.CreateTempStore(config.SessionId + ":pairs"))
 
     let checkpoints =
-        Checkpoints(
-            ledger,
-            config.CheckpointIntervalBytes,
-            config.CheckpointResidentBytes,
-            [| previousEncoding; currentEncoding |],
-            fun () -> host.CreateTempStore(config.SessionId + ":checkpoints")
-        )
+        Checkpoints(config.CheckpointIntervalBytes, [| previousEncoding; currentEncoding |])
 
     let knownLineCounts = Array.create 2 None
 
@@ -2897,7 +2891,6 @@ type TextDiffSession internal (
                         do! recordResult sequence value
                         result <- Some(EngineResult.Ok value)
                 else
-                    if checkpoints.HasPending then do! checkpoints.Flush()
                     if Meter.quantumDue meter then
                         do! host.Yield()
                         Meter.beginNextQuantum meter
@@ -2918,7 +2911,7 @@ type TextDiffSession internal (
         let spec = specAt sideIndex
         if spec.Source.IsNone then return None
         else
-            let! hit = checkpoints.Find(sideIndex, byLine, target)
+            let hit = checkpoints.Find(sideIndex, byLine, target)
             let state, firstLine =
                 match hit with
                 | Some found -> found.State, found.Line
@@ -3677,7 +3670,6 @@ type TextDiffSession internal (
                 do! appendExpansion pending sequence parts usedRows
                 return EngineResult.Ok(Resumable.Ready parts)
         else
-            if checkpoints.HasPending then do! checkpoints.Flush()
             let nextSequence = allocateExpandRequest ()
             let continuation = operationIdentifier "x" pending.Attempt nextSequence (expansionBinding pending.Gap.GapId pending.FromStart pending.Count)
             let! preview =
@@ -3742,7 +3734,6 @@ type TextDiffSession internal (
             pendingLineReads.Remove pending.Attempt |> ignore
             return EngineResult.Ok result
         else
-            if checkpoints.HasPending then do! checkpoints.Flush()
             let nextSequence = allocateLineRequest ()
             let continuation = operationIdentifier "l" pending.Attempt nextSequence (lineReadBinding pending.Side pending.Line pending.OffsetUtf16 pending.MaxUtf16)
             let! preview =
@@ -4050,7 +4041,7 @@ type TextDiffSession internal (
                 do! pairings.Dispose()
                 journal.Release()
                 do! journal.Dispose()
-                do! checkpoints.Dispose()
+                checkpoints.Dispose()
                 do! store.Dispose()
     }
 
@@ -4086,7 +4077,6 @@ module TextDiffSession =
                 || config.ResyncProbeLimit <= 0
                 || config.ResyncConfirmLines <= 0
                 || config.CheckpointIntervalBytes <= 0.0
-                || config.CheckpointResidentBytes < 0
             then
                 invalidArg (nameof config) "The session limits must be positive and the context count cannot be negative."
             if config.WindowMaxLines > SessionConfig.MaxWindowLines then

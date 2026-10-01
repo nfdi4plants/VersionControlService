@@ -661,7 +661,6 @@ module TextDiffEngineCases =
             let categories = [|
                 AllocationCategory.ChunkScratch, 16L
                 AllocationCategory.AlignmentScratch, 8L
-                AllocationCategory.ResidentCheckpoints, 1L
                 AllocationCategory.RetainedBlobs, 2L
             |]
             for category, capMb in categories do

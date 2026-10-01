@@ -48,8 +48,6 @@ type SessionConfig = {
     ResyncConfirmLines: int
     /// Source bytes between two checkpoints of one side.
     CheckpointIntervalBytes: float
-    /// Bytes of checkpoint records that stay in memory per session.
-    CheckpointResidentBytes: int
     /// Bytes of recent journal records that one session keeps in memory.
     JournalCacheBytes: int
     Limits: Limits
@@ -88,7 +86,6 @@ module SessionConfig =
         ResyncProbeLimit = 32
         ResyncConfirmLines = 8
         CheckpointIntervalBytes = 67_108_864.0
-        CheckpointResidentBytes = 1_048_576
         JournalCacheBytes = 1_048_576
         Limits = Limits.defaults
     }
