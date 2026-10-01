@@ -283,7 +283,6 @@ let private withPoolOptions
 
 let private withPoolConfigured
     (maxWorkers: int)
-    (sessionsPerWorker: int)
     (factory: TextDiffWorkerFactory)
     (configure: TextDiffPool.TextDiffPoolOptions -> TextDiffPool.TextDiffPoolOptions)
     (body: TextDiffPool.TextDiffPool -> JS.Promise<unit>)
@@ -294,17 +293,15 @@ let private withPoolConfigured
             configure {
                 options with
                     MaxWorkers = maxWorkers
-                    SessionsPerWorker = sessionsPerWorker
             })
         body
 
 let private withPool
     (maxWorkers: int)
-    (sessionsPerWorker: int)
     (factory: TextDiffWorkerFactory)
     (body: TextDiffPool.TextDiffPool -> JS.Promise<unit>)
     : JS.Promise<unit> =
-    withPoolConfigured maxWorkers sessionsPerWorker factory id body
+    withPoolConfigured maxWorkers factory id body
 
 let private context () =
     let source = OperationCancellation.Source()
@@ -391,7 +388,7 @@ let private verifyLateOpenCleanup (lateAnswer: string -> int -> TextDiffMessage)
             transports[index] <- transport
             transport :> ITextDiffWorkerTransport
 
-    withPool 2 1 factory (fun pool -> promise {
+    withPool 2 factory (fun pool -> promise {
         let service = pool.Service owner
         let source, cancellationContext = context ()
         let opening = Watched(service.Open openRequest cancellationContext |> run)
@@ -468,7 +465,7 @@ Vitest.describe (
             fun () ->
                 let control = Control()
 
-                withPool 1 1 (inProcessFactory control (ResizeArray())) (fun pool -> promise {
+                withPool 1 (inProcessFactory control (ResizeArray())) (fun pool -> promise {
                     let service = pool.Service owner
                     let! opened = service.Open openRequest (OperationContext.detached "open") |> run
                     let handle = openedHandle opened
@@ -497,7 +494,7 @@ Vitest.describe (
             fun () ->
                 let control = Control()
 
-                withPool 1 1 (inProcessFactory control (ResizeArray())) (fun pool -> promise {
+                withPool 1 (inProcessFactory control (ResizeArray())) (fun pool -> promise {
                     let service = pool.Service owner
                     let! first = service.Open openRequest (OperationContext.detached "open-1") |> run
                     let firstHandle = openedHandle first
@@ -551,7 +548,7 @@ Vitest.describe (
             fun () ->
                 let control = Control()
 
-                withPool 1 1 (inProcessFactory control (ResizeArray())) (fun pool -> promise {
+                withPool 1 (inProcessFactory control (ResizeArray())) (fun pool -> promise {
                     let service = pool.Service owner
                     let! first = service.Open openRequest (OperationContext.detached "open-1") |> run
                     let firstHandle = openedHandle first
@@ -580,7 +577,7 @@ Vitest.describe (
             fun () ->
                 let control = Control()
 
-                withPool 1 1 (inProcessFactory control (ResizeArray())) (fun pool -> promise {
+                withPool 1 (inProcessFactory control (ResizeArray())) (fun pool -> promise {
                     let service = pool.Service owner
                     let! opened = service.Open openRequest (OperationContext.detached "open") |> run
                     let handle = openedHandle opened
@@ -609,7 +606,7 @@ Vitest.describe (
             fun () ->
                 let control = Control()
 
-                withPool 1 1 (inProcessFactory control (ResizeArray())) (fun pool -> promise {
+                withPool 1 (inProcessFactory control (ResizeArray())) (fun pool -> promise {
                     let service = pool.Service owner
                     let! opened = service.Open openRequest (OperationContext.detached "open") |> run
                     let handle = openedHandle opened
@@ -640,7 +637,7 @@ Vitest.describe (
                 let control = Control()
                 let created = ResizeArray<ITextDiffWorkerTransport>()
 
-                withPool 1 2 (inProcessFactory control created) (fun pool -> promise {
+                withPool 1 (inProcessFactory control created) (fun pool -> promise {
                     let service = pool.Service owner
                     let! opened = service.Open openRequest (OperationContext.detached "open") |> run
                     let handle = openedHandle opened
@@ -673,7 +670,7 @@ Vitest.describe (
             fun () ->
                 let control = Control()
 
-                withPool 1 2 (inProcessFactory control (ResizeArray())) (fun pool -> promise {
+                withPool 1 (inProcessFactory control (ResizeArray())) (fun pool -> promise {
                     let service = pool.Service owner
                     let! opened = service.Open openRequest (OperationContext.detached "open") |> run
                     let handle = openedHandle opened
@@ -705,7 +702,7 @@ Vitest.describe (
                         handlers.Add handler
                         InProcessTransport.create (handler :> ITextDiffRequestHandler)
 
-                withPool 2 2 factory (fun pool -> promise {
+                withPool 2 factory (fun pool -> promise {
                     let service = pool.Service owner
                     let! first = service.Open openRequest (OperationContext.detached "open-token") |> run
                     let token = preparationToken first
@@ -742,7 +739,7 @@ Vitest.describe (
                         handlers.Add handler
                         InProcessTransport.create (handler :> ITextDiffRequestHandler)
 
-                withPool 2 2 factory (fun pool -> promise {
+                withPool 2 factory (fun pool -> promise {
                     pool.Prewarm()
                     do! waitUntil (fun () -> handlers.Count = 2)
                     let service = pool.Service owner
@@ -811,7 +808,6 @@ Vitest.describe (
 
                 withPoolConfigured
                     2
-                    2
                     factory
                     (fun options -> { options with NowMilliseconds = (fun () -> now) })
                     (fun pool -> promise {
@@ -869,7 +865,6 @@ Vitest.describe (
                             InProcessTransport.create (testHandler control)
 
                 withPoolConfigured
-                    1
                     1
                     factory
                     (fun options -> { options with InitTimeoutMs = 100 })
@@ -935,130 +930,13 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "closes a canceled queued continuation",
-            TestOptions(timeout = 60000),
-            fun () ->
-                let transport = ManualTransport()
-                let factory: TextDiffWorkerFactory = fun _ -> transport :> ITextDiffWorkerTransport
-
-                withPool 1 2 factory (fun pool -> promise {
-                    let service = pool.Service owner
-                    let firstOpening = Watched(service.Open openRequest (OperationContext.detached "first-scan") |> run)
-
-                    do! waitUntil (fun () -> transport.Posted.Count > 0)
-
-                    let workerId, epoch =
-                        match decodeMessage transport.Posted[0] with
-                        | Ok(TextDiffMessage.Init(workerId, epoch, _)) -> workerId, epoch
-                        | other -> failwith $"Expected init, got %A{other}"
-
-                    transport.Inject(encode (TextDiffMessage.InitAck(workerId, epoch)))
-
-                    let openRequests () =
-                        transport.Posted
-                        |> Seq.choose (fun message ->
-                            match decodeMessage message with
-                            | Ok(TextDiffMessage.Request(requestId, generation, RequestBody.Open _)) -> Some(requestId, generation)
-                            | _ -> None)
-                        |> Seq.toArray
-
-                    do! waitUntil (fun () -> openRequests().Length = 1)
-                    let firstRequestId, firstGeneration = openRequests()[0]
-                    let continuation = "scan-continuation"
-                    let scanning = Resumable.Scanning(page.Progress, continuation, None)
-                    transport.Inject(encode (TextDiffMessage.Result(firstRequestId, firstGeneration, ResultPayload.Open scanning)))
-                    let! first = firstOpening.Result
-
-                    match first with
-                    | Succeeded outcome ->
-                        match outcome.Value with
-                        | Resumable.Scanning(_, actual, _) -> Vitest.expect(actual).toBe continuation
-                        | other -> failwith $"Expected a scanning result, got %A{other}"
-                    | other -> failwith $"Open failed: %A{other}"
-
-                    let secondOpening = Watched(service.Open openRequest (OperationContext.detached "second-open") |> run)
-                    do! waitUntil (fun () -> openRequests().Length = 2)
-                    let secondRequestId, secondGeneration = openRequests()[1]
-                    let secondHandle = { DiffHandle.Id = "second-worker-handle"; Version = "1" }
-                    let opened = Resumable.Ready(OpenDiffResult.Opened(secondHandle, sourceInfo, sourceInfo, Resumable.Ready page))
-                    transport.Inject(encode (TextDiffMessage.Result(secondRequestId, secondGeneration, ResultPayload.Open opened)))
-                    let! second = secondOpening.Result
-                    let publicHandle = openedHandle second
-
-                    let reading = Watched(readPage service publicHandle "held-page" (OperationContext.detached "held-page"))
-                    do!
-                        waitUntil (fun () ->
-                            transport.Posted
-                            |> Seq.exists (fun message ->
-                                match decodeMessage message with
-                                | Ok(TextDiffMessage.Request(_, _, RequestBody.ReadPage _)) -> true
-                                | _ -> false))
-
-                    let readRequestId, readGeneration =
-                        transport.Posted
-                        |> Seq.choose (fun message ->
-                            match decodeMessage message with
-                            | Ok(TextDiffMessage.Request(requestId, generation, RequestBody.ReadPage _)) -> Some(requestId, generation)
-                            | _ -> None)
-                        |> Seq.last
-
-                    let source, cancellationContext = context ()
-                    let reopening =
-                        Watched(
-                            service.Open
-                                { openRequest with Continuation = Some continuation }
-                                cancellationContext
-                            |> run
-                        )
-
-                    do! delay 20
-                    Vitest.expect(reopening.Settled).toBe false
-                    source.Cancel()
-                    let! canceled = reopening.Result
-                    Vitest.expect(failureCode canceled).toBe "operation_canceled"
-                    Vitest.expect(reading.Settled).toBe false
-
-                    let closeWasPosted =
-                        transport.Posted
-                        |> Seq.exists (fun message ->
-                            match decodeMessage message with
-                            | Ok(TextDiffMessage.Request(_, _, RequestBody.Close _)) -> true
-                            | _ -> false)
-
-                    Vitest.expect(closeWasPosted).toBe false
-                    transport.Inject(encode (TextDiffMessage.Result(readRequestId, readGeneration, ResultPayload.ReadPage(Resumable.Ready page))))
-                    let! readResult = reading.Result
-                    Vitest.expect(readResult.IsSucceeded).toBe true
-
-                    do!
-                        waitUntil (fun () ->
-                            transport.Posted
-                            |> Seq.exists (fun message ->
-                                match decodeMessage message with
-                                | Ok(TextDiffMessage.Request(_, _, RequestBody.Close _)) -> true
-                                | _ -> false))
-
-                    let closeRequestId, closeGeneration, closeHandle =
-                        transport.Posted
-                        |> Seq.choose (fun message ->
-                            match decodeMessage message with
-                            | Ok(TextDiffMessage.Request(requestId, generation, RequestBody.Close handle)) -> Some(requestId, generation, handle)
-                            | _ -> None)
-                        |> Seq.last
-
-                    Vitest.expect(closeHandle).toEqual None
-                    transport.Inject(encode (TextDiffMessage.Result(closeRequestId, closeGeneration, ResultPayload.Close)))
-                })
-        )
-
-        Vitest.test (
             "stops forwarding progress after cancellation",
             TestOptions(timeout = 60000),
             fun () ->
                 let transport = ManualTransport()
                 let factory: TextDiffWorkerFactory = fun _ -> transport :> ITextDiffWorkerTransport
 
-                withPool 1 1 factory (fun pool -> promise {
+                withPool 1 factory (fun pool -> promise {
                     let service = pool.Service owner
                     let opening = Watched(service.Open openRequest (OperationContext.detached "open") |> run)
                     do! waitUntil (fun () -> transport.Posted.Count > 0)
@@ -1123,7 +1001,7 @@ Vitest.describe (
                 let transport = ManualTransport()
                 let factory: TextDiffWorkerFactory = fun _ -> transport :> ITextDiffWorkerTransport
 
-                withPool 1 1 factory (fun pool -> promise {
+                withPool 1 factory (fun pool -> promise {
                     let service = pool.Service owner
                     let opening = Watched(service.Open openRequest (OperationContext.detached "open") |> run)
 
@@ -1243,7 +1121,7 @@ Vitest.describe (
                         taps.Add tap
                         tap :> ITextDiffWorkerTransport
 
-                withPool 1 1 factory (fun pool -> promise {
+                withPool 1 factory (fun pool -> promise {
                     let service = pool.Service owner
                     let opening = Watched(service.Open openRequest (OperationContext.detached "open") |> run)
                     do! waitUntil (fun () -> taps.Count = 1 && taps[0].Posted.Count >= 1)

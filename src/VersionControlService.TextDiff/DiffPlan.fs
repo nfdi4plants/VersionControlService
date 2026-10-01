@@ -52,11 +52,6 @@ type internal LineTable(category: AllocationCategory, ledger: Ledger, hashMask: 
 
     member _.TryEnsure(required: int) = tryEnsure required
 
-    /// Sets the line count after the arrays were filled from a spilled copy.
-    member _.SetCount(value: int, firstLine: int64) =
-        count <- value
-        lineBase <- firstLine
-
     member _.Count = count
     member _.Capacity = capacity
     member _.LineBase = lineBase
@@ -142,8 +137,6 @@ type internal DiffOperation = {
 [<RequireQualifiedAccess>]
 type internal AlignStep =
     | Running
-    /// The step needs scratch memory that other sessions hold. The caller retries later.
-    | Waiting
     | NeedRun of previousIndex: int * currentIndex: int * count: int
     | Complete of DiffOperation[]
 
@@ -334,18 +327,18 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
             else slot <- (slot + 1) &&& uniqueMask
         slot
 
+    /// A worker runs one session, so the ledger always has room for the alignment scratch. A refusal is a bug.
     let reserveUnique () =
         let mutable slots = 16
         while slots < (previousCount + currentCount) * 2 do slots <- slots * 2
         let estimate = int64 slots * 6L + 4096L
-        if ledger.TryReserve(AllocationCategory.AlignmentScratch, estimate) then
-            uniqueReserved <- estimate
-            uniqueMask <- slots - 1
-            uniqueHolder <- Array.create slots -1
-            uniquePreviousCount <- Array.zeroCreate slots
-            uniqueCurrentCount <- Array.zeroCreate slots
-            true
-        else false
+        if not (ledger.TryReserve(AllocationCategory.AlignmentScratch, estimate)) then
+            invalidOp "The ledger refused the alignment scratch for the unique line count."
+        uniqueReserved <- estimate
+        uniqueMask <- slots - 1
+        uniqueHolder <- Array.create slots -1
+        uniquePreviousCount <- Array.zeroCreate slots
+        uniqueCurrentCount <- Array.zeroCreate slots
 
     let releaseUnique () =
         if uniqueReserved > 0L then
@@ -422,7 +415,7 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
 
     let finishMiddle () = beginConvert ()
 
-    /// Returns false when the scratch reservation is not available yet, so the caller retries the step.
+    /// A worker runs one session, so the ledger always has room for the alignment scratch. A refusal is a bug.
     let startMiddle () =
         middlePreviousStart <- prefixEnd
         middleCurrentStart <- prefixEnd
@@ -432,26 +425,23 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
         let currentMiddle = middleCurrentEnd - middleCurrentStart
         if previousMiddle <= 0 && currentMiddle <= 0 then
             finishMiddle ()
-            true
         elif previousMiddle <= 0 || currentMiddle <= 0 then
             emitBulk middlePreviousStart middlePreviousEnd middleCurrentStart middleCurrentEnd
             finishMiddle ()
-            true
         else
             let mutable slots = 16
             while slots < previousMiddle * 2 do slots <- slots * 2
             let estimate = int64 slots * 10L + int64 (min previousMiddle currentMiddle) * 40L + 4096L
-            if ledger.TryReserve(AllocationCategory.AlignmentScratch, estimate) then
-                reserved <- estimate
-                slotMask <- slots - 1
-                slotPrevious <- Array.create slots -1
-                slotPreviousCount <- Array.zeroCreate slots
-                slotCurrent <- Array.zeroCreate slots
-                slotCurrentCount <- Array.zeroCreate slots
-                cursor <- middlePreviousStart
-                phase <- AlignPhase.BuildSlots
-                true
-            else false
+            if not (ledger.TryReserve(AllocationCategory.AlignmentScratch, estimate)) then
+                invalidOp "The ledger refused the alignment scratch for the middle section."
+            reserved <- estimate
+            slotMask <- slots - 1
+            slotPrevious <- Array.create slots -1
+            slotPreviousCount <- Array.zeroCreate slots
+            slotCurrent <- Array.zeroCreate slots
+            slotCurrentCount <- Array.zeroCreate slots
+            cursor <- middlePreviousStart
+            phase <- AlignPhase.BuildSlots
 
     let tryStartPositionalConfirm () =
         let previousMiddle = suffixPrevious - prefixEnd
@@ -685,8 +675,9 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
         | AlignPhase.SuffixConfirm -> AlignStep.NeedRun(suffixPrevious, suffixCurrent, pendingLength)
         | AlignPhase.MiddleStart ->
             if not positionalAttempted && tryStartPositionalConfirm () then AlignStep.Running
-            elif startMiddle () then AlignStep.Running
-            else AlignStep.Waiting
+            else
+                startMiddle ()
+                AlignStep.Running
         | AlignPhase.PositionalConfirm -> AlignStep.NeedRun(positionalPrevious, positionalCurrent, positionalRemaining)
         | AlignPhase.BuildSlots ->
             let mutable count = 0
@@ -855,18 +846,17 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
                 startGap meter
                 AlignStep.Running
         | AlignPhase.CountUnique ->
-            if uniqueReserved = 0L && not (reserveUnique ()) then AlignStep.Waiting
-            else
-                let total = previousCount + currentCount
-                let mutable count = 0
-                while uniqueCursor < total && count < stepChunk do
-                    if uniqueCursor < previousCount then countLine previous uniqueCursor uniqueCursor uniquePreviousCount
-                    else countLine current (uniqueCursor - previousCount) uniqueCursor uniqueCurrentCount
-                    uniqueCursor <- uniqueCursor + 1
-                    count <- count + 1
-                Meter.charge meter (count / 8)
-                if uniqueCursor >= total then appendSuffix ()
-                AlignStep.Running
+            if uniqueReserved = 0L then reserveUnique ()
+            let total = previousCount + currentCount
+            let mutable count = 0
+            while uniqueCursor < total && count < stepChunk do
+                if uniqueCursor < previousCount then countLine previous uniqueCursor uniqueCursor uniquePreviousCount
+                else countLine current (uniqueCursor - previousCount) uniqueCursor uniqueCurrentCount
+                uniqueCursor <- uniqueCursor + 1
+                count <- count + 1
+            Meter.charge meter (count / 8)
+            if uniqueCursor >= total then appendSuffix ()
+            AlignStep.Running
         | AlignPhase.Convert ->
             let mutable budget = 4096
             let flushGroup () =

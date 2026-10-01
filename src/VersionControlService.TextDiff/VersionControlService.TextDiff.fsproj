@@ -24,7 +24,6 @@
     <Compile Include="LineCompare.fs" />
     <Compile Include="SampledIndex.fs" />
     <Compile Include="Resync.fs" />
-    <Compile Include="WorkerScratch.fs" />
     <Compile Include="TextDiffSession.fs" />
   </ItemGroup>
   <ItemGroup>

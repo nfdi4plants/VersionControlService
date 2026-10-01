@@ -635,39 +635,6 @@ module TextDiffSessionCases =
                 current.InsertRange(start, fresh edit amount)
         previous, current.ToArray()
 
-    /// Reads every page and spills the session between requests whenever it may give up its memory.
-    let private readAllSpilling (session: TextDiffSession) = async {
-        let pages = ResizeArray<DiffPage>()
-        let mutable spills = 0
-        let mutable requests = 0
-        let mutable result = EngineResult.Canceled
-        let mutable pending = true
-        let! first = session.FirstPage(fun () -> false)
-        result <- first
-        while pending do
-            requests <- requests + 1
-            if requests > 200_000 then failwith "The session did not finish."
-            let holder = session :> IScratchHolder
-            if holder.HoldsScratch && not holder.MustKeepScratch then
-                let! spilled = session.Spill()
-                match spilled with
-                | EngineResult.Ok() -> spills <- spills + 1
-                | other -> failwith $"The spill failed: {other}."
-            match result with
-            | EngineResult.Ok(Resumable.Ready page) ->
-                pages.Add page
-                match page.NextCursor with
-                | None -> pending <- false
-                | Some cursor ->
-                    let! next = session.ReadPage cursor (fun () -> false)
-                    result <- next
-            | EngineResult.Ok(Resumable.Scanning(_, continuation, _)) ->
-                let! next = session.ReadPage continuation (fun () -> false)
-                result <- next
-            | other -> failwith $"The session returned {other}."
-        return pages.ToArray(), spills
-    }
-
     let cases: (string * (unit -> Async<unit>)) list = [
         "a small edit between context rows keeps every line on both sides", fun () -> async {
             let build edited =
@@ -2169,23 +2136,6 @@ module TextDiffSessionCases =
 
             return ()
         }
-        "generated large edits rebuild both complete sources across forced spills", fun () -> async {
-            let random = RandomState 0x1A26E5u
-            let limits = { Limits.defaults with MaxUnits = 256 }
-            let mutable totalSpills = 0
-
-            for caseIndex in 0 .. 29 do
-                let previous, current = largeEdit random caseIndex
-                let sessionConfig = { config 2 10_000 256 16 limits with WindowMaxBytes = 4 * 1024 }
-                let! session = openSession sessionConfig (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
-                let! pages, spills = readAllSpilling session
-                totalSpills <- totalSpills + spills
-                checkOracle previous current pages
-                do! session.Close()
-
-            Check.true' (totalSpills > 0) "The sessions were spilled between requests."
-            return ()
-        }
         "deterministic edit scripts rebuild both complete sources", fun () -> async {
             let random = RandomState 0x5EED1234u
 
@@ -2416,10 +2366,6 @@ module TextDiffSessionCases =
             match later with
             | EngineResult.Failed(code, _, _) -> Check.equal TextDiffFailureCodes.WorkerFailed code "A later page request sees the failed session."
             | other -> failwith $"The failed session accepted another page request: {other}."
-            let holder = session :> IScratchHolder
-            Check.true' (not holder.MustKeepScratch) "A failed session does not keep its scratch."
-            do! holder.Spill()
-            Check.true' (not holder.HoldsScratch) "A failed session releases its scratch when asked to spill."
             do! session.Close()
             return ()
         }

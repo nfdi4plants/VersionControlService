@@ -220,31 +220,6 @@ type internal ScanSide(
 
     member _.LineObserver with get () = lineObserver and set value = lineObserver <- value; hasLineObserver <- true
 
-    /// Writes the scan position and the window counters. The line arrays are written by the caller.
-    member _.Export(header: HeaderBuilder) =
-        header.Bool finished
-        header.Number coverage
-        header.Number windowStart
-        header.Int windowLineLimit
-        header.Int windowByteLimit
-        header.Number windowAccountedBytes
-        header.Number(float table.LineBase)
-        header.Int table.Count
-        ScannerStateCodec.write header scanner
-
-    /// Reads what Export wrote and returns the number of window lines that the caller has to restore.
-    member _.Import(header: HeaderReader) =
-        finished <- header.Bool()
-        coverage <- header.Number()
-        windowStart <- header.Number()
-        windowLineLimit <- header.Int()
-        windowByteLimit <- header.Int()
-        windowAccountedBytes <- header.Number()
-        let firstLine = header.Number()
-        let lines = header.Int()
-        scanner <- ScannerStateCodec.read encoding header
-        struct (int64 firstLine, lines)
-
     member _.Dispose() = table.Dispose()
 
 /// Confirms a claimed run of equal lines against the source bytes when both sources share an encoding.

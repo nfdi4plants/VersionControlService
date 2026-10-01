@@ -25,7 +25,6 @@ type TextDiffPoolOptions = {
     Factory: TextDiffWorkerFactory
     Supervisor: Supervisor.TextDiffSupervisor
     MaxWorkers: int
-    SessionsPerWorker: int
     InitTimeoutMs: int
     NowMilliseconds: unit -> float
 }
@@ -38,7 +37,6 @@ module TextDiffPoolOptions =
         Factory = factory
         Supervisor = supervisor
         MaxWorkers = 3
-        SessionsPerWorker = 1
         InitTimeoutMs = 15000
         NowMilliseconds = fun () -> float DateTime.UtcNow.Ticks / 10000.0
     }
@@ -135,7 +133,6 @@ let private waitAtMost (milliseconds: int) (work: JS.Promise<unit>) : JS.Promise
 type TextDiffPool internal (options: TextDiffPoolOptions) =
     let supervisor = options.Supervisor
     let workers: PoolWorker option[] = Array.create (max 1 options.MaxWorkers) None
-    let sessionsPerWorker = max 1 options.SessionsPerWorker
     let admissions = ResizeArray<Admission>()
     let preparationAffinities = Dictionary<string, PreparationAffinity>()
     let handles = Dictionary<string, PoolSession>()
@@ -404,8 +401,7 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
     and tryReserve (owner: TextDiffOwner) : Result<PoolSession, OperationFailure> option =
         let candidate =
             liveWorkers ()
-            |> Array.filter (fun worker -> worker.Sessions.Count < sessionsPerWorker)
-            |> Array.sortBy (fun worker -> worker.Sessions.Count)
+            |> Array.filter (fun worker -> worker.Sessions.Count = 0)
             |> Array.tryHead
 
         let emptyIndex = workers |> Array.tryFindIndex Option.isNone
@@ -428,7 +424,7 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
 
     and tryReserveAdmission (admission: Admission) : Result<PoolSession, OperationFailure> option =
         match admissionWorker admission with
-        | Some worker when worker.Sessions.Count < sessionsPerWorker -> Some(Ok(reserveSession admission.Owner worker))
+        | Some worker when worker.Sessions.Count = 0 -> Some(Ok(reserveSession admission.Owner worker))
         | Some _ -> None
         | None -> tryReserve admission.Owner
 

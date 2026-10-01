@@ -7,7 +7,6 @@ open VersionControlService.Abstractions
 type internal ResyncStep =
     | Running
     | Waiting
-    | Reserving
     | Handover of previousOffset: float * previousLine: float * currentOffset: float * currentLine: float
     | Finished
 
@@ -88,8 +87,6 @@ type internal ResyncEngine
     let laneChunk = max 1 (min 1_024 config.PageMaxRows)
     let mask = config.ResyncSampleModulus - 1
 
-    let importCounts = Array.zeroCreate<int> 2
-    let mutable importReserved = true
     let mutable reserved = false
     let mutable stage = ResyncStage.Discover
 
@@ -156,8 +153,6 @@ type internal ResyncEngine
     let mutable emitPhase = 0
     let mutable emitKind = 0
 
-    let tableHeld (side: ScanSide) = side.Table.Capacity > 0
-
     let isVerifying (value: int) =
         value = ResyncStage.VerifyLoad
         || value = ResyncStage.VerifyForward
@@ -175,43 +170,41 @@ type internal ResyncEngine
         job <- None
         if isVerifying stage then stage <- ResyncStage.VerifyStart
 
+    /// A worker runs one session, so the ledger always has room for the index memory. A refusal is a bug.
     let reserve () =
-        if reserved then true
-        elif ledger.TryReserve(AllocationCategory.SampledIndexes, indexBytes) then
+        if not reserved then
+            if not (ledger.TryReserve(AllocationCategory.SampledIndexes, indexBytes)) then
+                invalidOp "The ledger refused the resync index reservation."
             reserved <- true
             indexes[0].Allocate()
             indexes[1].Allocate()
-            true
-        else false
 
     let startSide (side: ScanSide) (offset: float) (line: float) (limit: int) =
         side.SetCursor(offset, int64 line, limit, Int32.MaxValue)
 
-    /// Reads one chunk into a side. It returns 1 after progress, 0 when the source has no data yet, -1 when the
-    /// ledger refuses the line table and 2 when nothing changed.
+    /// Reads one chunk into a side. It returns 1 after progress, 0 when the source has no data yet and 2 when
+    /// nothing changed. A worker runs one session, so the ledger always has room for the line table. A refusal
+    /// is a bug.
     let loadStep (side: ScanSide) (buffer: byte[]) (limit: int) (meter: Meter) = async {
-        if not (side.Table.TryEnsure limit) then return -1
-        else
-            Meter.charge meter 1
-            let remainingLines = max 1 (limit - side.Table.Count)
-            let readMax = min buffer.Length (max 4_096 (remainingLines * 128))
-            let! step = side.ReadInto(buffer, readMax)
-            match step with
-            | ReadData(count, endOfSource) ->
-                side.Consume(buffer, count, endOfSource, meter) |> ignore
-                return 1
-            | ReadWaiting -> return 0
-            | ReadChanged ->
-                changed ()
-                return 2
-            | ReadWindowFull
-            | ReadFinished -> return 2
+        if not (side.Table.TryEnsure limit) then invalidOp "The ledger refused a resync line table."
+        Meter.charge meter 1
+        let remainingLines = max 1 (limit - side.Table.Count)
+        let readMax = min buffer.Length (max 4_096 (remainingLines * 128))
+        let! step = side.ReadInto(buffer, readMax)
+        match step with
+        | ReadData(count, endOfSource) ->
+            side.Consume(buffer, count, endOfSource, meter) |> ignore
+            return 1
+        | ReadWaiting -> return 0
+        | ReadChanged ->
+            changed ()
+            return 2
+        | ReadWindowFull
+        | ReadFinished -> return 2
     }
 
     let toStep (code: int) =
-        if code = 0 then ResyncStep.Waiting
-        elif code < 0 then ResyncStep.Reserving
-        else ResyncStep.Running
+        if code = 0 then ResyncStep.Waiting else ResyncStep.Running
 
     let beginEmit (offsets: float[]) (lines: float[]) (follow: int) =
         for side in 0..1 do
@@ -687,23 +680,21 @@ type internal ResyncEngine
                 return ResyncStep.Running
     }
 
-    member _.HoldsScratch = reserved || tableHeld disc[0] || tableHeld disc[1] || tableHeld aux[0] || tableHeld aux[1]
     member _.PreviewSides = [| disc; aux |]
 
     /// Runs one bounded unit of work. The buffers are the session's chunk scratch.
     member _.Step(meter: Meter, bufferA: byte[], bufferB: byte[]) : Async<ResyncStep> = async {
-        if not (reserve ()) then return ResyncStep.Reserving
-        else
-            match stage with
-            | ResyncStage.Discover -> return! discoverStep bufferA bufferB meter
-            | ResyncStage.VerifyStart ->
-                verifyStart ()
-                return ResyncStep.Running
-            | ResyncStage.VerifyLoad -> return! verifyLoad bufferA bufferB meter
-            | ResyncStage.Emit -> return! emitStep bufferA bufferB meter
-            | ResyncStage.DeepLoad -> return! deepLoadStep bufferA bufferB meter
-            | ResyncStage.DeepVerify -> return! deepVerifyStep bufferA bufferB meter
-            | _ -> return! verifyStep bufferA bufferB meter
+        reserve ()
+        match stage with
+        | ResyncStage.Discover -> return! discoverStep bufferA bufferB meter
+        | ResyncStage.VerifyStart ->
+            verifyStart ()
+            return ResyncStep.Running
+        | ResyncStage.VerifyLoad -> return! verifyLoad bufferA bufferB meter
+        | ResyncStage.Emit -> return! emitStep bufferA bufferB meter
+        | ResyncStage.DeepLoad -> return! deepLoadStep bufferA bufferB meter
+        | ResyncStage.DeepVerify -> return! deepVerifyStep bufferA bufferB meter
+        | _ -> return! verifyStep bufferA bufferB meter
     }
 
     /// Frees every line table and the index reservation. The engine cannot run afterwards.
@@ -720,81 +711,4 @@ type internal ResyncEngine
         for side in 0..1 do
             disc[side].Dispose()
             aux[side].Dispose()
-
-    /// Writes the scalar state. Verification restarts at its candidate after a restore and emission
-    /// reloads its lines, so the line tables are not part of the state.
-    member _.Export(header: HeaderBuilder) =
-        let saved =
-            if isVerifying stage then ResyncStage.VerifyStart else stage
-        header.Int saved
-        header.Int candSide
-        header.Int candCount
-        header.Int candNext
-        for index = 0 to candCount * ResyncStage.CandidateWidth - 1 do
-            header.Number candData[index]
-        for side in 0..1 do
-            header.Number originOffset[side]
-            header.Number originLine[side]
-            header.Number rangeOffset[side]
-            header.Number rangeLine[side]
-            header.Number procOffset[side]
-            header.Number procLine[side]
-            header.Bool finishedSide[side]
-            header.Int indexes[side].Count
-            header.Number endOffset[side]
-            header.Number endLine[side]
-            header.Number emitOffset[side]
-            header.Number emitLine[side]
-        header.Int emitFollow
-        header.Int emitPhase
-        header.Int emitKind
-        header.Int cutFollow
-        header.Number cutCount
-        header.Bool reserved
-
-    /// Reads what Export wrote. It returns the entry counts of the two indexes.
-    member _.Import(header: HeaderReader) =
-        stage <- header.Int()
-        candSide <- header.Int()
-        candCount <- header.Int()
-        candNext <- header.Int()
-        for index = 0 to candCount * ResyncStage.CandidateWidth - 1 do
-            candData[index] <- header.Number()
-        let counts = Array.zeroCreate<int> 2
-        for side in 0..1 do
-            originOffset[side] <- header.Number()
-            originLine[side] <- header.Number()
-            rangeOffset[side] <- header.Number()
-            rangeLine[side] <- header.Number()
-            procOffset[side] <- header.Number()
-            procLine[side] <- header.Number()
-            finishedSide[side] <- header.Bool()
-            counts[side] <- header.Int()
-            endOffset[side] <- header.Number()
-            endLine[side] <- header.Number()
-            emitOffset[side] <- header.Number()
-            emitLine[side] <- header.Number()
-        emitFollow <- header.Int()
-        emitPhase <- header.Int()
-        emitKind <- header.Int()
-        cutFollow <- header.Int()
-        cutCount <- header.Number()
-        importReserved <- header.Bool()
-        importCounts[0] <- counts[0]
-        importCounts[1] <- counts[1]
-
-    /// Reserves the index memory and creates empty arrays for the imported entries. It returns false while
-    /// other sessions hold the reservation. An engine that had not reserved its index memory when it was
-    /// spilled reserves it at its first step, as before the spill.
-    member _.TryAllocate() =
-        if reserved || not importReserved then true
-        elif ledger.TryReserve(AllocationCategory.SampledIndexes, indexBytes) then
-            reserved <- true
-            indexes[0].Prepare importCounts[0]
-            indexes[1].Prepare importCounts[1]
-            true
-        else false
-
-    /// The index arrays that the spilled state holds, in a fixed order.
-    member _.Slots: ArraySlot list = indexes[0].Slots(indexes[0].Count) @ indexes[1].Slots(indexes[1].Count)
 

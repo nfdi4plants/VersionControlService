@@ -865,8 +865,8 @@ Call `Prewarm` during startup and await `disposeDiffPool` when the app quits. Th
 disposes its supervisor during shutdown.
 
 `TextDiffPoolOptions.create` makes a pool with three workers and one session per worker.
-A fourth `Open` closes the least recently used idle session, or waits when every session is busy. Set `MaxWorkers` and
-`SessionsPerWorker` on the options record to change that.
+A fourth `Open` closes the least recently used idle session, or waits when every session is busy. Set `MaxWorkers`
+on the options record to change the worker count.
 
 An Electron app keeps the worker file outside the asar archive, because worker threads
 cannot load scripts from inside it. Unpack the file in the packager settings, using the

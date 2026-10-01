@@ -512,7 +512,6 @@ Vitest.describe (
                     TextDiffPool.create {
                         TextDiffPool.TextDiffPoolOptions.create factory supervisor with
                             MaxWorkers = 1
-                            SessionsPerWorker = 4
                     }
 
                 fixture <- Some { Root = root; Supervisor = supervisor; Pool = pool; Transports = transports; Events = events }

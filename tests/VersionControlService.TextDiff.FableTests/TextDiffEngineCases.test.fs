@@ -283,8 +283,6 @@ module TextDiffEngineCasesTests =
         fun () ->
             for name, run in TextDiffEngineCases.cases do
                 Vitest.it(name, fun () -> Async.StartAsPromise(run ()))
-            for name, run in WorkerScratchCases.cases do
-                Vitest.it(name, fun () -> Async.StartAsPromise(run ()))
             for name, run in TextDiffSessionCases.cases do
                 Vitest.it(name, fun () -> Async.StartAsPromise(run ()))
             for name, run in TextDiffStreamingCases.cases do

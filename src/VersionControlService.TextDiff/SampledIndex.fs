@@ -28,8 +28,6 @@ type SampledIndex(capacity: int) =
 
     let chunkLength (chunk: int) = min chunkSize (capacity - chunk * chunkSize)
 
-    let chunkCount (entries: int) = (entries + chunkSize - 1) >>> chunkBits
-
     let ensureChunk (chunk: int) =
         while offsets.Count <= chunk do
             let length = chunkLength offsets.Count
@@ -101,21 +99,3 @@ type SampledIndex(capacity: int) =
         else
             this.Add(offset, line, hash)
             true
-
-    /// Prepares empty arrays for a restore of `entries` entries.
-    member this.Prepare(entries: int) =
-        this.Allocate()
-        if entries > 0 then ensureChunk (chunkCount entries - 1)
-        count <- entries
-
-    /// The arrays of a spilled index in the order that Prepare filled them.
-    member internal _.Slots(entries: int) : ArraySlot list =
-        [
-            yield ArraySlot.OfInts(heads, heads.Length)
-            for chunk = 0 to chunkCount entries - 1 do
-                let length = min chunkSize (entries - chunk * chunkSize)
-                yield ArraySlot.OfFloats(offsets[chunk], length)
-                yield ArraySlot.OfFloats(lines[chunk], length)
-                yield ArraySlot.OfInts(hashes[chunk], length)
-                yield ArraySlot.OfInts(nexts[chunk], length)
-        ]

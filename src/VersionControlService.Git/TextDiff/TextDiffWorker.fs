@@ -249,7 +249,6 @@ type private Worker = {
     RunShort: WorkerHost -> TextDiffOwner -> string[] -> JS.Promise<GitShort>
     Tokens: PreparationTokenStore
     BlobLedger: Ledger
-    Scratch: WorkerScratch
     Slots: Dictionary<int, Slot>
     /// The Open that runs now. The dispatcher runs one request at a time.
     mutable ActiveOpen: WorkerHost option
@@ -919,8 +918,7 @@ let private createStep (worker: Worker) (host: WorkerHost) (request: OpenDiffReq
         }
 
         let! session =
-            TextDiffSession.createWithScratch
-                worker.Scratch
+            TextDiffSession.create
                 engine
                 worker.BlobLedger
                 config
@@ -1235,7 +1233,6 @@ let private createHandler
         RunShort = runShort
         Tokens = PreparationTokenStore()
         BlobLedger = Ledger()
-        Scratch = WorkerScratch()
         Slots = Dictionary<int, Slot>()
         ActiveOpen = None
         Clock = { new IClock with member _.NowMs() = performanceNow () }
