@@ -56,7 +56,7 @@ let private pathExists path = NodeFileSystem.existsSync path
 
 let private removeDirectory (path: string) = promise {
     try
-        do! NodePositionalFile.removeWithRetry path 20 100
+        do! NodeFileSystem.rmAsync path (NodeFileSystem.RmOptions(recursive = true, force = true, maxRetries = 19, retryDelay = 100))
     with _ -> ()
 }
 
@@ -224,6 +224,7 @@ Vitest.describe (
                         [| [| "fetch"; "origin" |]
                            [| "symbolic-ref"; "HEAD"; "refs/heads/x" |]
                            [| "rev-parse"; "--git-path"; "x" |]
+                           [| "rev-parse"; "--git-dir" |]
                            [| "for-each-ref"; "--contains"; "HEAD" |]
                            [| "cat-file"; "-s"; "HEAD" |] |] do
                         let! rejected = assertRejected arguments
@@ -231,10 +232,10 @@ Vitest.describe (
 
                     Vitest.expect(events |> Seq.exists (fun event -> match event.Kind with | TextDiffSupervisor.ChildSpawned _ -> true | _ -> false)).toBe false
 
-                    let! result = created.RunShort(owner, repo, [| "rev-parse"; "--git-dir" |])
+                    let! result = created.RunShort(owner, repo, [| "symbolic-ref"; "-q"; "HEAD" |])
                     Vitest.expect(result.ExitCode).toEqual (Some 0)
                     Vitest.expect(result.Error).toBe None
-                    Vitest.expect(bytesToUtf8 result.Stdout |> _.Trim()).toBe ".git"
+                    Vitest.expect((bytesToUtf8 result.Stdout |> _.Trim()).StartsWith "refs/heads/").toBe true
 
                     NodeFileSystem.writeFileSync (NodePath.join [| repo; "small.txt" |]) "small blob\n" NodeFileSystem.Utf8
                     do! runGitOk repo [| "add"; "--"; "small.txt" |]

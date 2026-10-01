@@ -45,6 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 -   `ContentView` and its `TextContent` and `UnsupportedContent` cases no longer exist. They belonged to the whole-file contract.
 -   Version 0.2.0 removes `TextDiffService.GetDiff`, `TextDiffService.GetWordDiff` and `TextDiffService.GetBaseContent`. Consumers use `TextDiffService` pages, replay, gap expansion and line slices instead.
+-   `VersionControlService.Runtime.Node` no longer exports `Process.isProcessAlive`. `Process.processExistence` replaces it and tells a process that is gone apart from one the caller cannot signal.
 
 ## 0.1.2 - 2026-09-28
 

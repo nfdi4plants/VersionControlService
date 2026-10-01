@@ -256,7 +256,8 @@ type private Worker = {
     BlobLedger: Ledger
     Scratch: WorkerScratch
     Slots: Dictionary<int, Slot>
-    ActiveOpens: Dictionary<string, WorkerHost>
+    /// The Open that runs now. The dispatcher runs one request at a time.
+    mutable ActiveOpen: WorkerHost option
     Clock: IClock
     IdleMs: float
     mutable Sweeping: bool
@@ -751,58 +752,17 @@ let private requireEncoding
 [<Literal>]
 let private MismatchPreviewBytes = 512
 
-/// Decodes UTF-8 and replaces each byte that does not start a valid sequence with U+FFFD.
-let private lenientUtf8 (bytes: byte[]) (start: int) : string =
-    let text = System.Text.StringBuilder()
-    let mutable index = start
+[<JS.PojoAttribute>]
+type private TextDecoderOptions(?fatal: bool, ?ignoreBOM: bool) =
+    member val fatal: bool option = fatal with get, set
+    member val ignoreBOM: bool option = ignoreBOM with get, set
 
-    while index < bytes.Length do
-        let lead = int bytes[index]
+[<Global>]
+type private TextDecoder(label: string, options: TextDecoderOptions) =
+    member _.decode(bytes: byte[]) : string = jsNative
 
-        let width =
-            if lead < 0x80 then 1
-            elif lead >= 0xC2 && lead < 0xE0 then 2
-            elif lead >= 0xE0 && lead < 0xF0 then 3
-            elif lead >= 0xF0 && lead < 0xF5 then 4
-            else 0
-
-        let mutable valid = width > 0 && index + width <= bytes.Length
-
-        let mutable scalar =
-            if width = 1 then lead
-            elif width = 2 then lead &&& 0x1F
-            elif width = 3 then lead &&& 0x0F
-            else lead &&& 0x07
-
-        for follower = 1 to width - 1 do
-            if valid then
-                let next = int bytes[index + follower]
-
-                if (next &&& 0xC0) = 0x80 then
-                    scalar <- (scalar <<< 6) ||| (next &&& 0x3F)
-                else
-                    valid <- false
-
-        valid <-
-            valid
-            && (width = 1
-                || (width = 2 && scalar >= 0x80)
-                || (width = 3 && scalar >= 0x800 && not (scalar >= 0xD800 && scalar <= 0xDFFF))
-                || (width = 4 && scalar >= 0x10000 && scalar <= 0x10FFFF))
-
-        if not valid then
-            text.Append('\uFFFD') |> ignore
-            index <- index + 1
-        else
-            if scalar < 0x10000 then
-                text.Append(char scalar) |> ignore
-            else
-                text.Append(char (0xD800 + ((scalar - 0x10000) >>> 10))).Append(char (0xDC00 + ((scalar - 0x10000) &&& 0x3FF)))
-                |> ignore
-
-            index <- index + width
-
-    text.ToString()
+/// Decodes UTF-8 and replaces each invalid sequence with U+FFFD. ignoreBOM keeps a leading U+FEFF in the text.
+let private lenientUtf8Decoder = TextDecoder("utf-8", TextDecoderOptions(fatal = false, ignoreBOM = true))
 
 let private windows1252Text (bytes: byte[]) (start: int) : string =
     let text = System.Text.StringBuilder()
@@ -846,7 +806,7 @@ let private encodingMismatchCandidates (worker: Worker) (slot: Slot) (detail: Di
 
                     return
                         Some [|
-                            { Encoding = Decoders.name TextEncoding.Utf8; Preview = lenientUtf8 trimmed 0 }
+                            { Encoding = Decoders.name TextEncoding.Utf8; Preview = lenientUtf8Decoder.decode trimmed }
                             { Encoding = Decoders.name TextEncoding.Windows1252; Preview = windows1252Text trimmed 0 }
                         |]
             | _ -> return None
@@ -1134,7 +1094,7 @@ let private openRequest
             slot.Host <- host
             slot.Busy <- true
             slot.Continuation <- None
-            worker.ActiveOpens[host.RequestId] <- host
+            worker.ActiveOpen <- Some host
             let stopTicker = startTicker host (progressOf slot)
             let meter = Meter.create worker.Clock Limits.defaults
 
@@ -1161,7 +1121,7 @@ let private openRequest
             }
 
             stopTicker ()
-            worker.ActiveOpens.Remove host.RequestId |> ignore
+            worker.ActiveOpen <- None
             slot.Busy <- false
             slot.LastUsed <- performanceNow ()
 
@@ -1302,7 +1262,7 @@ let private createHandler
         BlobLedger = Ledger()
         Scratch = WorkerScratch()
         Slots = Dictionary<int, Slot>()
-        ActiveOpens = Dictionary<string, WorkerHost>()
+        ActiveOpen = None
         Clock = { new IClock with member _.NowMs() = performanceNow () }
         IdleMs = idleMs
         Sweeping = false
@@ -1375,8 +1335,8 @@ let private createHandler
             | _ -> Promise.lift ()
 
         member _.Cancel requestId =
-            match worker.ActiveOpens.TryGetValue requestId with
-            | true, host -> host.ReleaseRequest()
+            match worker.ActiveOpen with
+            | Some host when host.RequestId = requestId -> host.ReleaseRequest()
             | _ -> ()
     }
 

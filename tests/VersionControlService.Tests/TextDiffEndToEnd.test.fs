@@ -137,7 +137,7 @@ let private writePatternFile (filePath: string) (size: int64) (firstLine: string
         else (64 * 1024 / repeated.Length) * repeated.Length
 
     let chunk = Array.init chunkLength (fun index -> repeated[index % repeated.Length])
-    do! NodePositionalFile.removeWithRetry filePath 1 0
+    do! NodeFileSystem.rmAsync filePath (NodeFileSystem.RmOptions(recursive = true, force = true, maxRetries = 0, retryDelay = 0))
     let! descriptor = NodePositionalFile.openCreateExclusive filePath
     let mutable position = 0L
 
@@ -171,7 +171,7 @@ let private writePatternFile (filePath: string) (size: int64) (firstLine: string
 
 let private removeDirectory (directory: string) = promise {
     try
-        do! NodePositionalFile.removeWithRetry directory 20 100
+        do! NodeFileSystem.rmAsync directory (NodeFileSystem.RmOptions(recursive = true, force = true, maxRetries = 19, retryDelay = 100))
     with _ -> ()
 }
 

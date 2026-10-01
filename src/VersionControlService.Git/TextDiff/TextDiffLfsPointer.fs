@@ -66,17 +66,12 @@ let private tryParseSize (line: string) : int64 option =
         None
     else
         let digits = line.Substring prefix.Length
-        let maximum = "9223372036854775807"
 
-        let fitsInt64 =
-            digits.Length < maximum.Length
-            || (digits.Length = maximum.Length && String.CompareOrdinal(digits, maximum) <= 0)
-
-        if digits.Length > 0
-           && digits |> Seq.forall isDigit
-           && (digits = "0" || digits[0] <> '0')
-           && fitsInt64 then
-            Some(Int64.Parse digits)
+        // Int64.TryParse accepts signs and white space, so the digits and leading zero checks stay.
+        if digits.Length > 0 && digits |> Seq.forall isDigit && (digits = "0" || digits[0] <> '0') then
+            match Int64.TryParse digits with
+            | true, size -> Some size
+            | _ -> None
         else
             None
 
@@ -101,7 +96,7 @@ let tryParseStrict (bytes: byte[]) : LfsPointer option =
     if bytes.Length = 0 || bytes.Length > MaximumPointerBytes || bytes |> Array.exists (fun value -> value >= 128uy) then
         None
     else
-        let text = String(bytes |> Array.map char)
+        let text = Text.Encoding.UTF8.GetString bytes
 
         match trySplitLines text with
         | None -> None

@@ -11,6 +11,7 @@ open VersionControlService.Git.TextDiff.TextDiffWorkerDispatcher
 open VersionControlService.Git.TextDiff.TextDiffInProcessTransport
 
 module NodePath = VersionControlService.Runtime.Node.Path
+module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodePositionalFile = VersionControlService.Runtime.Node.PositionalFile
 module TextDiffSupervisor = VersionControlService.Git.TextDiff.TextDiffSupervisor
 module TextDiffPool = VersionControlService.Git.TextDiff.TextDiffPool
@@ -272,7 +273,7 @@ let private withPoolOptions
         do! pool.Dispose()
 
         try
-            do! NodePositionalFile.removeWithRetry root 20 100
+            do! NodeFileSystem.rmAsync root (NodeFileSystem.RmOptions(recursive = true, force = true, maxRetries = 19, retryDelay = 100))
         with _ -> ()
 
         match failure with

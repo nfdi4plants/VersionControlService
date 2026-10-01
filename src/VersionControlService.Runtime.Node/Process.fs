@@ -164,14 +164,6 @@ let killProcessTree (pid: int) : unit =
             with _ ->
                 ()
 
-/// True when a process with the given pid is still alive (signal 0 probe).
-let isProcessAlive (pid: int) : bool =
-    try
-        processGlobal?kill (pid, 0) |> ignore
-        true
-    with _ ->
-        false
-
 /// Runs a child process under the operation context. On cancellation, it terminates
 /// the process tree and returns a canceled failure with StateChanged = false.
 /// Parsed progress meter lines are redacted before progress reporting.
@@ -369,14 +361,12 @@ let private bufferToIntegers (_buffer: obj) : int[] = jsNative
 [<Emit("$0 && $0.code ? $0.code : ''")>]
 let private nodeErrorCode (_error: obj) : string = jsNative
 
-let private processIsWindows () = (typedProcessGlobal ()).platform = "win32"
-
 let private processKill (pid: int) (signal: obj) =
     (typedProcessGlobal ()).kill(pid, signal) |> ignore
 
 let killProcessTreeAsync (pid: int) : JS.Promise<unit> =
     JS.Constructors.Promise.Create(fun resolve _ ->
-        if processIsWindows () then
+        if isWindows () then
             let options = createObj [ "windowsHide" ==> true; "shell" ==> false; "stdio" ==> "ignore" ]
 
             try
@@ -415,7 +405,7 @@ let private spawnOptions (cwd: string) (environment: obj) (stdio: obj) =
         "stdio" ==> stdio
         "shell" ==> false
         "windowsHide" ==> true
-        "detached" ==> not (processIsWindows ())
+        "detached" ==> not (isWindows ())
     ]
 
 let private createClosedPromise () =
@@ -553,15 +543,6 @@ let spawnToFileTracked
     (onStarted: int -> JS.Promise<ChildExit> -> unit)
     : JS.Promise<SpawnToFileHandle> =
     spawnToFileTrackedWith typedChildProcess.spawn command arguments cwd environment descriptor onStarted
-
-let spawnToFile
-    (command: string)
-    (arguments: string[])
-    (cwd: string)
-    (environment: obj)
-    (descriptor: int)
-    : JS.Promise<SpawnToFileHandle> =
-    spawnToFileTracked command arguments cwd environment descriptor (fun _ _ -> ())
 
 /// Runs a child with bounded output. The spawn function is a parameter so a caller can substitute a child, for
 /// example one without stdio streams as after an EMFILE failure.

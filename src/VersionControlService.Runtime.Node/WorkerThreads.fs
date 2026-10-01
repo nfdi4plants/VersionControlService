@@ -19,7 +19,6 @@ type MessagePort =
 type Worker(absolutePath: string, options: WorkerOptions) =
     member _.postMessage(message: obj) : unit = jsNative
     member _.terminate() : JS.Promise<int> = jsNative
-    member _.threadId: int = jsNative
 
     [<Emit("$0.on('message', $1)")>]
     member _.onMessage(handler: obj -> unit) : unit = jsNative
@@ -29,9 +28,6 @@ type Worker(absolutePath: string, options: WorkerOptions) =
 
     [<Emit("$0.on('exit', $1)")>]
     member _.onExit(handler: int -> unit) : unit = jsNative
-
-    [<Emit("$0.on('online', $1)")>]
-    member _.onOnline(handler: unit -> unit) : unit = jsNative
 
 [<Import("parentPort", "node:worker_threads")>]
 let parentPort: MessagePort option = jsNative

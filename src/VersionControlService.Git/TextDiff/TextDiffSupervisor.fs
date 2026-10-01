@@ -82,9 +82,6 @@ let private currentUserId () : int = jsNative
 [<Emit("performance.now()")>]
 let private performanceNow () : float = jsNative
 
-[<Emit("$0.PATH || $0.Path || $0.path || ''")>]
-let private environmentPath (_environment: obj) : string = jsNative
-
 [<Emit("Object.assign({}, $0, { GIT_NO_LAZY_FETCH: '1', GIT_ALLOW_PROTOCOL: '', GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0', LC_ALL: 'C', LANG: 'C' })")>]
 let private localOnlyEnvironment (_environment: obj) : obj = jsNative
 
@@ -96,14 +93,11 @@ let private isWrapperPath (path: string) =
     | ".bat" -> true
     | _ -> false
 
-let private isObjectId (value: string) =
+/// A full Git object id in the lower case hex that Git prints, as a SHA-1 or SHA-256 id.
+let internal isObjectId (value: string) =
     not (isNull value)
     && (value.Length = 40 || value.Length = 64)
-    && (value
-        |> Seq.forall (fun character ->
-            (character >= '0' && character <= '9')
-            || (character >= 'a' && character <= 'f')
-            || (character >= 'A' && character <= 'F')))
+    && value |> Seq.forall (fun character -> (character >= '0' && character <= '9') || (character >= 'a' && character <= 'f'))
 
 let private isRefPattern (value: string) =
     not (String.IsNullOrEmpty value)
@@ -121,9 +115,6 @@ let private isCommitVerification (value: string) =
 
 let private isAllowedShortCommand (arguments: string[]) =
     match arguments with
-    | [| "rev-parse"; "--absolute-git-dir" |]
-    | [| "rev-parse"; "--git-common-dir" |]
-    | [| "rev-parse"; "--git-dir" |]
     | [| "symbolic-ref"; "-q"; "HEAD" |] -> true
     | [| "rev-parse"; "--verify"; "--quiet"; expression |] -> isCommitVerification expression
     | [| "for-each-ref"; "--format=%(refname)"; "--"; refPattern |] -> isRefPattern refPattern
@@ -163,7 +154,7 @@ let private resolveGitExecutable (configured: string option) : JS.Promise<string
     | None ->
         let environment = GitExecution.resolvedEnvironment ()
         let separator = if isWindows () then ';' else ':'
-        let directories = environmentPath environment
+        let directories = GitExecution.environmentPath environment
         let entries = directories.Split([| separator |], StringSplitOptions.RemoveEmptyEntries)
         let mutable found: string option = None
         let mutable wrapperFound = false
@@ -201,26 +192,14 @@ let private tryGetInstanceOwnerPid (name: string) =
             || (character >= 'a' && character <= 'f')
             || (character >= 'A' && character <= 'F')
 
-        let mutable parsedPid = 0
-        let mutable validPid = pidText.Length > 0
-
-        for character in pidText do
-            if character < '0' || character > '9' then
-                validPid <- false
-            else
-                let digit = int character - int '0'
-
-                if parsedPid > (Int32.MaxValue - digit) / 10 then
-                    validPid <- false
-                else
-                    parsedPid <- parsedPid * 10 + digit
-
+        // Int32.TryParse accepts signs and white space, so the digits check stays.
+        let hasDigitsOnly = pidText.Length > 0 && pidText |> Seq.forall (fun character -> character >= '0' && character <= '9')
         let hasHexSuffix = randomText |> Seq.forall isHex
 
-        if validPid && parsedPid > 0 && hasHexSuffix then Some parsedPid else None
+        match Int32.TryParse pidText with
+        | true, pid when hasDigitsOnly && pid > 0 && hasHexSuffix -> Some pid
+        | _ -> None
     | _ -> None
-
-let private isOwnerWithin (scope: ChildOwner -> bool) (owner: ChildOwner) = scope owner
 
 /// The sessions and requests released on one worker. They stay recorded until their worker is released.
 type internal ReleasedWorker = {
@@ -229,6 +208,10 @@ type internal ReleasedWorker = {
 }
 
 let private releasedOwnerMessage = "The worker request is being released and cannot start another Git child."
+
+/// Removes a folder tree. Windows keeps handles on files that a killed child wrote, so rm retries a few times.
+let private removeTree (path: string) : JS.Promise<unit> =
+    NodeFileSystem.rmAsync path (NodeFileSystem.RmOptions(recursive = true, force = true, maxRetries = 4, retryDelay = 40))
 
 type TextDiffSupervisor internal (instanceDirectory: string, gitExecutable: string, options: TextDiffSupervisorOptions) =
     let children = Dictionary<int, ChildOwner * JS.Promise<NodeProcess.ChildExit>>()
@@ -293,14 +276,14 @@ type TextDiffSupervisor internal (instanceDirectory: string, gitExecutable: stri
 
     let registeredSpoolsWithin scope =
         spoolOwners
-        |> Seq.choose (fun entry -> if isOwnerWithin scope entry.Value then Some entry.Key else None)
+        |> Seq.choose (fun entry -> if scope entry.Value then Some entry.Key else None)
         |> Seq.toArray
 
     let trackedChildrenWithin scope =
         children
         |> Seq.choose (fun entry ->
             let owner, closed = entry.Value
-            if isOwnerWithin scope owner then Some(entry.Key, closed) else None)
+            if scope owner then Some(entry.Key, closed) else None)
         |> Seq.toArray
 
     let killChildrenThenWait (childrenToStop: (int * JS.Promise<NodeProcess.ChildExit>)[]) = promise {
@@ -313,7 +296,7 @@ type TextDiffSupervisor internal (instanceDirectory: string, gitExecutable: stri
     }
 
     let deleteOneSpool path = promise {
-        do! NodePositionalFile.removeWithRetry path 5 40
+        do! removeTree path
         spoolOwners.Remove path |> ignore
         emit (SpoolDeleted path)
     }
@@ -332,7 +315,7 @@ type TextDiffSupervisor internal (instanceDirectory: string, gitExecutable: stri
 
         match deleteWorkerDirectory with
         | Some path ->
-            do! NodePositionalFile.removeWithRetry path 5 40
+            do! removeTree path
             workerDirectories.Remove path |> ignore
             emit (WorkerDirectoryDeleted path)
         | None -> ()
@@ -468,11 +451,11 @@ type TextDiffSupervisor internal (instanceDirectory: string, gitExecutable: stri
         do! deleteSpools spoolSnapshot
 
         for directory in workerDirectories |> Seq.toArray do
-            do! NodePositionalFile.removeWithRetry directory 5 40
+            do! removeTree directory
             workerDirectories.Remove directory |> ignore
             emit (WorkerDirectoryDeleted directory)
 
-        do! NodePositionalFile.removeWithRetry instanceDirectory 5 40
+        do! removeTree instanceDirectory
     }
 
 /// Fails when a folder that already exists in the temp root belongs to another user or is not a plain folder.
@@ -510,7 +493,7 @@ let create (options: TextDiffSupervisorOptions) : JS.Promise<TextDiffSupervisor>
 
                 if stats.IsDirectory && not stats.IsSymbolicLink then
                     match NodeProcess.processExistence ownerPid with
-                    | NodeProcess.Gone -> do! NodePositionalFile.removeWithRetry siblingPath 5 40
+                    | NodeProcess.Gone -> do! removeTree siblingPath
                     | NodeProcess.Alive
                     | NodeProcess.Unknown _ -> ()
             with _ -> ()

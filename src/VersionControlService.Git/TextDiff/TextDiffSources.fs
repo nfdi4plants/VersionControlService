@@ -6,6 +6,7 @@ open VersionControlService.Abstractions
 open VersionControlService.TextDiff
 open VersionControlService.Git.TextDiff.TextDiffSourceResolver
 
+module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodeInterop = VersionControlService.Runtime.Node.Interop
 module NodePath = VersionControlService.Runtime.Node.Path
 module NodePositionalFile = VersionControlService.Runtime.Node.PositionalFile
@@ -392,8 +393,6 @@ type SpoolSource private (
     let validateChild exit actualLength =
         if completedChild exit && actualLength = expectedLength then
             complete <- true
-        elif not (completedChild exit) then
-            report (childFailure path exit expectedLength (Some actualLength)) |> ignore
         else
             report (childFailure path exit expectedLength (Some actualLength)) |> ignore
 
@@ -694,7 +693,7 @@ type NodeTempStore private (path: string, descriptor: int, initialLength: int64)
                         with _ -> ()
 
                         try
-                            do! NodePositionalFile.removeWithRetry path 5 40 |> Async.AwaitPromise
+                            do! NodeFileSystem.rmAsync path (NodeFileSystem.RmOptions(recursive = true, force = true, maxRetries = 4, retryDelay = 40)) |> Async.AwaitPromise
                         with _ -> ()
                     }
                     |> Async.StartAsPromise
@@ -716,7 +715,7 @@ type NodeTempStore private (path: string, descriptor: int, initialLength: int64)
                 with _ -> ()
 
                 try
-                    do! NodePositionalFile.removeWithRetry path 5 40 |> Async.AwaitPromise
+                    do! NodeFileSystem.rmAsync path (NodeFileSystem.RmOptions(recursive = true, force = true, maxRetries = 4, retryDelay = 40)) |> Async.AwaitPromise
                 with _ -> ()
 
                 return raise error

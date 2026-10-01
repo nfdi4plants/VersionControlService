@@ -132,10 +132,6 @@ let private isInsideRoot (root: string) (folder: string) =
     let folder = normalize folder
     folder.Equals(root, comparison) || folder.StartsWith(root + "/", comparison)
 
-let private isObjectId (value: string) =
-    (value.Length = 40 || value.Length = 64)
-    && value |> Seq.forall (fun character -> (character >= '0' && character <= '9') || (character >= 'a' && character <= 'f'))
-
 let private outputLines (bytes: byte[]) =
     (utf8 bytes).Split('\n') |> Array.map (fun line -> line.TrimEnd '\r')
 
@@ -144,7 +140,7 @@ let private resolveHead (host: IResolverHost) : Async<Step<string option>> = asy
     let! revParse = awaitHost host (host.RunGit [| "rev-parse"; "--verify"; "--quiet"; "HEAD^{commit}" |])
     let commitId = (utf8 revParse.Stdout).Trim()
 
-    if succeeded revParse && isObjectId commitId then
+    if succeeded revParse && Supervisor.isObjectId commitId then
         return Continue(Some commitId)
     else
         let! symbolicRef = awaitHost host (host.RunGit [| "symbolic-ref"; "-q"; "HEAD" |])
@@ -219,7 +215,7 @@ let private resolvePrevious (host: IResolverHost) (input: ResolverInput) (commit
             | Ok None -> return Continue ResolvedSide.Absent
             | Ok(Some entry) when entry.Mode = "040000" || entry.Mode = "120000" || entry.Mode = "160000" ->
                 return Stop(ResolveOutcome.Blocked(DiffBlocker.NotRegularFile DiffSide.Previous))
-            | Ok(Some entry) when (entry.Mode = "100644" || entry.Mode = "100755") && entry.Kind = "blob" && isObjectId entry.Oid ->
+            | Ok(Some entry) when (entry.Mode = "100644" || entry.Mode = "100755") && entry.Kind = "blob" && Supervisor.isObjectId entry.Oid ->
                 let! sizeResult = awaitHost host (host.RunGit [| "cat-file"; "-s"; entry.Oid |])
 
                 if not (succeeded sizeResult) then

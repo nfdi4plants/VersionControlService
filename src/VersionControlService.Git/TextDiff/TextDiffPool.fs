@@ -119,10 +119,14 @@ let private attempt (work: unit -> JS.Promise<'T>) : JS.Promise<'T> =
     with error ->
         Promise.reject error
 
-let private waitForTermination (work: JS.Promise<unit>) : JS.Promise<unit> =
+/// The handle that tells the worker to close whatever its session holds.
+let private anyHandle: DiffHandle = { Id = ""; Version = "" }
+
+/// Resolves when the work settles or after the given time, whichever comes first. A failure counts as settled.
+let private waitAtMost (milliseconds: int) (work: JS.Promise<unit>) : JS.Promise<unit> =
     Promise.create (fun resolve _ ->
         let mutable settled = false
-        let timer = startTimer (fun () -> settled <- true; resolve ()) 2000
+        let timer = startTimer (fun () -> settled <- true; resolve ()) milliseconds
         let finish () =
             if not settled then
                 settled <- true
@@ -260,7 +264,7 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
     and failWorker (worker: PoolWorker) (reason: string) =
         if abandonWorker worker reason then
             promise {
-                do! waitForTermination (attempt (fun () -> worker.Transport.Terminate()))
+                do! waitAtMost 2000 (attempt (fun () -> worker.Transport.Terminate()))
                 do! attempt (fun () -> supervisor.ReleaseWorker worker.WorkerId)
             }
             |> fun cleanup -> observe cleanup ignore ignore
@@ -291,18 +295,11 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
                     let closeHandle =
                         match result with
                         | Ok(ResultPayload.Open(Resumable.Ready(OpenDiffResult.Opened(handle, _, _, _)))) -> Some handle
-                        | Ok(ResultPayload.Open(Resumable.Scanning _)) -> Some { DiffHandle.Id = ""; Version = "" }
+                        | Ok(ResultPayload.Open(Resumable.Scanning _)) -> Some anyHandle
                         | _ -> None
 
                     match closeHandle with
-                    | Some handle ->
-                        observe
-                            (promise {
-                                let! _ = enqueueAt true session (RequestBody.Close handle) (OperationContext.detached "text-diff-close")
-                                do! releaseSlot session
-                            })
-                            ignore
-                            ignore
+                    | Some handle -> observe (closeAndRelease true session handle) ignore ignore
                     | None -> observe (releaseSlot session) ignore ignore
                 | _ -> ()
             else
@@ -453,12 +450,6 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
         |> Seq.collect _.Sessions
         |> Seq.filter (fun session -> (session.Phase = Opened || session.Phase = Scanning) && session.Active = 0)
 
-    and closingCount () =
-        liveWorkers ()
-        |> Seq.collect _.Sessions
-        |> Seq.filter (fun session -> session.Phase = Closing)
-        |> Seq.length
-
     and pumpAdmission () =
         let mutable blocked = false
         let mutable blockedAdmission = None
@@ -542,6 +533,11 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
                     settle request (Error(canceled ()))
                 | _ -> ()
 
+    and closeAndRelease (atFront: bool) (session: PoolSession) (handle: DiffHandle) : JS.Promise<unit> = promise {
+        let! _ = enqueueAt atFront session (RequestBody.Close handle) (OperationContext.detached "text-diff-close")
+        do! releaseSlot session
+    }
+
     // The slot stays taken until the worker acknowledged the close and the supervisor released the session.
     and closeSession (session: PoolSession) : JS.Promise<unit> =
         match session.Phase with
@@ -549,12 +545,7 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
         | Scanning ->
             session.Phase <- Closing
             forgetSession session
-            let handle = session.WorkerHandle |> Option.defaultValue { DiffHandle.Id = ""; Version = "" }
-
-            promise {
-                let! _ = enqueue session (RequestBody.Close handle) (OperationContext.detached "text-diff-close")
-                do! releaseSlot session
-            }
+            closeAndRelease false session (session.WorkerHandle |> Option.defaultValue anyHandle)
         | Opening
         | Closing
         | Closed -> Promise.lift ()
@@ -598,13 +589,7 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
             forgetSession session
 
             if not (canceledOpenStillRunning session) then
-                observe
-                    (promise {
-                        let! _ = enqueueAt true session (RequestBody.Close { DiffHandle.Id = ""; Version = "" }) (OperationContext.detached "text-diff-close")
-                        do! releaseSlot session
-                    })
-                    ignore
-                    ignore
+                observe (closeAndRelease true session anyHandle) ignore ignore
         | Opened
         | Closing
         | Closed -> ()
@@ -771,33 +756,11 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
                 && (session.Phase = Opened || session.Phase = Scanning))
             |> Seq.toArray
 
-        Promise.create (fun resolve _ ->
-            let finished = ref false
-            let remaining = ref targets.Length
-            let timer: obj option ref = ref None
+        let closes =
+            targets
+            |> Array.map (fun session -> attempt (fun () -> closeSession session) |> Promise.catch ignore)
 
-            let finish () =
-                if not finished.Value then
-                    finished.Value <- true
-                    timer.Value |> Option.iter stopTimer
-                    resolve ()
-
-            timer.Value <- Some(startTimer finish 5000)
-
-            let completeOne () =
-                remaining.Value <- remaining.Value - 1
-
-                if remaining.Value = 0 then
-                    finish ()
-
-            if targets.Length = 0 then
-                finish ()
-            else
-                for session in targets do
-                    observe
-                        (attempt (fun () -> closeSession session))
-                        (fun () -> completeOne ())
-                        (fun _ -> completeOne ()))
+        waitAtMost 5000 (Promise.all closes |> Promise.map ignore)
 
     /// Shuts every worker down and disposes the supervisor. Waiting and running calls fail with diff_worker_failed.
     member _.Dispose() : JS.Promise<unit> = promise {
