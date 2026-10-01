@@ -322,7 +322,9 @@ module TextDiffEngineCases =
                     None,
                     reportEvidence,
                     65_536.0,
-                    ignore)
+                    ignore,
+                    (fun _ _ -> ()),
+                    None)
             side.SetLimits(4_096, 32 * 1024 * 1024)
             side.Scanner.NextOffset <- float position
             side.Scanner.LineLengthUtf16 <- float position

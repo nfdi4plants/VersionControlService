@@ -39,19 +39,8 @@ type private JournalWriter() =
 
     member this.WriteInt64(value: int64) =
         ensure 8
-#if FABLE_COMPILER
-        if Native.writeNonnegativeSafeInt64 bytes count value then count <- count + 8
-        else
-            let bits = uint64 value
-            for index = 0 to 7 do
-                Native.writeByte bytes (count + index) (int ((bits >>> (index * 8)) &&& 0xFFUL))
-            count <- count + 8
-#else
-        let bits = uint64 value
-        for index = 0 to 7 do
-            Native.writeByte bytes (count + index) (int ((bits >>> (index * 8)) &&& 0xFFUL))
+        Native.writeInt64 bytes count value
         count <- count + 8
-#endif
 
     member _.WriteBytes(value: byte[]) =
         ensure value.Length
@@ -84,6 +73,13 @@ type private JournalReader(bytes: byte[]) =
         require 1
         let value = Native.readByte bytes position
         position <- position + 1
+        value
+
+    member _.ReadBytes(count: int) =
+        require count
+        let value = Array.zeroCreate<byte> count
+        Native.copyBytes bytes position value 0 count
+        position <- position + count
         value
 
     member this.ReadBool() = this.ReadByte() <> 0
@@ -396,8 +392,7 @@ module internal JournalRecord =
         if reader.ReadByte() <> 0x54 then invalidOp "The journal record header is invalid."
         let payloadLength = reader.ReadInt32()
         if payloadLength < 0 || payloadLength > record.Length - 9 then invalidOp "The journal payload length is invalid."
-        let payload = Array.zeroCreate<byte> payloadLength
-        for byteIndex = 0 to payloadLength - 1 do payload[byteIndex] <- byte (reader.ReadByte())
+        let payload = reader.ReadBytes payloadLength
         let storedLo = uint32 (reader.ReadInt32())
         let storedHi = uint32 (reader.ReadInt32())
         if not reader.AtEnd then invalidOp "The journal record length is invalid."

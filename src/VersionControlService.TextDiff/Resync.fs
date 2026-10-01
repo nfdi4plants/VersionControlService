@@ -10,31 +10,27 @@ type internal ResyncStep =
     | Handover of previousOffset: float * previousLine: float * currentOffset: float * currentLine: float
     | Finished
 
-module private ResyncStage =
-    [<Literal>]
-    let Discover = 0
+/// The stage that the next microstep runs.
+[<RequireQualifiedAccess>]
+type private ResyncStage =
+    | Discover
+    | VerifyStart
+    | VerifyLoad
+    | VerifyForward
+    | VerifyBackward
+    | Emit
+    | DeepLoad
+    | DeepVerify
 
-    [<Literal>]
-    let VerifyStart = 1
+/// The shape of the lines between the range start and the end of a region.
+[<RequireQualifiedAccess>]
+type private EmitKind =
+    | Nothing
+    | Removed
+    | Added
+    | Region
 
-    [<Literal>]
-    let VerifyLoad = 2
-
-    [<Literal>]
-    let VerifyForward = 3
-
-    [<Literal>]
-    let VerifyBackward = 4
-
-    [<Literal>]
-    let Emit = 5
-
-    [<Literal>]
-    let DeepLoad = 6
-
-    [<Literal>]
-    let DeepVerify = 7
-
+module private ResyncCode =
     [<Literal>]
     let FollowDiscover = 0
 
@@ -70,15 +66,12 @@ type internal ResyncEngine
     let categories = [| AllocationCategory.PreviousWindows; AllocationCategory.CurrentWindows |]
     let sides = [| DiffSide.Previous; DiffSide.Current |]
 
-    let makeSides () =
+    let makeSides (observer: int -> ScannerState -> float -> unit) =
         Array.init 2 (fun side ->
-            ScanSide(specs[side], encodings[side], categories[side], sides[side], ledger, evidenceTallies[side], config.HashMaskForTesting, report, config.CheckpointIntervalBytes, recordLineCount side))
+            ScanSide(specs[side], encodings[side], categories[side], sides[side], ledger, evidenceTallies[side], config.HashMaskForTesting, report, config.CheckpointIntervalBytes, recordLineCount side, observer side, None))
 
-    let disc = makeSides ()
-    do
-        for side in 0..1 do
-            disc[side].Observer <- fun state line -> observe side state line
-    let aux = makeSides ()
+    let disc = makeSides observe
+    let aux = makeSides (fun _ _ _ -> ())
     let indexes = [| SampledIndex config.ResyncIndexCapacity; SampledIndex config.ResyncIndexCapacity |]
     let indexBytes = 2L * SampledIndex.ReservedBytes config.ResyncIndexCapacity
 
@@ -104,7 +97,7 @@ type internal ResyncEngine
 
     // Candidates of the line that was just processed. Each one holds the own and other position and the earliest
     // position that a backward extension may reach.
-    let candData = Array.zeroCreate<float> (max 1 config.ResyncProbeLimit * ResyncStage.CandidateWidth)
+    let candData = Array.zeroCreate<float> (max 1 config.ResyncProbeLimit * ResyncCode.CandidateWidth)
     let mutable candSide = 0
     let mutable candCount = 0
     let mutable candNext = -1
@@ -151,14 +144,16 @@ type internal ResyncEngine
     let emitLoaded = Array.zeroCreate<bool> 2
     let mutable emitFollow = 0
     let mutable emitPhase = 0
-    let mutable emitKind = 0
+    let mutable emitKind = EmitKind.Nothing
 
-    let isVerifying (value: int) =
-        value = ResyncStage.VerifyLoad
-        || value = ResyncStage.VerifyForward
-        || value = ResyncStage.VerifyBackward
-        || value = ResyncStage.DeepLoad
-        || value = ResyncStage.DeepVerify
+    let isVerifying (value: ResyncStage) =
+        match value with
+        | ResyncStage.VerifyLoad
+        | ResyncStage.VerifyForward
+        | ResyncStage.VerifyBackward
+        | ResyncStage.DeepLoad
+        | ResyncStage.DeepVerify -> true
+        | _ -> false
 
     let dropTables () =
         for side in 0..1 do
@@ -182,8 +177,7 @@ type internal ResyncEngine
     let startSide (side: ScanSide) (offset: float) (line: float) (limit: int) =
         side.SetCursor(offset, int64 line, limit, Int32.MaxValue)
 
-    /// Reads one chunk into a side. It returns 1 after progress, 0 when the source has no data yet and 2 when
-    /// nothing changed. A worker runs one session, so the ledger always has room for the line table. A refusal
+    /// Reads one chunk into a side. It returns Waiting when the source has no data yet and Running otherwise. A worker runs one session, so the ledger always has room for the line table. A refusal
     /// is a bug.
     let loadStep (side: ScanSide) (buffer: byte[]) (limit: int) (meter: Meter) = async {
         if not (side.Table.TryEnsure limit) then invalidOp "The ledger refused a resync line table."
@@ -194,17 +188,14 @@ type internal ResyncEngine
         match step with
         | ReadData(count, endOfSource) ->
             side.Consume(buffer, count, endOfSource, meter) |> ignore
-            return 1
-        | ReadWaiting -> return 0
+            return ResyncStep.Running
+        | ReadWaiting -> return ResyncStep.Waiting
         | ReadChanged ->
             changed ()
-            return 2
+            return ResyncStep.Running
         | ReadWindowFull
-        | ReadFinished -> return 2
+        | ReadFinished -> return ResyncStep.Running
     }
-
-    let toStep (code: int) =
-        if code = 0 then ResyncStep.Waiting else ResyncStep.Running
 
     let beginEmit (offsets: float[]) (lines: float[]) (follow: int) =
         for side in 0..1 do
@@ -217,10 +208,10 @@ type internal ResyncEngine
         let previousCount = endLine[0] - rangeLine[0]
         let currentCount = endLine[1] - rangeLine[1]
         emitKind <-
-            if previousCount > 0.0 && currentCount > 0.0 then 3
-            elif previousCount > 0.0 then 1
-            elif currentCount > 0.0 then 2
-            else 0
+            if previousCount > 0.0 && currentCount > 0.0 then EmitKind.Region
+            elif previousCount > 0.0 then EmitKind.Removed
+            elif currentCount > 0.0 then EmitKind.Added
+            else EmitKind.Nothing
         emitFollow <- follow
         cutFollow <- 0
         emitPhase <- 0
@@ -237,9 +228,10 @@ type internal ResyncEngine
         if emitLoaded[side] && emitIdx[side] < table.Count then
             let count = min (int (min remaining (float laneChunk))) (table.Count - emitIdx[side])
             let index = emitIdx[side]
-            if emitKind = 3 then builder.RegionLines((side = 0), table, index, count)
-            elif emitKind = 1 then builder.Removed(table, index, count)
-            else builder.Added(table, index, count)
+            match emitKind with
+            | EmitKind.Region -> builder.RegionLines((side = 0), table, index, count)
+            | EmitKind.Removed -> builder.Removed(table, index, count)
+            | _ -> builder.Added(table, index, count)
             emitOffset[side] <- table.Finish(index + count - 1)
             emitLine[side] <- emitLine[side] + float count
             emitIdx[side] <- index + count
@@ -259,14 +251,14 @@ type internal ResyncEngine
             changed ()
             return ResyncStep.Running
         else
-            let! code = loadStep scan buffer auxLimit[side] meter
+            let! step = loadStep scan buffer auxLimit[side] meter
             coverage side scan.Coverage
-            return toStep code
+            return step
     }
 
     let finishEmit () =
         emitPhase <- 0
-        if emitFollow = ResyncStage.FollowDiscover then
+        if emitFollow = ResyncCode.FollowDiscover then
             for side in 0..1 do
                 rangeOffset[side] <- endOffset[side]
                 rangeLine[side] <- endLine[side]
@@ -276,27 +268,27 @@ type internal ResyncEngine
             candNext <- -1
             stage <- ResyncStage.Discover
             ResyncStep.Running
-        elif emitFollow = ResyncStage.FollowHandover then ResyncStep.Handover(endOffset[0], endLine[0], endOffset[1], endLine[1])
+        elif emitFollow = ResyncCode.FollowHandover then ResyncStep.Handover(endOffset[0], endLine[0], endOffset[1], endLine[1])
         else ResyncStep.Finished
 
     let emitStep (bufferA: byte[]) (bufferB: byte[]) (meter: Meter) = async {
         Meter.charge meter 1
         if emitPhase = 0 then
-            if emitKind = 3 then builder.BeginRegion()
+            if emitKind = EmitKind.Region then builder.BeginRegion()
             emitPhase <- 1
             return ResyncStep.Running
         elif emitPhase = 1 then
-            if emitKind = 2 || not (hasRoom 0) then
+            if emitKind = EmitKind.Added || not (hasRoom 0) then
                 emitPhase <- 2
                 return ResyncStep.Running
             else return! emitLane 0 bufferA meter
         elif emitPhase = 2 then
-            if emitKind = 1 || not (hasRoom 1) then
+            if emitKind = EmitKind.Removed || not (hasRoom 1) then
                 emitPhase <- 3
                 return ResyncStep.Running
             else return! emitLane 1 bufferB meter
         else
-            if emitKind = 3 then builder.EndRegion()
+            if emitKind = EmitKind.Region then builder.EndRegion()
             return finishEmit ()
     }
 
@@ -309,7 +301,7 @@ type internal ResyncEngine
     let addCandidate (own: int) (ownOffset: float) (ownBoundOffset: float) (ownBoundLine: float) (otherId: int) =
         let other = 1 - own
         let index = indexes[other]
-        let baseIndex = candCount * ResyncStage.CandidateWidth
+        let baseIndex = candCount * ResyncCode.CandidateWidth
         candData[baseIndex] <- ownOffset
         candData[baseIndex + 1] <- procLine[own]
         candData[baseIndex + 2] <- ownBoundOffset
@@ -350,13 +342,13 @@ type internal ResyncEngine
                 running <- false
             elif scanned >= float config.ResyncScanLines
                  || procOffset[side] - originOffset[side] >= config.ResyncScanBytes then
-                cutAt side ResyncStage.FollowHandover
+                cutAt side ResyncCode.FollowHandover
                 running <- false
             else
                 let hash = table.HashLow index
                 let sampled = (hash &&& mask) = 0
                 if sampled && own.IsFull then
-                    cutAt side ResyncStage.FollowDiscover
+                    cutAt side ResyncCode.FollowDiscover
                     running <- false
                 else
                     if sampled then
@@ -387,7 +379,7 @@ type internal ResyncEngine
 
     let discoverStep (bufferA: byte[]) (bufferB: byte[]) (meter: Meter) = async {
         if finishedSide[0] && finishedSide[1] then
-            emitProc ResyncStage.FollowFinish
+            emitProc ResyncCode.FollowFinish
             return ResyncStep.Running
         elif cutFollow <> 0
              && (finishedSide[0] || procLine[0] - originLine[0] >= cutCount)
@@ -412,9 +404,9 @@ type internal ResyncEngine
                 procIdx[side] <- 0
                 return ResyncStep.Running
             else
-                let! code = loadStep scan (if side = 0 then bufferA else bufferB) discCap meter
+                let! step = loadStep scan (if side = 0 then bufferA else bufferB) discCap meter
                 coverage side scan.Coverage
-                return toStep code
+                return step
     }
 
     let rejectCandidate () =
@@ -432,7 +424,7 @@ type internal ResyncEngine
             job <- Some(fun meter -> compare.Step meter)
 
     let verifyStart () =
-        let baseIndex = candNext * ResyncStage.CandidateWidth
+        let baseIndex = candNext * ResyncCode.CandidateWidth
         let other = 1 - candSide
         candOffset[candSide] <- candData[baseIndex]
         candLine[candSide] <- candData[baseIndex + 1]
@@ -475,9 +467,9 @@ type internal ResyncEngine
                 startSide scan newOffset newLine limit
                 return ResyncStep.Running
             else
-                let! code = loadStep scan (if side = 0 then bufferA else bufferB) auxLimit[side] meter
+                let! step = loadStep scan (if side = 0 then bufferA else bufferB) auxLimit[side] meter
                 coverage side scan.Coverage
-                return toStep code
+                return step
         else
             rowP <- int (candLine[0] - float aux[0].Table.LineBase)
             rowC <- int (candLine[1] - float aux[1].Table.LineBase)
@@ -522,7 +514,7 @@ type internal ResyncEngine
     let acceptAt (offsets: float[]) (lines: float[]) =
         job <- None
         if lines[0] <= rangeLine[0] && lines[1] <= rangeLine[1] then rejectCandidate ()
-        else beginEmit offsets lines ResyncStage.FollowHandover
+        else beginEmit offsets lines ResyncCode.FollowHandover
 
     let beginDeep (offsets: float[]) (lines: float[]) =
         for side in 0..1 do
@@ -597,9 +589,9 @@ type internal ResyncEngine
                     deepFinish ()
                     return ResyncStep.Running
                 else
-                    let! code = loadStep scan (if missing = 0 then bufferA else bufferB) auxLimit[missing] meter
+                    let! step = loadStep scan (if missing = 0 then bufferA else bufferB) auxLimit[missing] meter
                     coverage missing scan.Coverage
-                    return toStep code
+                    return step
             else
                 let previousTable = aux[0].Table
                 let currentTable = aux[1].Table
@@ -694,7 +686,8 @@ type internal ResyncEngine
         | ResyncStage.Emit -> return! emitStep bufferA bufferB meter
         | ResyncStage.DeepLoad -> return! deepLoadStep bufferA bufferB meter
         | ResyncStage.DeepVerify -> return! deepVerifyStep bufferA bufferB meter
-        | _ -> return! verifyStep bufferA bufferB meter
+        | ResyncStage.VerifyForward
+        | ResyncStage.VerifyBackward -> return! verifyStep bufferA bufferB meter
     }
 
     /// Frees every line table and the index reservation. The engine cannot run afterwards.

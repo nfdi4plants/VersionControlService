@@ -26,8 +26,14 @@ module Native =
     [<Emit("$2.set($0.subarray($1, $1 + $4), $3)")>]
     let copyBytes (source: byte[]) (sourceOffset: int) (target: byte[]) (targetOffset: int) (count: int) : unit = jsNative
 
-    [<Emit("(($buffer, $offset, $value) => { const number = Number($value); if (!Number.isSafeInteger(number) || number < 0) return false; $buffer[$offset] = number % 256; $buffer[$offset + 1] = Math.floor(number / 256) % 256; $buffer[$offset + 2] = Math.floor(number / 65536) % 256; $buffer[$offset + 3] = Math.floor(number / 16777216) % 256; $buffer[$offset + 4] = Math.floor(number / 4294967296) % 256; $buffer[$offset + 5] = Math.floor(number / 1099511627776) % 256; $buffer[$offset + 6] = Math.floor(number / 281474976710656) % 256; $buffer[$offset + 7] = Math.floor(number / 72057594037927936) % 256; return true; })($0, $1, $2)")>]
-    let writeNonnegativeSafeInt64 (bytes: byte[]) (index: int) (value: int64) : bool = jsNative
+    /// The JavaScript DataView class, which writes multi-byte numbers at a byte offset.
+    [<Global>]
+    type private DataView(buffer: JS.ArrayBuffer, byteOffset: int, byteLength: int) =
+        member _.setBigInt64(offset: int, value: int64, littleEndian: bool) : unit = jsNative
+
+    /// Writes the eight bytes of a 64-bit integer in little-endian order. Fable 5 holds int64 as a BigInt.
+    let writeInt64 (bytes: byte[]) (index: int) (value: int64) : unit =
+        DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).setBigInt64(index, value, true)
 
     [<Emit("$0[$1]")>]
     let readInt (values: int[]) (index: int) : int = jsNative
@@ -135,6 +141,9 @@ module Native =
     let inline readByte (bytes: byte[]) (index: int) = int bytes[index]
 
     let inline writeByte (bytes: byte[]) (index: int) (value: int) = bytes[index] <- byte value
+
+    let writeInt64 (bytes: byte[]) (index: int) (value: int64) =
+        System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(Span<byte>(bytes, index, 8), value)
 
     let inline copyBytes (source: byte[]) (sourceOffset: int) (target: byte[]) (targetOffset: int) (count: int) =
         Array.Copy(source, sourceOffset, target, targetOffset, count)

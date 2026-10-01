@@ -62,6 +62,13 @@ module LineEndingCode =
         | 3 -> LineEnding.CR
         | _ -> LineEnding.NoEnding
 
+    let ofLineEnding (ending: LineEnding) =
+        match ending with
+        | LineEnding.NoEnding -> NoEnding
+        | LineEnding.LF -> LF
+        | LineEnding.CRLF -> CRLF
+        | LineEnding.CR -> CR
+
 /// Scanned lines stored column by column in typed arrays, so the scanner allocates nothing per line.
 /// Offsets and UTF-16 lengths are floats, which are exact below 2^53. Keys are the two signed words of
 /// the FNV-1a 64 hash. The scanner hands a full batch to its consumer and clears it afterwards, so a

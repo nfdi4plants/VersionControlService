@@ -68,7 +68,9 @@ type internal ScanSide(
     hashMask: (uint32 * uint32) option,
     reportEvidence: DiffSide -> string -> int64 -> int64 option -> unit,
     checkpointIntervalBytes: float,
-    recordLineCount: int64 -> unit
+    recordLineCount: int64 -> unit,
+    observer: ScannerState -> float -> unit,
+    lineObserver: (float -> float -> float) option
 ) =
     let table = LineTable(category, ledger, hashMask)
     let mutable scanner = Scanner.create encoding (int64 spec.BomLength)
@@ -78,9 +80,6 @@ type internal ScanSide(
     let mutable windowLineLimit = Int32.MaxValue
     let mutable windowByteLimit = Int32.MaxValue
     let mutable windowAccountedBytes = 0.0
-    let mutable observer: ScannerState -> float -> unit = fun _ _ -> ()
-    let mutable lineObserver: float -> float -> float = fun _ _ -> checkpointIntervalBytes
-    let mutable hasLineObserver = false
     let mutable lineCheckpointDue = checkpointIntervalBytes
 
     member _.Spec = spec
@@ -192,11 +191,12 @@ type internal ScanSide(
             (fun start bytes controls scalars firstControl firstNul -> evidenceTally.ObserveCounts(start, bytes, controls, scalars, firstControl, firstNul))
         for index = previousCount to table.Count - 1 do
             windowAccountedBytes <- windowAccountedBytes + table.Finish index - table.Start index + table.Length index * 2.0 + 40.0
-        if hasLineObserver && table.Count > previousCount then
-            let last = table.Count - 1
-            let offset = table.Finish last
+        match lineObserver with
+        | Some observeLine when table.Count > previousCount ->
+            let offset = table.Finish(table.Count - 1)
             if offset >= lineCheckpointDue then
-                lineCheckpointDue <- lineObserver offset (float table.LineBase + float table.Count)
+                lineCheckpointDue <- observeLine offset (float table.LineBase + float table.Count)
+        | _ -> ()
         observer scanner (float table.LineBase + float table.Count)
         coverage <- max coverage (float scanner.StartOffset + scanner.ValidatedBytes)
         evidenceTally.AdvanceThrough(float scanner.StartOffset + scanner.ValidatedBytes)
@@ -214,11 +214,6 @@ type internal ScanSide(
         evidenceTally.AdvanceThrough value
         if value >= float spec.ByteLength && (spec.Source |> Option.forall (fun source -> source.IsComplete())) then
             evidenceTally.Finish()
-
-    /// Called after every consumed chunk with the scanner and the number of lines that ended before its position.
-    member _.Observer with get () = observer and set value = observer <- value
-
-    member _.LineObserver with get () = lineObserver and set value = lineObserver <- value; hasLineObserver <- true
 
     member _.Dispose() = table.Dispose()
 

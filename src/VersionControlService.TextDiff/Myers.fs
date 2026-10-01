@@ -153,23 +153,23 @@ type MyersStepper(
         | WriteEqual(previous, current, count) when count > 0 ->
             output.Add(MyersOperation.Equal(previous, current))
             if count > 1 then tasks.Push(WriteEqual(previous + 1, current + 1, count - 1))
-            true, false
+            true
         | WriteDeletes(previous, count) when count > 0 ->
             output.Add(MyersOperation.Delete previous)
             if count > 1 then tasks.Push(WriteDeletes(previous + 1, count - 1))
-            true, false
+            true
         | WriteInserts(current, count) when count > 0 ->
             output.Add(MyersOperation.Insert current)
             if count > 1 then tasks.Push(WriteInserts(current + 1, count - 1))
-            true, false
-        | _ -> false, false
+            true
+        | _ -> false
 
-    let chargeWork countsTowardLimit =
-        if countsTowardLimit && steps >= limit then
+    let chargeWork () =
+        if steps >= limit then
             false
         else
             Meter.charge meter 1
-            if countsTowardLimit then steps <- steps + 1
+            steps <- steps + 1
             true
 
     let compare previousIndex currentIndex =
@@ -253,11 +253,9 @@ type MyersStepper(
                             | VisitRange(aStart, aEnd, bStart, bEnd) ->
                                 active <- Some(MyersRange(aStart, aEnd, bStart, bEnd))
                             | task ->
-                                let emitted, countsTowardLimit = emitOne task
-                                if emitted then
-                                    if chargeWork countsTowardLimit then didWork <- true
-                                    else markLimitExceeded ()
-                                else ()
+                                if emitOne task then
+                                    Meter.charge meter 1
+                                    didWork <- true
                 | Some range ->
                     match range.Stage with
                     | RangeStage.Prefix ->
@@ -371,7 +369,7 @@ type MyersStepper(
                             range.X <- x
                             range.Y <- x - range.K
                             range.Stage <- RangeStage.ForwardSnake
-                            if chargeWork true then didWork <- true else markLimitExceeded ()
+                            if chargeWork () then didWork <- true else markLimitExceeded ()
                     | RangeStage.ForwardSnake ->
                         if range.X < range.N && range.Y >= 0 && range.Y < range.M then
                             let previousIndex = range.PreviousStart + range.X
@@ -461,7 +459,7 @@ type MyersStepper(
                             range.X <- x
                             range.Y <- x - range.K
                             range.Stage <- RangeStage.ReverseSnake
-                            if chargeWork true then didWork <- true else markLimitExceeded ()
+                            if chargeWork () then didWork <- true else markLimitExceeded ()
                     | RangeStage.ReverseSnake ->
                         if range.X < range.N && range.Y >= 0 && range.Y < range.M then
                             let previousIndex = range.CorePreviousEnd - range.X - 1

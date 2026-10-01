@@ -531,16 +531,12 @@ type TextDiffSession internal (
     let currentEvidence = ControlRatioTally(DiffSide.Current, currentSpec.BomLength, currentSpec.ByteLength, reportTallyEvidence)
 
     let previousSide =
-        ScanSide(previousSpec, previousEncoding, AllocationCategory.PreviousWindows, DiffSide.Previous, ledger, previousEvidence, config.HashMaskForTesting, report, config.CheckpointIntervalBytes, setKnownLineCount 0)
+        ScanSide(previousSpec, previousEncoding, AllocationCategory.PreviousWindows, DiffSide.Previous, ledger, previousEvidence, config.HashMaskForTesting, report, config.CheckpointIntervalBytes, setKnownLineCount 0, (fun state line -> checkpoints.Observe(0, state, line)), Some(fun offset line -> checkpoints.ObserveLine(0, offset, line)))
 
     let currentSide =
-        ScanSide(currentSpec, currentEncoding, AllocationCategory.CurrentWindows, DiffSide.Current, ledger, currentEvidence, config.HashMaskForTesting, report, config.CheckpointIntervalBytes, setKnownLineCount 1)
+        ScanSide(currentSpec, currentEncoding, AllocationCategory.CurrentWindows, DiffSide.Current, ledger, currentEvidence, config.HashMaskForTesting, report, config.CheckpointIntervalBytes, setKnownLineCount 1, (fun state line -> checkpoints.Observe(1, state, line)), Some(fun offset line -> checkpoints.ObserveLine(1, offset, line)))
 
     do
-        previousSide.Observer <- fun state line -> checkpoints.Observe(0, state, line)
-        currentSide.Observer <- fun state line -> checkpoints.Observe(1, state, line)
-        previousSide.LineObserver <- fun offset line -> checkpoints.ObserveLine(0, offset, line)
-        currentSide.LineObserver <- fun offset line -> checkpoints.ObserveLine(1, offset, line)
         previousSide.BeginWindow(0L, windowLimit, config.WindowMaxBytes)
         currentSide.BeginWindow(0L, windowLimit, config.WindowMaxBytes)
 
@@ -1404,6 +1400,20 @@ type TextDiffSession internal (
         Exhausted = contentEnd <= startByte
     }
 
+    let createForwardCursorFromBounds side spec encoding startByte contentEnd : TextReadCursor = {
+        Side = side
+        Spec = spec
+        Encoding = encoding
+        ContentEnd = contentEnd
+        Buffer = Array.zeroCreate<byte> 4_096
+        Position = startByte
+        Decoder = Decoders.createAt encoding (int64 startByte)
+        PendingUnit = None
+    }
+
+    let createForwardCursorFromRef side spec encoding (line: LineRef) =
+        createForwardCursorFromBounds side spec encoding line.Start (line.Start + lineContentBytes encoding line)
+
     let createReverseCursorFromRef side spec encoding (line: LineRef) =
         createReverseCursorFromBounds side spec encoding line.Start (line.Start + lineContentBytes encoding line)
 
@@ -2026,16 +2036,6 @@ type TextDiffSession internal (
         if not (ledger.TryReserve(AllocationCategory.AlignmentScratch, reservation)) then None
         else
             try
-                let createCursor (side: DiffSide) (spec: SourceSpec) (encoding: TextEncoding) (line: LineRef) : TextReadCursor = {
-                    Side = side
-                    Spec = spec
-                    Encoding = encoding
-                    ContentEnd = line.Start + lineContentBytes encoding line
-                    Buffer = Array.zeroCreate<byte> 4_096
-                    Position = line.Start
-                    Decoder = Decoders.createAt encoding (int64 line.Start)
-                    PendingUnit = None
-                }
                 Some {
                     Item = item
                     RowIndex = rowIndex
@@ -2043,8 +2043,8 @@ type TextDiffSession internal (
                     Current = currentRef
                     PreviousLine = previousLine
                     CurrentLine = currentLine
-                    PreviousCursor = createCursor DiffSide.Previous previousSpec previousEncoding previousRef
-                    CurrentCursor = createCursor DiffSide.Current currentSpec currentEncoding currentRef
+                    PreviousCursor = createForwardCursorFromRef DiffSide.Previous previousSpec previousEncoding previousRef
+                    CurrentCursor = createForwardCursorFromRef DiffSide.Current currentSpec currentEncoding currentRef
                     PreviousBlock = Array.zeroCreate<uint16> 4_100
                     CurrentBlock = Array.zeroCreate<uint16> 4_100
                     PreviousBlockCount = 0
@@ -3052,12 +3052,7 @@ type TextDiffSession internal (
         Start = float line.StartOffset
         Finish = float line.EndOffset
         Length = float line.Utf16Length
-        Ending =
-            match line.Ending with
-            | LineEnding.NoEnding -> LineEndingCode.NoEnding
-            | LineEnding.LF -> LineEndingCode.LF
-            | LineEnding.CRLF -> LineEndingCode.CRLF
-            | LineEnding.CR -> LineEndingCode.CR
+        Ending = LineEndingCode.ofLineEnding line.Ending
     }
 
     let makeExpansion (pending: PendingExpansion) = async {
@@ -3236,37 +3231,18 @@ type TextDiffSession internal (
         }
     }
 
+    let scannedContentEnd encoding (scanned: ScannedLine) =
+        float scanned.EndOffset - Widths.endingWidth encoding (LineEndingCode.ofLineEnding scanned.Ending)
+
     let createPairCursor side (scanned: ScannedLine) =
         let index = if side = DiffSide.Previous then 0 else 1
         let encoding = encodingAt index
-        let endingCode =
-            match scanned.Ending with
-            | LineEnding.NoEnding -> LineEndingCode.NoEnding
-            | LineEnding.LF -> LineEndingCode.LF
-            | LineEnding.CRLF -> LineEndingCode.CRLF
-            | LineEnding.CR -> LineEndingCode.CR
-        {
-            Side = side
-            Spec = specAt index
-            Encoding = encoding
-            ContentEnd = float scanned.EndOffset - Widths.endingWidth encoding endingCode
-            Buffer = Array.zeroCreate<byte> 4_096
-            Position = float scanned.StartOffset
-            Decoder = Decoders.createAt encoding scanned.StartOffset
-            PendingUnit = None
-        }
+        createForwardCursorFromBounds side (specAt index) encoding (float scanned.StartOffset) (scannedContentEnd encoding scanned)
 
     let createReverseCursor side (scanned: ScannedLine) =
         let index = if side = DiffSide.Previous then 0 else 1
         let encoding = encodingAt index
-        let endingCode =
-            match scanned.Ending with
-            | LineEnding.NoEnding -> LineEndingCode.NoEnding
-            | LineEnding.LF -> LineEndingCode.LF
-            | LineEnding.CRLF -> LineEndingCode.CRLF
-            | LineEnding.CR -> LineEndingCode.CR
-        let contentEnd = float scanned.EndOffset - Widths.endingWidth encoding endingCode
-        createReverseCursorFromBounds side (specAt index) encoding (float scanned.StartOffset) contentEnd
+        createReverseCursorFromBounds side (specAt index) encoding (float scanned.StartOffset) (scannedContentEnd encoding scanned)
 
     let createPairAnalysis (previous: ScannedLine) (current: ScannedLine) =
         let collect = InlineHighlights.canUseWholeLine (float previous.Utf16Length) (float current.Utf16Length)
@@ -3516,13 +3492,7 @@ type TextDiffSession internal (
                 let total = float scanned.Utf16Length
                 let requestedOffset = float (max 0L pending.OffsetUtf16)
                 let mutable requestedEnd = min total (requestedOffset + float pending.TakeMaxUtf16)
-                let endingCode =
-                    match scanned.Ending with
-                    | LineEnding.NoEnding -> LineEndingCode.NoEnding
-                    | LineEnding.LF -> LineEndingCode.LF
-                    | LineEnding.CRLF -> LineEndingCode.CRLF
-                    | LineEnding.CR -> LineEndingCode.CR
-                let contentEnd = float scanned.EndOffset - Widths.endingWidth (encodingAt (if pending.Side = DiffSide.Previous then 0 else 1)) endingCode
+                let contentEnd = scannedContentEnd (encodingAt (if pending.Side = DiffSide.Previous then 0 else 1)) scanned
                 if pending.TakeMaxUtf16 = 0 || requestedOffset >= total then ready <- true
                 else
                     let mutable running = pending.UnitPosition < requestedEnd && pending.BytePosition < contentEnd
@@ -3785,76 +3755,66 @@ type TextDiffSession internal (
         return acquired
     }
 
+    // Closed, failed and invalid sessions answer every request the same way. A request that arrives
+    // while the session closes is rejected only when rejectClosing is set, otherwise acquire cancels it.
+    let rejectedRequest (rejectClosing: bool) : EngineResult<_> option =
+        if closed || (rejectClosing && closing) then Some(failClosed ())
+        elif failure.IsSome then
+            let code, message = failure.Value
+            Some(EngineResult.Failed(code, message, None))
+        elif invalidDetail.IsSome then Some(failContent ())
+        else None
+
+    // Runs one request under the busy flag. invalidRequest is a cheap argument check that answers with
+    // a mismatch before the request waits for the session.
+    let exclusive (rejectClosing: bool) (invalidRequest: bool) (cancel: unit -> bool) (body: unit -> Async<EngineResult<'T>>) = async {
+        match rejectedRequest rejectClosing with
+        | Some rejected -> return rejected
+        | None ->
+            if invalidRequest then return failMismatch ()
+            else
+                let! acquired = acquire cancel
+                if not acquired then return EngineResult.Canceled
+                else
+                    try
+                        try
+                            if cancel () then return EngineResult.Canceled
+                            else return! body ()
+                        with error -> return failWorker error.Message
+                    finally busy <- false
+    }
+
+    let pageAt (sequence: int64) (cancel: unit -> bool) = async {
+        let! recorded = journal.Read(journalKey 0L sequence)
+        match recorded with
+        | Some(JournalValue.Page(Resumable.Ready page as value)) ->
+            do! rememberPagePairs sequence page
+            return! presentPageResult (EngineResult.Ok value)
+        | Some(JournalValue.Page value) -> return! presentPageResult (EngineResult.Ok value)
+        | Some _ -> return failMismatch ()
+        | None when sequence <> requestSequence -> return failMismatch ()
+        | None -> return! advance sequence cancel
+    }
+
     member _.Progress = progress ()
 
     member _.SourceInfo = sourceInfo 0, sourceInfo 1
 
     member _.InitializeJournal() = journal.Initialize()
 
-    member this.FirstPage(cancel: unit -> bool) = async {
-        if closed then return failClosed ()
-        elif failure.IsSome then
-            let code, message = failure.Value
-            return EngineResult.Failed(code, message, None)
-        elif invalidDetail.IsSome then return failContent ()
-        else
-            let! acquired = acquire cancel
-            if not acquired then return EngineResult.Canceled
-            else
-                try
-                    try
-                        if cancel () then return EngineResult.Canceled
-                        else
-                            let! recorded = journal.Read(journalKey 0L 0L)
-                            match recorded with
-                            | Some(JournalValue.Page(Resumable.Ready page as value)) ->
-                                do! rememberPagePairs 0L page
-                                return! presentPageResult (EngineResult.Ok value)
-                            | Some(JournalValue.Page value) -> return! presentPageResult (EngineResult.Ok value)
-                            | Some _ -> return failMismatch ()
-                            | None when requestSequence <> 0L -> return failMismatch ()
-                            | None -> return! advance 0L cancel
-                    with error -> return failWorker error.Message
-                finally busy <- false
-    }
+    member _.FirstPage(cancel: unit -> bool) = exclusive false false cancel (fun () -> pageAt 0L cancel)
 
-    member this.ReadPage (cursor: string) (cancel: unit -> bool) = async {
-        if closed then return failClosed ()
-        elif failure.IsSome then
-            let code, message = failure.Value
-            return EngineResult.Failed(code, message, None)
-        elif invalidDetail.IsSome then return failContent ()
-        else
-            let! acquired = acquire cancel
-            if not acquired then return EngineResult.Canceled
-            else
-                try
-                    try
-                        if cancel () then return EngineResult.Canceled
-                        else
-                            match readIdentifier "c" cursor with
-                            | None -> return failMismatch ()
-                            | Some sequence ->
-                                let! recorded = journal.Read(journalKey 0L sequence)
-                                match recorded with
-                                | Some(JournalValue.Page(Resumable.Ready page as value)) ->
-                                    do! rememberPagePairs sequence page
-                                    return! presentPageResult (EngineResult.Ok value)
-                                | Some(JournalValue.Page value) -> return! presentPageResult (EngineResult.Ok value)
-                                | Some _ -> return failMismatch ()
-                                | None when sequence <> requestSequence -> return failMismatch ()
-                                | None -> return! advance sequence cancel
-                    with error -> return failWorker error.Message
-                finally busy <- false
-    }
+    member _.ReadPage (cursor: string) (cancel: unit -> bool) =
+        exclusive false false cancel (fun () -> async {
+            match readIdentifier "c" cursor with
+            | None -> return failMismatch ()
+            | Some sequence -> return! pageAt sequence cancel
+        })
 
     member _.ReplayPage(pageId: string) = async {
-        if closed || closing then return failClosed ()
-        elif failure.IsSome then
-            let code, message = failure.Value
-            return EngineResult.Failed(code, message, None)
-        elif invalidDetail.IsSome then return failContent ()
-        else
+        match rejectedRequest true with
+        | Some rejected -> return rejected
+        | None ->
             match readIdentifier "p" pageId with
             | None -> return failMismatch ()
             | Some sequence ->
@@ -3873,131 +3833,102 @@ type TextDiffSession internal (
                     finally busy <- false
     }
 
-    member _.Expand(gapId: string, fromStart: bool, count: int, continuation: string option, cancel: unit -> bool) = async {
-        if closed || closing then return failClosed ()
-        elif failure.IsSome then
-            let code, message = failure.Value
-            return EngineResult.Failed(code, message, None)
-        elif invalidDetail.IsSome then return failContent ()
-        else
-            let! acquired = acquire cancel
-            if not acquired then return EngineResult.Canceled
-            else
-                try
-                    try
-                        if cancel () then return EngineResult.Canceled
-                        else
-                            match readIdentifier "g" gapId with
-                            | None -> return failMismatch ()
-                            | Some gapSequence ->
-                                let binding = expansionBinding gapId fromStart count
-                                let parsed = continuation |> Option.map (readOperationIdentifier "x" binding)
-                                if parsed = Some None then return failMismatch ()
-                                else
-                                    let! committed = committedExpansion gapSequence
-                                    match committed with
-                                    | Some parts -> return EngineResult.Ok(Resumable.Ready parts)
-                                    | None ->
-                                      match continuation, parsed with
-                                      | Some _, Some(Some(attempt, sequence)) ->
-                                        match pendingExpansions.TryGetValue gapSequence with
-                                        | true, pending when attempt = pending.Attempt ->
-                                            let! recorded = journal.Read(journalKey 1L sequence)
-                                            match recorded with
-                                            | Some(JournalValue.Expansion(Resumable.Scanning(scanProgress, recordedContinuation, _))) ->
-                                                let! preview = pending.Search |> Option.map pendingSeekPreview |> Option.defaultValue (async.Return None)
-                                                if invalidDetail.IsSome then return failContent ()
-                                                else return EngineResult.Ok(Resumable.Scanning(scanProgress, recordedContinuation, preview))
-                                            | Some(JournalValue.Expansion result) -> return EngineResult.Ok result
-                                            | Some _ -> return failMismatch ()
-                                            | None when sequence <> pending.RequestSequence -> return failMismatch ()
-                                            | None -> return! runExpansionRequest pending sequence cancel
-                                        | _ -> return failMismatch ()
-                                      | None, _ ->
-                                        pendingExpansions.Remove gapSequence |> ignore
-                                        let! gap = readGap gapSequence gapId
-                                        match gap with
-                                        | None -> return failMismatch ()
-                                        | Some value ->
-                                            let take = min 100 (max 0 count |> min (int (min value.PreviousRange.Count 100L)))
-                                            let attempt = allocateExpandAttempt ()
-                                            let sequence = allocateExpandRequest ()
-                                            let pending = {
-                                                Attempt = attempt
-                                                GapSequence = gapSequence
-                                                Gap = value
-                                                FromStart = fromStart
-                                                Count = count
-                                                TakeCount = take
-                                                RequestSequence = sequence
-                                                Search = None
-                                                PreviousLines = None
-                                                CurrentLines = None
-                                            }
-                                            do! startExpansionSearch pending 0
-                                            pendingExpansions[gapSequence] <- pending
-                                            return! runExpansionRequest pending sequence cancel
-                                      | _ -> return failMismatch ()
-                    with error -> return failWorker error.Message
-                finally busy <- false
-    }
+    member _.Expand(gapId: string, fromStart: bool, count: int, continuation: string option, cancel: unit -> bool) =
+        exclusive true false cancel (fun () -> async {
+            match readIdentifier "g" gapId with
+            | None -> return failMismatch ()
+            | Some gapSequence ->
+                let binding = expansionBinding gapId fromStart count
+                let parsed = continuation |> Option.map (readOperationIdentifier "x" binding)
+                if parsed = Some None then return failMismatch ()
+                else
+                    let! committed = committedExpansion gapSequence
+                    match committed with
+                    | Some parts -> return EngineResult.Ok(Resumable.Ready parts)
+                    | None ->
+                      match continuation, parsed with
+                      | Some _, Some(Some(attempt, sequence)) ->
+                        match pendingExpansions.TryGetValue gapSequence with
+                        | true, pending when attempt = pending.Attempt ->
+                            let! recorded = journal.Read(journalKey 1L sequence)
+                            match recorded with
+                            | Some(JournalValue.Expansion(Resumable.Scanning(scanProgress, recordedContinuation, _))) ->
+                                let! preview = pending.Search |> Option.map pendingSeekPreview |> Option.defaultValue (async.Return None)
+                                if invalidDetail.IsSome then return failContent ()
+                                else return EngineResult.Ok(Resumable.Scanning(scanProgress, recordedContinuation, preview))
+                            | Some(JournalValue.Expansion result) -> return EngineResult.Ok result
+                            | Some _ -> return failMismatch ()
+                            | None when sequence <> pending.RequestSequence -> return failMismatch ()
+                            | None -> return! runExpansionRequest pending sequence cancel
+                        | _ -> return failMismatch ()
+                      | None, _ ->
+                        pendingExpansions.Remove gapSequence |> ignore
+                        let! gap = readGap gapSequence gapId
+                        match gap with
+                        | None -> return failMismatch ()
+                        | Some value ->
+                            let take = min 100 (max 0 count |> min (int (min value.PreviousRange.Count 100L)))
+                            let attempt = allocateExpandAttempt ()
+                            let sequence = allocateExpandRequest ()
+                            let pending = {
+                                Attempt = attempt
+                                GapSequence = gapSequence
+                                Gap = value
+                                FromStart = fromStart
+                                Count = count
+                                TakeCount = take
+                                RequestSequence = sequence
+                                Search = None
+                                PreviousLines = None
+                                CurrentLines = None
+                            }
+                            do! startExpansionSearch pending 0
+                            pendingExpansions[gapSequence] <- pending
+                            return! runExpansionRequest pending sequence cancel
+                      | _ -> return failMismatch ()
+        })
 
-    member _.ReadLine(side: DiffSide, line: int64, offsetUtf16: int64, maxUtf16: int, continuation: string option, cancel: unit -> bool) = async {
-        if closed || closing then return failClosed ()
-        elif failure.IsSome then
-            let code, message = failure.Value
-            return EngineResult.Failed(code, message, None)
-        elif invalidDetail.IsSome then return failContent ()
-        elif line < 0L || offsetUtf16 < 0L then return failMismatch ()
-        elif (specAt (if side = DiffSide.Previous then 0 else 1)).Source.IsNone then return failMismatch ()
-        else
-            let! acquired = acquire cancel
-            if not acquired then return EngineResult.Canceled
-            else
-                try
-                    try
-                        if cancel () then return EngineResult.Canceled
-                        else
-                            let binding = lineReadBinding side line offsetUtf16 maxUtf16
-                            match continuation with
-                            | Some token ->
-                                match readOperationIdentifier "l" binding token with
-                                | None -> return failMismatch ()
-                                | Some(attempt, sequence) when not (lineReadContinuationWasIssued attempt sequence) -> return failMismatch ()
-                                | Some(attempt, sequence) ->
-                                    let! recorded = journal.Read(journalKey 2L sequence)
-                                    match recorded with
-                                    | Some(JournalValue.Line(Resumable.Scanning(scanProgress, recordedContinuation, _) as recordedResult)) ->
-                                        match pendingLineReads.TryGetValue attempt with
-                                        | true, pending ->
-                                            touchLineRead pending
-                                            let! preview = pending.Search |> Option.map pendingSeekPreview |> Option.defaultValue (async.Return None)
-                                            if invalidDetail.IsSome then return failContent ()
-                                            else return EngineResult.Ok(Resumable.Scanning(scanProgress, recordedContinuation, preview))
-                                        | _ -> return EngineResult.Ok recordedResult
-                                    | Some(JournalValue.Line result) -> return EngineResult.Ok result
-                                    | Some _ -> return failMismatch ()
-                                    | None ->
-                                        match pendingLineReads.TryGetValue attempt with
-                                        | true, pending when pending.Side = side && pending.Line = line && pending.OffsetUtf16 = offsetUtf16 && pending.MaxUtf16 = maxUtf16 && pending.RequestSequence = sequence ->
-                                            touchLineRead pending
-                                            return! runLineReadRequest pending sequence cancel
-                                        | _ -> return failMismatch ()
-                            | None ->
-                                let attempt = allocateLineAttempt ()
-                                let sequence = allocateLineRequest ()
-                                let! pairedLine = pairings.Find(side, line)
-                                let! pending = createLineRead side line offsetUtf16 maxUtf16 attempt sequence pairedLine
-                                cacheLineRead pending
-                                let! result = runLineReadRequest pending sequence cancel
-                                match result with
-                                | EngineResult.Canceled
-                                | EngineResult.Failed _ -> releasePendingLineRead pending; pendingLineReads.Remove attempt |> ignore
-                                | _ -> ()
-                                return result
-                    with error -> return failWorker error.Message
-                finally busy <- false
-    }
+    member _.ReadLine(side: DiffSide, line: int64, offsetUtf16: int64, maxUtf16: int, continuation: string option, cancel: unit -> bool) =
+        let invalidRequest = line < 0L || offsetUtf16 < 0L || (specAt (if side = DiffSide.Previous then 0 else 1)).Source.IsNone
+        exclusive true invalidRequest cancel (fun () -> async {
+            let binding = lineReadBinding side line offsetUtf16 maxUtf16
+            match continuation with
+            | Some token ->
+                match readOperationIdentifier "l" binding token with
+                | None -> return failMismatch ()
+                | Some(attempt, sequence) when not (lineReadContinuationWasIssued attempt sequence) -> return failMismatch ()
+                | Some(attempt, sequence) ->
+                    let! recorded = journal.Read(journalKey 2L sequence)
+                    match recorded with
+                    | Some(JournalValue.Line(Resumable.Scanning(scanProgress, recordedContinuation, _) as recordedResult)) ->
+                        match pendingLineReads.TryGetValue attempt with
+                        | true, pending ->
+                            touchLineRead pending
+                            let! preview = pending.Search |> Option.map pendingSeekPreview |> Option.defaultValue (async.Return None)
+                            if invalidDetail.IsSome then return failContent ()
+                            else return EngineResult.Ok(Resumable.Scanning(scanProgress, recordedContinuation, preview))
+                        | _ -> return EngineResult.Ok recordedResult
+                    | Some(JournalValue.Line result) -> return EngineResult.Ok result
+                    | Some _ -> return failMismatch ()
+                    | None ->
+                        match pendingLineReads.TryGetValue attempt with
+                        | true, pending when pending.Side = side && pending.Line = line && pending.OffsetUtf16 = offsetUtf16 && pending.MaxUtf16 = maxUtf16 && pending.RequestSequence = sequence ->
+                            touchLineRead pending
+                            return! runLineReadRequest pending sequence cancel
+                        | _ -> return failMismatch ()
+            | None ->
+                let attempt = allocateLineAttempt ()
+                let sequence = allocateLineRequest ()
+                let! pairedLine = pairings.Find(side, line)
+                let! pending = createLineRead side line offsetUtf16 maxUtf16 attempt sequence pairedLine
+                cacheLineRead pending
+                let! result = runLineReadRequest pending sequence cancel
+                match result with
+                | EngineResult.Canceled
+                | EngineResult.Failed _ -> releasePendingLineRead pending; pendingLineReads.Remove attempt |> ignore
+                | _ -> ()
+                return result
+        })
 
     member _.Close() = async {
         if not closed then
