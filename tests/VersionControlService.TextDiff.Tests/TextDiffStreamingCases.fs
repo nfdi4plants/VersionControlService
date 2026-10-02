@@ -796,9 +796,9 @@ module TextDiffStreamingCases =
             let runs = Array.append (times 32 "a") (times 32 "b")
             let cases = [
                 "budget family", Array.concat [ times 300 "p"; times 64 "a"; one "X"; times 300 "b" ],
-                                 Array.concat [ times 300 "qq"; one "X"; times 64 "a"; times 300 "c" ], (1, 64, 64, 600, 0)
+                                 Array.concat [ times 300 "qq"; one "X"; times 64 "a"; times 300 "c" ], (64, 1, 1, 600, 0)
                 "below the threshold", Array.concat [ one "p"; times 63 "a"; one "X"; times 63 "b" ],
-                                       Array.concat [ one "qq"; one "X"; times 63 "a"; times 63 "b" ], (64, 63, 63, 1, 0)
+                                       Array.concat [ one "qq"; one "X"; times 63 "a"; times 63 "b" ], (126, 1, 1, 1, 0)
                 "at the threshold", Array.concat [ one "p"; times 64 "a"; one "X"; times 64 "b" ],
                                     Array.concat [ one "qq"; one "X"; times 64 "a"; times 64 "b" ], (128, 1, 1, 1, 0)
                 "mixed run up", Array.concat [ one "p"; runs; one "X"; times 64 "c" ],
@@ -829,13 +829,33 @@ module TextDiffStreamingCases =
                 "restored gaps exhaust again", Array.concat [ times 700 "p"; times 64 "a"; one "X"; times 700 "b" ],
                                                Array.concat [ times 700 "qq"; one "X"; times 64 "a"; times 700 "c" ], (1, 0, 0, 0, 2928)
                 "two restored lines", Array.concat [ times 300 "p"; times 64 "a"; one "X"; times 64 "b"; one "Y"; times 300 "c" ],
-                                      Array.concat [ times 300 "qq"; one "X"; times 64 "a"; one "Y"; times 64 "b"; times 300 "d" ], (2, 64, 64, 664, 0)
+                                      Array.concat [ times 300 "qq"; one "X"; times 64 "a"; one "Y"; times 64 "b"; times 300 "d" ], (128, 1, 1, 601, 0)
             ]
             for name, previous, current, expected in cases do
                 let! session = openSession (Ledger()) (SessionConfig.defaults ("stream-restore-" + name)) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
                 let! pages, _ = readAll session
                 checkOracle previous current pages
                 Check.equal expected (rowCounts pages) $"The {name} case has the expected rows."
+                do! session.Close()
+            return ()
+        }
+        "a gap that exhausts its budget in files too large for one window gets its rejected moved lines back", fun () -> async {
+            // The shared trailing block puts both files above 20,000 lines, so no window holds both whole files
+            // and the anchor path aligns them.
+            let one text = [| { Text = text; Ending = LineEnding.LF } |]
+            let times count text = Array.create count { Text = text; Ending = LineEnding.LF }
+            let padding = Array.init 25_000 (fun index -> { Text = $"pad line {index}"; Ending = LineEnding.LF })
+            let cases = [
+                "budget family", Array.concat [ times 300 "p"; times 64 "a"; one "X"; times 300 "b"; padding ],
+                                 Array.concat [ times 300 "qq"; one "X"; times 64 "a"; times 300 "c"; padding ], (25_001, 64, 64, 600, 0)
+                "two restored lines", Array.concat [ times 300 "p"; times 64 "a"; one "X"; times 64 "b"; one "Y"; times 300 "c"; padding ],
+                                      Array.concat [ times 300 "qq"; one "X"; times 64 "a"; one "Y"; times 64 "b"; times 300 "d"; padding ], (25_002, 64, 64, 664, 0)
+            ]
+            for name, previous, current, expected in cases do
+                let! session = openSession (Ledger()) (SessionConfig.defaults ("stream-restore-padded-" + name)) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+                let! pages, _ = readAll session
+                checkOracle previous current pages
+                Check.equal expected (rowCounts pages) $"The padded {name} case has the expected rows."
                 do! session.Close()
             return ()
         }

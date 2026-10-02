@@ -988,6 +988,13 @@ type TextDiffSession internal (
     let canGrowWindow () =
         windowLimit < config.WindowMaxLines && not previousSide.ByteFull && not currentSide.ByteFull
 
+    let growWindow () =
+        windowLimit <- min config.WindowMaxLines (windowLimit * 2)
+        previousSide.SetLimits(windowLimit, config.WindowMaxBytes)
+        currentSide.SetLimits(windowLimit, config.WindowMaxBytes)
+        ops <- Array.empty
+        windowState <- WindowState.Loading
+
     /// Chooses how many operations the window commits. Trailing changes stay unsettled because the next window
     /// may match them differently.
     let decideCommit () =
@@ -1086,12 +1093,6 @@ type TextDiffSession internal (
             && lastConfirmedAnchor >= 0
             && (equalAtAnchor - equalAtConfirmed) * 2 < max (previousEnd - confirmedPreviousEnd) (currentEnd - confirmedCurrentEnd)
         let anchorTailSmall = anchorTail <= 64 && (max previousTail currentTail <= 64 || anchorRunLines >= 64) && not sparseZone
-        let growWindow () =
-            windowLimit <- min config.WindowMaxLines (windowLimit * 2)
-            previousSide.SetLimits(windowLimit, config.WindowMaxBytes)
-            currentSide.SetLimits(windowLimit, config.WindowMaxBytes)
-            ops <- Array.empty
-            windowState <- WindowState.Loading
         if partialAlign then
             // Growing sources stall before the window fills. Only settled operations are committed and the
             // window keeps its size so the next bytes extend the same lines. A partial alignment starts only
@@ -1146,17 +1147,30 @@ type TextDiffSession internal (
                 // At its largest size without an anchor the diff continues with a forward search.
                 startResync ()
 
+    /// Both sources have fewer than 20,000 lines, so they are aligned as one window and the aligner can run its
+    /// single Myers pass over all of them. The line count of a source that is not read to its end is estimated
+    /// from the lines in its window and the bytes they span.
+    let holdsSmallFiles () =
+        let smallFileLines = 20_000.0
+        let estimate (side: ScanSide) (spec: SourceSpec) =
+            let table = side.Table
+            if side.Finished || table.Count = 0 then float table.Count
+            else float table.Count * float spec.ByteLength / max 1.0 (table.Finish(table.Count - 1))
+        estimate previousSide previousSpec < smallFileLines && estimate currentSide currentSpec < smallFileLines
+
     let startAlign () =
         let previousTable = previousSide.Table
         let currentTable = currentSide.Table
-        if previousTable.Count = 0 || currentTable.Count = 0 then
+        if not partialAlign && canGrowWindow () && not (previousSide.Finished && currentSide.Finished) && holdsSmallFiles () then
+            growWindow ()
+        elif previousTable.Count = 0 || currentTable.Count = 0 then
             ops <-
                 if previousTable.Count > 0 then [| DiffOperations.make OperationKind.Removed 0 -1 previousTable.Count 0 |]
                 elif currentTable.Count > 0 then [| DiffOperations.make OperationKind.Added -1 0 0 currentTable.Count |]
                 else Array.empty
             decideCommit ()
         else
-            aligner <- Some(WindowAligner(previousTable, currentTable, config.MyersStepsPerGap, previousSpec.ByteLength = currentSpec.ByteLength, (not partialAlign) && not (canGrowWindow ()), ledger))
+            aligner <- Some(WindowAligner(previousTable, currentTable, config.MyersStepsPerGap, previousSpec.ByteLength = currentSpec.ByteLength, (not partialAlign) && not (canGrowWindow ()), previousSide.Finished && currentSide.Finished, ledger))
             windowState <- WindowState.Aligning
 
     let loadSide (side: ScanSide) (buffer: byte[]) (meter: Meter) = async {

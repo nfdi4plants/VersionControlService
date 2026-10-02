@@ -201,6 +201,7 @@ type private AlignPhase =
     | AnchorConfirm
     | RestoreConfirm
     | Gaps
+    | DirectConfirm
     | CountUnique
     | Convert
     | MarkRuns
@@ -212,7 +213,7 @@ type private AlignPhase =
 /// of work and charge the meter. A window of a source that is still growing, or a window that can still grow,
 /// passes false for longRunAnchors, because a long equal run in repetitive text can line up at a shifted
 /// position until more lines arrive.
-type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap: int, sameSourceLength: bool, longRunAnchors: bool, ledger: Ledger) =
+type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap: int, sameSourceLength: bool, longRunAnchors: bool, directPass: bool, ledger: Ledger) =
     let stepChunk = 512
     let lookaheadLines = 2
     let longRunLines = 64
@@ -279,6 +280,10 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
     let mutable restoreFirst = 0
     let mutable lookupProbes = 0
 
+    let mutable directAttempted = false
+    let mutable directActive = false
+    let directOperations = ResizeArray<DiffOperation>()
+    let mutable directConfirmIndex = 0
     let mutable gapIndex = 0
     let mutable gapStarted = false
     let mutable gapPreviousStart = 0
@@ -456,6 +461,23 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
             cursor <- middlePreviousStart
             phase <- AlignPhase.BuildSlots
 
+    /// A window that holds both complete sources aligns its middle with one Myers pass first. Where a chance
+    /// anchor would cost extra changed lines, the pass finds the same alignment as git's line diff. It compares
+    /// keys only and DirectConfirm checks the equal runs against the source bytes afterwards, because a
+    /// confirmation per line is slower than the pass itself. The pass gets twice the per-gap step budget, which
+    /// is enough for every corpus pair it improves. When the pass completes, its result is the alignment. When
+    /// it exceeds the budget, or two different lines turn out to share a key, it is dropped and the anchor path
+    /// runs as if it never started.
+    let startDirect () =
+        directAttempted <- true
+        if suffixPrevious > prefixEnd && suffixCurrent > prefixEnd then
+            middlePreviousStart <- prefixEnd
+            middleCurrentStart <- prefixEnd
+            middlePreviousEnd <- suffixPrevious
+            middleCurrentEnd <- suffixCurrent
+            directActive <- true
+            beginGaps ()
+
     let tryStartPositionalConfirm () =
         let previousMiddle = suffixPrevious - prefixEnd
         let currentMiddle = suffixCurrent - prefixEnd
@@ -497,6 +519,7 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
 
     let equalOracle (p: int) (c: int) =
         if not (keysEqual p c) then Some false
+        elif directActive then Some true
         else
             match gapCache.TryGetValue(float p * 4294967296.0 + float c) with
             | true, value -> Some value
@@ -685,7 +708,7 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
                         gapPreviousEnd - gapPreviousStart,
                         gapCurrentStart,
                         gapCurrentEnd - gapCurrentStart,
-                        stepsPerGap,
+                        (if directActive then max 1 (stepsPerGap * 2) else stepsPerGap),
                         meter,
                         equalOracle
                     )
@@ -765,6 +788,13 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
                 anchorLength <- anchorLength - matched - 1
             else anchorLength <- 0
             anchorPending <- false
+        | AlignPhase.DirectConfirm ->
+            if matched >= directOperations[directConfirmIndex].PreviousCount then directConfirmIndex <- directConfirmIndex + 1
+            else
+                // Two different lines share a key.
+                directOperations.Clear()
+                directActive <- false
+                phase <- AlignPhase.MiddleStart
         | AlignPhase.Gaps ->
             let struct (p, c) = pendingPair
             gapCache[float p * 4294967296.0 + float c] <- matched > 0
@@ -808,7 +838,10 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
                 AlignStep.Running
         | AlignPhase.SuffixConfirm -> AlignStep.NeedRun(suffixPrevious, suffixCurrent, pendingLength)
         | AlignPhase.MiddleStart ->
-            if not positionalAttempted && tryStartPositionalConfirm () then AlignStep.Running
+            if directPass && not directAttempted then
+                startDirect ()
+                AlignStep.Running
+            elif not positionalAttempted && tryStartPositionalConfirm () then AlignStep.Running
             else
                 startMiddle ()
                 AlignStep.Running
@@ -981,22 +1014,42 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
                     pendingPair <- struct (p, c)
                     AlignStep.NeedRun(p, c, 1)
                 | MyersStepResult.Complete operations ->
+                    let target = if directActive then directOperations else raw
                     for operation in operations do
                         match operation with
-                        | MyersOperation.Equal(p, c) -> DiffOperations.appendRaw raw (DiffOperations.make OperationKind.Equal p c 1 1)
-                        | MyersOperation.Delete p -> DiffOperations.appendRaw raw (DiffOperations.make OperationKind.Removed p -1 1 0)
-                        | MyersOperation.Insert c -> DiffOperations.appendRaw raw (DiffOperations.make OperationKind.Added -1 c 0 1)
+                        | MyersOperation.Equal(p, c) -> DiffOperations.appendRaw target (DiffOperations.make OperationKind.Equal p c 1 1)
+                        | MyersOperation.Delete p -> DiffOperations.appendRaw target (DiffOperations.make OperationKind.Removed p -1 1 0)
+                        | MyersOperation.Insert c -> DiffOperations.appendRaw target (DiffOperations.make OperationKind.Added -1 c 0 1)
                     Meter.charge meter (operations.Length / 64)
                     stepper <- None
-                    finishGap ()
+                    if directActive then
+                        directConfirmIndex <- 0
+                        phase <- AlignPhase.DirectConfirm
+                    else finishGap ()
                     AlignStep.Running
                 | MyersStepResult.StepLimitExceeded ->
                     // The gap exceeded its step budget. Rejected spans inside it return as anchors. Without any,
                     // its lines are reported as one unaligned region.
-                    if not (tryBeginRestore meter) then emitUnaligned ()
+                    if directActive then
+                        directActive <- false
+                        stepper <- None
+                        gapStarted <- false
+                        phase <- AlignPhase.MiddleStart
+                    elif not (tryBeginRestore meter) then emitUnaligned ()
                     AlignStep.Running
             | None ->
                 startGap meter
+                AlignStep.Running
+        | AlignPhase.DirectConfirm ->
+            while directConfirmIndex < directOperations.Count && directOperations[directConfirmIndex].Kind <> OperationKind.Equal do
+                directConfirmIndex <- directConfirmIndex + 1
+            if directConfirmIndex < directOperations.Count then
+                let operation = directOperations[directConfirmIndex]
+                AlignStep.NeedRun(operation.PreviousIndex, operation.CurrentIndex, operation.PreviousCount)
+            else
+                for operation in directOperations do DiffOperations.appendRaw raw operation
+                directActive <- false
+                beginConvert ()
                 AlignStep.Running
         | AlignPhase.CountUnique ->
             if uniqueReserved = 0L then reserveUnique ()

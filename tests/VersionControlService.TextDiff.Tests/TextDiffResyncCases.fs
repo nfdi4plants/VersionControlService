@@ -690,6 +690,29 @@ module TextDiffResyncCases =
             let! shape = run (defaultConfig "parity-copied-block") previous current
             checkExact "copied block" shape 1_112 451 0
         }
+        "a line that moved across a short run of equal lines is one added and one removed row", fun () -> async {
+            // The moved line and the lines behind the run occur once in each file, so a chain of unique lines
+            // would anchor the moved line and report the whole run as changed. The files hold more lines than
+            // the first window of 512, and a file of that size is aligned as one window with one pass over its
+            // middle, which keeps the run equal as git does.
+            let same = Array.create 10 (plainLine "same")
+            let tail = lines "tail-" 0 600
+            let previous = Array.concat [ [| plainLine "marker" |]; same; tail ]
+            let current = Array.concat [ same; [| plainLine "marker" |]; tail; [| plainLine "extra" |] ]
+            let! shape = run (defaultConfig "parity-moved-line") previous current
+            checkExact "moved line" shape 610 2 1
+        }
+        "a heavy rewrite that exceeds the budget of the single pass keeps the alignment around its anchors", fun () -> async {
+            // Four runs of 60 lines that all changed, separated by three lines that stay. The single pass over
+            // the whole file needs more steps than a tenth of the budget and gives up, and each run between two
+            // anchors still fits the full budget.
+            let rewrite prefix = Array.init 4 (fun run' -> Array.append (lines $"{prefix}-{run'}-" 0 60) [| plainLine $"anchor {run'}" |]) |> Array.concat
+            let previous = rewrite "old"
+            let current = rewrite "new"
+            let! shape = run { defaultConfig "parity-heavy-rewrite" with MyersStepsPerGap = 20_000 } previous.[.. previous.Length - 2] current.[.. current.Length - 2]
+            Check.equal 3 shape.Equal "Heavy rewrite: the three anchors are equal rows."
+            Check.equal 0 (shape.UnalignedPrevious + shape.UnalignedCurrent) "Heavy rewrite: no line is unaligned."
+        }
     ]
 
     let cases = phaseCases @ settleCases @ parityCases @ budgetCases @ scanLimitCases @ seekCases @ extensionCases @ byteOrderMarkCases @ giantLineCases

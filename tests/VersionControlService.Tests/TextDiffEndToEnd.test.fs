@@ -1064,7 +1064,7 @@ Vitest.describe (
             TestOptions(timeout = 300000),
             fun () -> promise {
                 let! repository = newRepository ()
-                let lineCount = 20_000
+                let lineCount = 40_000
                 let previousLines = Array.init lineCount (fun index -> $"shared-line-{(string index).PadLeft(5, '0')}")
                 let currentLines = Array.copy previousLines
                 currentLines[0] <- "changed-first-line"
