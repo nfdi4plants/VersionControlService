@@ -545,6 +545,7 @@ type TextDiffSession internal (
     let mutable regionStarted = false
     let mutable preserveWindowAfterCommit = false
     let mutable windowSelfUniqueLines = 0
+    let mutable smallFileGrowthOff = false
     let mutable pBase = float previousSpec.BomLength
     let mutable cBase = float currentSpec.BomLength
     let mutable partialAlign = false
@@ -1095,6 +1096,7 @@ type TextDiffSession internal (
             && lastConfirmedAnchor >= 0
             && (equalAtAnchor - equalAtConfirmed) * 2 < max (previousEnd - confirmedPreviousEnd) (currentEnd - confirmedCurrentEnd)
         let anchorTailSmall = anchorTail <= AlignerLimits.LongRunLines && (max previousTail currentTail <= AlignerLimits.LongRunLines || anchorRunLines >= AlignerLimits.LongRunLines) && not sparseZone
+        let mostlyEqualRepeats = windowSelfUniqueLines = 0 && lastEqual >= 0 && equalAtLastEqual >= 8 * otherAtLastEqual
         if partialAlign then
             // Growing sources stall before the window fills. Only settled operations are committed and the
             // window keeps its size so the next bytes extend the same lines. A partial alignment starts only
@@ -1122,16 +1124,13 @@ type TextDiffSession internal (
                 commitCount <- lastPrefixAnchor + 1
                 preserveWindowAfterCommit <- true
                 beginFeeding ()
-            elif canGrow
-                 && not (windowSelfUniqueLines = 0
-                         && lastEqual >= 0
-                         && equalAtLastEqual >= 8 * otherAtLastEqual) then
+            elif canGrow && not mostlyEqualRepeats then
                 // The window may hold an insertion or deletion larger than itself, so it grows first. A window
                 // of repeated lines that already aligns eight equal lines for each other line does not grow.
                 // The branch below commits its alignment, because a larger window would only find the same repeats
                 // and can exhaust the Myers budget.
                 growWindow ()
-            elif windowSelfUniqueLines = 0 && lastEqual >= 0 && (lastEqualRunLines >= AlignerLimits.LongRunLines || equalAtLastEqual >= 8 * otherAtLastEqual) then
+            elif mostlyEqualRepeats || (windowSelfUniqueLines = 0 && lastEqual >= 0 && lastEqualRunLines >= AlignerLimits.LongRunLines) then
                 // Every line occurs at least twice within its own window, as in a file of identical rows. The
                 // window keeps its own alignment up to its last equal operation when its last equal run has 64
                 // lines or when equal lines are at least eight times the other lines up to that operation. In
@@ -1163,7 +1162,22 @@ type TextDiffSession internal (
             let table = side.Table
             if side.Finished || table.Count = 0 then float table.Count
             else (float table.LineBase + float table.Count) * float spec.ByteLength / max 1.0 (table.Finish(table.Count - 1))
-        estimate previousSide previousSpec < smallFileLines && estimate currentSide currentSpec < smallFileLines
+        not smallFileGrowthOff && estimate previousSide previousSpec < smallFileLines && estimate currentSide currentSpec < smallFileLines
+
+    /// The window grew to hold both small files and its alignment did not settle. The session aligns again from
+    /// the start of the window with the initial size, so the windowed rules apply, and does not grow for small
+    /// files again.
+    let realignWithoutSmallFileGrowth () =
+        smallFileGrowthOff <- true
+        aligner |> Option.iter (fun active -> active.Dispose())
+        aligner <- None
+        let previousFirst = previousSide.Table.LineBase
+        let currentFirst = currentSide.Table.LineBase
+        windowLimit <- initialWindowLines
+        previousSide.SetCursor(pBase, previousFirst, windowLimit, config.WindowMaxBytes)
+        currentSide.SetCursor(cBase, currentFirst, windowLimit, config.WindowMaxBytes)
+        ops <- Array.empty
+        windowState <- WindowState.Loading
 
     let startAlign () =
         let previousTable = previousSide.Table
@@ -1231,7 +1245,8 @@ type TextDiffSession internal (
         match aligner with
         | Some active ->
             match active.Step meter with
-            | AlignStep.Running -> ()
+            | AlignStep.Running ->
+                if active.DirectExceeded && windowLimit > initialWindowLines && holdsSmallFiles () then realignWithoutSmallFileGrowth ()
             | AlignStep.NeedRun(previousIndex, currentIndex, count) -> startCompare previousIndex currentIndex count
             | AlignStep.Complete completed ->
                 ops <- completed

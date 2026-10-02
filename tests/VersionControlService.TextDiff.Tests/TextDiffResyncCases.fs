@@ -877,11 +877,44 @@ module TextDiffResyncCases =
             // repeats the same alignment. The scan request count bounds the work, since growing to the full size
             // exhausts the step budget of the single pass and restarts the search after each edit.
             let rows = [| plainLine "row A"; plainLine "row B"; plainLine "row C" |]
-            let previous = Array.init 20_000 (fun index -> rows[index % 3])
+            let previous = Array.init 25_000 (fun index -> rows[index % 3])
             let current = previous |> Array.mapi (fun index line -> if index > 0 && index % 60 = 0 then rows[(index + 1) % 3] else line)
             let! shape = run { defaultConfig "padded-repeated-rows" with Limits = { Limits.defaults with MaxUnits = 256; RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 } } previous current
-            checkExact "repeated rows" shape 19_667 74 74
-            Check.true' (shape.Scans < 10_000) $"The search finishes within 10,000 scan requests (used {shape.Scans})."
+            checkExact "repeated rows" shape 24_584 92 92
+            Check.true' (shape.Scans < 8_000) $"The search finishes within 8,000 scan requests (used {shape.Scans})."
+        }
+        "a short cycle of repeated rows with a sparse edit in a file of 15,000 lines is aligned as git aligns it", fun () -> async {
+            // The file is below 20,000 lines, so its window grows to hold it whole. The single pass over that
+            // window exhausts its step budget. The session then aligns from the first window, as it does for a
+            // larger file. The scan request count bounds the work.
+            let rows = [| plainLine "row A"; plainLine "row B"; plainLine "row C" |]
+            let previous = Array.init 15_000 (fun index -> rows[index % 3])
+            let current = previous |> Array.mapi (fun index line -> if index > 0 && index % 60 = 0 then rows[(index + 1) % 3] else line)
+            let! shape = run { defaultConfig "repeated-rows-15k" with Limits = { Limits.defaults with MaxUnits = 256; RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 } } previous current
+            checkExact "repeated rows in 15,000 lines" shape 14_751 56 56
+            Check.true' (shape.Scans < 14_000) $"The search finishes within 14,000 scan requests (used {shape.Scans})."
+        }
+        "an insertion before a run of identical rows in a window of repeated lines is one added row in a file above 20,000 lines", fun () -> async {
+            // The window of 64 lines holds only identical rows and no line that is unique within it. It does not settle
+            // on its own alignment, because that pairs the inserted row with the first identical row.
+            let previous = Array.append (Array.create 100 (plainLine "rep 0")) (padding "tail-" 20_000)
+            let current = Array.append [| plainLine "insert x" |] previous
+            let! shape = run { defaultConfig "padded-identical-rows-insertion" with WindowMaxLines = 64 } previous current
+            checkExact "insertion before identical rows" shape 20_100 1 0
+        }
+        "a deletion before a run of identical rows in a window of repeated lines is one removed row in a file above 20,000 lines", fun () -> async {
+            let current = Array.append (Array.create 100 (plainLine "rep 0")) (padding "tail-" 20_000)
+            let previous = Array.append [| plainLine "insert x" |] current
+            let! shape = run { defaultConfig "padded-identical-rows-deletion" with WindowMaxLines = 64 } previous current
+            checkExact "deletion before identical rows" shape 20_100 0 1
+        }
+        "an insertion before a run of identical rows grows the window before it settles in a file above 20,000 lines", fun () -> async {
+            // The window of 512 lines holds only identical rows, so growing it to reach the distinct tail lines
+            // decides the alignment.
+            let previous = Array.append (Array.create 1_000 (plainLine "rep 0")) (padding "tail-" 21_000)
+            let current = Array.append [| plainLine "insert x" |] previous
+            let! shape = run (defaultConfig "padded-identical-rows-growth") previous current
+            checkExact "insertion before 1,000 identical rows" shape 22_000 1 0
         }
     ]
 

@@ -285,6 +285,7 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
     let mutable lookupProbes = 0
 
     let mutable directAttempted = false
+    let mutable directExceeded = false
     let mutable directActive = false
     let directOperations = ResizeArray<DiffOperation>()
     let mutable directConfirmIndex = 0
@@ -724,6 +725,9 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
     /// exactly once within the current window. It is known once the alignment completes.
     member _.SelfUniqueLines = selfUniqueLines
 
+    /// True once the direct pass ran out of its step budget.
+    member _.DirectExceeded = directExceeded
+
     member _.ResolveRun(matched: int) =
         match phase with
         | AlignPhase.PrefixConfirm ->
@@ -1034,6 +1038,7 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
                     // reports its lines as one unaligned region.
                     if directActive then
                         directActive <- false
+                        directExceeded <- true
                         stepper <- None
                         phase <- AlignPhase.MiddleStart
                     elif not (tryBeginRestore meter) then emitUnaligned ()
