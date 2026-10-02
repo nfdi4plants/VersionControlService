@@ -894,6 +894,17 @@ module TextDiffResyncCases =
             checkExact "repeated rows in 15,000 lines" shape 14_751 56 56
             Check.true' (shape.Scans < 14_000) $"The search finishes within 14,000 scan requests (used {shape.Scans})."
         }
+        "the last window of a large file keeps its alignment when its single pass runs out", fun () -> async {
+            // The window that holds the end of both files did not grow for small files, so the session keeps its
+            // alignment instead of aligning the window again from its first lines. The scan request count bounds
+            // the work.
+            let shared = lines "shared line " 0 30_000
+            let previous = Array.append shared (lines "old tail " 0 3_000)
+            let current = Array.append shared (lines "new tail " 0 3_000)
+            let! shape = run { defaultConfig "large-file-tail-rewrite" with Limits = { Limits.defaults with MaxUnits = 256; RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 } } previous current
+            Check.equal 30_000 shape.Equal "Tail rewrite: the shared lines are equal rows."
+            Check.true' (shape.Scans < 32_000) $"The tail rewrite finishes within 32,000 scan requests (used {shape.Scans})."
+        }
         "an insertion before a run of identical rows in a window of repeated lines is one added row in a file above 20,000 lines", fun () -> async {
             // The window of 64 lines holds only identical rows and no line that is unique within it. It does not settle
             // on its own alignment, because that pairs the inserted row with the first identical row.

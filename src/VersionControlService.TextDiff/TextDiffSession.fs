@@ -546,6 +546,9 @@ type TextDiffSession internal (
     let mutable preserveWindowAfterCommit = false
     let mutable windowSelfUniqueLines = 0
     let mutable smallFileGrowthOff = false
+    // True while the current window grew only because both files looked small. The last window of a large file
+    // can also hold both remaining parts, and the realign fallback must not discard that window.
+    let mutable grownForSmallFiles = false
     let mutable pBase = float previousSpec.BomLength
     let mutable cBase = float currentSpec.BomLength
     let mutable partialAlign = false
@@ -799,6 +802,7 @@ type TextDiffSession internal (
         mode <- Mode.Window
         windowState <- WindowState.Loading
         windowLimit <- initialWindowLines
+        grownForSmallFiles <- false
         partialPrevious <- -1
         partialCurrent <- -1
         previousSide.SetCursor(cursor, int64 builder.NextPrevious, windowLimit, config.WindowMaxBytes)
@@ -1164,11 +1168,12 @@ type TextDiffSession internal (
             else (float table.LineBase + float table.Count) * float spec.ByteLength / max 1.0 (table.Finish(table.Count - 1))
         not smallFileGrowthOff && estimate previousSide previousSpec < smallFileLines && estimate currentSide currentSpec < smallFileLines
 
-    /// The window grew to hold both small files and its alignment did not settle. The session aligns again from
+    /// The window grew only to hold both small files, and its single Myers pass ran out. The session aligns again from
     /// the start of the window with the initial size, so the windowed rules apply, and does not grow for small
     /// files again.
     let realignWithoutSmallFileGrowth () =
         smallFileGrowthOff <- true
+        grownForSmallFiles <- false
         aligner |> Option.iter (fun active -> active.Dispose())
         aligner <- None
         let previousFirst = previousSide.Table.LineBase
@@ -1183,6 +1188,7 @@ type TextDiffSession internal (
         let previousTable = previousSide.Table
         let currentTable = currentSide.Table
         if not partialAlign && canGrowWindow () && not (previousSide.Finished && currentSide.Finished) && holdsSmallFiles () then
+            grownForSmallFiles <- true
             growWindow ()
         elif previousTable.Count = 0 || currentTable.Count = 0 then
             ops <-
@@ -1246,7 +1252,7 @@ type TextDiffSession internal (
         | Some active ->
             match active.Step meter with
             | AlignStep.Running ->
-                if active.DirectExceeded && windowLimit > initialWindowLines && holdsSmallFiles () then realignWithoutSmallFileGrowth ()
+                if active.DirectExceeded && grownForSmallFiles then realignWithoutSmallFileGrowth ()
             | AlignStep.NeedRun(previousIndex, currentIndex, count) -> startCompare previousIndex currentIndex count
             | AlignStep.Complete completed ->
                 ops <- completed
@@ -1300,6 +1306,7 @@ type TextDiffSession internal (
         mode <- Mode.Window
         windowState <- WindowState.Loading
         windowLimit <- initialWindowLines
+        grownForSmallFiles <- false
         partialAlign <- false
         partialPrevious <- -1
         partialCurrent <- -1
@@ -1333,6 +1340,7 @@ type TextDiffSession internal (
     }
 
     let finishWindow () =
+        grownForSmallFiles <- false
         let previousTable = previousSide.Table
         let currentTable = currentSide.Table
         let mutable previousLines = 0
