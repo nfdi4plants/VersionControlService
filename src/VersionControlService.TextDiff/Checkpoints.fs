@@ -17,8 +17,6 @@ type internal Checkpoints(intervalBytes: float, encodings: TextEncoding[]) =
     let nextDue = [| intervalBytes; intervalBytes |]
     let lastOffset = [| -1.0; -1.0 |]
 
-    member _.Count(side: int) = entries[side].Count
-
     /// True when a side has passed its next interval boundary.
     member _.IsDue(side: int, offset: float) = offset >= nextDue[side]
 

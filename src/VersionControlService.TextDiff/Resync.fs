@@ -177,8 +177,8 @@ type internal ResyncEngine
     let startSide (side: ScanSide) (offset: float) (line: float) (limit: int) =
         side.SetCursor(offset, int64 line, limit, Int32.MaxValue)
 
-    /// Reads one chunk into a side. It returns Waiting when the source has no data yet and Running otherwise. A worker runs one session, so the ledger always has room for the line table. A refusal
-    /// is a bug.
+    /// Reads one chunk into a side. It returns Waiting when the source has no data yet and Running otherwise.
+    /// A worker runs one session, so the ledger always has room for the line table. A refusal is a bug.
     let loadStep (side: ScanSide) (buffer: byte[]) (limit: int) (meter: Meter) = async {
         if not (side.Table.TryEnsure limit) then invalidOp "The ledger refused a resync line table."
         Meter.charge meter 1

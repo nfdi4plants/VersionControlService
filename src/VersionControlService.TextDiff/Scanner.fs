@@ -157,9 +157,6 @@ type ScannerState = {
 
 module Scanner =
     [<Literal>]
-    let ObservationWindowBytes = 65_536L
-
-    [<Literal>]
     let SmallFinalWindowBytes = 4_096
 
     [<Literal>]

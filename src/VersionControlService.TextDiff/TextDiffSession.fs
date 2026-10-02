@@ -3985,6 +3985,8 @@ type TextDiffSession internal (
     }
 
 module TextDiffSession =
+    /// Opens a session on two sources. The ledger serves one session at a time, so two sessions on one ledger
+    /// can be refused instead of waiting.
     let create
         (host: EngineHost)
         (ledger: Ledger)

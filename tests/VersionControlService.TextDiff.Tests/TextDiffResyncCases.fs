@@ -364,6 +364,48 @@ module TextDiffResyncCases =
         }
     ]
 
+    /// Opens a session on the shared ledger, makes up to limit requests, and closes it. Returns None when the
+    /// session was still open at the close, otherwise whether it ended in a failure.
+    let private closeAfter (ledger: Ledger) sessionConfig (previous: byte[]) (current: byte[]) (limit: int) = async {
+        let host = Host.createInMemory (ManualClock 0.0 :> IClock)
+        let! session = TextDiffSession.create host ledger sessionConfig (fun _ -> 1) (spec previous) (spec current)
+        let! first = session.FirstPage(fun () -> false)
+        let mutable result = first
+        let mutable requests = 1
+        let mutable ended = None
+        while ended.IsNone && requests < limit do
+            match result with
+            | EngineResult.Ok(Resumable.Ready page) ->
+                match page.NextCursor with
+                | None -> ended <- Some false
+                | Some cursor ->
+                    let! next = session.ReadPage cursor (fun () -> false)
+                    result <- next
+                    requests <- requests + 1
+            | EngineResult.Ok(Resumable.Scanning(_, continuation, _)) ->
+                let! next = session.ReadPage continuation (fun () -> false)
+                result <- next
+                requests <- requests + 1
+            | EngineResult.Failed _ -> ended <- Some true
+            | EngineResult.Canceled -> failwith "The session canceled an uncanceled request."
+        do! session.Close()
+        return ended
+    }
+
+    let private allCategories = [
+        AllocationCategory.PreviousWindows
+        AllocationCategory.CurrentWindows
+        AllocationCategory.SampledIndexes
+        AllocationCategory.ChunkScratch
+        AllocationCategory.AlignmentScratch
+        AllocationCategory.ResponseData
+        AllocationCategory.RetainedBlobs
+    ]
+
+    let private checkLedgerEmpty (ledger: Ledger) (message: string) =
+        for category in allCategories do
+            Check.equal 0L (ledger.Used category) $"{message} ({category})"
+
     let private giantLimits = { tightLimits with MaxUnits = 2 }
 
     let private giantConfig sessionId = { smallConfig sessionId with WindowMaxBytes = 2_048 }
@@ -442,6 +484,45 @@ module TextDiffResyncCases =
             let! shape = giantRun (giantConfig "giant-resync") { giantLimits with MaxUnits = 32 } previous current
             Check.equal 200 shape.Added "Every inserted line is an added row."
             Check.equal 0 (shape.UnalignedPrevious + shape.UnalignedCurrent) "The insertion is not unaligned."
+        }
+    ]
+
+    let private ledgerCases: (string * (unit -> Async<unit>)) list = [
+        "closing a session in any state releases its reservations on a shared ledger", fun () -> async {
+            let ledger = Ledger()
+            let tiny maxUnits (sessionConfig: SessionConfig) = { sessionConfig with Limits = { sessionConfig.Limits with MaxUnits = maxUnits } }
+            let line text = { Text = text; Ending = LineEnding.LF }
+            let alignPrevious = Array.init 80 (fun index -> line (if index % 3 = 0 then "shared" else "old-" + string index))
+            let alignCurrent = Array.init 80 (fun index -> line (if index % 3 = 0 then "shared" else "new-" + string index))
+            let resyncPrevious = lines "line-" 0 800
+            let resyncCurrent = Array.concat [ resyncPrevious[.. 99]; lines "new-" 0 300; resyncPrevious[100 ..] ]
+            let longText = String('a', 160_000)
+            let longPrevious = [| line "head"; line longText; line "tail" |]
+            let longCurrent = [| line "head"; line (longText.Substring(0, 80_000) + "b" + longText.Substring 80_001); line "tail" |]
+            let invalid (bytes: byte[]) = Array.mapi (fun index value -> if index = bytes.Length - 20 then 0xFFuy else value) bytes
+            let contentPrevious = encode (lines "line-" 0 3_000)
+            let scenarios = [
+                "mid-alignment", tiny 40 (smallConfig "ledger-align"), encode alignPrevious, encode alignCurrent, false
+                "in resync", tiny 32 (smallConfig "ledger-resync"), encode resyncPrevious, encode resyncCurrent, false
+                "with a pending long pair", tiny 64 { smallConfig "ledger-long" with WindowMaxBytes = 2_048 }, encode longPrevious, encode longCurrent, false
+                "after a content failure", tiny 64 (smallConfig "ledger-content"), contentPrevious, invalid contentPrevious, true
+            ]
+            for name, sessionConfig, previous, current, expectFailure in scenarios do
+                let mutable closedOpen = 0
+                let mutable outcome = None
+                let mutable requests = 1
+                while outcome.IsNone && requests <= 400 do
+                    let! ended = closeAfter ledger sessionConfig previous current requests
+                    checkLedgerEmpty ledger $"The ledger is empty after closing {name} at request {requests}"
+                    match ended with
+                    | None -> closedOpen <- closedOpen + 1
+                    | Some failed -> outcome <- Some failed
+                    requests <- requests + 1
+                Check.true' (closedOpen >= 3) $"The sweep for {name} closed {closedOpen} open sessions."
+                Check.equal (Some expectFailure) outcome $"The sweep for {name} ends as expected."
+            let! shape = runWith (smallConfig "ledger-second") ledger noHook resyncPrevious resyncCurrent
+            Check.equal 300 shape.Added "A second session on the same ledger runs to completion."
+            checkLedgerEmpty ledger "The ledger is empty after the second session"
         }
     ]
 
@@ -715,4 +796,4 @@ module TextDiffResyncCases =
         }
     ]
 
-    let cases = phaseCases @ settleCases @ parityCases @ budgetCases @ scanLimitCases @ seekCases @ extensionCases @ byteOrderMarkCases @ giantLineCases
+    let cases = phaseCases @ settleCases @ parityCases @ budgetCases @ scanLimitCases @ seekCases @ extensionCases @ byteOrderMarkCases @ giantLineCases @ ledgerCases

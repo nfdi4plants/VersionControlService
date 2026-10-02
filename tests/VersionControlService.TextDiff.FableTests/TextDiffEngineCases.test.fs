@@ -195,6 +195,28 @@ module TextDiffEngineCasesTests =
         ByteLength = int64 data.Length
     }
 
+    /// Counts the reads that the session makes on one source.
+    type private CountingByteSource(data: byte[]) =
+        let inner = MemoryByteSource(data) :> IByteSource
+        let mutable reads = 0
+
+        member _.Reads = reads
+
+        interface IByteSource with
+            member _.KnownLength = inner.KnownLength
+            member _.AvailableLength() = inner.AvailableLength()
+            member _.IsComplete() = inner.IsComplete()
+            member _.ReadAt position buffer offset count =
+                reads <- reads + 1
+                inner.ReadAt position buffer offset count
+
+    let private countedSource (source: CountingByteSource) (data: byte[]) = {
+        Source = Some(source :> IByteSource)
+        Encoding = "utf-8"
+        BomLength = 0
+        ByteLength = int64 data.Length
+    }
+
     let private startRequest work = work |> Async.StartAsPromise |> Async.AwaitPromise
 
     let rec private finishFirstPage (session: TextDiffSession) (result: EngineResult<Resumable<DiffPage>>) = async {
@@ -317,11 +339,6 @@ module TextDiffEngineCasesTests =
     )
 
     Vitest.it (
-        "scans a 64 MiB ASCII buffer with 40-byte lines",
-        fun () -> reportScan "ASCII scanner throughput" TextEncoding.Utf8 (asciiLines benchmarkSize)
-    )
-
-    Vitest.it (
         "finds the common run of two identical 64 MiB ASCII buffers",
         fun () -> reportCommonRun "Phase 1 ASCII common run throughput" (asciiLines benchmarkSize)
     )
@@ -428,24 +445,31 @@ module TextDiffEngineCasesTests =
             let ledger = Ledger()
             let config = benchmarkSessionConfig "benchmark-insertion-64m" 3 1_000 (8 * 1024 * 1024)
             let started = BrowserClock.nowMs()
-            let! session = startRequest (TextDiffSession.create (Host.createInMemory (ManualClock 0.0 :> IClock)) ledger config (fun _ -> 1) (benchmarkSource previous) (benchmarkSource current))
+            let previousSource = CountingByteSource previous
+            let currentSource = CountingByteSource current
+            let! session = startRequest (TextDiffSession.create (Host.createInMemory (ManualClock 0.0 :> IClock)) ledger config (fun _ -> 1) (countedSource previousSource previous) (countedSource currentSource current))
             let! first = startRequest (session.FirstPage(fun () -> false))
             let! page = startRequest (finishFirstPage session first)
             if page.Parts.Length = 0 then failwith "The first page has no edit rows."
             do! finishSessionOutput session page
             let elapsed = max 1.0 (BrowserClock.nowMs() - started)
             let rate = float (previous.Length + current.Length) / 1_000_000.0 * 1_000.0 / elapsed
+            // The equal-byte phase after the insertion measured 282 reads. A session that stays in window or resync mode measured about 13,000.
+            let reads = previousSource.Reads + currentSource.Reads
+            if reads > 600 then failwith $"The session made {reads} reads, so it did not return to the equal-byte phase after the insertion."
             Vitest.log ($"64 MiB file with an 8 MiB insertion near the start: %.1f{elapsed} ms, %.1f{rate} MB/s across both sources")
             do! session.Close()
         })
     )
 
     /// Measures a whole session with the default budgets and logs the time to the first page and the total time.
-    let private reportSessionRun label sessionId (previous: byte[]) (current: byte[]) (observe: DiffPage -> unit) (checkLedger: Ledger -> unit) =
+    let private reportSessionRun label sessionId (previous: byte[]) (current: byte[]) (observe: DiffPage -> unit) (checkRun: Ledger -> int -> unit) =
         let ledger = Ledger()
         let config = { SessionConfig.defaults sessionId with Limits = { Limits.defaults with MaxUnits = 2_147_483_647; RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 } }
+        let previousSource = CountingByteSource previous
+        let currentSource = CountingByteSource current
         let started = BrowserClock.nowMs()
-        let create = TextDiffSession.create (Host.createInMemory (ManualClock 0.0 :> IClock)) ledger config (fun _ -> 1) (benchmarkSource previous) (benchmarkSource current)
+        let create = TextDiffSession.create (Host.createInMemory (ManualClock 0.0 :> IClock)) ledger config (fun _ -> 1) (countedSource previousSource previous) (countedSource currentSource current)
         promiseThen (Async.StartAsPromise create) (fun session ->
             promiseThen (Async.StartAsPromise(session.FirstPage(fun () -> false))) (fun result ->
                 promiseThen (finishFirstPagePromise session result) (fun page ->
@@ -454,7 +478,7 @@ module TextDiffEngineCasesTests =
                     else
                         promiseThen (finishSessionOutputPromise observe session page) (fun () ->
                             let elapsed = max 1.0 (BrowserClock.nowMs() - started)
-                            checkLedger ledger
+                            checkRun ledger (previousSource.Reads + currentSource.Reads)
                             Vitest.log ($"{label}: first page %.1f{firstPageMs} ms, total %.1f{elapsed} ms")
                             promiseThen (Async.StartAsPromise(session.Close())) (fun () -> promiseResolveUnit ())
                         )
@@ -489,7 +513,9 @@ module TextDiffEngineCasesTests =
         Array.blit previous cutByte current (cutByte + insertion.Length) (previous.Length - cutByte)
         // The insertion is larger than one alignment window, so the search has to find the unchanged lines after it.
         let tally = Array.zeroCreate<int> 3
-        let check (ledger: Ledger) =
+        let check (ledger: Ledger) (reads: int) =
+            // The equal-byte phase after the insertion measured 512 reads. A session that stays in window or resync mode measured about 7,000.
+            if reads > 1_000 then failwith $"The session made {reads} reads, so it did not return to the equal-byte phase after the insertion."
             if tally[0] <> insertedLines || tally[1] <> 0 || tally[2] <> 0 then
                 failwith $"The insertion shows {tally[0]} added rows, {tally[1]} removed rows and {tally[2]} unaligned lines, expected {insertedLines} added rows and nothing else."
         reportSessionRun "64 MiB file with an 8 MiB insertion in the middle" "benchmark-insertion-middle" previous current (tallyPage tally) check
@@ -499,7 +525,7 @@ module TextDiffEngineCasesTests =
         let lineCount = benchmarkSize / lineBytes
         let previous = numberedLines 0x70uy lineBytes lineCount
         let current = numberedLines 0x71uy lineBytes lineCount
-        reportSessionRun "64 MiB full rewrite" "benchmark-rewrite" previous current ignore ignore
+        reportSessionRun "64 MiB full rewrite" "benchmark-rewrite" previous current ignore (fun _ _ -> ())
 
     Vitest.itWithTimeout("measures a 64 MiB file with an 8 MiB insertion of 40-byte lines in the middle", measureMiddleInsertion, 1_800_000)
 

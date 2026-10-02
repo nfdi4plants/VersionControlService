@@ -715,14 +715,24 @@ next offset by the returned text length. Stop when `TotalUtf16` is present and t
 reaches that total. `LineSlice.Highlights` holds UTF-16 spans marked as changed or
 unchanged text.
 
+A session keeps at most eight suspended line reads and drops the least recently used one
+when a ninth starts. A continuation for a dropped read answers `continuation_mismatch`.
+The caller then starts that read again without a continuation, as the sample does.
+
 ```fsharp
 let rec private readLineReady (service: TextDiffService) (request: ReadLineRequest) (context: OperationContext) = async {
     let! result = service.ReadLine request context
 
-    match valueOf result with
-    | Resumable.Ready line -> return line
-    | Resumable.Scanning(_, continuation, _) ->
-        return! readLineReady service { request with Continuation = Some continuation } context
+    match result with
+    | Failed failure when
+        failure.Code = TextDiffFailureCodes.ContinuationMismatch && request.Continuation.IsSome
+        ->
+        return! readLineReady service { request with Continuation = None } context
+    | _ ->
+        match valueOf result with
+        | Resumable.Ready line -> return line
+        | Resumable.Scanning(_, continuation, _) ->
+            return! readLineReady service { request with Continuation = Some continuation } context
 }
 
 let readFirstLineSlice (service: TextDiffService) (handle: DiffHandle) (context: OperationContext) = async {

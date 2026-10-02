@@ -1331,7 +1331,8 @@ let private trampolineHopViaSetImmediate: Async<unit> = jsNative
 let internal switchTrampolineToSetImmediate () : unit =
     Async.StartImmediate trampolineHopViaSetImmediate
 
-/// Serves text diff requests on the given port with the given handler.
+/// Serves text diff requests on the given port with the given handler. It switches the async trampoline of the
+/// whole thread to setImmediate, so it runs only on a worker thread.
 let bootstrapWith (port: NodeWorkerThreads.MessagePort) (handler: ITextDiffRequestHandler) : unit =
     switchTrampolineToSetImmediate ()
     let receive = attachDispatcher ((fun message -> port.postMessage message), (fun () -> port.close ()), handler)

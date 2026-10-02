@@ -360,7 +360,8 @@ type internal LineDecoder(encoding: TextEncoding) =
     member _.Units = units
     member _.Count = filled
 
-    /// Decodes count bytes that hold complete characters. Invalid bytes were reported when the line was scanned.
+    /// Decodes count bytes that hold complete characters. Decoders.decode stops at the first invalid byte, and the
+    /// scan blocks the session before any compare reaches a line that holds one, so decoding here is safe.
     member _.Decode(bytes: byte[], offset: int, count: int, start: float) =
         // No encoding produces more units than it consumes bytes.
         if units.Length < count then units <- Array.zeroCreate<int> (max count (units.Length * 2))

@@ -613,9 +613,6 @@ type internal Journal(store: ITempStore, ledger: Ledger, cacheBytes: int, create
         | None -> invalidOp "The journal target does not exist."
     }
 
-    /// Bytes of cached records, which count against the ledger.
-    member _.CachedBytes = cache.Used
-
     /// Drops the cached records and returns their bytes to the ledger.
     member _.Release() = cache.Clear()
 

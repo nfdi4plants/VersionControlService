@@ -28,6 +28,21 @@ module TextDiffStreamingCases =
                     return ReadOutcome.Bytes count
             }
 
+    /// Counts the reads that the session makes.
+    type private CountingByteSource(bytes: byte[]) =
+        let inner = MemoryByteSource(bytes) :> IByteSource
+        let mutable reads = 0
+
+        member _.Reads = reads
+
+        interface IByteSource with
+            member _.KnownLength = inner.KnownLength
+            member _.AvailableLength() = inner.AvailableLength()
+            member _.IsComplete() = inner.IsComplete()
+            member _.ReadAt position buffer offset count =
+                reads <- reads + 1
+                inner.ReadAt position buffer offset count
+
     let private endingText = function
         | LineEnding.NoEnding -> ""
         | LineEnding.LF -> "\n"
@@ -260,9 +275,17 @@ module TextDiffStreamingCases =
         let ledger = Ledger()
         let limits = { Limits.defaults with MaxUnits = 2_147_483_647; RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 }
         let sessionConfig = config sessionId 8_192 1_000_000 limits None
-        let! session = openSession ledger sessionConfig (sourceSpec previousBytes) (sourceSpec currentBytes)
+        let previousSource = CountingByteSource previousBytes
+        let currentSource = CountingByteSource currentBytes
+        let previousSpec = { sourceSpec previousBytes with Source = Some(previousSource :> IByteSource) }
+        let currentSpec = { sourceSpec currentBytes with Source = Some(currentSource :> IByteSource) }
+        let! session = openSession ledger sessionConfig previousSpec currentSpec
         let! pages, _ = readAll session
         checkOracle previous current pages
+        let reads = previousSource.Reads + currentSource.Reads
+        // With the equal-byte phase the insertion and deletion cases measured 121 and 118 reads. A session that
+        // stays in window or resync mode after the shift measured about 1,550.
+        Check.true' (reads < 250) $"The session made {reads} reads, so it did not return to the equal-byte phase after the shift."
         do! session.Close()
         return ()
     }

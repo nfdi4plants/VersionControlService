@@ -12,6 +12,8 @@ type AllocationCategory =
     | ResponseData
     | RetainedBlobs
 
+/// Tracks the bytes that the sessions of one worker reserve, per category. A ledger serves one session at a
+/// time. A second session on the same ledger can be refused when a category is full, and it does not wait.
 type Ledger() =
     let used = Array.zeroCreate<int64> 7
     let caps = [| 32L; 32L; 54L; 16L; 8L; 8L; 2L |] |> Array.map (fun value -> value * 1024L * 1024L)

@@ -30,6 +30,16 @@ module TextDiffSessionCases =
                 return outcome
             }
 
+    /// Serves at most maxPerRead bytes per call so that large requests come back short.
+    type private ShortReadByteSource(bytes: byte[], maxPerRead: int) =
+        let inner = MemoryByteSource(bytes) :> IByteSource
+
+        interface IByteSource with
+            member _.KnownLength = inner.KnownLength
+            member _.AvailableLength() = inner.AvailableLength()
+            member _.IsComplete() = inner.IsComplete()
+            member _.ReadAt position buffer offset count = inner.ReadAt position buffer offset (min count maxPerRead)
+
     type private DelayedByteSource(bytes: byte[], clock: ManualClock, delayMs: float) =
         let inner = MemoryByteSource(bytes) :> IByteSource
 
@@ -267,6 +277,45 @@ module TextDiffSessionCases =
     }
 
     let private allParts pages = pages |> Array.collect (fun page -> page.Parts)
+
+    let private memorySource (bytes: byte[]) = MemoryByteSource(bytes) :> IByteSource
+
+    let private rowShape pages =
+        allParts pages
+        |> Array.collect (function
+            | DiffPart.Hunk { Body = HunkBody.AlignedRows values } ->
+                values
+                |> Array.map (fun row ->
+                    row.Kind,
+                    row.Previous |> Option.map (fun line -> line.Number, line.Slice.Text),
+                    row.Current |> Option.map (fun line -> line.Number, line.Slice.Text))
+            | _ -> Array.empty)
+
+    /// Diffs previousText as UTF-8 against currentText as Windows-1252, and the same texts as UTF-8 on both
+    /// sides. Both runs use the same hash mask. Returns the row shapes of the uniform run and the mixed run.
+    let private mixedAndUniformRows name mask wrap (previousText: string) (currentText: string) = async {
+        let previousBytes = Encoding.UTF8.GetBytes previousText
+        let currentLatin1 = Array.init currentText.Length (fun index -> byte currentText[index])
+        let currentUtf8 = Encoding.UTF8.GetBytes currentText
+        let withMask id = { SessionConfig.defaults id with HashMaskForTesting = mask }
+        let! mixedSession =
+            openSession
+                (withMask (name + "-mixed"))
+                (sourceSpecWith (wrap previousBytes) "utf-8" 0 (int64 previousBytes.Length))
+                (sourceSpecWith (wrap currentLatin1) "windows-1252" 0 (int64 currentLatin1.Length))
+        let! mixedPages = readAll mixedSession (fun () -> false)
+        do! mixedSession.Close()
+        let! uniformSession = openSession (withMask (name + "-uniform")) (sourceSpec previousBytes) (sourceSpec currentUtf8)
+        let! uniformPages = readAll uniformSession (fun () -> false)
+        do! uniformSession.Close()
+        return rowShape uniformPages, rowShape mixedPages
+    }
+
+    let private checkMixedRows name mask wrap previousText currentText = async {
+        let! expected, mixed = mixedAndUniformRows name mask wrap previousText currentText
+        Check.true' (expected |> Array.exists (fun (kind, _, _) -> kind = DiffRowKind.Replaced)) "The comparison has a replaced row."
+        Check.sequence expected mixed "Mixed encodings give the rows of the same text in one encoding."
+    }
 
     let private jsonStringBytes (value: string) =
         let mutable size = 2
@@ -2747,16 +2796,6 @@ module TextDiffSessionCases =
             let currentText = build "Gräfin"
             let currentLatin1 = Array.init currentText.Length (fun index -> byte currentText[index])
             let currentUtf8 = Encoding.UTF8.GetBytes currentText
-            let rowShape pages =
-                allParts pages
-                |> Array.collect (function
-                    | DiffPart.Hunk { Body = HunkBody.AlignedRows values } ->
-                        values
-                        |> Array.map (fun row ->
-                            row.Kind,
-                            row.Previous |> Option.map (fun line -> line.Number, line.Slice.Text),
-                            row.Current |> Option.map (fun line -> line.Number, line.Slice.Text))
-                    | _ -> Array.empty)
             let previousSource = CountingByteSource previousBytes
             let currentSource = CountingByteSource currentLatin1
             let mixed = SessionConfig.defaults "decode-compare-reads"
@@ -2775,5 +2814,38 @@ module TextDiffSessionCases =
             Check.sequence expected (rowShape mixedPages) "Mixed encodings give the rows of the same text in one encoding."
             let reads = previousSource.Reads + currentSource.Reads
             Check.true' (reads < 2_000) $"The mixed encoding comparison used {reads} reads."
+        }
+        "mixed encodings confirm unequal pairs inside claimed runs", fun () -> async {
+            let lineText special index =
+                if index % 400 = 7 then sprintf "%s Zeile %04d\n" special index else sprintf "gemeinsame Zeile %04d mit Füllung\n" index
+            let build special = String.concat "" [ for index in 0 .. 1_999 -> lineText special index ]
+            // With the mask at zero every line hash matches. The special lines keep their UTF-16 length, so the
+            // scan claims them as equal and the decoded compare finds the unequal pairs inside the run.
+            do! checkMixedRows "decode-compare-unequal" (Some(0u, 0u)) memorySource (build "Grafin") (build "Gräfin")
+        }
+        "mixed encodings confirm lines that arrive in short reads", fun () -> async {
+            let lineText special index =
+                if index = 600 then special + " von Hohenlohe\n"
+                elif index % 250 = 100 then String('Ü', 1_500) + "\n"
+                else sprintf "gemeinsame Zeile %05d mit Füllung\n" index
+            let build special = String.concat "" [ for index in 0 .. 1_499 -> lineText special index ]
+            // Reads return at most 1,000 bytes, so a chunk request comes back with a few whole lines
+            // and the 1,500-character lines never arrive whole.
+            let wrap (bytes: byte[]) = ShortReadByteSource(bytes, 1_000) :> IByteSource
+            do! checkMixedRows "decode-compare-short" None wrap (build "Graefin") (build "Gräfin")
+        }
+        "mixed encodings confirm lines longer than the compare buffer", fun () -> async {
+            let longLine fill changed =
+                let body = String(fill, 100_000)
+                if changed then body.Substring(0, 50_000) + "X" + body.Substring 50_001 else body
+            let build special changedLong =
+                String.concat "" [
+                    for index in 0 .. 9 do yield sprintf "gemeinsame Zeile %02d mit Füllung\n" index
+                    yield longLine 'ä' false + "\n"
+                    yield sprintf "%s Zeile\n" special
+                    yield longLine 'ö' changedLong + "\n"
+                    yield "ende\n"
+                ]
+            do! checkMixedRows "decode-compare-long" None memorySource (build "Graefin" false) (build "Gräfin" true)
         }
     ]
