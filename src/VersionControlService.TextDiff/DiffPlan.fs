@@ -199,6 +199,7 @@ type private AlignPhase =
     | LongestChain
     | RecoverChain
     | AnchorConfirm
+    | RestoreConfirm
     | Gaps
     | CountUnique
     | Convert
@@ -266,6 +267,17 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
     let mutable anchorLength = 0
     let mutable anchorPending = false
     let mutable chainSpanStart = -1
+
+    // Spans that rule C rejected, in chain order. A gap that merged them and then exhausts its step budget gets
+    // them back as anchors, which splits it into the smaller gaps it had without the rejection.
+    let rejectedPrevious = ResizeArray<int>()
+    let rejectedCurrent = ResizeArray<int>()
+    let rejectedLength = ResizeArray<int>()
+    let mutable restoreCursor = 0
+    let mutable restoreEnd = 0
+    let mutable restoreAt = 0
+    let mutable restoreFirst = 0
+    let mutable lookupProbes = 0
 
     let mutable gapIndex = 0
     let mutable gapStarted = false
@@ -496,6 +508,76 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
         anchorPending <- true
         AlignStep.NeedRun(anchorPrevious, anchorCurrent, anchorLength)
 
+    /// Counts matching line pairs from (p, c) stepping by (dp, dc) inside the middle section, up to longRunLines.
+    let matchedRun (p: int) (c: int) (dp: int) (dc: int) =
+        let mutable k = 0
+        while k < longRunLines
+              && p + k * dp >= middlePreviousStart && p + k * dp < middlePreviousEnd
+              && c + k * dc >= middleCurrentStart && c + k * dc < middleCurrentEnd
+              && keysEqual (p + k * dp) (c + k * dc) do
+            k <- k + 1
+        lookupProbes <- lookupProbes + k
+        k
+
+    /// The first line of the current middle with the key of a previous line, or -1 when the key does not occur
+    /// there. A collision chain longer than longRunLines answers -1, which keeps the candidate.
+    let firstCurrent (p: int) =
+        let mutable slot = slotFor previous p
+        let mutable found = -1
+        let mutable steps = 0
+        let mutable searching = true
+        while searching do
+            let holder = Native.readInt slotPrevious slot
+            if holder < 0 || steps >= longRunLines then searching <- false
+            elif previous.HashLow holder = previous.HashLow p
+                 && previous.HashHigh holder = previous.HashHigh p
+                 && previous.Length holder = previous.Length p then
+                if Native.readByte slotCurrentCount slot > 0 then found <- Native.readInt slotCurrent slot
+                searching <- false
+            else
+                slot <- (slot + 1) &&& slotMask
+                steps <- steps + 1
+        lookupProbes <- lookupProbes + steps + 1
+        found
+
+    /// The first line of the previous middle with the key of a current line, or -1 when the key does not occur
+    /// there. A collision chain longer than longRunLines answers -1, which keeps the candidate.
+    let firstPrevious (c: int) =
+        let mutable slot = slotFor current c
+        let mutable found = -1
+        let mutable steps = 0
+        let mutable searching = true
+        while searching do
+            let holder = Native.readInt slotPrevious slot
+            if holder < 0 || steps >= longRunLines then searching <- false
+            elif keysEqual holder c then
+                found <- holder
+                searching <- false
+            else
+                slot <- (slot + 1) &&& slotMask
+                steps <- steps + 1
+        lookupProbes <- lookupProbes + steps + 1
+        found
+
+    /// A span of lines that occur once in each window is no anchor when it moved across a long equal run. The
+    /// longRunLines lines before it on one side sit after it on the other side, either right after the span or
+    /// where their first line first occurs. Anchored, the span would turn that run into removed and added lines.
+    /// Left to the gap, the run aligns and the span becomes the moved line. Lines moved together are each
+    /// rejected on their own, so the order of the chain does not matter.
+    let movedAcrossRun () =
+        let before = anchorPrevious - 1
+        let after = anchorCurrent + anchorLength
+        let previousBlock = anchorPrevious - longRunLines
+        let currentBlock = anchorCurrent - longRunLines
+        (matchedRun before (anchorCurrent - 1) (-1) (-1) < longRunLines
+         && (matchedRun before after (-1) 1 >= longRunLines
+             || (previousBlock >= middlePreviousStart
+                 && (let f = firstCurrent previousBlock in f >= after && matchedRun previousBlock f 1 1 >= longRunLines))))
+        || (matchedRun (anchorPrevious + anchorLength) after 1 1 < longRunLines
+            && (matchedRun (anchorPrevious + anchorLength) (anchorCurrent - 1) 1 (-1) >= longRunLines
+                || (currentBlock >= middleCurrentStart
+                    && (let f = firstPrevious currentBlock in f >= anchorPrevious + anchorLength && matchedRun f currentBlock 1 1 >= longRunLines))))
+
     let markLookaheadAnchors () =
         let mutable followingPrevious = -1
         let mutable followingCurrent = -1
@@ -538,6 +620,40 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
                 currentEnd <- currentEnd + operation.CurrentCount
             else
                 openPrefix <- false
+
+    let emitUnaligned () =
+        raw.Add(
+            DiffOperations.make
+                OperationKind.Unaligned
+                gapPreviousStart
+                gapCurrentStart
+                (gapPreviousEnd - gapPreviousStart)
+                (gapCurrentEnd - gapCurrentStart)
+        )
+        stepper <- None
+        finishGap ()
+
+    /// Starts confirming the rejected spans that lie inside the gap that just exhausted its budget. They form one
+    /// contiguous run of the rejected list because both lists follow the same chain.
+    let tryBeginRestore (meter: Meter) =
+        restoreFirst <- -1
+        restoreEnd <- -1
+        for i = 0 to rejectedPrevious.Count - 1 do
+            let n = rejectedLength[i]
+            if rejectedPrevious[i] >= gapPreviousStart && rejectedPrevious[i] + n <= gapPreviousEnd
+               && rejectedCurrent[i] >= gapCurrentStart && rejectedCurrent[i] + n <= gapCurrentEnd then
+                if restoreFirst < 0 then restoreFirst <- i
+                restoreEnd <- i + 1
+        Meter.charge meter (rejectedPrevious.Count / 8)
+        if restoreFirst < 0 then false
+        else
+            restoreCursor <- restoreFirst
+            restoreAt <- gapIndex
+            anchorLength <- 0
+            anchorPending <- false
+            stepper <- None
+            phase <- AlignPhase.RestoreConfirm
+            true
 
     let startGap (meter: Meter) =
         gapCache.Clear()
@@ -621,11 +737,18 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
                 for operation in positionalOperations do DiffOperations.appendRaw raw operation
                 positionalConfirmed <- true
                 beginConvert ()
-        | AlignPhase.AnchorConfirm ->
+        | AlignPhase.AnchorConfirm
+        | AlignPhase.RestoreConfirm ->
             if matched > 0 then
-                spanPrevious.Add anchorPrevious
-                spanCurrent.Add anchorCurrent
-                spanLength.Add matched
+                if phase = AlignPhase.RestoreConfirm then
+                    spanPrevious.Insert(restoreAt, anchorPrevious)
+                    spanCurrent.Insert(restoreAt, anchorCurrent)
+                    spanLength.Insert(restoreAt, matched)
+                    restoreAt <- restoreAt + 1
+                else
+                    spanPrevious.Add anchorPrevious
+                    spanCurrent.Add anchorCurrent
+                    spanLength.Add matched
             if matched < anchorLength then
                 anchorPrevious <- anchorPrevious + matched + 1
                 anchorCurrent <- anchorCurrent + matched + 1
@@ -805,7 +928,34 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
                         anchorIndex <- anchorIndex - 1
                     else extending <- false
                 Meter.charge meter (anchorLength / 8)
-                confirmAnchor ()
+                lookupProbes <- 0
+                let moved = movedAcrossRun ()
+                Meter.charge meter (lookupProbes / 8)
+                if moved then
+                    rejectedPrevious.Add anchorPrevious
+                    rejectedCurrent.Add anchorCurrent
+                    rejectedLength.Add anchorLength
+                    anchorLength <- 0
+                    AlignStep.Running
+                else confirmAnchor ()
+        | AlignPhase.RestoreConfirm ->
+            if anchorPending then AlignStep.NeedRun(anchorPrevious, anchorCurrent, anchorLength)
+            elif anchorLength > 0 then confirmAnchor ()
+            elif restoreCursor < restoreEnd then
+                anchorPrevious <- rejectedPrevious[restoreCursor]
+                anchorCurrent <- rejectedCurrent[restoreCursor]
+                anchorLength <- rejectedLength[restoreCursor]
+                restoreCursor <- restoreCursor + 1
+                AlignStep.Running
+            else
+                let count = restoreEnd - restoreFirst
+                rejectedPrevious.RemoveRange(restoreFirst, count)
+                rejectedCurrent.RemoveRange(restoreFirst, count)
+                rejectedLength.RemoveRange(restoreFirst, count)
+                phase <- AlignPhase.Gaps
+                // When no span confirmed, the gap would exhaust the same budget again.
+                if restoreAt = gapIndex then emitUnaligned ()
+                AlignStep.Running
         | AlignPhase.Gaps ->
             match stepper with
             | Some active ->
@@ -831,17 +981,9 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
                     finishGap ()
                     AlignStep.Running
                 | MyersStepResult.StepLimitExceeded ->
-                    // The gap exceeded its step budget, so its lines are reported as one unaligned region.
-                    raw.Add(
-                        DiffOperations.make
-                            OperationKind.Unaligned
-                            gapPreviousStart
-                            gapCurrentStart
-                            (gapPreviousEnd - gapPreviousStart)
-                            (gapCurrentEnd - gapCurrentStart)
-                    )
-                    stepper <- None
-                    finishGap ()
+                    // The gap exceeded its step budget. Rejected spans inside it return as anchors. Without any,
+                    // its lines are reported as one unaligned region.
+                    if not (tryBeginRestore meter) then emitUnaligned ()
                     AlignStep.Running
             | None ->
                 startGap meter

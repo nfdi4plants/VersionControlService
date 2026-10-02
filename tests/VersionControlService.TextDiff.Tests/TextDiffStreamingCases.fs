@@ -194,8 +194,50 @@ module TextDiffStreamingCases =
 
         output.ToArray()
 
+    /// Walks the parts in order. Each side must advance by one line per row without a gap or an overlap, and every
+    /// equal row and every hidden equal range must name the same text and ending on both sides.
+    let private checkAcrossSides (previous: SourceLine array) (current: SourceLine array) parts =
+        let mutable nextPrevious = 0L
+        let mutable nextCurrent = 0L
+        let takePrevious (line: DiffLine) =
+            if line.Number <> nextPrevious then failwith $"The previous side expects line {nextPrevious} and the diff shows {line.Number}."
+            nextPrevious <- nextPrevious + 1L
+        let takeCurrent (line: DiffLine) =
+            if line.Number <> nextCurrent then failwith $"The current side expects line {nextCurrent} and the diff shows {line.Number}."
+            nextCurrent <- nextCurrent + 1L
+        for part in parts do
+            match part with
+            | DiffPart.HiddenEqual gap ->
+                if gap.PreviousRange.Start <> nextPrevious || gap.CurrentRange.Start <> nextCurrent then
+                    failwith $"A hidden equal range starts at {gap.PreviousRange.Start} and {gap.CurrentRange.Start}, but the sides are at {nextPrevious} and {nextCurrent}."
+                if gap.PreviousRange.Count <> gap.CurrentRange.Count then failwith "A hidden equal range has different counts on the two sides."
+                for offset = 0 to int gap.PreviousRange.Count - 1 do
+                    if previous[int gap.PreviousRange.Start + offset] <> current[int gap.CurrentRange.Start + offset] then
+                        failwith $"A hidden equal range differs at previous line {gap.PreviousRange.Start + int64 offset}."
+                nextPrevious <- nextPrevious + gap.PreviousRange.Count
+                nextCurrent <- nextCurrent + gap.CurrentRange.Count
+            | DiffPart.Hunk fragment ->
+                match fragment.Body with
+                | HunkBody.AlignedRows rows ->
+                    for row in rows do
+                        if row.Kind = DiffRowKind.Context then
+                            match row.Previous, row.Current with
+                            | Some left, Some right ->
+                                if left.Slice.Text <> right.Slice.Text || left.Ending <> right.Ending then
+                                    failwith $"An equal row differs between previous line {left.Number} and current line {right.Number}."
+                            | _ -> failwith "An equal row lacks a line on one side."
+                        row.Previous |> Option.iter takePrevious
+                        row.Current |> Option.iter takeCurrent
+                | HunkBody.UnalignedSides(left, right) ->
+                    for line in left do takePrevious line
+                    for line in right do takeCurrent line
+            | DiffPart.ExpandedContext _ -> ()
+        if nextPrevious <> int64 previous.Length || nextCurrent <> int64 current.Length then
+            failwith $"The sides end at {nextPrevious} and {nextCurrent} of {previous.Length} and {current.Length} lines."
+
     let private checkOracle previous current pages =
         let parts = allParts pages
+        checkAcrossSides previous current parts
         Check.sequence previous (rebuild previous parts true) "The page stream covers every previous line exactly once."
         Check.sequence current (rebuild current parts false) "The page stream covers every current line exactly once."
 
@@ -679,6 +721,124 @@ module TextDiffStreamingCases =
             do! session.Close()
             return ()
         }
+        "a unique line that moved across a long equal run is one moved line", fun () -> async {
+            let sourceLine text = { Text = text; Ending = LineEnding.LF }
+            let repeated count text = Array.create count (sourceLine text)
+            let marker = [| sourceLine "X" |]
+            let cases = [
+                "up 600", Array.concat [ [| sourceLine "p" |]; repeated 600 "a"; marker; repeated 600 "b" ],
+                          Array.concat [ [| sourceLine "qq" |]; marker; repeated 600 "a"; repeated 600 "b" ]
+                "up 2000", Array.concat [ [| sourceLine "p" |]; repeated 2_000 "a"; marker; repeated 2_000 "b" ],
+                           Array.concat [ [| sourceLine "qq" |]; marker; repeated 2_000 "a"; repeated 2_000 "b" ]
+                "down 600", Array.concat [ [| sourceLine "qq" |]; marker; repeated 600 "a"; repeated 600 "b" ],
+                            Array.concat [ [| sourceLine "p" |]; repeated 600 "a"; marker; repeated 600 "b" ]
+                "partly down 600", Array.concat [ [| sourceLine "p" |]; repeated 600 "a"; marker; repeated 600 "b" ],
+                                   Array.concat [ [| sourceLine "qq" |]; repeated 5 "a"; marker; repeated 595 "a"; repeated 600 "b" ]
+            ]
+            for name, previous, current in cases do
+                let! session = openSession (Ledger()) (SessionConfig.defaults ("stream-moved-marker-" + name)) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+                let! pages, _ = readAll session
+                checkOracle previous current pages
+                Check.equal (previous.Length - 2, 1, 1, 1, 0) (rowCounts pages) $"The {name} case aligns both runs, with one added line, one removed line and one replaced row."
+                do! session.Close()
+            return ()
+        }
+        "unique lines that moved together across long equal runs are moved lines", fun () -> async {
+            let sourceLine text = { Text = text; Ending = LineEnding.LF }
+            let runLength = 600
+            // Previous: p, a-run, X, b-run, Y, c-run and so on. Current: qq, all markers, then the runs.
+            let cluster markerCount =
+                let markers = [| "X"; "Y"; "Z" |][.. markerCount - 1]
+                let runs = [| "a"; "b"; "c"; "d" |][.. markerCount]
+                let previous =
+                    Array.concat [
+                        [| sourceLine "p" |]
+                        yield! runs |> Array.mapi (fun index run ->
+                            Array.append (Array.create runLength (sourceLine run)) (if index < markerCount then [| sourceLine markers[index] |] else [||]))
+                    ]
+                let current =
+                    Array.concat [
+                        [| sourceLine "qq" |]
+                        markers |> Array.map sourceLine
+                        runs |> Array.collect (fun run -> Array.create runLength (sourceLine run))
+                    ]
+                previous, current
+            let up2, up2Current = cluster 2
+            let up3, up3Current = cluster 3
+            for name, previous, current, markerCount in [ "2 up", up2, up2Current, 2; "3 up", up3, up3Current, 3; "2 down", up2Current, up2, 2 ] do
+                let! session = openSession (Ledger()) (SessionConfig.defaults ("stream-moved-markers-" + name)) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+                let! pages, _ = readAll session
+                checkOracle previous current pages
+                Check.equal ((markerCount + 1) * runLength, markerCount, markerCount, 1, 0) (rowCounts pages) $"The {name} case aligns every run, with one added and one removed line per marker."
+                do! session.Close()
+            return ()
+        }
+        "unique lines that stay in place keep their rows between long equal runs", fun () -> async {
+            let sourceLine text = { Text = text; Ending = LineEnding.LF }
+            let previous = Array.init 3_000 (fun index -> sourceLine (if index % 300 = 299 then $"M{index}" else "a"))
+            let inserted =
+                previous
+                |> Array.mapi (fun index line -> if index % 300 = 299 then Array.append (Array.create 5 (sourceLine "b")) [| line |] else [| line |])
+                |> Array.concat
+            let edited = Array.copy previous
+            edited[0] <- sourceLine "edited"
+            for name, current, expected in [ "inserted", inserted, (3_000, 50, 0, 0, 0); "edited", edited, (2_999, 0, 0, 1, 0) ] do
+                let! session = openSession (Ledger()) (SessionConfig.defaults ("stream-marker-in-place-" + name)) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+                let! pages, _ = readAll session
+                checkOracle previous current pages
+                Check.equal expected (rowCounts pages) $"The {name} case keeps every marker row in place."
+                do! session.Close()
+            return ()
+        }
+        "a moved unique line keeps its rows at the run thresholds and in odd layouts", fun () -> async {
+            let one text = [| { Text = text; Ending = LineEnding.LF } |]
+            let times count text = Array.create count { Text = text; Ending = LineEnding.LF }
+            let runs = Array.append (times 32 "a") (times 32 "b")
+            let cases = [
+                "budget family", Array.concat [ times 300 "p"; times 64 "a"; one "X"; times 300 "b" ],
+                                 Array.concat [ times 300 "qq"; one "X"; times 64 "a"; times 300 "c" ], (1, 64, 64, 600, 0)
+                "below the threshold", Array.concat [ one "p"; times 63 "a"; one "X"; times 63 "b" ],
+                                       Array.concat [ one "qq"; one "X"; times 63 "a"; times 63 "b" ], (64, 63, 63, 1, 0)
+                "at the threshold", Array.concat [ one "p"; times 64 "a"; one "X"; times 64 "b" ],
+                                    Array.concat [ one "qq"; one "X"; times 64 "a"; times 64 "b" ], (128, 1, 1, 1, 0)
+                "mixed run up", Array.concat [ one "p"; runs; one "X"; times 64 "c" ],
+                                Array.concat [ one "qq"; one "X"; runs; times 64 "c" ], (128, 1, 1, 1, 0)
+                "mixed run down", Array.concat [ one "qq"; one "X"; runs; times 64 "c" ],
+                                  Array.concat [ one "p"; runs; one "X"; times 64 "c" ], (128, 1, 1, 1, 0)
+                "two markers", Array.concat [ one "p"; times 64 "a"; one "X"; one "Y"; times 64 "b" ],
+                               Array.concat [ one "qq"; one "X"; one "Y"; times 64 "a"; times 64 "b" ], (128, 2, 2, 1, 0)
+                "keys on one side", Array.concat [ one "p"; times 64 "a"; one "X"; times 64 "b" ],
+                                    Array.concat [ one "qq"; times 64 "c"; one "X"; times 64 "d" ], (1, 0, 0, 129, 0)
+                "inner boundaries up", Array.concat [ one "head"; one "p"; times 64 "a"; one "X"; one "tail" ],
+                                       Array.concat [ one "head"; one "qq"; one "X"; times 64 "a"; one "tail" ], (66, 1, 1, 1, 0)
+                "inner boundaries down", Array.concat [ one "head"; one "qq"; one "X"; times 64 "a"; one "tail" ],
+                                         Array.concat [ one "head"; one "p"; times 64 "a"; one "X"; one "tail" ], (66, 1, 1, 1, 0)
+            ]
+            for name, previous, current, expected in cases do
+                let! session = openSession (Ledger()) (SessionConfig.defaults ("stream-moved-marker-edge-" + name)) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+                let! pages, _ = readAll session
+                checkOracle previous current pages
+                Check.equal expected (rowCounts pages) $"The {name} case has the expected rows."
+                do! session.Close()
+            return ()
+        }
+        "a gap that exhausts its budget gets its rejected moved lines back", fun () -> async {
+            let one text = [| { Text = text; Ending = LineEnding.LF } |]
+            let times count text = Array.create count { Text = text; Ending = LineEnding.LF }
+            let cases = [
+                "restored gaps exhaust again", Array.concat [ times 700 "p"; times 64 "a"; one "X"; times 700 "b" ],
+                                               Array.concat [ times 700 "qq"; one "X"; times 64 "a"; times 700 "c" ], (1, 0, 0, 0, 2928)
+                "two restored lines", Array.concat [ times 300 "p"; times 64 "a"; one "X"; times 64 "b"; one "Y"; times 300 "c" ],
+                                      Array.concat [ times 300 "qq"; one "X"; times 64 "a"; one "Y"; times 64 "b"; times 300 "d" ], (2, 64, 64, 664, 0)
+            ]
+            for name, previous, current, expected in cases do
+                let! session = openSession (Ledger()) (SessionConfig.defaults ("stream-restore-" + name)) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+                let! pages, _ = readAll session
+                checkOracle previous current pages
+                Check.equal expected (rowCounts pages) $"The {name} case has the expected rows."
+                do! session.Close()
+            return ()
+        }
         "a cyclic log with a growing previous source misses no equal lines", fun () -> async {
             let sourceLine text = { Text = text; Ending = LineEnding.LF }
             let cycle index = sourceLine $"cycle line {index % 13}"
@@ -691,8 +851,7 @@ module TextDiffStreamingCases =
                 let! session = openSession (Ledger()) (SessionConfig.defaults $"stream-cyclic-growth-{growth}") (sourceSpecWith growing previousBytes) (sourceSpec currentBytes)
                 let! pages, _ = readAll session
                 checkOracle previous current pages
-                let _, added, removed, replaced, unaligned = rowCounts pages
-                Check.equal (700, 0, 0, 0) (added, removed, replaced, unaligned) $"Growth by {growth} bytes shows only the inserted lines."
+                Check.equal (6_000, 700, 0, 0, 0) (rowCounts pages) $"Growth by {growth} bytes keeps every original line equal and shows only the inserted lines."
                 do! session.Close()
             return ()
         }
