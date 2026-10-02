@@ -242,8 +242,11 @@ type MyersStepper(
             MyersStepResult.NeedComparison(previousIndex, currentIndex)
         | None, _ ->
             let mutable didWork = false
+            let mutable batch = 0
             let mutable answer: MyersStepResult option = None
-            while answer.IsNone && not didWork && terminal.IsNone do
+            // A call does up to 64 units of work, so the caller's per-step bookkeeping is shared between them.
+            while answer.IsNone && terminal.IsNone && batch < 64 do
+                didWork <- false
                 match active with
                 | None ->
                     match finishIfIdle () with
@@ -530,6 +533,7 @@ type MyersStepper(
                                 range.Stage <- RangeStage.ReverseFrontier
                     | RangeStage.Fallback ->
                         pushFallback range
+                if didWork then batch <- batch + 1
             if terminal.IsSome then
                 terminal.Value
             elif answer.IsSome then

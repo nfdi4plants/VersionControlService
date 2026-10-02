@@ -1422,8 +1422,11 @@ type TextDiffSession internal (
     /// lives outside any async block since an async loop schedules one continuation per iteration.
     let runSynchronously (meter: Meter) =
         let mutable running = true
+        let mutable microsteps = 0
         while running do
             synchronousMicrostep meter
+            microsteps <- microsteps + 1
+            // A microstep takes microseconds, so the two clock reads run once per 64 microsteps.
             running <-
                 synchronousStep ()
                 && failure.IsNone
@@ -1432,8 +1435,8 @@ type TextDiffSession internal (
                 && builder.QueuedFragments < config.PageMaxFragments
                 && not (modeIsDone () && builder.Finished)
                 && not (builder.CompletedHunks > 0 && not (modeIsDone ()) && not firstPageReturned)
-                && not (Meter.overBudget meter)
-                && not (Meter.quantumDue meter)
+                && meter.Units < meter.MaxUnits
+                && ((microsteps &&& 63) <> 0 || (not (Meter.overBudget meter) && not (Meter.quantumDue meter)))
 
     // HDF5 superblocks can start at 512 times a power of two. The classifier samples only the first 64 KiB,
     // so the scan checks the later offsets when its coverage passes them. The signature is read directly from the
