@@ -792,19 +792,16 @@ Vitest.describe (
 
                 let session = createSession (currentFixture ()).Pool repository
                 let service = serviceFor session
-                let opened = ResizeArray<DiffHandle * DiffPage>()
                 let mutable failure = None
 
                 try
+                    // The fixture pool has one slot, so each Open closes the previous idle diff.
+                    // Every diff is paged to its end before the next one opens.
                     for relativePath in relativePaths do
                         let! handle, _, _, first =
                             openedWithFirstPage service (openRequest relativePath) ("scratch-" + relativePath)
                         Vitest.expect(pageHasChange first).toBe true
-                        opened.Add(handle, first)
-
-                    for index = 0 to opened.Count - 1 do
-                        let handle, first = opened[index]
-                        let! pages = readAllPages service handle first ("scratch-page-" + string index)
+                        let! pages = readAllPages service handle first ("scratch-page-" + relativePath)
                         Vitest.expect(pages.Length > 0).toBe true
                         Vitest.expect(pages[pages.Length - 1].NextCursor.IsNone).toBe true
                 with error ->

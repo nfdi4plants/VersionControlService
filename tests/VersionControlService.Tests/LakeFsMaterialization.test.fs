@@ -20,7 +20,10 @@ let private createTempDirectoryAsync () : JS.Promise<string> =
 
 let private removeDirectoryAsync (path: string) : JS.Promise<unit> = promise {
     let! _ =
-        fsPromisesDynamic?rm (path, createObj [ "recursive" ==> true; "force" ==> true ])
+        fsPromisesDynamic?rm (
+            path,
+            createObj [ "recursive" ==> true; "force" ==> true; "maxRetries" ==> 10; "retryDelay" ==> 50 ]
+        )
         |> unbox<JS.Promise<obj>>
 
     return ()

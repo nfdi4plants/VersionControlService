@@ -28,8 +28,13 @@ let private createTempDirectoryAsync () : JS.Promise<string> = promise {
 }
 
 let private removeDirectoryAsync (path: string) : JS.Promise<unit> = promise {
+    // Windows keeps a canceled Git child's working directory busy for a few milliseconds after the
+    // child has exited and closed its pipes, so the removal retries on EBUSY.
     let! _ =
-        fsPromisesDynamic?rm (path, createObj [ "recursive" ==> true; "force" ==> true ])
+        fsPromisesDynamic?rm (
+            path,
+            createObj [ "recursive" ==> true; "force" ==> true; "maxRetries" ==> 10; "retryDelay" ==> 50 ]
+        )
         |> unbox<JS.Promise<obj>>
 
     return ()
