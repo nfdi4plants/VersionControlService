@@ -1018,8 +1018,8 @@ type TextDiffSession internal (
         let mutable lastConfirmedAnchor = -1
         let mutable anchoredLines = 0
         let mutable runLines = 0
-        // Lines of the current run from its first operation that re-enters the anchor path (a prefix run, a
-        // chain anchor or a unique suffix run), whether or not that run holds a line unique in both windows.
+        // Lines of the current run from its first operation with ReenterAnchor set, which a prefix run carries as
+        // well as a chain anchor, whether or not that run holds a line unique in both windows.
         // A forward search confirms a match from a line it found, so lines that a Myers pass matched before
         // such an operation do not count.
         let mutable uniqueRunLines = 0
@@ -1135,7 +1135,7 @@ type TextDiffSession internal (
                 // the place where the sources meet again.
                 commitCount <- lastEqual + 1
                 beginFeeding ()
-            elif anchoredLines >= AlignerLimits.LongRunLines && cleanAnchoredLines >= AlignerLimits.LongRunLines then
+            elif cleanAnchoredLines >= AlignerLimits.LongRunLines then
                 // At its largest size the window settles when it holds 64 anchored lines and has a clean anchor,
                 // the last one reached while replaced and unaligned lines were at most an eighth of the anchored
                 // lines. The window commits up to that anchor. A line or a short copied block that matches by

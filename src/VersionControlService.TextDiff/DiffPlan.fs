@@ -464,8 +464,8 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
             cursor <- middlePreviousStart
             phase <- AlignPhase.BuildSlots
 
-    /// A window that holds both sources, or the last window of a larger file, aligns its middle with one Myers pass
-    /// first, and so does the aligner after a resync. Where a chance anchor would cost extra changed lines, the pass
+    /// A window in which both sources end, whether it holds both whole files or the last part of larger ones, aligns
+    /// its middle with one Myers pass first. Where a chance anchor would cost extra changed lines, the pass
     /// finds an alignment close to git's line diff. It has no indent heuristic and no slider compaction, so its
     /// hunks can sit differently from git's. It compares keys only, and DirectConfirm checks the equal runs
     /// against the source bytes afterwards, because a confirmation per line is slower than the pass itself. The pass
