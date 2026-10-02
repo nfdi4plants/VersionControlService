@@ -70,6 +70,50 @@ jobs:
       - run: .\build.cmd test focused GitSynchronization.test.js "Git LFS transfer ordering"
       - run: .\build.cmd test focused GitPartialSuccess.test.js "selected revision|publish|push"
 
+  git-minimum-version:
+    # Runs the whole suite against the oldest Git that CheckDependencies accepts.
+    runs-on: windows-latest
+    env:
+      MINGIT_TAG: v2.42.0.windows.2
+      MINGIT_ASSET: MinGit-2.42.0.2-64-bit.zip
+      MINGIT_SHA256: 7139f2c13667c70facd6c105d955a4bbd034b807535963b5f6fc6ed026bb53a3
+      MINGIT_VERSION: 2.42.0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: dotnet tool restore
+      - run: dotnet restore VersionControlService.slnx
+      - run: npm ci
+      - run: git lfs install --skip-repo
+      - name: Put MinGit first on PATH and keep the runner's git-lfs reachable
+        shell: pwsh
+        run: |
+          $lfs = (Get-Command git-lfs -ErrorAction SilentlyContinue).Source
+          if (-not $lfs) { $lfs = "C:\Program Files\Git\mingw64\bin\git-lfs.exe" }
+          $lfsDir = Join-Path $env:RUNNER_TEMP "git-lfs"
+          New-Item -ItemType Directory -Force $lfsDir | Out-Null
+          Copy-Item $lfs $lfsDir
+          Add-Content $env:GITHUB_PATH $lfsDir
+          $zip = Join-Path $env:RUNNER_TEMP "mingit.zip"
+          $dir = Join-Path $env:RUNNER_TEMP "mingit"
+          Invoke-WebRequest "https://github.com/git-for-windows/git/releases/download/$env:MINGIT_TAG/$env:MINGIT_ASSET" -OutFile $zip
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne $env:MINGIT_SHA256) { throw "MinGit checksum mismatch" }
+          Expand-Archive $zip -DestinationPath $dir
+          Add-Content $env:GITHUB_PATH (Join-Path $dir "cmd")
+      - name: Check the Git and Git LFS versions
+        shell: pwsh
+        run: |
+          git --version
+          git lfs version
+          if (-not ((git --version) -match "^git version $([regex]::Escape($env:MINGIT_VERSION))\.")) { throw "MinGit is not first on PATH" }
+      - run: .\build.cmd test run
+
   package-graph-consumer:
     runs-on: windows-latest
     steps:
