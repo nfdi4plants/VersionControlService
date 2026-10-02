@@ -470,11 +470,21 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
             && previous.Start(prefixEnd) = current.Start(prefixEnd)
         let mutable keyMismatches = 0
         let mutable offset = 0
+        let mismatchOffsets = ResizeArray<int>()
         while candidate && offset < previousMiddle do
             if not (keysEqual (prefixEnd + offset) (prefixEnd + offset)) then
                 keyMismatches <- keyMismatches + 1
                 if keyMismatches > lookaheadLines * 4 then candidate <- false
+                else mismatchOffsets.Add(prefixEnd + offset)
             offset <- offset + 1
+        // Adjacent lines that swapped places or rotated cost fewer rows as a move than as paired replacements,
+        // so the general alignment takes them.
+        if candidate && mismatchOffsets.Count > 1 && mismatchOffsets[mismatchOffsets.Count - 1] - mismatchOffsets[0] + 1 = mismatchOffsets.Count then
+            let mutable moved = false
+            for first in mismatchOffsets do
+                for second in mismatchOffsets do
+                    if first <> second && keysEqual first second then moved <- true
+            if moved then candidate <- false
         if candidate then
             positionalPrevious <- prefixEnd
             positionalCurrent <- prefixEnd

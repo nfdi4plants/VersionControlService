@@ -1022,6 +1022,11 @@ type TextDiffSession internal (
         let mutable changedLines = 0
         let mutable previousEnd = 0
         let mutable currentEnd = 0
+        // The line counts at the last confirmed anchor, so the zone between it and the last anchor needs no second pass.
+        let mutable confirmedPreviousEnd = 0
+        let mutable confirmedCurrentEnd = 0
+        let mutable equalAtConfirmed = 0
+        let mutable equalAtAnchor = 0
         for index = 0 to ops.Length - 1 do
             let operation = ops[index]
             if operation.Kind = OperationKind.Equal || operation.Kind = OperationKind.EndingChanged then
@@ -1042,6 +1047,11 @@ type TextDiffSession internal (
                     if operation.PrefixAnchor then lastPrefixAnchor <- index
                     previousEnd <- operation.PreviousIndex + operation.PreviousCount
                     currentEnd <- operation.CurrentIndex + operation.CurrentCount
+                    equalAtAnchor <- equalLines
+                    if lastConfirmedAnchor = index then
+                        confirmedPreviousEnd <- previousEnd
+                        confirmedCurrentEnd <- currentEnd
+                        equalAtConfirmed <- equalLines
             else
                 runLines <- 0
                 uniqueRunLines <- 0
@@ -1068,7 +1078,14 @@ type TextDiffSession internal (
         while runIndex >= 0 && (ops[runIndex].Kind = OperationKind.Equal || ops[runIndex].Kind = OperationKind.EndingChanged) do
             anchorRunLines <- anchorRunLines + ops[runIndex].PreviousCount
             runIndex <- runIndex - 1
-        let anchorTailSmall = anchorTail <= 64 && (max previousTail currentTail <= 64 || anchorRunLines >= 64)
+        // Between its last confirmed run and its last anchor, a window whose lines mostly differ can hold an
+        // insertion or deletion that runs past the window end. The anchors there are chance matches, and a larger
+        // window sees the real ones.
+        let sparseZone =
+            canGrow
+            && lastConfirmedAnchor >= 0
+            && (equalAtAnchor - equalAtConfirmed) * 2 < max (previousEnd - confirmedPreviousEnd) (currentEnd - confirmedCurrentEnd)
+        let anchorTailSmall = anchorTail <= 64 && (max previousTail currentTail <= 64 || anchorRunLines >= 64) && not sparseZone
         let growWindow () =
             windowLimit <- min config.WindowMaxLines (windowLimit * 2)
             previousSide.SetLimits(windowLimit, config.WindowMaxBytes)

@@ -664,4 +664,32 @@ module TextDiffResyncCases =
         }
     ]
 
-    let cases = phaseCases @ settleCases @ budgetCases @ scanLimitCases @ seekCases @ extensionCases @ byteOrderMarkCases @ giantLineCases
+    // Small edits for which git's line diff reports the fewest changed lines. A case has one added or removed row
+    // per changed line and no replaced row.
+    let private parityCases: (string * (unit -> Async<unit>)) list = [
+        "two adjacent lines that swapped places are one added and one removed row", fun () -> async {
+            let previous = lines "line-" 0 20
+            let current = Array.copy previous
+            current[10] <- previous[11]
+            current[11] <- previous[10]
+            let! shape = run (defaultConfig "parity-swap") previous current
+            checkExact "swapped lines" shape 19 1 1
+        }
+        "a window that mostly differs after its last long run grows before it settles on chance matches", fun () -> async {
+            // Every third inserted line up to line 132 copies a block line, four block lines apart. Each copy occurs
+            // once per window and the copies chain in order. The block itself starts behind the end of the first
+            // window of 512 current lines, so only a larger window sees the real match.
+            let shared = lines "shared-" 0 330
+            let block = lines "block-" 0 182
+            let tail = lines "tail-" 0 600
+            let inserted = lines "inserted-" 0 450
+            for copy = 0 to 44 do
+                inserted[3 * copy] <- block[4 * copy]
+            let previous = Array.concat [ shared; block; tail ]
+            let current = Array.concat [ [| plainLine "head" |]; shared; inserted; block; tail ]
+            let! shape = run (defaultConfig "parity-copied-block") previous current
+            checkExact "copied block" shape 1_112 451 0
+        }
+    ]
+
+    let cases = phaseCases @ settleCases @ parityCases @ budgetCases @ scanLimitCases @ seekCases @ extensionCases @ byteOrderMarkCases @ giantLineCases
