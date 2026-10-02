@@ -1018,8 +1018,10 @@ type TextDiffSession internal (
         let mutable lastConfirmedAnchor = -1
         let mutable anchoredLines = 0
         let mutable runLines = 0
-        // Lines of the current run from its first chain or prefix anchor on. A forward search confirms a match
-        // from a line it found, so lines matched before the first unique line of a run do not count.
+        // Lines of the current run from its first operation that re-enters the anchor path (a prefix run, a
+        // chain anchor or a unique suffix run), whether or not that run holds a line unique in both windows.
+        // A forward search confirms a match from a line it found, so lines that a Myers pass matched before
+        // such an operation do not count.
         let mutable uniqueRunLines = 0
         // The last anchor reached while replaced or unaligned lines were at most an eighth of the anchored
         // lines, and the anchored lines up to it. Records that share ids with different values alternate
@@ -1047,7 +1049,7 @@ type TextDiffSession internal (
                 if operation.Anchored then
                     lastAnchored <- index
                     anchoredLines <- anchoredLines + operation.PreviousCount
-                    if uniqueRunLines >= config.ResyncConfirmLines || runLines >= 64 then lastConfirmedAnchor <- index
+                    if uniqueRunLines >= config.ResyncConfirmLines || runLines >= AlignerLimits.LongRunLines then lastConfirmedAnchor <- index
                     if changedLines * 8 <= anchoredLines then
                         lastCleanAnchor <- index
                         cleanAnchoredLines <- anchoredLines
@@ -1092,7 +1094,7 @@ type TextDiffSession internal (
             canGrow
             && lastConfirmedAnchor >= 0
             && (equalAtAnchor - equalAtConfirmed) * 2 < max (previousEnd - confirmedPreviousEnd) (currentEnd - confirmedCurrentEnd)
-        let anchorTailSmall = anchorTail <= 64 && (max previousTail currentTail <= 64 || anchorRunLines >= 64) && not sparseZone
+        let anchorTailSmall = anchorTail <= AlignerLimits.LongRunLines && (max previousTail currentTail <= AlignerLimits.LongRunLines || anchorRunLines >= AlignerLimits.LongRunLines) && not sparseZone
         if partialAlign then
             // Growing sources stall before the window fills. Only settled operations are committed and the
             // window keeps its size so the next bytes extend the same lines. A partial alignment starts only
@@ -1123,7 +1125,7 @@ type TextDiffSession internal (
             elif canGrow then
                 // The window may hold an insertion or deletion larger than itself, so it grows first.
                 growWindow ()
-            elif windowSelfUniqueLines = 0 && lastEqual >= 0 && (lastEqualRunLines >= 64 || equalAtLastEqual >= 8 * otherAtLastEqual) then
+            elif windowSelfUniqueLines = 0 && lastEqual >= 0 && (lastEqualRunLines >= AlignerLimits.LongRunLines || equalAtLastEqual >= 8 * otherAtLastEqual) then
                 // Every line occurs at least twice within its own window, as in a file of identical rows. The
                 // window keeps its own alignment up to its last equal operation when its last equal run has 64
                 // lines or when equal lines are at least eight times the other lines up to that operation. In
@@ -1133,29 +1135,28 @@ type TextDiffSession internal (
                 // the place where the sources meet again.
                 commitCount <- lastEqual + 1
                 beginFeeding ()
-            elif anchoredLines >= 64 && (lastConfirmedAnchor >= 0 || cleanAnchoredLines >= 64) then
-                // At its largest size the window settles when it holds 64 anchored lines and has a confirmed
-                // anchor or a clean anchor. A confirmed anchor ends a run that a forward search would also
-                // confirm (ResyncConfirmLines lines from the first line that is unique in both windows, or 64
-                // lines). A clean anchor is the last one reached while replaced and unaligned lines were at most
-                // an eighth of the anchored lines. The window commits up to the later of the two. A line that
-                // matches by chance inside an insertion larger than the window sits in a one-line run among few
-                // anchored lines, so such a window goes to the forward search.
-                commitCount <- (max lastConfirmedAnchor (if cleanAnchoredLines >= 64 then lastCleanAnchor else -1)) + 1
+            elif anchoredLines >= AlignerLimits.LongRunLines && cleanAnchoredLines >= AlignerLimits.LongRunLines then
+                // At its largest size the window settles when it holds 64 anchored lines and has a clean anchor,
+                // the last one reached while replaced and unaligned lines were at most an eighth of the anchored
+                // lines. The window commits up to that anchor. A line or a short copied block that matches by
+                // chance inside an insertion larger than the window sits among replaced lines, so such a window
+                // goes to the forward search.
+                commitCount <- lastCleanAnchor + 1
                 beginFeeding ()
             else
                 // At its largest size without an anchor the diff continues with a forward search.
                 startResync ()
 
     /// Both sources have fewer than 20,000 lines, so they are aligned as one window and the aligner can run its
-    /// single Myers pass over all of them. The line count of a source that is not read to its end is estimated
-    /// from the lines in its window and the bytes they span.
+    /// single Myers pass over all of them. For a source that is not read to its end, the session estimates the
+    /// line count from the lines up to the end of its window (including the lines before a window that starts
+    /// mid-file) and the bytes they span.
     let holdsSmallFiles () =
         let smallFileLines = 20_000.0
         let estimate (side: ScanSide) (spec: SourceSpec) =
             let table = side.Table
             if side.Finished || table.Count = 0 then float table.Count
-            else float table.Count * float spec.ByteLength / max 1.0 (table.Finish(table.Count - 1))
+            else (float table.LineBase + float table.Count) * float spec.ByteLength / max 1.0 (table.Finish(table.Count - 1))
         estimate previousSide previousSpec < smallFileLines && estimate currentSide currentSpec < smallFileLines
 
     let startAlign () =

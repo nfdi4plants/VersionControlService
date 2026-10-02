@@ -1319,22 +1319,10 @@ let createDefaultHandlerWithRunner
 let createDefaultHandler () : ITextDiffRequestHandler =
     createDefaultHandlerWithRunner (fun host owner arguments -> host.SpawnShort(owner.WorkspaceRoot, arguments))
 
-// Fable's async trampoline breaks long bind chains with a setTimeout(0) hop, and on Windows each hop waits for
-// a timer tick of 11 to 15 ms. A diff takes thousands of hops, so the worker hops through setImmediate instead.
-// The trampoline is reached through the context of a running async. If a Fable version shapes it differently,
-// nothing changes.
-[<Emit("(ctx) => { const proto = ctx.trampoline ? Object.getPrototypeOf(ctx.trampoline) : null; if (proto && typeof proto.hijack === 'function') { proto.hijack = function (f) { this.callCount = 0; setImmediate(f); }; } ctx.onSuccess(); }")>]
-let private trampolineHopViaSetImmediate: Async<unit> = jsNative
-
-/// Makes the async trampoline hop through setImmediate. The change holds for every async on the thread, so only
-/// a worker thread, which runs nothing but the engine, calls it. Calling it again changes nothing.
-let internal switchTrampolineToSetImmediate () : unit =
-    Async.StartImmediate trampolineHopViaSetImmediate
-
 /// Serves text diff requests on the given port with the given handler. It switches the async trampoline of the
 /// whole thread to setImmediate, so it runs only on a worker thread.
 let bootstrapWith (port: NodeWorkerThreads.MessagePort) (handler: ITextDiffRequestHandler) : unit =
-    switchTrampolineToSetImmediate ()
+    AsyncTrampoline.switchToSetImmediate ()
     let receive = attachDispatcher ((fun message -> port.postMessage message), (fun () -> port.close ()), handler)
     port.onMessage receive
 

@@ -207,6 +207,11 @@ type private AlignPhase =
     | MarkRuns
     | Finished
 
+/// Lines in an equal run that the aligner and the session both treat as a long run.
+module internal AlignerLimits =
+    [<Literal>]
+    let LongRunLines = 64
+
 /// Aligns the lines of two windows without ever holding line text. Line keys (two hash halves and the
 /// UTF-16 length) select candidates, and the caller confirms every claimed run of equal lines against the
 /// source bytes through NeedRun and ResolveRun. The work is split into steps that each do a bounded amount
@@ -216,7 +221,7 @@ type private AlignPhase =
 type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap: int, sameSourceLength: bool, longRunAnchors: bool, directPass: bool, ledger: Ledger) =
     let stepChunk = 512
     let lookaheadLines = 2
-    let longRunLines = 64
+    let longRunLines = AlignerLimits.LongRunLines
     let raw = ResizeArray<DiffOperation>()
     let mutable phase = AlignPhase.Prefix
     let previousCount = previous.Count
@@ -267,7 +272,6 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
     let mutable anchorCurrent = 0
     let mutable anchorLength = 0
     let mutable anchorPending = false
-    let mutable chainSpanStart = -1
 
     // Spans that rule C rejected, in chain order. A gap that merged them and then exhausts its step budget gets
     // them back as anchors, which splits it into the smaller gaps it had without the rejection.
@@ -285,7 +289,6 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
     let directOperations = ResizeArray<DiffOperation>()
     let mutable directConfirmIndex = 0
     let mutable gapIndex = 0
-    let mutable gapStarted = false
     let mutable gapPreviousStart = 0
     let mutable gapCurrentStart = 0
     let mutable gapPreviousEnd = 0
@@ -461,13 +464,14 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
             cursor <- middlePreviousStart
             phase <- AlignPhase.BuildSlots
 
-    /// A window that holds both complete sources aligns its middle with one Myers pass first. Where a chance
-    /// anchor would cost extra changed lines, the pass finds the same alignment as git's line diff. It compares
-    /// keys only and DirectConfirm checks the equal runs against the source bytes afterwards, because a
-    /// confirmation per line is slower than the pass itself. The pass gets twice the per-gap step budget, which
-    /// is enough for every corpus pair it improves. When the pass completes, its result is the alignment. When
-    /// it exceeds the budget, or two different lines turn out to share a key, it is dropped and the anchor path
-    /// runs as if it never started.
+    /// A window that holds both sources, or the last window of a larger file, aligns its middle with one Myers pass
+    /// first, and so does the aligner after a resync. Where a chance anchor would cost extra changed lines, the pass
+    /// finds an alignment close to git's line diff. It has no indent heuristic and no slider compaction, so its
+    /// hunks can sit differently from git's. It compares keys only, and DirectConfirm checks the equal runs
+    /// against the source bytes afterwards, because a confirmation per line is slower than the pass itself. The pass
+    /// gets twice the per-gap step budget, which is enough for every corpus pair it improves. When the pass
+    /// completes, its result is the alignment. When it exceeds the budget, or two different lines turn out to
+    /// share a key, the aligner drops its result and runs the anchor path as if the pass never started.
     let startDirect () =
         directAttempted <- true
         if suffixPrevious > prefixEnd && suffixCurrent > prefixEnd then
@@ -499,8 +503,8 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
                 if keyMismatches > lookaheadLines * 4 then candidate <- false
                 else mismatchOffsets.Add(prefixEnd + offset)
             offset <- offset + 1
-        // Adjacent lines that swapped places or rotated cost fewer rows as a move than as paired replacements,
-        // so the general alignment takes them.
+        // Adjacent lines that swapped places or rotated show fewer changed lines as a move than as paired
+        // replacements (2 against 4 for a swap), so the general alignment takes them.
         if candidate && mismatchOffsets.Count > 1 && mismatchOffsets[mismatchOffsets.Count - 1] - mismatchOffsets[0] + 1 = mismatchOffsets.Count then
             let mutable moved = false
             for first in mismatchOffsets do
@@ -526,7 +530,6 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
             | _ -> None
 
     let finishGap () =
-        gapStarted <- false
         if gapIndex < spanPrevious.Count then
             let p = spanPrevious[gapIndex]
             let c = spanCurrent[gapIndex]
@@ -690,7 +693,6 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
 
     let startGap (meter: Meter) =
         gapCache.Clear()
-        gapStarted <- true
         if gapIndex < spanPrevious.Count then
             gapPreviousEnd <- spanPrevious[gapIndex]
             gapCurrentEnd <- spanCurrent[gapIndex]
@@ -1028,12 +1030,11 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
                     else finishGap ()
                     AlignStep.Running
                 | MyersStepResult.StepLimitExceeded ->
-                    // The gap exceeded its step budget. Rejected spans inside it return as anchors. Without any,
-                    // its lines are reported as one unaligned region.
+                    // The gap exceeded its step budget. Rejected spans inside it return as anchors. Without any, the aligner
+                    // reports its lines as one unaligned region.
                     if directActive then
                         directActive <- false
                         stepper <- None
-                        gapStarted <- false
                         phase <- AlignPhase.MiddleStart
                     elif not (tryBeginRestore meter) then emitUnaligned ()
                     AlignStep.Running

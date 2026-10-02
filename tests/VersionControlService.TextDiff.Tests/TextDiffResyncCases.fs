@@ -688,6 +688,17 @@ module TextDiffResyncCases =
                 let! shape = run (defaultConfig $"settle-copied-block-{block}") previous current
                 checkExact $"copied block of {block}" shape 100_000 70_000 0
         }
+        "eight copied blocks of eight lines inside an insertion of 70,000 lines do not pin the window", fun () -> async {
+            // Each block is a copy of old lines. Together they hold 64 anchored lines, but they sit among replaced
+            // lines, so the window goes to the forward search instead of settling on them.
+            let previous = uniqueLines "old" 0 100_000
+            let inserted = uniqueLines "new" 0 70_000
+            for block = 0 to 7 do
+                Array.blit previous (1_000 + 30_000 + block * 500) inserted (20_000 + block * 500) 8
+            let current = Array.concat [ previous[.. 999]; inserted; previous[1_000 ..] ]
+            let! shape = run (defaultConfig "settle-copied-blocks-8x8") previous current
+            checkExact "eight copied blocks of eight lines" shape 100_000 70_000 0
+        }
         "a drifting region before an insertion of 70,000 lines keeps its alignment", fun () -> async {
             let drifting = uniqueLines "old" 0 3_000
             let spread = Array.init 600 (fun block -> Array.append drifting[block * 5 .. block * 5 + 4] (uniqueLines $"ins{block}" 0 10)) |> Array.concat
@@ -784,16 +795,82 @@ module TextDiffResyncCases =
             checkExact "moved line" shape 610 2 1
         }
         "a heavy rewrite that exceeds the budget of the single pass keeps the alignment around its anchors", fun () -> async {
-            // Four runs of 60 lines that all changed, separated by three lines that stay. The single pass over
-            // the whole file needs more steps than a tenth of the budget and gives up, and each run between two
-            // anchors still fits the full budget.
+            // Four runs of 60 lines that all changed are separated by three lines that stay. The single pass gets
+            // twice the step budget of a gap and needs more for the whole file, so it gives up. Each run between two
+            // anchors fits the budget of a gap. A unique line sits behind fifty identical lines in the previous file
+            // and in front of them in the current file. The single pass would keep the identical lines equal and
+            // move the unique line (53 equal rows). The anchor path keeps the unique line equal and changes the
+            // identical lines (4 equal rows), so the result shows that the single pass gave up.
             let rewrite prefix = Array.init 4 (fun run' -> Array.append (lines $"{prefix}-{run'}-" 0 60) [| plainLine $"anchor {run'}" |]) |> Array.concat
-            let previous = rewrite "old"
-            let current = rewrite "new"
+            let identical = Array.create 50 (plainLine "r")
+            let previous = Array.concat [ [| plainLine "X" |]; identical; rewrite "old" ]
+            let current = Array.concat [ identical; [| plainLine "X" |]; rewrite "new" ]
             let! shape = run { defaultConfig "parity-heavy-rewrite" with MyersStepsPerGap = 20_000 } previous.[.. previous.Length - 2] current.[.. current.Length - 2]
-            Check.equal 3 shape.Equal "Heavy rewrite: the three anchors are equal rows."
+            Check.equal 4 shape.Equal "Heavy rewrite: the unique line and the three anchors are equal rows."
+            Check.equal 50 shape.Added "Heavy rewrite: the identical lines in the current file are added rows."
+            Check.equal 50 shape.Removed "Heavy rewrite: the identical lines in the previous file are removed rows."
             Check.equal 0 (shape.UnalignedPrevious + shape.UnalignedCurrent) "Heavy rewrite: no line is unaligned."
         }
     ]
 
-    let cases = phaseCases @ settleCases @ parityCases @ budgetCases @ scanLimitCases @ seekCases @ extensionCases @ byteOrderMarkCases @ giantLineCases @ ledgerCases
+    let private padding (prefix: string) (count: int) = Array.init count (fun index -> plainLine $"{prefix}{index}")
+
+    // The cases below repeat small edits inside files with a shared trailing block, so that the files are larger
+    // than the 20,000 lines that one window can take with the single Myers pass. The alignment then runs its anchor
+    // path, which has its own rules for moved lines, swaps and sparse chance anchors.
+    let private paddedCases: (string * (unit -> Async<unit>)) list = [
+        "unique lines that moved across long equal runs are added and removed rows in a file above 20,000 lines", fun () -> async {
+            let times count text = Array.create count (plainLine text)
+            let runs = [| "a"; "b"; "c"; "d" |]
+            let markers = [| "X"; "Y"; "Z" |]
+            // The previous file holds p, a run, a marker, the next run and so on. The current file lists the markers first.
+            let cluster markerCount =
+                let previous = Array.concat [ [| plainLine "p" |]; Array.concat [ for index in 0 .. markerCount -> Array.append (times 600 runs[index]) (if index < markerCount then [| plainLine markers[index] |] else [||]) ] ]
+                let current = Array.concat [ [| plainLine "qq" |]; Array.map plainLine markers[.. markerCount - 1]; Array.concat [ for index in 0 .. markerCount -> times 600 runs[index] ] ]
+                previous, current
+            let tail = padding "pad line " 25_000
+            let one, oneCurrent = cluster 1
+            let two, twoCurrent = cluster 2
+            let three, threeCurrent = cluster 3
+            for name, previous, current, markerCount in [ "1 up", one, oneCurrent, 1; "3 up", three, threeCurrent, 3; "2 down", twoCurrent, two, 2 ] do
+                let! shape = run (defaultConfig ("padded-moved-" + name)) (Array.append previous tail) (Array.append current tail)
+                checkExact name shape ((markerCount + 1) * 600 + 25_000) markerCount markerCount
+        }
+        "two adjacent lines that swapped places are one added and one removed row in a file above 20,000 lines", fun () -> async {
+            let previous = Array.append (lines "line-" 0 20) (padding "pad line " 25_000)
+            let current = Array.copy previous
+            current[10] <- previous[11]
+            current[11] <- previous[10]
+            let! shape = run (defaultConfig "padded-swap") previous current
+            checkExact "swapped lines" shape 25_019 1 1
+        }
+        "a line that moved across a short run of equal lines is one added and one removed row in a file of 15,000 lines", fun () -> async {
+            // The files stay below 20,000 lines, so one window takes them with the single pass over its middle.
+            let same = Array.create 10 (plainLine "same")
+            let tail = padding "pad-" 14_400
+            let previous = Array.concat [ [| plainLine "marker" |]; same; lines "tail-" 0 600; tail ]
+            let current = Array.concat [ same; [| plainLine "marker" |]; lines "tail-" 0 600; [| plainLine "extra" |]; tail ]
+            let! shape = run (defaultConfig "padded-moved-line-15k") previous current
+            checkExact "moved line in 15,000 lines" shape 15_010 2 1
+        }
+        "a window that mostly differs after its confirmed run grows before it settles on chance matches in a file above 20,000 lines", fun () -> async {
+            // The confirmed run is 330 unique lines, 330 identical lines, or 330 unique lines that the current file
+            // edits at every 30th line. The inserted lines copy every fourth line of a block that starts behind the
+            // first window, and each copy occurs once per window.
+            let block = lines "block-" 0 182
+            let tail = Array.append (lines "tail-" 0 600) (padding "pad line " 25_000)
+            let unique = lines "shared-" 0 330
+            let identical = Array.create 330 (plainLine "same")
+            let edited = unique |> Array.mapi (fun index line -> if index % 30 = 29 then plainLine $"{line.Text}x{index}" else line)
+            for name, previousShared, currentShared, replaced in [ "unique", unique, unique, 0; "identical", identical, identical, 0; "edited", unique, edited, 11 ] do
+                let inserted = lines "inserted-" 0 450
+                for copy = 0 to 44 do
+                    inserted[3 * copy] <- block[4 * copy]
+                let previous = Array.concat [ previousShared; block; tail ]
+                let current = Array.concat [ [| plainLine "head" |]; currentShared; inserted; block; tail ]
+                let! shape = run (defaultConfig ("padded-copied-block-" + name)) previous current
+                checkExact name shape (330 - replaced + 182 + 600 + 25_000) 451 0
+        }
+    ]
+
+    let cases = phaseCases @ settleCases @ parityCases @ paddedCases @ budgetCases @ scanLimitCases @ seekCases @ extensionCases @ byteOrderMarkCases @ giantLineCases @ ledgerCases

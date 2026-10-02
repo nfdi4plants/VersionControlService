@@ -294,13 +294,9 @@ module TextDiffEngineCasesTests =
 
         data
 
-    /// Fable's async trampoline hops through setTimeout(0) every 2,000 steps, which waits at least a millisecond
-    /// (a whole timer tick on Windows). The diff worker threads hop through setImmediate instead, and these tests
-    /// do the same, so the large alignment cases run at the speed they have in the app.
-    [<Emit("(ctx) => { const proto = ctx.trampoline ? Object.getPrototypeOf(ctx.trampoline) : null; if (proto && typeof proto.hijack === 'function') { proto.hijack = function (f) { this.callCount = 0; setImmediate(f); }; } ctx.onSuccess(); }")>]
-    let private hopTrampolineThroughSetImmediate: Async<unit> = jsNative
-
-    Async.StartImmediate hopTrampolineThroughSetImmediate
+    // The diff worker threads hop the async trampoline through setImmediate, and these tests do the same, so the
+    // large alignment cases run at the speed they have in the app.
+    AsyncTrampoline.switchToSetImmediate ()
 
     let private createBenchmarkSession config previous current : Async<TextDiffSession> = async {
         let clock = ManualClock 0.0

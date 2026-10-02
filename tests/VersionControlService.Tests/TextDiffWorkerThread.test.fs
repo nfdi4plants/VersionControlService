@@ -525,7 +525,7 @@ Vitest.describe (
                 let spy = spyOnZeroDelayTimeouts ()
 
                 try
-                    TextDiffWorker.switchTrampolineToSetImmediate ()
+                    VersionControlService.TextDiff.AsyncTrampoline.switchToSetImmediate ()
                     do! Async.StartAsPromise(bindLoop 20000)
                     Vitest.expect(spy.ZeroDelayCalls).toBe 0
                 finally

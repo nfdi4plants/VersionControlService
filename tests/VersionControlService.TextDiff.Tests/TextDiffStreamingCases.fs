@@ -624,6 +624,19 @@ module TextDiffStreamingCases =
             do! session.Close()
             return ()
         }
+        "a window that starts mid-file does not make a large file look small", fun () -> async {
+            let previous = Array.init 40_000 (fun index -> { Text = $"unique line {index} text"; Ending = LineEnding.LF })
+            let current = Array.copy previous
+            current[30_000] <- { Text = "edited"; Ending = LineEnding.LF }
+            let limits = { Limits.defaults with MaxUnits = 2_147_483_647; RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 }
+            let sessionConfig = config "stream-mid-file-estimate" 65_536 1_000_000 limits None
+            let! session = openSession (Ledger()) sessionConfig (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+            let! initial = session.FirstPage(fun () -> false)
+            let! page, _ = resolvePageAsync session (fun () -> false) initial
+            Check.true' (page.Progress.ValidatedBytes < page.Progress.TotalBytes) $"The first page does not read both files completely. Validated {page.Progress.ValidatedBytes} of {page.Progress.TotalBytes} bytes."
+            do! session.Close()
+            return ()
+        }
         "alignment suspends across small request budgets and matches an uninterrupted run", fun () -> async {
             let previous = Array.init 36 (fun index -> {
                 Text = if index % 3 = 0 then "shared" else "old-" + string index
