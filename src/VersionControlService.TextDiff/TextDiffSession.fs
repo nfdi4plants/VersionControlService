@@ -1122,8 +1122,14 @@ type TextDiffSession internal (
                 commitCount <- lastPrefixAnchor + 1
                 preserveWindowAfterCommit <- true
                 beginFeeding ()
-            elif canGrow then
-                // The window may hold an insertion or deletion larger than itself, so it grows first.
+            elif canGrow
+                 && not (windowSelfUniqueLines = 0
+                         && lastEqual >= 0
+                         && equalAtLastEqual >= 8 * otherAtLastEqual) then
+                // The window may hold an insertion or deletion larger than itself, so it grows first. A window
+                // of repeated lines that already aligns eight equal lines for each other line does not grow.
+                // The branch below commits its alignment, because a larger window would only find the same repeats
+                // and can exhaust the Myers budget.
                 growWindow ()
             elif windowSelfUniqueLines = 0 && lastEqual >= 0 && (lastEqualRunLines >= AlignerLimits.LongRunLines || equalAtLastEqual >= 8 * otherAtLastEqual) then
                 // Every line occurs at least twice within its own window, as in a file of identical rows. The

@@ -871,6 +871,18 @@ module TextDiffResyncCases =
                 let! shape = run (defaultConfig ("padded-copied-block-" + name)) previous current
                 checkExact name shape (330 - replaced + 182 + 600 + 25_000) 451 0
         }
+        "a short cycle of repeated rows with a sparse edit is aligned by its first window", fun () -> async {
+            // Every line occurs many times in its window, and one line in sixty is replaced by the next row of the
+            // cycle. The first window of 512 lines already aligns almost all of them, so a larger window only
+            // repeats the same alignment. The scan request count bounds the work, since growing to the full size
+            // exhausts the step budget of the single pass and restarts the search after each edit.
+            let rows = [| plainLine "row A"; plainLine "row B"; plainLine "row C" |]
+            let previous = Array.init 20_000 (fun index -> rows[index % 3])
+            let current = previous |> Array.mapi (fun index line -> if index > 0 && index % 60 = 0 then rows[(index + 1) % 3] else line)
+            let! shape = run { defaultConfig "padded-repeated-rows" with Limits = { Limits.defaults with MaxUnits = 256; RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 } } previous current
+            checkExact "repeated rows" shape 19_667 74 74
+            Check.true' (shape.Scans < 10_000) $"The search finishes within 10,000 scan requests (used {shape.Scans})."
+        }
     ]
 
     let cases = phaseCases @ settleCases @ parityCases @ paddedCases @ budgetCases @ scanLimitCases @ seekCases @ extensionCases @ byteOrderMarkCases @ giantLineCases @ ledgerCases
