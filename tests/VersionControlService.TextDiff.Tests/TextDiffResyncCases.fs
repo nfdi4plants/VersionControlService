@@ -76,6 +76,7 @@ module TextDiffResyncCases =
         UnalignedCurrent: int
         Added: int
         Removed: int
+        Equal: int
     }
 
     let private shapeOf (pages: DiffPage array) scans =
@@ -83,9 +84,11 @@ module TextDiffResyncCases =
         let mutable unalignedCurrent = 0
         let mutable added = 0
         let mutable removed = 0
+        let mutable equal = 0
         for page in pages do
             for part in page.Parts do
                 match part with
+                | DiffPart.HiddenEqual gap -> equal <- equal + int gap.PreviousRange.Count
                 | DiffPart.Hunk fragment ->
                     match fragment.Body with
                     | HunkBody.UnalignedSides(previous, current) ->
@@ -96,9 +99,10 @@ module TextDiffResyncCases =
                             match row.Kind with
                             | DiffRowKind.Added -> added <- added + 1
                             | DiffRowKind.Removed -> removed <- removed + 1
+                            | DiffRowKind.Context -> equal <- equal + 1
                             | _ -> ()
                 | _ -> ()
-        { Pages = pages; Scans = scans; UnalignedPrevious = unalignedPrevious; UnalignedCurrent = unalignedCurrent; Added = added; Removed = removed }
+        { Pages = pages; Scans = scans; UnalignedPrevious = unalignedPrevious; UnalignedCurrent = unalignedCurrent; Added = added; Removed = removed; Equal = equal }
 
     /// Reads every page. The hook runs after each request and before the next one.
     let private readAll (session: TextDiffSession) (between: TextDiffSession -> Async<unit>) = async {
@@ -497,4 +501,82 @@ module TextDiffResyncCases =
         }
     ]
 
-    let cases = phaseCases @ budgetCases @ scanLimitCases @ seekCases @ extensionCases @ byteOrderMarkCases @ giantLineCases
+    // The cases below use files larger than one window with many separate edits. A window at its largest size
+    // settles on the unchanged runs between the edits.
+    let private proseLines (prefix: string) (count: int) =
+        Array.init count (fun index -> plainLine (if index % 2 = 1 then "" else $"{prefix} paragraph {index} has some words in it."))
+
+    let private defaultConfig sessionId =
+        { SessionConfig.defaults sessionId with Limits = { Limits.defaults with RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 } }
+
+    /// A block of ten new lines after every 42nd old line, or one new line after every fifth old line.
+    let private spreadInsertions (count: int) (every: int) (block: int) =
+        let previous = proseLines "old" count
+        let current = ResizeArray<SourceLine>()
+        let mutable blocks = 0
+        for index = 0 to previous.Length - 1 do
+            current.Add previous[index]
+            if index % every = every - 1 then
+                if block = 1 then current.Add(plainLine $"new line {blocks}") else current.AddRange(proseLines $"new{blocks}" block)
+                blocks <- blocks + 1
+        previous, current.ToArray()
+
+    let private jsonRecord (id: string) (value: int) (last: bool) =
+        [| "  {"; $"    \"id\": \"{id}\","; $"    \"value\": {value}"; (if last then "  }" else "  },") |] |> Array.map plainLine
+
+    /// Eight-line records, so that an id that collides gives a chance match of eight lines.
+    let private wideRecord (id: string) =
+        [| "  {"; $"    \"id\": \"{id}\","; "    \"kind\": \"item\","; "    \"enabled\": true,"; "    \"tags\": [],"; "    \"owner\": null,"; "    \"note\": \"\""; "  }," |]
+        |> Array.map plainLine
+
+    let private brackets (body: SourceLine array) = Array.concat [ [| plainLine "[" |]; body; [| plainLine "]" |] ]
+
+    let private checkExact name (shape: Shape) equal added removed =
+        Check.equal equal shape.Equal $"{name}: every unchanged line is an equal row."
+        Check.equal added shape.Added $"{name}: every inserted line is an added row."
+        Check.equal removed shape.Removed $"{name}: every deleted line is a removed row."
+        Check.equal 0 (shape.UnalignedPrevious + shape.UnalignedCurrent) $"{name}: no line is unaligned."
+
+    let private settleCases: (string * (unit -> Async<unit>)) list = [
+        "spread insertions in a file of two windows align without unaligned lines", fun () -> async {
+            let previous, current = spreadInsertions 56_000 42 10
+            let! shape = run (defaultConfig "settle-spread-56k") previous current
+            checkExact "spread 56,000" shape 56_000 13_330 0
+        }
+        "spread insertions in a file of more than one window align without unaligned lines", fun () -> async {
+            let previous, current = spreadInsertions 80_000 42 10
+            let! shape = run (defaultConfig "settle-spread-80k") previous current
+            checkExact "spread 80,000" shape 80_000 19_040 0
+        }
+        "spread deletions in a file of more than one window align without unaligned lines", fun () -> async {
+            let previous, current = spreadInsertions 80_000 42 10
+            let! shape = run (defaultConfig "settle-spread-delete") current previous
+            checkExact "spread deletion 80,000" shape 80_000 0 19_040
+        }
+        "one inserted line after every fifth line aligns in a file of more than one window", fun () -> async {
+            let previous, current = spreadInsertions 80_000 5 1
+            let! shape = run (defaultConfig "settle-drift") previous current
+            checkExact "drift 80,000" shape 80_000 16_000 0
+        }
+        "a chance match inside an insertion of 70,000 lines does not pin the window", fun () -> async {
+            let records = 18_750
+            let previous = brackets (Array.init records (fun index -> jsonRecord $"old-{index}" (index * 7) (index = records - 1)) |> Array.concat)
+            let at = 1 + 250 * 4
+            // New record 5000 repeats the value of old record 300 and sits in the first half of the window.
+            let inserted = Array.init 17_500 (fun index -> jsonRecord $"new-{index}" (if index = 5_000 then 300 * 7 else 1_000_000 + index) false) |> Array.concat
+            let current = Array.concat [ previous[.. at - 1]; inserted; previous[at ..] ]
+            let! shape = run (defaultConfig "settle-chance-json") previous current
+            checkExact "chance match in JSON" shape 75_002 70_000 0
+        }
+        "a chance match of one eight-line record inside an insertion does not pin the window", fun () -> async {
+            let records = 9_375
+            let previous = brackets (Array.init records (fun index -> wideRecord $"old-{index}") |> Array.concat)
+            let at = 1 + 125 * 8
+            let inserted = Array.init 8_750 (fun index -> wideRecord (if index = 2_500 then "old-300" else $"new-{index}")) |> Array.concat
+            let current = Array.concat [ previous[.. at - 1]; inserted; previous[at ..] ]
+            let! shape = run (defaultConfig "settle-chance-wide") previous current
+            checkExact "chance match of a wide record" shape 75_002 70_000 0
+        }
+    ]
+
+    let cases = phaseCases @ settleCases @ budgetCases @ scanLimitCases @ seekCases @ extensionCases @ byteOrderMarkCases @ giantLineCases

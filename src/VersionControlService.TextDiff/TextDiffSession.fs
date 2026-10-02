@@ -942,17 +942,25 @@ type TextDiffSession internal (
         let mutable lastAnchored = -1
         let mutable lastPrefixAnchor = -1
         let mutable lastEqual = -1
+        let mutable lastConfirmedAnchor = -1
+        let mutable anchoredLines = 0
+        let mutable runLines = 0
         let mutable previousEnd = 0
         let mutable currentEnd = 0
         for index = 0 to ops.Length - 1 do
             let operation = ops[index]
             if operation.Kind = OperationKind.Equal || operation.Kind = OperationKind.EndingChanged then
                 lastEqual <- index
+                runLines <- runLines + operation.PreviousCount
                 if operation.Anchored then
                     lastAnchored <- index
+                    anchoredLines <- anchoredLines + operation.PreviousCount
+                    if runLines >= config.ResyncConfirmLines then lastConfirmedAnchor <- index
                     if operation.PrefixAnchor then lastPrefixAnchor <- index
                     previousEnd <- operation.PreviousIndex + operation.PreviousCount
                     currentEnd <- operation.CurrentIndex + operation.CurrentCount
+            else
+                runLines <- 0
         // A window commits up to its last anchored equal run only when few lines follow that run. The lines
         // are counted on a side whose window stopped at its limit. A side that reached the end of its source
         // holds everything that is left, so its count says nothing about the anchor. When both windows
@@ -1016,6 +1024,14 @@ type TextDiffSession internal (
                 // unique within itself may be part of an insertion or deletion larger than the window, and the
                 // forward search looks for the place where the sources meet again.
                 commitCount <- lastEqual + 1
+                beginFeeding ()
+            elif lastConfirmedAnchor >= 0 || (lastAnchored >= 0 && anchoredLines >= 64) then
+                // At its largest size the window settles on its last anchored run that a forward search would also
+                // confirm (ResyncConfirmLines lines), or on its last anchor when the window holds many anchored
+                // lines. A line that matches by chance inside an insertion larger than the window sits in a
+                // one-line run in a window with almost no other anchored lines, so such a window still goes to
+                // the forward search.
+                commitCount <- (if lastConfirmedAnchor >= 0 then lastConfirmedAnchor else lastAnchored) + 1
                 beginFeeding ()
             else
                 // At its largest size without an anchor the diff continues with a forward search.
