@@ -94,12 +94,13 @@ jobs:
       - name: Put MinGit first on PATH and keep the runner's git-lfs reachable
         shell: pwsh
         run: |
+          # MinGit has no Git LFS. The runner's git-lfs stays in its own folder, where it finds a git to launch.
+          # A copy of git-lfs.exe on its own fails with "error launching git". Each GITHUB_PATH line is prepended,
+          # so MinGit, added last, comes first.
           $lfs = (Get-Command git-lfs -ErrorAction SilentlyContinue).Source
           if (-not $lfs) { $lfs = "C:\Program Files\Git\mingw64\bin\git-lfs.exe" }
-          $lfsDir = Join-Path $env:RUNNER_TEMP "git-lfs"
-          New-Item -ItemType Directory -Force $lfsDir | Out-Null
-          Copy-Item $lfs $lfsDir
-          Add-Content $env:GITHUB_PATH $lfsDir
+          if (-not (Test-Path $lfs)) { throw "git-lfs not found on the runner" }
+          Add-Content $env:GITHUB_PATH (Split-Path $lfs)
           $zip = Join-Path $env:RUNNER_TEMP "mingit.zip"
           $dir = Join-Path $env:RUNNER_TEMP "mingit"
           Invoke-WebRequest "https://github.com/git-for-windows/git/releases/download/$env:MINGIT_TAG/$env:MINGIT_ASSET" -OutFile $zip
