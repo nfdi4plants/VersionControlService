@@ -1288,8 +1288,10 @@ guide describes 5.5.0, which is what `.config/dotnet-tools.json` pins here. CI r
 in this repository without the install step. Fable names each output file after its source
 file, so the entry point is the compiled name of your entry `.fs` file.
 
-The Git provider shells out to the real tools on top of that. It requires Git 2.38 or newer,
-because it uses `merge-tree --write-tree`. Git LFS 3.7 or newer is optional, and without it
+The Git provider shells out to the real tools on top of that. It requires Git 2.42 or newer.
+`merge-tree --write-tree` needs Git 2.38, and Git LFS 3.7 reads the index in `git lfs checkout`
+only with Git 2.42 or newer. With older Git it reads the HEAD tree, so a picked LFS conflict
+candidate stays a pointer. Git LFS 3.7 or newer is optional, and without it
 the object materialization, storage policy and maintenance services report their own
 dependency status while core Git work carries on. `CheckDependencies` reports all of that at
 runtime, which is why it is worth calling before the user gets far. lakeFS needs no local

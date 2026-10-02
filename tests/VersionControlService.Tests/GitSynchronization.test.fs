@@ -5575,7 +5575,7 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "preview includes dirty workspace and requires Git 2.38",
+            "preview includes dirty workspace and requires Git 2.42",
             TestOptions(timeout = 120000),
             fun () -> promise {
                 let! root, workPath, barePath, session =
@@ -5611,20 +5611,20 @@ Vitest.describe (
                     let! localContent = tryReadUtf8FileAsync (join [| workPath; "base.txt" |])
                     Vitest.expect(localContent).toEqual (Some "local dirty change\n")
 
-                    // Dependency diagnostics reject Git 2.37: pull preview uses
-                    // `merge-tree --write-tree`, documented from Git 2.38.
-                    let oldFactory = GitWorkspaceSession.createFactory (versionFakingRunner "2.37.2")
-                    let! oldResult = Async.StartAsPromise(oldFactory.CheckDependencies(ctx "deps-237"))
-                    let oldDependencies = expectValue "dependencies for 2.37" oldResult
+                    // Dependency diagnostics reject Git 2.41: Git LFS 3.7 checks out files from
+                    // the index only with Git 2.42 or newer.
+                    let oldFactory = GitWorkspaceSession.createFactory (versionFakingRunner "2.41.0")
+                    let! oldResult = Async.StartAsPromise(oldFactory.CheckDependencies(ctx "deps-241"))
+                    let oldDependencies = expectValue "dependencies for 2.41" oldResult
                     let oldGit = oldDependencies |> Array.find (fun entry -> entry.Component = "git")
 
                     Vitest.expect(oldGit.Installed).toBe (true)
                     Vitest.expect(oldGit.Compatible).toBe (false)
                     Vitest.expect(oldGit.Remediation.IsSome).toBe (true)
 
-                    let newFactory = GitWorkspaceSession.createFactory (versionFakingRunner "2.38.0")
-                    let! newResult = Async.StartAsPromise(newFactory.CheckDependencies(ctx "deps-238"))
-                    let newDependencies = expectValue "dependencies for 2.38" newResult
+                    let newFactory = GitWorkspaceSession.createFactory (versionFakingRunner "2.42.0")
+                    let! newResult = Async.StartAsPromise(newFactory.CheckDependencies(ctx "deps-242"))
+                    let newDependencies = expectValue "dependencies for 2.42" newResult
                     let newGit = newDependencies |> Array.find (fun entry -> entry.Component = "git")
 
                     Vitest.expect(newGit.Compatible).toBe (true)

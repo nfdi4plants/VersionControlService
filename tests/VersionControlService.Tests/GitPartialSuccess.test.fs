@@ -11,6 +11,8 @@ module GitWorkspaceSession = VersionControlService.Git.GitWorkspaceSession
 module GitService = VersionControlService.Git.GitService
 module GitExecution = VersionControlService.Git.GitExecution
 module GitLfsService = VersionControlService.Git.GitLfsService
+module GitLfsAdapter = VersionControlService.Git.GitLfsAdapter
+module GitInternals = VersionControlService.Git.GitInternals
 module NodeProcess = VersionControlService.Runtime.Node.Process
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 
@@ -195,6 +197,68 @@ let private gitProviderId =
     | Error message -> failwith message
 
 let private ctx (name: string) = OperationContext.detached name
+
+/// A work repository whose origin already has two branches at different commits, plus one
+/// unpushed commit on main that adds an LFS file. Returns the remote tip ids and the LFS oid.
+let private createOutboundLfsPushFixture () = promise {
+    let! root = createTempDirectoryAsync ()
+    let barePath = join [| root; "origin.git" |]
+    let workPath = join [| root; "work" |]
+    let! _ = runGitOk root [| "init"; "--bare"; "-b"; "main"; barePath |]
+    let! _ = runGitOk root [| "init"; "-b"; "main"; workPath |]
+    let! _ = runGitOk workPath [| "config"; "user.name"; "VCS Partial Tests" |]
+    let! _ = runGitOk workPath [| "config"; "user.email"; "partial@example.org" |]
+    let! _ = runGitOk workPath [| "config"; "core.autocrlf"; "false" |]
+    let! _ = runGitOk workPath [| "lfs"; "install"; "--local" |]
+    let! _ = runGitOk workPath [| "lfs"; "track"; "*.bin" |]
+    do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) "base\n"
+    let! _ = runGitOk workPath [| "add"; "-A" |]
+    let! _ = runGitOk workPath [| "commit"; "-m"; "init" |]
+    let! _ = runGitOk workPath [| "remote"; "add"; "origin"; barePath |]
+    let! _ = runGitOk workPath [| "push"; "origin"; "main" |]
+    let! _ = runGitOk workPath [| "checkout"; "-b"; "other" |]
+    do! writeUtf8FileAsync (join [| workPath; "other.txt" |]) "other\n"
+    let! _ = runGitOk workPath [| "add"; "-A" |]
+    let! _ = runGitOk workPath [| "commit"; "-m"; "other branch" |]
+    let! _ = runGitOk workPath [| "push"; "origin"; "other" |]
+    let! _ = runGitOk workPath [| "checkout"; "main" |]
+    do! writeUtf8FileAsync (join [| workPath; "data.bin" |]) "outbound LFS content\n"
+    let! _ = runGitOk workPath [| "add"; "-A" |]
+    let! _ = runGitOk workPath [| "commit"; "-m"; "add LFS file" |]
+    let! remoteRefs = runGitOk workPath [| "ls-remote"; "--refs"; "origin" |]
+    let! pointerText = runGitOk workPath [| "show"; "HEAD:data.bin" |]
+
+    let remoteTipIds =
+        remoteRefs.Replace("\r\n", "\n").Split('\n', StringSplitOptions.RemoveEmptyEntries)
+        |> Array.map (fun line -> line.Split('\t').[0])
+
+    let oid =
+        pointerText.Replace("\r\n", "\n").Split '\n'
+        |> Array.pick (fun line ->
+            let prefix = "oid sha256:"
+            if line.StartsWith(prefix, StringComparison.Ordinal) then Some(line.Substring(prefix.Length)) else None)
+
+    return root, workPath, remoteTipIds, oid
+}
+
+let private planOutboundLfsPush
+    (runSpawnedGit: GitLfsAdapter.GitSpawnRequest -> JS.Promise<GitLfsAdapter.GitSpawnResult>)
+    (workPath: string)
+    =
+    let git =
+        GitInternals.createOptions workPath GitInternals.standardTimeout None
+        |> GitInternals.createGit
+
+    GitLfsService.planOutboundPush
+        (fun operation currentGit -> GitInternals.runSimpleGit id operation currentGit)
+        runSpawnedGit
+        id
+        (fun currentGit -> GitInternals.runSimpleGit id (fun gitInstance -> gitInstance.status ()) currentGit)
+        workPath
+        "origin"
+        (Some "main")
+        git
+        git
 
 let private createSelectedRevisionFixture () = promise {
     let! root = createTempDirectoryAsync ()
@@ -1204,6 +1268,89 @@ Vitest.describe (
                 Vitest.expect(environment?GIT_CONFIG_COUNT).toEqual "1"
                 Vitest.expect(environment?GIT_CONFIG_KEY_0).toEqual "lfs.fetchexclude"
                 Vitest.expect(environment?GIT_CONFIG_VALUE_0).toEqual ""
+            }
+        )
+
+        Vitest.test (
+            "LFS push planning excludes each remote tip with a caret line in rev-list input",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let! root, workPath, remoteTipIds, oid = createOutboundLfsPushFixture ()
+
+                    try
+                        let revListInputs = ResizeArray<string>()
+
+                        let recordingRunner (request: GitLfsAdapter.GitSpawnRequest) =
+                            if request.Arguments.[0] = "rev-list" then
+                                revListInputs.Add(request.StandardInput |> Option.defaultValue "")
+
+                            GitLfsAdapter.runGitCaptured request
+
+                        let! plan = planOutboundLfsPush recordingRunner workPath
+
+                        Vitest.expect(plan).toEqual (Ok(GitLfsService.OutboundPushPlan.UploadLfsObjects [| oid |]))
+                        // Git before 2.42 fails on option lines such as --not in --stdin mode, so one
+                        // rev-list call means the first attempt succeeded without a fallback.
+                        Vitest.expect(revListInputs.Count).toBe 1
+
+                        let lines = revListInputs.[0].Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                        Vitest.expect(remoteTipIds.Length).toBe 2
+                        Vitest.expect(lines.[0]).toBe "main"
+
+                        Vitest.expect(Array.sort lines.[1..]).toEqual (
+                            remoteTipIds |> Array.map (fun id -> "^" + id) |> Array.sort
+                        )
+
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "LFS push planning falls back when rev-list rejects options on standard input",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let! root, workPath, _, oid = createOutboundLfsPushFixture ()
+
+                    try
+                        let rejectedCalls = ref 0
+
+                        let rejectingRunner (request: GitLfsAdapter.GitSpawnRequest) =
+                            if request.Arguments.[0] = "rev-list" && request.Arguments |> Array.contains "--stdin" then
+                                rejectedCalls.Value <- rejectedCalls.Value + 1
+
+                                let rejection: GitLfsAdapter.GitSpawnResult = {
+                                    ExitCode = 128
+                                    StdoutBuffer = null
+                                    StdoutText = ""
+                                    StderrText = "fatal: options not supported in --stdin mode\n"
+                                    TimedOut = false
+                                }
+
+                                Promise.lift rejection
+                            else
+                                GitLfsAdapter.runGitCaptured request
+
+                        let! plan = planOutboundLfsPush rejectingRunner workPath
+
+                        Vitest.expect(rejectedCalls.Value > 0).toBe true
+                        Vitest.expect(plan).toEqual (Ok(GitLfsService.OutboundPushPlan.UploadLfsObjects [| oid |]))
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
             }
         )
 

@@ -6121,9 +6121,12 @@ let private createFactoryWithSessions
                             | Ok output when output.ExitCode = 0 ->
                                 let versionText = output.StdOut.Trim()
 
+                                // Git LFS 3.7 lists files from the index only with Git 2.42 or newer.
+                                // With older Git, `git lfs checkout` reads the HEAD tree and leaves a
+                                // picked conflict candidate, which is staged but not committed, as a pointer.
                                 let compatible =
                                     match GitService.tryParseVersion versionText with
-                                    | Some(major, minor, _) -> major > 2 || (major = 2 && minor >= 38)
+                                    | Some(major, minor, _) -> major > 2 || (major = 2 && minor >= 42)
                                     | None -> false
 
                                 {
@@ -6136,7 +6139,7 @@ let private createFactoryWithSessions
                                             None
                                         else
                                             Some
-                                                "Install Git 2.38 or newer: synchronization preview requires `git merge-tree --write-tree`."
+                                                "Install Git 2.42 or newer: Git LFS needs it to check out files that are staged but not committed."
                                 }
                             | _ ->
                                 {
@@ -6144,7 +6147,7 @@ let private createFactoryWithSessions
                                     Installed = false
                                     Version = None
                                     Compatible = false
-                                    Remediation = Some "Install Git 2.38 or newer and ensure it is on PATH."
+                                    Remediation = Some "Install Git 2.42 or newer and ensure it is on PATH."
                                 }
 
                         let lfsStatus: DependencyStatus =
@@ -6782,7 +6785,7 @@ let private createFactoryWithSessions
                             OperationFailure.create
                                 Unsupported
                                 "manual_install_required"
-                                "Install Git 2.38 or newer manually, then rerun dependency checks."
+                                "Install Git 2.42 or newer manually, then rerun dependency checks."
                         )
                 | "git-lfs" ->
                     return Failed(manualLfsInstallationRequired ())

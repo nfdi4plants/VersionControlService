@@ -195,8 +195,10 @@ let private partialClone () = promise {
     return clone, oid
 }
 
+// Git before 2.45 ignores GIT_NO_LAZY_FETCH, so protocol.allow=never keeps the check from fetching there.
 let private objectIsMissing (repository: string) (oid: string) = promise {
-    let! result = runGitWith (noLazyFetchEnvironment ()) repository [| "cat-file"; "-e"; oid |]
+    let! result =
+        runGitWith (noLazyFetchEnvironment ()) repository [| "-c"; "protocol.allow=never"; "cat-file"; "-e"; oid |]
     return result.ExitCode <> Some 0
 }
 

@@ -34,7 +34,7 @@ Run all local profiles and provider-specific tests:
 dotnet run --project build/Build.fsproj -- test run
 ```
 
-Git profiles use isolated local repositories and bare remotes. They require Git 2.38 or newer and Git LFS 3.7 or newer but do not need Docker.
+Git profiles use isolated local repositories and bare remotes. They require Git 2.42 or newer and Git LFS 3.7 or newer but do not need Docker.
 
 The ordinary run registers lakeFS tests as skipped when `LAKEFS_INTEGRATION` is not `1`. The release gate starts the pinned lakeFS container and makes every lakeFS profile mandatory:
 

@@ -1297,16 +1297,14 @@ let private parseLsRemoteTipIds (output: string) =
     )
     |> Array.distinct
 
+/// Git before 2.42 rejects option lines such as `--not` in `rev-list --stdin` mode, so
+/// the input excludes each remote tip with its own `^<oid>` line.
 let private buildRevListStandardInput (refSpec: string) (remoteTipIds: string[]) =
-    if remoteTipIds.Length = 0 then
-        $"{refSpec}\n"
-    else
-        String.concat "\n" [|
-            yield refSpec
-            yield "--not"
-            yield! remoteTipIds
-            yield ""
-        |]
+    String.concat "\n" [|
+        yield refSpec
+        yield! remoteTipIds |> Array.map (fun id -> "^" + id)
+        yield ""
+    |]
 
 let private tryParsePointerOid (content: string) =
     let lines =
@@ -1554,7 +1552,8 @@ let private isUnsupportedOptionFailure (result: GitSpawnResult) =
     && (diagnosticText.Contains("unknown option")
         || diagnosticText.Contains("unknown flag")
         || diagnosticText.Contains("unrecognized option")
-        || diagnosticText.Contains("invalid option"))
+        || diagnosticText.Contains("invalid option")
+        || diagnosticText.Contains("options not supported"))
 
 let private filterResolvableRemoteTipIds
     (runSpawnedGit: GitSpawnRequest -> JS.Promise<GitSpawnResult>)

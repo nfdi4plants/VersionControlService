@@ -40,12 +40,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -   The Git worker pool answers cancellation immediately. The worker closes an idle diff session after 15 minutes, and the pool closes an idle session earlier when an `Open` needs its slot. Both cases fail later requests with `diff_session_closed`, and the caller opens a new diff to continue.
 -   `OperationFailure` has a new `DiffDetail` field, so code that builds the record has to set it. `OperationFailure.create` sets it to `None`.
 -   The text diff fallback of `WorkspaceSession.withFallbackServices` used to return `UnsupportedContent` from its three reads. It now returns `NotDiffable ProviderUnsupported` from `Open`. `ReadPage`, `ReplayPage`, `Expand`, `ReadLine` and `GetSourceInfo` fail with `service_unavailable`, and `Close` succeeds with that warning.
+-   The Git provider requires Git 2.42 or newer, and `CheckDependencies` reports older Git as incompatible. Git LFS 3.7 reads the index in `git lfs checkout` only with Git 2.42 or newer. With Git 2.38 to 2.41 it reads the HEAD tree, so a conflict pick of an LFS candidate whose object is in the local cache left a pointer and the warning `object_not_materialized`.
 
 ### Removed
 
 -   `ContentView` and its `TextContent` and `UnsupportedContent` cases no longer exist. They belonged to the whole-file contract.
 -   Version 0.2.0 removes `TextDiffService.GetDiff`, `TextDiffService.GetWordDiff` and `TextDiffService.GetBaseContent`. Consumers use `TextDiffService` pages, replay, gap expansion and line slices instead.
 -   `VersionControlService.Runtime.Node` no longer exports `Process.isProcessAlive`. `Process.processExistence` replaces it and tells a process that is gone apart from one the caller cannot signal.
+
+### Fixed
+
+-   `Publish` and `Synchronize` no longer fail on Git 2.38 to 2.41 when the remote already has branches. The Git LFS upload planning wrote a `--not` line to `git rev-list --stdin`, and Git accepts option lines on standard input only from 2.42 on, so every such publish failed with `fatal: options not supported in --stdin mode`. The planning now excludes each remote tip with a `^<oid>` line. A rev-list that still rejects its input with that message makes the planning fall back to its slower path.
 
 ## 0.1.2 - 2026-09-28
 
