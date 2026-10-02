@@ -311,6 +311,43 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "a Git or Git LFS that cannot run names the cause in its remediation",
+            fun () -> promise {
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request _ ->
+                            async {
+                                match request.Arguments with
+                                | [| "--version" |] ->
+                                    return
+                                        OperationResult.failed (
+                                            OperationFailure.create
+                                                DependencyMissing
+                                                "spawn_failed"
+                                                "Could not run 'git': spawn git EPERM"
+                                        )
+                                | [| "lfs"; "version" |] ->
+                                    return OperationResult.succeeded (processOutput 2 "" "git-lfs: access is denied\n")
+                                | _ -> return OperationResult.succeeded (processOutput 1 "" "")
+                            })
+                    Barrier = None
+                }
+
+                let factory = GitWorkspaceSession.createFactory hooks
+                let! result = Async.StartAsPromise(factory.CheckDependencies(context "unrunnable-git"))
+                let dependencies = expectValue "dependencies of a Git that cannot run" result
+
+                let remediationOf name =
+                    (dependencies |> Array.find (fun entry -> entry.Component = name)).Remediation
+                    |> Option.defaultValue ""
+
+                Vitest.expect((remediationOf "git").Contains "spawn git EPERM").toBe true
+                Vitest.expect((remediationOf "git-lfs").Contains "exited with code 2: git-lfs: access is denied").toBe true
+            }
+        )
+
+        Vitest.test (
             "Git dependency cancellation is preserved",
             fun () -> promise {
                 let cancellation = OperationCancellation.Source()

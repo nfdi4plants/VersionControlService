@@ -6116,6 +6116,15 @@ let private createFactoryWithSessions
                     match lfsFilter with
                     | Error failure when failure.Category = Canceled -> return Failed failure
                     | _ ->
+                        // The remediation names the cause, so a Git that could not start or
+                        // failed does not read like a missing or outdated install.
+                        let versionFailureDetail (command: string) (result: Result<NodeProcess.ProcessOutput, OperationFailure>) =
+                            match result with
+                            | Error failure -> $"{failure.Message.TrimEnd('.')}. "
+                            | Ok output when String.IsNullOrWhiteSpace output.StdErr ->
+                                $"`{command}` exited with code {output.ExitCode}. "
+                            | Ok output -> $"`{command}` exited with code {output.ExitCode}: {output.StdErr.Trim().TrimEnd('.')}. "
+
                         let gitStatus: DependencyStatus =
                             match gitVersion with
                             | Ok output when output.ExitCode = 0 ->
@@ -6147,7 +6156,11 @@ let private createFactoryWithSessions
                                     Installed = false
                                     Version = None
                                     Compatible = false
-                                    Remediation = Some "Install Git 2.42 or newer and ensure it is on PATH."
+                                    Remediation =
+                                        Some(
+                                            versionFailureDetail "git --version" gitVersion
+                                            + "Install Git 2.42 or newer and ensure it is on PATH."
+                                        )
                                 }
 
                         let lfsStatus: DependencyStatus =
@@ -6177,7 +6190,11 @@ let private createFactoryWithSessions
                                     Installed = false
                                     Version = None
                                     Compatible = false
-                                    Remediation = Some "Install Git LFS and ensure `git lfs version` succeeds."
+                                    Remediation =
+                                        Some(
+                                            versionFailureDetail "git lfs version" lfsVersion
+                                            + "Install Git LFS and ensure `git lfs version` succeeds."
+                                        )
                                 }
 
                         let filterInstalled =

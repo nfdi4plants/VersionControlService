@@ -51,6 +51,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 -   `Publish` and `Synchronize` no longer fail on Git 2.38 to 2.41 when the remote already has branches. The Git LFS upload planning wrote a `--not` line to `git rev-list --stdin`, and Git accepts option lines on standard input only from 2.42 on, so every such publish failed with `fatal: options not supported in --stdin mode`. The planning now excludes each remote tip with a `^<oid>` line. A rev-list that still rejects its input with that message makes the planning fall back to its slower path.
+-   When `git --version` or `git lfs version` cannot start or exits with an error, the `CheckDependencies` remediation for `git` or `git-lfs` starts with the start error, or with the exit code and stderr. It used to give the install advice alone, so a Git that could not start looked like a missing one.
 
 ## 0.1.2 - 2026-09-28
 
