@@ -600,9 +600,11 @@ Vitest.describe (
                 expectBlocked (DiffBlocker.LocalContentUnavailable(DiffSide.Previous, Some oid)) outcome
                 Vitest.expect(elapsed < 5000.0).toBe true
 
+                // Git 2.42 to 2.44 start the promisor fetch, report the denied transport and print "could not
+                // fetch", so the check looks for a connection attempt.
                 for result in results do
                     Vitest.expect(result.Stderr.Contains("127.0.0.1:9", StringComparison.OrdinalIgnoreCase)).toBe false
-                    Vitest.expect(result.Stderr.Contains("fetch", StringComparison.OrdinalIgnoreCase)).toBe false
+                    Vitest.expect(result.Stderr.Contains("unable to access", StringComparison.OrdinalIgnoreCase)).toBe false
             }
         )
 
