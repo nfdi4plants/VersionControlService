@@ -524,10 +524,13 @@ module TextDiffResyncCases =
     let private jsonRecord (id: string) (value: int) (last: bool) =
         [| "  {"; $"    \"id\": \"{id}\","; $"    \"value\": {value}"; (if last then "  }" else "  },") |] |> Array.map plainLine
 
-    /// Eight-line records, so that an id that collides gives a chance match of eight lines.
-    let private wideRecord (id: string) =
-        [| "  {"; $"    \"id\": \"{id}\","; "    \"kind\": \"item\","; "    \"enabled\": true,"; "    \"tags\": [],"; "    \"owner\": null,"; "    \"note\": \"\""; "  }," |]
+    /// Ten-line records where only the value line differs between two records with the same id.
+    let private wideRecord (id: string) (value: int) =
+        [| "  {"; $"    \"id\": \"{id}\","; "    \"kind\": \"item\","; "    \"enabled\": true,"; "    \"tags\": [],"; "    \"owner\": null,"; "    \"note\": \"\","; $"    \"value\": {value}"; "  },"; "" |]
         |> Array.map plainLine
+
+    let private uniqueLines (prefix: string) (start: int) (count: int) =
+        Array.init count (fun index -> plainLine $"{prefix} line {start + index} text")
 
     let private brackets (body: SourceLine array) = Array.concat [ [| plainLine "[" |]; body; [| plainLine "]" |] ]
 
@@ -577,14 +580,87 @@ module TextDiffResyncCases =
             let! shape = run (defaultConfig "settle-chance-json") previous current
             checkExact "chance match in JSON" shape 75_002 70_000 0
         }
-        "a chance match of one eight-line record inside an insertion does not pin the window", fun () -> async {
-            let records = 9_375
-            let previous = brackets (Array.init records (fun index -> wideRecord $"old-{index}") |> Array.concat)
-            let at = 1 + 125 * 8
-            let inserted = Array.init 8_750 (fun index -> wideRecord (if index = 2_500 then "old-300" else $"new-{index}")) |> Array.concat
+        "records that reuse the ids of the old records inside an insertion of 70,000 lines align", fun () -> async {
+            let records = 18_750
+            let previous = brackets (Array.init records (fun index -> jsonRecord $"old-{index}" (index * 7) (index = records - 1)) |> Array.concat)
+            let at = 1 + 250 * 4
+            let inserted = Array.init 17_500 (fun index -> jsonRecord $"old-{index}" (1_000_000 + index) false) |> Array.concat
             let current = Array.concat [ previous[.. at - 1]; inserted; previous[at ..] ]
-            let! shape = run (defaultConfig "settle-chance-wide") previous current
-            checkExact "chance match of a wide record" shape 75_002 70_000 0
+            let! shape = run (defaultConfig "settle-colliding-json") previous current
+            checkExact "colliding ids in JSON" shape 75_002 70_000 0
+        }
+        "ten-line records that reuse the ids of the old records inside an insertion align", fun () -> async {
+            let records = 7_500
+            let previous = brackets (Array.init records (fun index -> wideRecord $"old-{index}" (index * 7)) |> Array.concat)
+            let at = 1 + 250 * 10
+            let inserted = Array.init 7_000 (fun index -> wideRecord $"old-{index}" (1_000_000 + index)) |> Array.concat
+            let current = Array.concat [ previous[.. at - 1]; inserted; previous[at ..] ]
+            let! shape = run (defaultConfig "settle-colliding-wide") previous current
+            checkExact "colliding ids of wide records" shape 75_002 70_000 0
+        }
+        "a copied block of seven or eight lines inside an insertion of 70,000 lines does not pin the window", fun () -> async {
+            for block in [ 8; 7 ] do
+                let previous = uniqueLines "old" 0 100_000
+                let inserted = uniqueLines "new" 0 70_000
+                Array.blit previous (1_000 + 30_000) inserted 20_000 block
+                let current = Array.concat [ previous[.. 999]; inserted; previous[1_000 ..] ]
+                let! shape = run (defaultConfig $"settle-copied-block-{block}") previous current
+                checkExact $"copied block of {block}" shape 100_000 70_000 0
+        }
+        "a drifting region before an insertion of 70,000 lines keeps its alignment", fun () -> async {
+            let drifting = uniqueLines "old" 0 3_000
+            let spread = Array.init 600 (fun block -> Array.append drifting[block * 5 .. block * 5 + 4] (uniqueLines $"ins{block}" 0 10)) |> Array.concat
+            let tail = uniqueLines "c" 0 100_000
+            let inserted = uniqueLines "new" 0 70_000
+            inserted[30_000] <- tail[40_000]
+            let! shape = run (defaultConfig "settle-drift-before-insertion") (Array.append drifting tail) (Array.concat [ spread; inserted; tail ])
+            checkExact "drift before an insertion" shape 103_000 76_000 0
+        }
+        "65 old lines in runs of one settle the window before an insertion of 70,000 lines and 64 go to the forward search", fun () -> async {
+            for anchored in [ 65; 64 ] do
+                let old = uniqueLines "old" 0 anchored
+                let spread = Array.init anchored (fun index -> Array.append [| old[index] |] (uniqueLines $"ins{index}" 0 20)) |> Array.concat
+                let tail = uniqueLines "c" 0 100_000
+                let! shape = run (defaultConfig $"settle-anchored-{anchored}") (Array.append old tail) (Array.concat [ spread; uniqueLines "new" 0 70_000; tail ])
+                if anchored = 65 then checkExact "65 anchored lines" shape 100_065 71_300 0
+                else
+                    Check.equal 100_001 shape.Equal "64 anchored lines: the forward search keeps one chance line."
+                    Check.equal 63 shape.UnalignedPrevious "64 anchored lines: previous lines are unaligned."
+                    Check.equal 71_343 shape.UnalignedCurrent "64 anchored lines: current lines are unaligned."
+        }
+        "nine runs of eight old lines settle the window before an insertion of 70,000 lines and runs of seven go to the forward search", fun () -> async {
+            for run' in [ 8; 7 ] do
+                let old = uniqueLines "old" 0 (9 * run')
+                let spread = Array.init 9 (fun index -> Array.append old[index * run' .. (index + 1) * run' - 1] (uniqueLines $"ins{index}" 0 20)) |> Array.concat
+                let tail = uniqueLines "c" 0 100_000
+                let! shape = run (defaultConfig $"settle-runs-{run'}") (Array.append old tail) (Array.concat [ spread; uniqueLines "new" 0 70_000; tail ])
+                if run' = 8 then checkExact "runs of eight" shape (100_000 + 72) (70_000 + 180) 0
+                else
+                    Check.equal 100_007 shape.Equal "Runs of seven: the forward search keeps seven lines."
+                    Check.equal 56 shape.UnalignedPrevious "Runs of seven: previous lines are unaligned."
+        }
+        "long lines of three contents with one edit every 60 lines align in byte-limited windows", fun () -> async {
+            let contents = [| 'A'; 'B'; 'C' |] |> Array.map (fun letter -> plainLine (String(letter, 2_048)))
+            let previous = Array.init 6_000 (fun index -> contents[index % 3])
+            let current = previous |> Array.mapi (fun index line -> if index > 0 && index % 60 = 0 then contents[(index + 1) % 3] else line)
+            let! shape = run { defaultConfig "settle-long-repeats" with WindowMaxBytes = (512 * 1024) } previous current
+            Check.true' (shape.Equal >= 5_800) $"Almost every unchanged line is an equal row, got {shape.Equal}."
+            Check.equal 0 (shape.UnalignedPrevious + shape.UnalignedCurrent) "No line is unaligned."
+        }
+        "a window of repeated lines settles on an equal run of 64 lines and sends one of 63 to the forward search", fun () -> async {
+            for run' in [ 64; 63 ] do
+                let pair (prefix: string) (index: int) = [| plainLine $"{prefix}{index}"; plainLine $"{prefix}{index}" |]
+                let shared = Array.create run' (plainLine "row")
+                // Every line occurs twice in its window, and the last pair of the odd case gets a third copy.
+                let side (prefix: string) =
+                    Array.concat [
+                        Array.init 48 (pair prefix) |> Array.concat
+                        (if run' % 2 = 1 then [| plainLine $"{prefix}47" |] else [||])
+                        shared
+                        Array.init 1_500 (pair (prefix + "t")) |> Array.concat
+                    ]
+                let! shape = run { defaultConfig $"settle-repeated-run-{run'}" with WindowMaxLines = 256 } (side "old") (side "new")
+                Check.equal (if run' = 64 then 64 else 0) shape.Equal $"A run of {run'} equal lines: equal rows."
         }
     ]
 

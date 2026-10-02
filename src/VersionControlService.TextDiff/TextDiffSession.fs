@@ -1001,9 +1001,25 @@ type TextDiffSession internal (
         let mutable lastPrefixAnchor = -1
         let mutable lastEqual = -1
         let mutable lastEqualRunLines = 0
+        // Equal lines and other lines (both sides of every other operation) up to the last equal operation. A
+        // window of repeated lines keeps an alignment that is mostly equal lines. One that is mostly changes
+        // matched by chance, as in duplicated paragraphs, goes to the forward search.
+        let mutable equalLines = 0
+        let mutable otherLines = 0
+        let mutable equalAtLastEqual = 0
+        let mutable otherAtLastEqual = 0
         let mutable lastConfirmedAnchor = -1
         let mutable anchoredLines = 0
         let mutable runLines = 0
+        // Lines of the current run from its first chain or prefix anchor on. A forward search confirms a match
+        // from a line it found, so lines matched before the first unique line of a run do not count.
+        let mutable uniqueRunLines = 0
+        // The last anchor reached while replaced or unaligned lines were at most an eighth of the anchored
+        // lines, and the anchored lines up to it. Records that share ids with different values alternate
+        // short anchored runs and replaced lines, and such a window does not settle on them.
+        let mutable lastCleanAnchor = -1
+        let mutable cleanAnchoredLines = 0
+        let mutable changedLines = 0
         let mutable previousEnd = 0
         let mutable currentEnd = 0
         for index = 0 to ops.Length - 1 do
@@ -1012,15 +1028,26 @@ type TextDiffSession internal (
                 lastEqual <- index
                 runLines <- runLines + operation.PreviousCount
                 lastEqualRunLines <- runLines
+                equalLines <- equalLines + operation.PreviousCount
+                equalAtLastEqual <- equalLines
+                otherAtLastEqual <- otherLines
+                if operation.ReenterAnchor || uniqueRunLines > 0 then uniqueRunLines <- uniqueRunLines + operation.PreviousCount
                 if operation.Anchored then
                     lastAnchored <- index
                     anchoredLines <- anchoredLines + operation.PreviousCount
-                    if runLines >= config.ResyncConfirmLines then lastConfirmedAnchor <- index
+                    if uniqueRunLines >= config.ResyncConfirmLines || runLines >= 64 then lastConfirmedAnchor <- index
+                    if changedLines * 8 <= anchoredLines then
+                        lastCleanAnchor <- index
+                        cleanAnchoredLines <- anchoredLines
                     if operation.PrefixAnchor then lastPrefixAnchor <- index
                     previousEnd <- operation.PreviousIndex + operation.PreviousCount
                     currentEnd <- operation.CurrentIndex + operation.CurrentCount
             else
                 runLines <- 0
+                uniqueRunLines <- 0
+                otherLines <- otherLines + operation.PreviousCount + operation.CurrentCount
+                if operation.Kind = OperationKind.Replaced then changedLines <- changedLines + operation.PreviousCount + operation.CurrentCount
+                elif operation.Kind = OperationKind.Unaligned then changedLines <- changedLines + max operation.PreviousCount operation.CurrentCount
         // A window commits up to its last anchored equal run only when few lines follow that run. The lines
         // are counted on a side whose window stopped at its limit. A side that reached the end of its source
         // holds everything that is left, so its count says nothing about the anchor. When both windows
@@ -1078,22 +1105,25 @@ type TextDiffSession internal (
             elif canGrow then
                 // The window may hold an insertion or deletion larger than itself, so it grows first.
                 growWindow ()
-            elif windowSelfUniqueLines = 0 && lastEqual >= 0 && lastEqualRunLines >= 64 then
+            elif windowSelfUniqueLines = 0 && lastEqual >= 0 && (lastEqualRunLines >= 64 || equalAtLastEqual >= 8 * otherAtLastEqual) then
                 // Every line occurs at least twice within its own window, as in a file of identical rows. The
-                // window keeps its own alignment up to its last equal run there when that run is long. A short
-                // run of repeated lines can match at the wrong place, as in duplicated paragraphs, so the window
-                // then goes to the forward search. A window that holds a line unique within itself may be part of
-                // an insertion or deletion larger than the window, and the forward search looks for the place
-                // where the sources meet again.
+                // window keeps its own alignment up to its last equal operation when its last equal run has 64
+                // lines or when equal lines are at least eight times the other lines up to that operation. In
+                // any other window the repeated lines can match at the wrong place, as in duplicated paragraphs,
+                // and the window goes to the forward search. A window that holds a line unique within itself may
+                // be part of an insertion or deletion larger than the window, and the forward search looks for
+                // the place where the sources meet again.
                 commitCount <- lastEqual + 1
                 beginFeeding ()
-            elif lastConfirmedAnchor >= 0 || (lastAnchored >= 0 && anchoredLines >= 64) then
-                // At its largest size the window settles on its last anchored run that a forward search would also
-                // confirm (ResyncConfirmLines lines), or on its last anchor when the window holds many anchored
-                // lines. A line that matches by chance inside an insertion larger than the window sits in a
-                // one-line run in a window with almost no other anchored lines, so such a window still goes to
-                // the forward search.
-                commitCount <- (if lastConfirmedAnchor >= 0 then lastConfirmedAnchor else lastAnchored) + 1
+            elif anchoredLines >= 64 && (lastConfirmedAnchor >= 0 || cleanAnchoredLines >= 64) then
+                // At its largest size the window settles when it holds 64 anchored lines and has a confirmed
+                // anchor or a clean anchor. A confirmed anchor ends a run that a forward search would also
+                // confirm (ResyncConfirmLines lines from the first line that is unique in both windows, or 64
+                // lines). A clean anchor is the last one reached while replaced and unaligned lines were at most
+                // an eighth of the anchored lines. The window commits up to the later of the two. A line that
+                // matches by chance inside an insertion larger than the window sits in a one-line run among few
+                // anchored lines, so such a window goes to the forward search.
+                commitCount <- (max lastConfirmedAnchor (if cleanAnchoredLines >= 64 then lastCleanAnchor else -1)) + 1
                 beginFeeding ()
             else
                 // At its largest size without an anchor the diff continues with a forward search.
