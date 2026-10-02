@@ -942,6 +942,7 @@ type TextDiffSession internal (
         let mutable lastAnchored = -1
         let mutable lastPrefixAnchor = -1
         let mutable lastEqual = -1
+        let mutable lastEqualRunLines = 0
         let mutable lastConfirmedAnchor = -1
         let mutable anchoredLines = 0
         let mutable runLines = 0
@@ -952,6 +953,7 @@ type TextDiffSession internal (
             if operation.Kind = OperationKind.Equal || operation.Kind = OperationKind.EndingChanged then
                 lastEqual <- index
                 runLines <- runLines + operation.PreviousCount
+                lastEqualRunLines <- runLines
                 if operation.Anchored then
                     lastAnchored <- index
                     anchoredLines <- anchoredLines + operation.PreviousCount
@@ -1018,11 +1020,13 @@ type TextDiffSession internal (
             elif canGrow then
                 // The window may hold an insertion or deletion larger than itself, so it grows first.
                 growWindow ()
-            elif windowSelfUniqueLines = 0 && lastEqual >= 0 then
+            elif windowSelfUniqueLines = 0 && lastEqual >= 0 && lastEqualRunLines >= 64 then
                 // Every line occurs at least twice within its own window, as in a file of identical rows. The
-                // window keeps its own alignment up to its last equal run there. A window that holds a line
-                // unique within itself may be part of an insertion or deletion larger than the window, and the
-                // forward search looks for the place where the sources meet again.
+                // window keeps its own alignment up to its last equal run there when that run is long. A short
+                // run of repeated lines can match at the wrong place, as in duplicated paragraphs, so the window
+                // then goes to the forward search. A window that holds a line unique within itself may be part of
+                // an insertion or deletion larger than the window, and the forward search looks for the place
+                // where the sources meet again.
                 commitCount <- lastEqual + 1
                 beginFeeding ()
             elif lastConfirmedAnchor >= 0 || (lastAnchored >= 0 && anchoredLines >= 64) then

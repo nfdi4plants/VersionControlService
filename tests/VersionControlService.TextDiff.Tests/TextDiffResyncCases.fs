@@ -558,6 +558,15 @@ module TextDiffResyncCases =
             let! shape = run (defaultConfig "settle-drift") previous current
             checkExact "drift 80,000" shape 80_000 16_000 0
         }
+        "duplicated paragraphs inserted before a file align with the unchanged lines", fun () -> async {
+            // Every line occurs twice in its own window, and the window ends inside a short equal run of repeats.
+            let paragraph (prefix: string) (index: int) =
+                [| plainLine $"{prefix}{index}"; plainLine $"{prefix}{index}"; plainLine ""; plainLine "" |]
+            let previous = Array.init 3_000 (paragraph "old") |> Array.concat
+            let current = Array.append (Array.init 1_152 (paragraph "new") |> Array.concat) previous
+            let! shape = run { defaultConfig "settle-duplicates" with WindowMaxLines = 2_048 } previous current
+            checkExact "duplicated paragraphs" shape 12_000 4_608 0
+        }
         "a chance match inside an insertion of 70,000 lines does not pin the window", fun () -> async {
             let records = 18_750
             let previous = brackets (Array.init records (fun index -> jsonRecord $"old-{index}" (index * 7) (index = records - 1)) |> Array.concat)
