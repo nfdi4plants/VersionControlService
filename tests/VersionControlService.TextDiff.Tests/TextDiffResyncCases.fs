@@ -136,6 +136,21 @@ module TextDiffResyncCases =
 
     let private noHook (_: TextDiffSession) = async.Return()
 
+    type private CountingByteSource(bytes: byte[]) =
+        let inner = MemoryByteSource(bytes) :> IByteSource
+        let mutable reads = 0
+
+        member _.Reads = reads
+
+        interface IByteSource with
+            member _.KnownLength = inner.KnownLength
+            member _.AvailableLength() = inner.AvailableLength()
+            member _.IsComplete() = inner.IsComplete()
+            member _.ReadAt position buffer offset count = async {
+                reads <- reads + 1
+                return! inner.ReadAt position buffer offset count
+            }
+
     let private runWith (sessionConfig: SessionConfig) (ledger: Ledger) between (previous: SourceLine array) (current: SourceLine array) = async {
         let host = Host.createInMemory (ManualClock 0.0 :> IClock)
         let! session = TextDiffSession.create host ledger sessionConfig (fun _ -> 1) (spec (encode previous)) (spec (encode current))
@@ -882,6 +897,25 @@ module TextDiffResyncCases =
             let! shape = run { defaultConfig "padded-repeated-rows" with Limits = { Limits.defaults with MaxUnits = 256; RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 } } previous current
             checkExact "repeated rows" shape 24_584 92 92
             Check.true' (shape.Scans < 8_000) $"The search finishes within 8,000 scan requests (used {shape.Scans})."
+        }
+        "a short cycle of repeated rows with a sparse edit is confirmed in runs", fun () -> async {
+            // Window Myers compares pairs on diagonals of equal keys. One request confirms a whole diagonal run, so
+            // the sources serve far fewer reads than the one-per-pair confirmation did.
+            let rows = [| plainLine "row A"; plainLine "row B"; plainLine "row C" |]
+            let previous = Array.init 25_000 (fun index -> rows[index % 3])
+            let current = previous |> Array.mapi (fun index line -> if index > 0 && index % 60 = 0 then rows[(index + 1) % 3] else line)
+            let counted (lines: SourceLine array) =
+                let source = CountingByteSource(encode lines)
+                source, { spec (encode lines) with Source = Some(source :> IByteSource) }
+            let previousSource, previousSpec = counted previous
+            let currentSource, currentSpec = counted current
+            let host = Host.createInMemory (ManualClock 0.0 :> IClock)
+            let! session = TextDiffSession.create host (Ledger()) (defaultConfig "repeated-rows-reads") (fun _ -> 1) previousSpec currentSpec
+            let! shape = readAll session noHook
+            do! session.Close()
+            checkExact "repeated rows read counting" shape 24_584 92 92
+            let reads = previousSource.Reads + currentSource.Reads
+            Check.true' (reads < 30_000) $"The sources serve fewer than 30,000 reads (used {reads})."
         }
         "a short cycle of repeated rows with a sparse edit in a file of 15,000 lines is aligned as git aligns it", fun () -> async {
             // The file is below 20,000 lines, so its window grows to hold it whole. The single pass over that

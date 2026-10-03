@@ -296,6 +296,8 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
     let mutable gapCurrentEnd = 0
     let mutable stepper: MyersStepper option = None
     let mutable pendingPair = struct (-1, -1)
+    let mutable pendingRunStart = 0
+    let mutable pendingRunLength = 0
     let mutable pendingResult: bool option = None
     let gapCache = Dictionary<float, bool>()
 
@@ -694,6 +696,7 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
 
     let startGap (meter: Meter) =
         gapCache.Clear()
+        pendingRunStart <- 0
         if gapIndex < spanPrevious.Count then
             gapPreviousEnd <- spanPrevious[gapIndex]
             gapCurrentEnd <- spanCurrent[gapIndex]
@@ -803,8 +806,11 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
                 phase <- AlignPhase.MiddleStart
         | AlignPhase.Gaps ->
             let struct (p, c) = pendingPair
-            gapCache[float p * 4294967296.0 + float c] <- matched > 0
-            pendingResult <- Some(matched > 0)
+            for offset = 0 to min matched (pendingRunLength - 1) do
+                gapCache[float (p + offset) * 4294967296.0 + float (c + offset)] <- offset < matched
+            // A mismatch before the requested pair leaves the answer open, and the next request starts at that pair.
+            pendingResult <- if matched < pendingRunStart then None else Some(matched > pendingRunStart)
+            if matched < pendingRunStart then pendingRunStart <- -1
         | _ -> invalidOp "No confirmation was requested."
 
     member _.Step(meter: Meter) : AlignStep =
@@ -1017,8 +1023,23 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
                 match active.Step() with
                 | MyersStepResult.Running -> AlignStep.Running
                 | MyersStepResult.NeedComparison(p, c) ->
-                    pendingPair <- struct (p, c)
-                    AlignStep.NeedRun(p, c, 1)
+                    // Confirm the whole run of key-equal uncached pairs around (p, c) with one request.
+                    let uncached p c = keysEqual p c && not (gapCache.ContainsKey(float p * 4294967296.0 + float c))
+                    let mutable before = 0
+                    while pendingRunStart >= 0 && before < stepChunk - 1
+                          && p - before > gapPreviousStart && c - before > gapCurrentStart
+                          && uncached (p - before - 1) (c - before - 1) do
+                        before <- before + 1
+                    let startP, startC = p - before, c - before
+                    pendingRunStart <- before
+                    pendingRunLength <- before + 1
+                    while pendingRunLength < stepChunk
+                          && startP + pendingRunLength < gapPreviousEnd && startC + pendingRunLength < gapCurrentEnd
+                          && uncached (startP + pendingRunLength) (startC + pendingRunLength) do
+                        pendingRunLength <- pendingRunLength + 1
+                    Meter.charge meter (pendingRunLength / 4)
+                    pendingPair <- struct (startP, startC)
+                    AlignStep.NeedRun(startP, startC, pendingRunLength)
                 | MyersStepResult.Complete operations ->
                     let target = if directActive then directOperations else raw
                     for operation in operations do
