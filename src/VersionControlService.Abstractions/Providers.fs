@@ -159,7 +159,8 @@ module WorkspaceSession =
     ///
     /// Each successful fallback does nothing and carries a service_unavailable warning.
     /// Opening a paged diff reports an unsupported provider. The text diff requests that read
-    /// a handle fail because no diff handle exists, and Close succeeds with the warning.
+    /// a handle fail as Unsupported with the service_unavailable code, and Close succeeds with
+    /// the warning.
     /// ListObjects returns an empty array, and GetSettings returns no threshold with
     /// MaterializeLargeObjects = true. GetActiveSession and GetRepositoryWebUrl return None.
     /// Prune and Deduplicate return the reason as their report.

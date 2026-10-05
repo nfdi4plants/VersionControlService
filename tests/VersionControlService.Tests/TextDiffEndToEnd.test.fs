@@ -779,7 +779,7 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "pages large diffs in turns with shared scratch",
+            "pages three large diffs to their end through a one-slot pool",
             TestOptions(timeout = 60000),
             fun () -> promise {
                 let! repository = newRepository ()

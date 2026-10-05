@@ -362,7 +362,7 @@ let private parseChoice (name: string option) : Result<TextEncoding option, Oper
     | Some value ->
         match Decoders.tryParseName value with
         | Some encoding -> Ok(Some encoding)
-        | None -> Error(OperationFailure.create Validation "unsupported_encoding" "The chosen encoding is not supported.")
+        | None -> Error(OperationFailure.create Validation TextDiffFailureCodes.UnsupportedEncoding "The chosen encoding is not supported.")
 
 let private resolveStep (worker: Worker) (host: WorkerHost) (request: OpenDiffRequest) (owner: TextDiffOwner) (slot: Slot) : Async<OpenStep> = async {
     match slot.Resolved with

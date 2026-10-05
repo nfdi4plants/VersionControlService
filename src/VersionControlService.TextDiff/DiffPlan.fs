@@ -273,7 +273,7 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
     let mutable anchorLength = 0
     let mutable anchorPending = false
 
-    // Spans that rule C rejected, in chain order. A gap that merged them and then exhausts its step budget gets
+    // Spans that movedAcrossRun rejected, in chain order. A gap that merged them and then exhausts its step budget gets
     // them back as anchors, which splits it into the smaller gaps it had without the rejection.
     let rejectedPrevious = ResizeArray<int>()
     let rejectedCurrent = ResizeArray<int>()

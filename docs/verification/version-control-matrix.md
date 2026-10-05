@@ -4,7 +4,7 @@
 
 | Prerequisite | Minimum | Verify |
 |---|---|---|
-| Git | 2.38 (`merge-tree --write-tree`) | `git --version` |
+| Git | 2.42 (Git LFS 3.7 reads the index in `git lfs checkout` from that version on) | `git --version` |
 | Git LFS | 3.7 | `git lfs version` |
 | .NET SDK | 10.0 | `dotnet --version` |
 | Node.js (with npm) | 22 | `node --version` |
@@ -29,6 +29,9 @@ Docker is required only for the live lakeFS row.
 |---|---|---|
 | Formatting and Release build | `dotnet format VersionControlService.slnx --verify-no-changes && dotnet build VersionControlService.slnx --no-restore -c Release` | No |
 | Portable .NET tests | `dotnet test tests/VersionControlService.Abstractions.Tests/VersionControlService.Abstractions.Tests.fsproj --no-restore` | No |
+| Text diff engine on .NET | `dotnet test tests/VersionControlService.TextDiff.Tests/VersionControlService.TextDiff.Tests.fsproj --no-restore` | No |
+| Text diff engine in Fable and Vitest | `dotnet run --project build/Build.fsproj -- test textdiff` | No |
+| Text diff suites with the Fable compiler Swate uses | `dotnet run --project build/Build.fsproj -- test textdiff-swate-fable` | No |
 | Fable and Vitest | `dotnet run --project build/Build.fsproj -- test run` | No |
 | Portable Fable consumer | `dotnet run --project build/Build.fsproj -- test consumer` | No |
 | Git and Git LFS scenarios | `dotnet run --project build/Build.fsproj -- test focused GitProviderContract.test.js ".*"` | No |
@@ -36,12 +39,12 @@ Docker is required only for the live lakeFS row.
 | External provider sample | `dotnet build samples/ExternalProvider/ExternalProvider.fsproj -c Release` | No |
 | Live lakeFS profiles and integration scenarios | `dotnet run --project build/Build.fsproj -- test lakefs` | Yes |
 
-The package row packs the five coordinated packages at a unique local version, verifies
+The package row packs the six coordinated packages at a unique local version, verifies
 the graph and then restores and Fable-compiles the one-reference consumer against that
 feed. The feed, the package cache and the compiler output are created under the temporary
 directory. `--temp=<dir>` puts them somewhere else and `--version=<v>` pins the version.
 
-The restore must resolve the umbrella and all four internal dependencies at that one
+The restore must resolve the umbrella and the five packages it depends on at that one
 version. Only the umbrella package is referenced, so anything missing from the graph shows
 up here.
 

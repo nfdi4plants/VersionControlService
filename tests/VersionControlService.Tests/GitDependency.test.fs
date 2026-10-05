@@ -338,12 +338,16 @@ Vitest.describe (
                 let! result = Async.StartAsPromise(factory.CheckDependencies(context "unrunnable-git"))
                 let dependencies = expectValue "dependencies of a Git that cannot run" result
 
-                let remediationOf name =
-                    (dependencies |> Array.find (fun entry -> entry.Component = name)).Remediation
-                    |> Option.defaultValue ""
+                let statusOf name =
+                    dependencies |> Array.find (fun entry -> entry.Component = name)
 
-                Vitest.expect((remediationOf "git").Contains "spawn git EPERM").toBe true
-                Vitest.expect((remediationOf "git-lfs").Contains "exited with code 2: git-lfs: access is denied").toBe true
+                // The remediation carries the cause the runner reported, so it is the fake's own text that must appear.
+                for name, cause in [ "git", "spawn git EPERM"; "git-lfs", "git-lfs: access is denied" ] do
+                    let status = statusOf name
+                    Vitest.expect(status.Installed).toBe false
+                    Vitest.expect(status.Compatible).toBe false
+                    Vitest.expect(status.Remediation.IsSome).toBe true
+                    Vitest.expect(status.Remediation.Value.Contains cause).toBe true
             }
         )
 

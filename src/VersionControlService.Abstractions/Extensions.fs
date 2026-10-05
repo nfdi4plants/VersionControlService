@@ -215,6 +215,10 @@ module TextDiffFailureCodes =
     [<Literal>]
     let ReadFailed = "diff_read_failed"
 
+    /// `Open` received an encoding name in `PreviousEncoding` or `CurrentEncoding` that the engine does not know.
+    [<Literal>]
+    let UnsupportedEncoding = "unsupported_encoding"
+
     /// A pinned source identity changed while its diff was open.
     [<Literal>]
     let SourceChanged = "source_changed"
