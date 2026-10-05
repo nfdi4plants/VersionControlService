@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
--   `VersionControlService.TextDiff` adds a streaming diff engine for files of any size. It bounds memory use and work per request and targets .NET and Fable.
+-   `VersionControlService.TextDiff` adds a streaming diff engine for large files. It bounds the work per request and its read buffers. Its scanner checkpoints, one per 64 MiB of each side, stay in memory, so memory use grows slowly with file size. It targets .NET and Fable.
 -   `AsyncTrampoline.switchToSetImmediate` makes Fable's async trampoline hop through `setImmediate` on the calling thread, which saves a timer tick of 11 to 15 ms per hop on Windows. Call it only on a thread that runs nothing but the engine, such as a diff worker thread. The Git worker calls it already. On .NET it does nothing.
 -   The Git provider can run text diffs in a worker pool supervised by `TextDiffSupervisor`. Hosts create a `TextDiffPool` with `TextDiffPoolOptions.create` and `TextDiffPool.create`, and use `TextDiffTransport.WorkerThreadTransport.create` to start a worker thread from their own worker file.
 -   `DiffSide` and `DiffContentBlocked` describe which side of a diff could not be read as text and the evidence found. `DiffContentBlocked.InvalidSequenceOffset` holds the byte offset of a sequence that is invalid in the encoding of that side, and is `None` for other evidence. Code that builds the record sets it. `OperationFailure.DiffDetail` carries a `DiffContentBlocked` for a `diff_content_not_text` or `diff_encoding_mismatch` failure.
