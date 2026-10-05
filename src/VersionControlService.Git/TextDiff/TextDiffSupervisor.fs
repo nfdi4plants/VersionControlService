@@ -241,8 +241,6 @@ type TextDiffSupervisor internal (instanceDirectory: string, gitExecutable: stri
 
     member _.InstanceDirectory = instanceDirectory
 
-    member _.GitExecutable = gitExecutable
-
     member _.WorkerDirectory(workerId: string) : JS.Promise<string> =
         let owner = { WorkerId = workerId; SessionId = ""; RequestId = "" }
 

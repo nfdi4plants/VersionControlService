@@ -56,8 +56,6 @@ module Decoders =
         PendingHighEnd = 0L
     }
 
-    let create encoding = createAt encoding 0L
-
     let private fail offset reason = Error { Offset = offset; Reason = reason }
 
     let private emitScalar sink start finish scalar =

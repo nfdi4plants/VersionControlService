@@ -29,10 +29,8 @@ type private FragmentBuild = { Part: DiffPart; Taken: int; Size: int }
 
 type private SeekCursor = {
     SideIndex: int
-    ByLine: bool
     StartLine: float
     EndLine: float
-    TargetOffset: float
     State: ScannerState
     mutable Buffer: byte[]
     mutable Batch: LineBatch
@@ -3035,24 +3033,22 @@ type TextDiffSession internal (
     let encodingAt sideIndex = if sideIndex = 0 then previousEncoding else currentEncoding
     let scanSideAt sideIndex = if sideIndex = 0 then previousSide else currentSide
 
-    let beginSeek (sideIndex: int) (byLine: bool) (target: float) (startLine: float) (endLine: float) = async {
+    let beginSeek (sideIndex: int) (startLine: float) (endLine: float) = async {
         let spec = specAt sideIndex
         if spec.Source.IsNone then return None
         else
-            let hit = checkpoints.Find(sideIndex, byLine, target)
+            let hit = checkpoints.Find(sideIndex, startLine)
             let state, firstLine =
                 match hit with
                 | Some found -> found.State, found.Line
                 | None -> Scanner.create (encodingAt sideIndex) (int64 spec.BomLength), 0.0
-            let remaining = if byLine then endLine - firstLine + 1.0 else 1.0
+            let remaining = endLine - firstLine + 1.0
             let batchCapacity = max 1 (int (max 1.0 (min 4_096.0 remaining)))
             let batch = LineBatch batchCapacity
             return Some {
                 SideIndex = sideIndex
-                ByLine = byLine
                 StartLine = startLine
                 EndLine = endLine
-                TargetOffset = target
                 State = state
                 Buffer = Array.zeroCreate<byte> 65_536
                 Batch = batch
@@ -3089,13 +3085,10 @@ type TextDiffSession internal (
                     for index = 0 to lines.Count - 1 do
                         let scanned = lines.Line index
                         let currentLine = cursor.LineNumber
-                        let selected =
-                            if cursor.ByLine then currentLine >= cursor.StartLine && currentLine <= cursor.EndLine
-                            else float scanned.EndOffset > cursor.TargetOffset
-                        if selected then cursor.FoundLines.Add scanned
+                        if currentLine >= cursor.StartLine && currentLine <= cursor.EndLine then cursor.FoundLines.Add scanned
                         cursor.LineNumber <- currentLine + 1.0
                         checkpoints.ObserveLine(cursor.SideIndex, float scanned.EndOffset, cursor.LineNumber) |> ignore
-                        if (cursor.ByLine && currentLine >= cursor.EndLine) || (not cursor.ByLine && selected) then
+                        if currentLine >= cursor.EndLine then
                             cursor.Complete <- true
                             lines.StopRequested <- true
                 let sideState = scanSideAt cursor.SideIndex
@@ -3141,7 +3134,6 @@ type TextDiffSession internal (
                 if Meter.quantumDue meter && running then
                     do! host.Yield()
                     Meter.beginNextQuantum meter
-            if cursor.Complete && cursor.FoundLines.Count = 0 && cursor.EndLine < cursor.LineNumber then ()
     }
 
     let expansionBinding gapId fromStart count =
@@ -3263,7 +3255,7 @@ type TextDiffSession internal (
             let range = if sideIndex = 0 then pending.Gap.PreviousRange else pending.Gap.CurrentRange
             let first = if pending.FromStart then range.Start else range.Start + range.Count - int64 pending.TakeCount
             let last = first + int64 pending.TakeCount - 1L
-            let! cursor = beginSeek sideIndex true (float first) (float first) (float last)
+            let! cursor = beginSeek sideIndex (float first) (float last)
             pending.Search <- cursor
     }
 
@@ -3321,12 +3313,12 @@ type TextDiffSession internal (
 
     let createLineRead side line offset maxUtf16 attempt sequence pairedLine = async {
         let index = if side = DiffSide.Previous then 0 else 1
-        let! search = beginSeek index true (float line) (float line) (float line)
+        let! search = beginSeek index (float line) (float line)
         let! pairSearch =
             match pairedLine with
             | Some paired ->
                 let peerIndex = if side = DiffSide.Previous then 1 else 0
-                beginSeek peerIndex true (float paired) (float paired) (float paired)
+                beginSeek peerIndex (float paired) (float paired)
             | None -> async.Return None
         return {
             Attempt = attempt
@@ -3595,7 +3587,6 @@ type TextDiffSession internal (
                             | ReadOutcome.EndOfSource -> sourceChanged (); failed <- true; running <- false
                             | ReadOutcome.Bytes _ -> running <- false
                     if pending.UnitPosition >= requestedEnd || pending.BytePosition >= contentEnd then ready <- true
-                    if not ready && not failed && Meter.overBudget meter then ()
             | _ -> ()
         if pending.Search.IsSome then ready <- false
         return ready, failed, pending.Waiting || (pending.Search |> Option.exists (fun cursor -> cursor.Waiting))
@@ -3845,9 +3836,6 @@ type TextDiffSession internal (
     let pageAt (sequence: int64) (cancel: unit -> bool) = async {
         let! recorded = journal.Read(journalKey 0L sequence)
         match recorded with
-        | Some(JournalValue.Page(Resumable.Ready page as value)) ->
-            do! rememberPagePairs sequence page
-            return! presentPageResult (EngineResult.Ok value)
         | Some(JournalValue.Page value) -> return! presentPageResult (EngineResult.Ok value)
         | Some _ -> return failMismatch ()
         | None when sequence <> requestSequence -> return failMismatch ()
@@ -3884,7 +3872,6 @@ type TextDiffSession internal (
                             let! recorded = journal.Read(journalKey 0L sequence)
                             match recorded with
                             | Some(JournalValue.Page(Resumable.Ready page)) when page.PageId = pageId ->
-                                do! rememberPagePairs sequence page
                                 return EngineResult.Ok { page with Pending = None }
                             | _ -> return failMismatch ()
                         with error -> return failWorker error.Message

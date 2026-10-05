@@ -32,12 +32,6 @@ type Worker(absolutePath: string, options: WorkerOptions) =
 [<Import("parentPort", "node:worker_threads")>]
 let parentPort: MessagePort option = jsNative
 
-[<Import("isMainThread", "node:worker_threads")>]
-let isMainThread: bool = jsNative
-
-[<Import("workerData", "node:worker_threads")>]
-let workerData: obj = jsNative
-
 [<Import("setImmediate", "node:timers")>]
 let setImmediate (callback: unit -> unit) : unit = jsNative
 

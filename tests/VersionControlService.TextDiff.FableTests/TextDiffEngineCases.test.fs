@@ -203,8 +203,6 @@ module TextDiffEngineCasesTests =
         member _.Reads = reads
 
         interface IByteSource with
-            member _.KnownLength = inner.KnownLength
-            member _.AvailableLength() = inner.AvailableLength()
             member _.IsComplete() = inner.IsComplete()
             member _.ReadAt position buffer offset count =
                 reads <- reads + 1

@@ -4,14 +4,12 @@ open System
 
 /// A scanner position that a seek resumes from.
 type internal CheckpointHit = {
-    Offset: float
     Line: float
-    InLine: float
     State: ScannerState
 }
 
 /// Scanner checkpoints of both sides. Every side records its scanner state once per interval of source
-/// bytes. Records are ordered by offset, so a seek finds the nearest earlier one with a binary search.
+/// bytes. Records are ordered by line, so a seek finds the nearest earlier one with a binary search.
 type internal Checkpoints(intervalBytes: float, encodings: TextEncoding[]) =
     let entries = [| ResizeArray<CheckpointHit>(); ResizeArray<CheckpointHit>() |]
     let nextDue = [| intervalBytes; intervalBytes |]
@@ -29,32 +27,27 @@ type internal Checkpoints(intervalBytes: float, encodings: TextEncoding[]) =
             if offset > lastOffset[side] then
                 lastOffset[side] <- offset
                 entries[side].Add {
-                    Offset = offset
                     Line = line
-                    InLine = state.LineLengthUtf16
                     State = Scanner.copyState state
                 }
 
     member _.ObserveLine(side: int, offset: float, line: float) =
         if offset >= nextDue[side] then
             entries[side].Add {
-                Offset = offset
                 Line = line
-                InLine = 0.0
                 State = Scanner.create encodings[side] (int64 offset)
             }
             nextDue[side] <- (Math.Floor(offset / intervalBytes) + 1.0) * intervalBytes
         nextDue[side]
 
-    /// Finds the last record of a side at or before a line number or a byte offset.
-    member _.Find(side: int, byLine: bool, target: float) : CheckpointHit option =
+    /// Finds the last record of a side at or before a line number.
+    member _.Find(side: int, line: float) : CheckpointHit option =
         let list = entries[side]
-        let key (entry: CheckpointHit) = if byLine then entry.Line else entry.Offset
         let mutable low = 0
         let mutable high = list.Count
         while low < high do
             let middle = low + ((high - low) >>> 1)
-            if key list[middle] <= target then low <- middle + 1 else high <- middle
+            if list[middle].Line <= line then low <- middle + 1 else high <- middle
         if low = 0 then None
         else
             let entry = list[low - 1]

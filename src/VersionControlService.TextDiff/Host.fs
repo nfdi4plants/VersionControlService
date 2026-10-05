@@ -16,8 +16,6 @@ type ReadOutcome =
     | EndOfSource
 
 type IByteSource =
-    abstract KnownLength: int64 option
-    abstract AvailableLength: unit -> int64
     abstract IsComplete: unit -> bool
     abstract ReadAt: int64 -> byte[] -> int -> int -> Async<ReadOutcome>
 

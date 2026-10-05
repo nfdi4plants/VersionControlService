@@ -20,6 +20,8 @@ let private bytesToUtf8 (_bytes: byte[]) : string = jsNative
 [<Import("setTimeout", "node:timers/promises")>]
 let private delay (milliseconds: int) : JS.Promise<unit> = jsNative
 
+let private defaultHandler = TextDiffWorker.createDefaultHandler ()
+
 let private spoolingHandler: ITextDiffRequestHandler =
     { new ITextDiffRequestHandler with
         member _.Open(host, request, owner) = promise {
@@ -43,12 +45,12 @@ let private spoolingHandler: ITextDiffRequestHandler =
             return Error(canceledFailure ())
           }
 
-        member _.ReadPage(host, request) = TextDiffWorker.defaultHandler.ReadPage(host, request)
-        member _.ReplayPage(host, request) = TextDiffWorker.defaultHandler.ReplayPage(host, request)
-        member _.Expand(host, request) = TextDiffWorker.defaultHandler.Expand(host, request)
-        member _.ReadLine(host, request) = TextDiffWorker.defaultHandler.ReadLine(host, request)
-        member _.GetSourceInfo(host, request) = TextDiffWorker.defaultHandler.GetSourceInfo(host, request)
-        member _.Close(host, handle) = TextDiffWorker.defaultHandler.Close(host, handle)
+        member _.ReadPage(host, request) = defaultHandler.ReadPage(host, request)
+        member _.ReplayPage(host, request) = defaultHandler.ReplayPage(host, request)
+        member _.Expand(host, request) = defaultHandler.Expand(host, request)
+        member _.ReadLine(host, request) = defaultHandler.ReadLine(host, request)
+        member _.GetSourceInfo(host, request) = defaultHandler.GetSourceInfo(host, request)
+        member _.Close(host, handle) = defaultHandler.Close(host, handle)
         member _.Cancel _ = ()
     }
 

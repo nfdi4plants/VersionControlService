@@ -280,11 +280,6 @@ module private JournalCodec =
                 Body = body
             }
 
-    /// Pages carry a pending-preview flag that is always false, because replays never show a preview.
-    let private readPending (reader: JournalReader) : PendingPreview option =
-        reader.ReadBool() |> ignore
-        None
-
     let encode (value: JournalValue) =
         let writer = JournalWriter()
         writer.WriteByte 1
@@ -300,12 +295,10 @@ module private JournalCodec =
                 for part in page.Parts do writePart writer part
                 writeProgress writer page.Progress
                 writer.WriteBool page.OutputComplete
-                writer.WriteBool false
             | Resumable.Scanning(progress, continuation, _) ->
                 writer.WriteByte 1
                 writeProgress writer progress
                 writer.WriteString continuation
-                writer.WriteBool false
         | JournalValue.Expansion result ->
             writer.WriteByte 1
             match result with
@@ -335,7 +328,7 @@ module private JournalCodec =
             | 0 ->
                 let result =
                     match reader.ReadByte() with
-                    | 1 -> Resumable.Scanning(readProgress reader, reader.ReadString(), readPending reader)
+                    | 1 -> Resumable.Scanning(readProgress reader, reader.ReadString(), None)
                     | _ ->
                         let pageId = reader.ReadString()
                         let cursor = reader.ReadOptionString()
@@ -344,14 +337,13 @@ module private JournalCodec =
                         let parts = Array.init count (fun _ -> readPart reader)
                         let progress = readProgress reader
                         let outputComplete = reader.ReadBool()
-                        let pending = readPending reader
                         Resumable.Ready {
                             PageId = pageId
                             NextCursor = cursor
                             Parts = parts
                             Progress = progress
                             OutputComplete = outputComplete
-                            Pending = pending
+                            Pending = None
                         }
                 JournalValue.Page result
             | 1 ->
@@ -456,8 +448,6 @@ type private JournalCache(ledger: Ledger, capBytes: int) =
             ledger.Release(AllocationCategory.ResponseData, int64 removed.Cost)
             true
         else false
-
-    member _.Used = used
 
     member _.TryGet(sequence: int64) =
         match entries.TryGetValue sequence with

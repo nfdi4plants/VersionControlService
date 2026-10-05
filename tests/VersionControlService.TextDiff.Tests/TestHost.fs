@@ -27,8 +27,6 @@ type MemoryByteSource(bytes: byte[], ?growing: bool) =
         available <- next
 
     interface IByteSource with
-        member _.KnownLength = Some(int64 bytes.Length)
-        member _.AvailableLength() = available
         member _.IsComplete() = available = int64 bytes.Length
         member _.ReadAt position buffer offset count = async {
             if position < 0L then invalidArg (nameof position) "The position cannot be negative."

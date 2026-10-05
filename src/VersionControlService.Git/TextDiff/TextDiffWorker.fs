@@ -1326,8 +1326,5 @@ let bootstrapWith (port: NodeWorkerThreads.MessagePort) (handler: ITextDiffReque
     let receive = attachDispatcher ((fun message -> port.postMessage message), (fun () -> port.close ()), handler)
     port.onMessage receive
 
-/// A shared instance of the default handler.
-let defaultHandler: ITextDiffRequestHandler = createDefaultHandler ()
-
 /// Serves text diff requests on the given port with a new default handler.
 let bootstrap (port: NodeWorkerThreads.MessagePort) : unit = bootstrapWith port (createDefaultHandler ())

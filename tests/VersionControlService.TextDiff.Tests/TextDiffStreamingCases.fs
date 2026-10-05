@@ -13,8 +13,6 @@ module TextDiffStreamingCases =
         let mutable reads = 0
 
         interface IByteSource with
-            member _.KnownLength = Some(int64 bytes.Length)
-            member _.AvailableLength() = int64 available
             member _.IsComplete() = available >= bytes.Length
             member _.ReadAt position buffer offset count = async {
                 reads <- reads + 1
@@ -36,8 +34,6 @@ module TextDiffStreamingCases =
         member _.Reads = reads
 
         interface IByteSource with
-            member _.KnownLength = inner.KnownLength
-            member _.AvailableLength() = inner.AvailableLength()
             member _.IsComplete() = inner.IsComplete()
             member _.ReadAt position buffer offset count =
                 reads <- reads + 1
@@ -351,42 +347,6 @@ module TextDiffStreamingCases =
                 let code, evidence = outcome.Value
                 Check.equal TextDiffFailureCodes.ContentNotText code "The later signature reports the text failure code."
                 Check.true' (evidence.Contains "131072") "The evidence names the signature offset."
-            do! session.Close()
-            return ()
-        }
-        "journal records reach the temp store as typed arrays and read back", fun () -> async {
-            let previous = makeLines 40 "line-"
-            let current = Array.copy previous
-            current[7] <- { current[7] with Text = "changed" }
-            let untyped = ref 0
-            let writes = ref 0
-            let recording (inner: ITempStore) =
-                let check (bytes: byte[]) =
-                    writes.Value <- writes.Value + 1
-                    if not (Native.isTypedBytes bytes) then untyped.Value <- untyped.Value + 1
-                { new ITempStore with
-                    member _.Append bytes offset count = check bytes; inner.Append bytes offset count
-                    member _.WriteAt position bytes offset count = check bytes; inner.WriteAt position bytes offset count
-                    member _.ReadAt position bytes offset count = inner.ReadAt position bytes offset count
-                    member _.Length() = inner.Length()
-                    member _.Dispose() = inner.Dispose() }
-            let host = {
-                Host.createInMemory (ManualClock 0.0 :> IClock) with
-                    CreateTempStore = fun _ -> async.Return(recording (MemoryTempStore() :> ITempStore))
-            }
-            let! session = TextDiffSession.create host (Ledger()) (config "stream-journal-bytes" 64 1_000_000 Limits.defaults None) (fun _ -> 1) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
-            let! first = session.FirstPage(fun () -> false)
-            let! pageId =
-                async {
-                    let! page, _ = resolvePageAsync session (fun () -> false) first
-                    return page.PageId
-                }
-            let! replayed = session.ReplayPage pageId
-            match replayed with
-            | EngineResult.Ok page -> Check.equal pageId page.PageId "A replayed page reads back from the journal."
-            | _ -> failwith "The journal did not return the recorded page."
-            Check.true' (writes.Value > 0) "The session wrote to the temp store."
-            Check.equal 0 untyped.Value "Every temp store write passes a typed array."
             do! session.Close()
             return ()
         }

@@ -397,7 +397,7 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
 
             Some worker
 
-    // Prefers an empty worker, then a new worker, then the least loaded worker with a free slot.
+    // Prefers an empty worker, then a new worker. Each worker serves one session.
     and tryReserve (owner: TextDiffOwner) : Result<PoolSession, OperationFailure> option =
         let candidate =
             liveWorkers ()
@@ -408,15 +408,13 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
 
         let chosen =
             match candidate, emptyIndex with
-            | Some worker, _ when worker.Sessions.Count = 0 -> Some(Ok worker)
-            | _, Some index ->
-                match startWorker index, candidate with
-                | Some worker, _ -> Some(Ok worker)
-                | None, Some worker -> Some(Ok worker)
-                | None, None ->
+            | Some worker, _ -> Some(Ok worker)
+            | None, Some index ->
+                match startWorker index with
+                | Some worker -> Some(Ok worker)
+                | None ->
                     let reason = lastStartFailure |> Option.defaultValue "unknown error"
                     Some(Error(workerFailed $"The text diff worker could not be started: {reason}"))
-            | Some worker, None -> Some(Ok worker)
             | None, None -> None
 
         chosen

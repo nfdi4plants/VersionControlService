@@ -640,9 +640,6 @@ module internal InlineHighlights =
                 appendSpan result start (end' - start) span.Kind
         result.ToArray()
 
-    let clip (_wholeText: string) (offset: int64) (sliceText: string) (highlights: Highlight[]) =
-        clipSlice offset sliceText highlights
-
     let middleSlice (total: float) (otherTotal: float) (prefix: float) (suffix: float) (offset: int64) (sliceText: string) =
         let suffix = min suffix (max 0.0 (min total otherTotal - prefix))
         let changedEnd = max prefix (total - suffix)

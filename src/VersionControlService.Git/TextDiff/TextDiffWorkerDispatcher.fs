@@ -165,22 +165,14 @@ type TextDiffWorkerDispatcher(post: obj -> unit, close: unit -> unit, handler: I
                 | _ -> finish (Error(workerFailure (NodeInterop.errorMessage error))))
 
     let cancel requestId generation =
-        match queue |> Seq.tryFindIndex (fun request -> request.RequestId = requestId && request.Generation = generation) with
-        | Some index ->
-            match queue[index].Body with
-            | RequestBody.Close _ -> ()
-            | _ ->
-                queue.RemoveAt index
-                send (TextDiffMessage.Error(requestId, generation, canceledFailure ()))
-        | None ->
-            match running with
-            | Some request when request.RequestId = requestId && request.Generation = generation && not request.Canceled ->
-                request.Canceled <- true
+        match running with
+        | Some request when request.RequestId = requestId && request.Generation = generation && not request.Canceled ->
+            request.Canceled <- true
 
-                try
-                    handler.Cancel requestId
-                with _ -> ()
-            | _ -> ()
+            try
+                handler.Cancel requestId
+            with _ -> ()
+        | _ -> ()
 
     let receive (message: TextDiffMessage) =
         match message with

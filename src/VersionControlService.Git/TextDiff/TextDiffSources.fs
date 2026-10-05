@@ -138,15 +138,9 @@ type private FileSourceCore(
 
     member _.Path = path
 
-    member _.KnownLength = knownLength
-
     member _.Failure = terminalFailure
 
-    member _.AvailableLength() = if disposed then 0L else knownLength
-
     member _.IsComplete() = not disposed && terminalFailure.IsNone
-
-    member _.DescriptorIdentity = descriptorIdentity
 
     member _.CheckIdentity() = validateIdentities ()
 
@@ -266,8 +260,6 @@ type private FileSourceCore(
         |> Async.StartAsPromise
 
     interface IByteSource with
-        member _.KnownLength = Some knownLength
-        member _.AvailableLength() = if disposed then 0L else knownLength
         member _.IsComplete() = not disposed && terminalFailure.IsNone
         member this.ReadAt position buffer offset count = this.ReadAt position buffer offset count
 
@@ -326,10 +318,6 @@ type FileSource private (core: FileSourceCore) =
 
     member _.Path = core.Path
 
-    member _.KnownLength = Some core.KnownLength
-
-    member _.AvailableLength() = core.AvailableLength()
-
     member _.IsComplete() = core.IsComplete()
 
     member this.ReadAt position buffer offset count = core.ReadAt position buffer offset count
@@ -343,8 +331,6 @@ type FileSource private (core: FileSourceCore) =
     member _.Dispose() = core.Dispose()
 
     interface IByteSource with
-        member _.KnownLength = Some core.KnownLength
-        member _.AvailableLength() = core.AvailableLength()
         member _.IsComplete() = core.IsComplete()
         member _.ReadAt position buffer offset count = core.ReadAt position buffer offset count
 
@@ -461,12 +447,6 @@ type SpoolSource private (
                 |> ignore)
 
     member _.Path = path
-
-    member _.ExpectedLength = expectedLength
-
-    member _.RefreshAvailableLength() = refresh ()
-
-    member _.Available = available
 
     member _.Failure = terminalFailure
 
@@ -586,8 +566,6 @@ type SpoolSource private (
     }
 
     interface IByteSource with
-        member _.KnownLength = Some expectedLength
-        member _.AvailableLength() = if disposed then 0L else available
         member _.IsComplete() = not disposed && complete && terminalFailure.IsNone
         member this.ReadAt position buffer offset count = this.ReadAt position buffer offset count
 

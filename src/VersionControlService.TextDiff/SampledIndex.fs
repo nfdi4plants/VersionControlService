@@ -43,7 +43,6 @@ type SampledIndex(capacity: int) =
     member _.Count = count
     member _.Capacity = capacity
     member _.IsFull = count >= capacity
-    member _.IsAllocated = heads.Length > 0
 
     /// Creates the bucket heads. Calling it again keeps the current content.
     member _.Allocate() =

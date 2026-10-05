@@ -274,11 +274,7 @@ type internal HunkBuilder(contextLines: int, pageMaxRows: int) =
     member _.QueueCount = queue.Count
     member _.HasOpenRows = isOpen && rows.Count > 0
 
-    member _.RingCount = ringCount
-
     /// Queue items in page order. The page builder reads them without removing them.
-    member _.ItemAt(index: int) = Seq.item index queue
-
     member _.Items = queue
 
     /// Removes the first fullCount items and records that the following item has emitted consumed lines.

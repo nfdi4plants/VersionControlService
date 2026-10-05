@@ -18,8 +18,6 @@ module TextDiffSessionCases =
         member _.Reset() = bytesRead <- 0L
 
         interface IByteSource with
-            member _.KnownLength = inner.KnownLength
-            member _.AvailableLength() = inner.AvailableLength()
             member _.IsComplete() = inner.IsComplete()
             member _.ReadAt position buffer offset count = async {
                 reads <- reads + 1
@@ -35,8 +33,6 @@ module TextDiffSessionCases =
         let inner = MemoryByteSource(bytes) :> IByteSource
 
         interface IByteSource with
-            member _.KnownLength = inner.KnownLength
-            member _.AvailableLength() = inner.AvailableLength()
             member _.IsComplete() = inner.IsComplete()
             member _.ReadAt position buffer offset count = inner.ReadAt position buffer offset (min count maxPerRead)
 
@@ -44,8 +40,6 @@ module TextDiffSessionCases =
         let inner = MemoryByteSource(bytes) :> IByteSource
 
         interface IByteSource with
-            member _.KnownLength = inner.KnownLength
-            member _.AvailableLength() = inner.AvailableLength()
             member _.IsComplete() = inner.IsComplete()
             member _.ReadAt position buffer offset count = async {
                 clock.Advance delayMs

@@ -116,7 +116,3 @@ type PreparationTokenStore(now: unit -> float) =
             |> Seq.map _.Key
             |> Seq.toArray do
             tokens.Remove id |> ignore
-
-    member _.Count =
-        pruneExpired ()
-        tokens.Count

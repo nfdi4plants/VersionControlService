@@ -24,7 +24,7 @@ module TextDiffEngineCases =
 
     let private ascii (value: string) = value |> Seq.map (fun character -> byte character) |> Seq.toArray
 
-    type private SparseByteSource(length: int64) =
+    type private SparseByteSource() =
         let mutable lastPosition = -1L
         let mutable lastCount = -1
 
@@ -32,8 +32,6 @@ module TextDiffEngineCases =
         member _.LastCount = lastCount
 
         interface IByteSource with
-            member _.KnownLength = Some length
-            member _.AvailableLength() = length
             member _.IsComplete() = true
             member _.ReadAt position buffer offset count = async {
                 if position < 0L then invalidArg (nameof position) "The position cannot be negative."
@@ -147,7 +145,7 @@ module TextDiffEngineCases =
         for split = 0 to data.Length do
             let units = ResizeArray<int>()
             let sink _ _ unit = units.Add unit
-            let initial = Decoders.create encoding
+            let initial = Decoders.createAt encoding 0L
             let afterFirst, firstResult = Decoders.decode initial data 0 split sink
 
             match firstResult with
@@ -167,7 +165,7 @@ module TextDiffEngineCases =
             Check.sequence expectedUnits (units.ToArray()) "Split decoding returned the same UTF-16 units."
 
     let private decoderError (encoding: TextEncoding) (data: byte[]) (flushAtEnd: bool) (expectedOffset: int64) =
-        let state = Decoders.create encoding
+        let state = Decoders.createAt encoding 0L
         let _, decoded = Decoders.decode state data 0 data.Length (fun _ _ _ -> ())
 
         match decoded with
@@ -284,8 +282,6 @@ module TextDiffEngineCases =
         "memory sources distinguish growing data from proven EOF", fun () -> async {
             let source = MemoryByteSource(bytes [ 1; 2; 3 ], growing = true) :> IByteSource
             let buffer = Array.zeroCreate<byte> 3
-            Check.equal (Some 3L) source.KnownLength "A growing source retains its expected length."
-            Check.equal 0L (source.AvailableLength()) "A new growing source exposes no bytes."
             Check.true' (not (source.IsComplete())) "A growing source has not reached EOF."
             let! waiting = source.ReadAt 0L buffer 0 3
             Check.equal ReadOutcome.NotYetAvailable waiting "An empty growing source waits for bytes."
@@ -302,7 +298,7 @@ module TextDiffEngineCases =
         "scan-side reads stay bounded above 2 GiB", fun () -> async {
             let position = 2_147_483_648L
             let length = position + 65_536L
-            let source = SparseByteSource(length)
+            let source = SparseByteSource()
             let spec = {
                 Source = Some(source :> IByteSource)
                 Encoding = "utf-8"

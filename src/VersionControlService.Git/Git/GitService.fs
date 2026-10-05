@@ -980,17 +980,6 @@ let private ensureCurrentlyConflictedPath (status: GitStatusDto) (requestedPath:
     else
         Error(exn $"File '{requestedPath}' is not currently marked as conflicted.")
 
-let private missingHeadContentMarkers = [|
-    "does not exist in 'head'"
-    "exists on disk, but not in 'head'"
-    "bad revision 'head'"
-    "invalid object name 'head'"
-|]
-
-let private isMissingHeadContentFailure (failure: GitFailure) =
-    let message = failure.Message.ToLowerInvariant()
-    missingHeadContentMarkers |> Array.exists message.Contains
-
 let private readWorkingTreeTextIfPresent
     (arcPath: string)
     (requestedPath: string)
@@ -1011,14 +1000,6 @@ let private readWorkingTreeTextIfPresent
                 else
                     return Ok(Some(bufferToUtf8String buffer))
     }
-
-let private quoteDiffPathToken (pathPrefix: string) (path: string option) =
-    match path with
-    | None -> "/dev/null"
-    | Some value ->
-        let escapedPath = value.Replace("\\", "\\\\").Replace("\"", "\\\"")
-
-        $"\"{pathPrefix}{escapedPath}\""
 
 let private reconcileTrackingBranchForCheckout
     (remoteName: string)

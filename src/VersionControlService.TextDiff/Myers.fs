@@ -224,8 +224,6 @@ type MyersStepper(
             fun previousIndex currentIndex -> Some(equal previousIndex currentIndex)
         )
 
-    member _.Steps = steps
-
     member _.UseMeter(value: Meter) = meter <- value
 
     member _.ResolveComparison(result: bool) =

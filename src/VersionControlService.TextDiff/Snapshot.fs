@@ -3,12 +3,9 @@ namespace VersionControlService.TextDiff
 open System
 open VersionControlService.Abstractions
 
-/// Little-endian number coding for the pairing index records. Numbers are floats that are integral and at least -2^31, so
-/// offsets, counts and signed hash words use the same coding on both runtimes without 64-bit integers.
+/// Little-endian number coding for the pairing index records. Numbers are non-negative integral floats, so line
+/// numbers and counts use the same coding on both runtimes without 64-bit integers.
 module internal Numbers =
-    [<Literal>]
-    let Bias = 2147483648.0
-
     [<Literal>]
     let Radix = 4294967296.0
 
@@ -28,15 +25,14 @@ module internal Numbers =
         ||| (Native.readByte bytes (index + 3) <<< 24)
 
     let writeNumber (bytes: byte[]) (index: int) (value: float) =
-        let biased = value + Bias
-        if biased < 0.0 then invalidArg (nameof value) "The number is below the supported range."
-        let high = Math.Floor(biased / Radix)
-        let low = biased - high * Radix
+        if value < 0.0 then invalidArg (nameof value) "The number is below the supported range."
+        let high = Math.Floor(value / Radix)
+        let low = value - high * Radix
         writeInt32 bytes index (int (uint32 low))
         writeInt32 bytes (index + 4) (int (uint32 high))
 
     let readNumber (bytes: byte[]) (index: int) =
-        float (uint32 (readInt32 bytes index)) + float (uint32 (readInt32 bytes (index + 4))) * Radix - Bias
+        float (uint32 (readInt32 bytes index)) + float (uint32 (readInt32 bytes (index + 4))) * Radix
 
     let encodeAll (values: float[]) : byte[] =
         let bytes = Array.zeroCreate<byte> (values.Length * NumberBytes)
