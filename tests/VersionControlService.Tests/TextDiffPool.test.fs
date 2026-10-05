@@ -511,6 +511,51 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "admits a waiting Open once the running Open has opened",
+            TestOptions(timeout = 60000),
+            fun () ->
+                let transports = System.Collections.Generic.Dictionary<int, ManualTransport>()
+
+                let factory: TextDiffWorkerFactory =
+                    fun index ->
+                        let transport = ManualTransport()
+                        transports[index] <- transport
+                        transport :> ITextDiffWorkerTransport
+
+                let opened id =
+                    Resumable.Ready(OpenDiffResult.Opened({ DiffHandle.Id = id; Version = "1" }, sourceInfo, sourceInfo, Resumable.Ready page))
+
+                withPool 1 factory (fun pool -> promise {
+                    let service = pool.Service owner
+                    let first = Watched(service.Open openRequest (OperationContext.detached "first") |> run)
+                    do! waitUntil (fun () -> transports.ContainsKey 0)
+                    let worker = transports[0]
+                    do! initializeWorker worker
+                    do! waitUntil (fun () -> (openRequestsOf worker).Length = 1)
+                    let second = Watched(service.Open openRequest (OperationContext.detached "second") |> run)
+                    do! delay 20
+                    Vitest.expect(second.Settled).toBe false
+                    let firstRequestId, firstGeneration = (openRequestsOf worker)[0]
+                    worker.Inject(encode (TextDiffMessage.Result(firstRequestId, firstGeneration, ResultPayload.Open(opened "first-worker-handle"))))
+                    let! firstResult = first.Result
+                    openedHandle firstResult |> ignore
+
+                    // The first session is idle now, so the waiting Open closes it to get the only slot.
+                    do! waitUntil (fun () -> (closeRequestsOf worker).Length = 1)
+                    let closeRequestId, closeGeneration, closeHandle = (closeRequestsOf worker)[0]
+                    Vitest.expect(closeHandle).toEqual(Some { DiffHandle.Id = "first-worker-handle"; Version = "1" })
+                    Vitest.expect((openRequestsOf worker).Length).toBe 1
+                    worker.Inject(encode (TextDiffMessage.Result(closeRequestId, closeGeneration, ResultPayload.Close)))
+
+                    do! waitUntil (fun () -> (openRequestsOf worker).Length = 2)
+                    let secondRequestId, secondGeneration = (openRequestsOf worker)[1]
+                    worker.Inject(encode (TextDiffMessage.Result(secondRequestId, secondGeneration, ResultPayload.Open(opened "second-worker-handle"))))
+                    let! secondResult = second.Result
+                    openedHandle secondResult |> ignore
+                })
+        )
+
+        Vitest.test (
             "closes the least recently used idle session when a fourth diff opens with the default options",
             TestOptions(timeout = 60000),
             fun () ->

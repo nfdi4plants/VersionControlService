@@ -646,11 +646,14 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
                     session.PublicId <- Some publicHandle.Id
                     session.Phase <- Opened
                     handles[publicHandle.Id] <- session
+                    // The Open settled while the session was still Opening, so a waiting Open could not evict it yet.
+                    if admissions.Count > 0 then pumpAdmission ()
                     return OperationResult.succeeded (Resumable.Ready(OpenDiffResult.Opened(publicHandle, previous, current, first)))
                 | Resumable.Scanning(_, continuation, _) ->
                     session.Phase <- Scanning
                     session.Continuation <- Some continuation
                     continuations[continuation] <- session
+                    if admissions.Count > 0 then pumpAdmission ()
                     return OperationResult.succeeded result
                 | Resumable.Ready(OpenDiffResult.NotDiffable(DiffBlocker.EncodingRequired(_, token, _))) ->
                     preparationAffinities[token.Id] <- {
