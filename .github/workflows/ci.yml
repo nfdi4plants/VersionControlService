@@ -31,6 +31,7 @@ jobs:
       - run: dotnet format VersionControlService.slnx --verify-no-changes --no-restore
       - run: dotnet build VersionControlService.slnx --no-restore -c Release
       - run: dotnet test tests/VersionControlService.Abstractions.Tests/VersionControlService.Abstractions.Tests.fsproj --no-restore -c Release
+      - run: dotnet test tests/VersionControlService.TextDiff.Tests -c Release
 
   fable-vitest:
     runs-on: windows-latest
@@ -48,6 +49,24 @@ jobs:
       - run: npm ci
       - run: git lfs install --skip-repo
       - run: .\build.cmd test run
+
+  text-diff-engine:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: dotnet tool restore
+      - run: dotnet restore VersionControlService.slnx
+      - run: npm ci
+      - run: git lfs install --skip-repo
+      - run: .\build.cmd test textdiff
+      - run: .\build.cmd test textdiff-swate-fable
 
   git-lfs-scenarios:
     runs-on: windows-latest
