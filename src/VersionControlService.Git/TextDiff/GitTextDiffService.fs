@@ -9,9 +9,9 @@ open VersionControlService.Git.TextDiff.TextDiffProtocol
 module TextDiffPool = VersionControlService.Git.TextDiff.TextDiffPool
 
 type GitTextDiffOptions = {
-    /// Called on a diff Open until it returns a pool. None fails that Open with diff_worker_failed, and the
-    /// next Open asks again. The session keeps the first pool it gets, so the host returns the same pool on
-    /// every call. A host with a ready pool passes `fun () -> Promise.lift (Some pool)`.
+    /// The session calls this on a diff Open until it returns a pool. None fails that Open with
+    /// diff_worker_failed, and the next Open asks again. The session keeps the first pool it gets, so the host
+    /// must return the same pool on every call. A host with a ready pool passes `fun () -> Promise.lift (Some pool)`.
     Pool: unit -> JS.Promise<TextDiffPool.TextDiffPool option>
     /// The window that started the call. The host maps its operation id to that window.
     WindowOwnerOf: OperationContext -> string
@@ -22,7 +22,7 @@ let private sessionClosed () =
 
 /// Forwards to the pool that the first successful Open acquires. Handles stay bound to the window owner that
 /// opened them, so a call from another window finds no session and a Close from another window changes
-/// nothing. Until a pool is acquired, handle calls report a closed session. The second value closes the
+/// nothing. Until an Open acquires a pool, handle calls report a closed session. The second value closes the
 /// pool's diffs of the workspace and does nothing without an acquired pool.
 let create
     (options: GitTextDiffOptions)
