@@ -72,13 +72,6 @@ type GitBranchRefDto = {
     IsTracking: bool
 }
 
-type GitDiffViewDataDto = {
-    Path: string
-    PreviousContent: string
-    CurrentContent: string
-    WordDiffText: string
-}
-
 type GitMergeConflictViewDataDto = {
     Path: string
     MergeConflictContent: string

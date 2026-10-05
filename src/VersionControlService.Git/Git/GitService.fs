@@ -1012,33 +1012,6 @@ let private readWorkingTreeTextIfPresent
                     return Ok(Some(bufferToUtf8String buffer))
     }
 
-let private readHeadTextIfAvailable
-    (git: ISimpleGit)
-    (requestedPath: string)
-    (headPath: string)
-    : JS.Promise<GitResult<string option>> =
-    promise {
-        match ensureValidPathspec requestedPath, ensureValidPathspec headPath with
-        | Error validationError, _
-        | _, Error validationError -> return errorResult validationError
-        | Ok safeRequestedPath, Ok safeHeadPath ->
-            if isExplicitlyUnsupportedPath safeRequestedPath || isExplicitlyUnsupportedPath safeHeadPath then
-                return unsupportedGitContentResult safeRequestedPath
-            else
-                let! result =
-                    GitInternals.runSimpleGit
-                        toFailure
-                        (fun currentGit -> currentGit.showBuffer(U2.Case1 $"HEAD:{safeHeadPath}"))
-                        git
-
-                match result with
-                | Ok buffer when isLikelyBinaryBuffer buffer ->
-                    return unsupportedGitContentResult safeRequestedPath
-                | Ok buffer -> return Ok(Some(bufferToUtf8String buffer))
-                | Error failure when isMissingHeadContentFailure failure -> return Ok None
-                | Error failure -> return Error failure
-}
-
 let private quoteDiffPathToken (pathPrefix: string) (path: string option) =
     match path with
     | None -> "/dev/null"
@@ -1046,29 +1019,6 @@ let private quoteDiffPathToken (pathPrefix: string) (path: string option) =
         let escapedPath = value.Replace("\\", "\\\\").Replace("\"", "\\\"")
 
         $"\"{pathPrefix}{escapedPath}\""
-
-let private buildSyntheticWordDiffText (previousPath: string option) (currentPath: string option) =
-    let previousToken = quoteDiffPathToken "a/" previousPath
-    let currentToken = quoteDiffPathToken "b/" currentPath
-
-    [
-        yield $"diff --git {previousToken} {currentToken}"
-
-        match previousPath, currentPath with
-        | None, Some _ -> yield "new file mode 100644"
-        | Some _, None -> yield "deleted file mode 100644"
-        | _ -> ()
-
-        match previousPath, currentPath with
-        | Some oldPath, Some currentPath when not (String.Equals(oldPath, currentPath, StringComparison.Ordinal)) ->
-            yield $"rename from {oldPath}"
-            yield $"rename to {currentPath}"
-        | _ -> ()
-
-        yield $"--- {previousToken}"
-        yield $"+++ {currentToken}"
-    ]
-    |> String.concat "\n"
 
 let private reconcileTrackingBranchForCheckout
     (remoteName: string)
@@ -1836,104 +1786,6 @@ let getDiffSummary (arcPath: string) : JS.Promise<GitResult<GitDiffSummaryDto>> 
                 Deletions = diff.deletions
             }
         })
-
-/// Loads previous/current text plus word-diff metadata for diff views.
-/// Binary or explicitly unsupported files return the unsupported-content sentinel.
-let getDiffViewData (arcPath: string) (requestedPath: string) : JS.Promise<GitResult<GitDiffViewDataDto>> = promise {
-    match ensureValidPathspec requestedPath with
-    | Error validationError -> return errorResult validationError
-    | Ok safeRequestedPath ->
-        if isExplicitlyUnsupportedPath safeRequestedPath then
-            return unsupportedGitContentResult safeRequestedPath
-        else
-            return!
-                withLocalGit
-                    arcPath
-                    (fun git -> promise {
-                        let! status = git.status ()
-                        let statusDto = toStatusDto arcPath status
-
-                        match
-                            statusDto.Files
-                            |> Array.tryFind (fun file ->
-                                String.Equals(file.Path, safeRequestedPath, StringComparison.Ordinal)
-                            )
-                        with
-                        | None -> return abortGitPromise $"No git status entry found for '{safeRequestedPath}'."
-                        | Some fileStatus ->
-                            let previousPathCandidate =
-                                fileStatus.OriginalPath |> Option.defaultValue safeRequestedPath
-
-                            let! previousContentResult =
-                                readHeadTextIfAvailable git safeRequestedPath previousPathCandidate
-
-                            let previousContent =
-                                match previousContentResult with
-                                | Ok content -> content
-                                | Error failure -> abortGitPromise failure.Message
-
-                            let! currentContentResult = readWorkingTreeTextIfPresent arcPath safeRequestedPath
-
-                            let currentContent =
-                                match currentContentResult with
-                                | Ok content -> content
-                                | Error failure -> abortGitPromise failure.Message
-
-                            if previousContent.IsNone && currentContent.IsNone then
-                                return abortGitPromise $"No git diff content found for '{safeRequestedPath}'."
-                            else
-                                let diffPaths = [|
-                                    yield safeRequestedPath
-
-                                    match fileStatus.OriginalPath with
-                                    | Some originalPath when
-                                        not (String.Equals(originalPath, safeRequestedPath, StringComparison.Ordinal))
-                                        ->
-                                        yield originalPath
-                                    | _ -> ()
-                                |]
-                                let literalDiffPaths = literalPathspecsFromStrings diffPaths
-
-                                let! wordDiffResult =
-                                    runSimpleGit
-                                        (fun currentGit ->
-                                            currentGit.raw [|
-                                                "diff"
-                                                "--word-diff=porcelain"
-                                                "-U0"
-                                                "--find-renames"
-                                                "HEAD"
-                                                "--"
-                                                yield! literalDiffPaths
-                                            |]
-                                        )
-                                        git
-
-                                let previousPathForMetadata =
-                                    if previousContent.IsSome then
-                                        Some previousPathCandidate
-                                    else
-                                        None
-
-                                let currentPathForMetadata =
-                                    if currentContent.IsSome then
-                                        Some safeRequestedPath
-                                    else
-                                        None
-
-                                let wordDiffText =
-                                    match wordDiffResult with
-                                    | Ok diff when not (String.IsNullOrWhiteSpace diff) -> diff
-                                    | _ -> buildSyntheticWordDiffText previousPathForMetadata currentPathForMetadata
-
-                                return {
-                                    Path = safeRequestedPath
-                                    PreviousContent = previousContent |> Option.defaultValue ""
-                                    CurrentContent = currentContent |> Option.defaultValue ""
-                                    WordDiffText = wordDiffText
-                                }
-                    })
-}
 
 /// Loads the current conflicted file content for the merge-resolution view.
 let getMergeConflictViewData
