@@ -1568,6 +1568,35 @@ module TextDiffSessionCases =
             do! session.Close()
             return ()
         }
+        "pending previews skip the low half of a surrogate pair at the snippet start", fun () -> async {
+            // The emoji pairs occupy the even and odd units up to 3000, so the snippet start 3001 - 256 = 2745 is a low surrogate.
+            let prefix = String.replicate 1_500 "\U0001F600" + "z"
+            let previous = sourceSpec (Encoding.UTF8.GetBytes(prefix + "a" + String('z', 2_000) + "\n"))
+            let current = sourceSpec (Encoding.UTF8.GetBytes(prefix + "b" + String('z', 2_000) + String('q', 50_000) + "\n"))
+            let limits = { Limits.defaults with MaxUnits = 4; RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 }
+            let! session = openSession (config 0 1_000 1_024 8 limits) previous current
+            let! initial = session.FirstPage(fun () -> false)
+            let! preview, _ =
+                findPendingPreview session
+                    (fun (value: PendingPreview) ->
+                        match value.Previous, value.Current with
+                        | PendingSide.Snippet oldLine, PendingSide.Snippet newLine -> oldLine.Text.Length > 0 && newLine.Text.Length > 0 && value.Mismatch.IsSome
+                        | _ -> false)
+                    initial
+            match preview with
+            | Some value ->
+                match value.Previous, value.Current, value.Mismatch with
+                | PendingSide.Snippet oldLine, PendingSide.Snippet newLine, Some marker ->
+                    Check.equal 3_001L marker.PreviousOffsetUtf16 "The marker names the changed unit after the emoji."
+                    for line in [ oldLine; newLine ] do
+                        Check.equal 2_746L line.OffsetUtf16 "The snippet starts at the next whole pair."
+                        Check.true' (Char.IsHighSurrogate line.Text[0]) "The snippet starts with the high half of a pair."
+                        Check.true' (line.Text.IndexOf '�' < 0) "The snippet has no replacement character."
+                | _ -> failwith "The mismatching line pair has snippets and a marker."
+            | None -> failwith "The mismatching emoji line has no preview."
+            do! session.Close()
+            return ()
+        }
         "deadline returns a partial page after finalized rows", fun () -> async {
             let previous = Array.init 80 (fun index -> { Text = (if index = 0 then "old" else "same-" + string index); Ending = LineEnding.LF })
             let current = Array.init 80 (fun index -> { Text = (if index = 0 then "new" else "same-" + string index); Ending = LineEnding.LF })

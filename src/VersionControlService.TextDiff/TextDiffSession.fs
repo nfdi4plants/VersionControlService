@@ -1525,8 +1525,8 @@ type TextDiffSession internal (
     }
 
     // Page construction.
-    // Stage one reads row text and builds the parts without changing any state. Stage two records
-    // the page and removes the consumed queue content.
+    // Stage one reads row text and builds the parts. It advances nextGapSequence and keeps pendingLongPair
+    // between calls. Stage two records the page in the journal and removes the consumed queue content.
 
     let rowBuffer = Array.zeroCreate<byte> 32_768
     let pageReadBuffer = Array.zeroCreate<byte> (1024 * 1024)
@@ -1913,14 +1913,16 @@ type TextDiffSession internal (
             if cursor.Captured > 0 && cursor.Units[cursor.Captured - 1] >= 0xD800us && cursor.Units[cursor.Captured - 1] <= 0xDBFFus then
                 cursor.Captured - 1
             else cursor.Captured
-        let text = Native.utf16Decode cursor.Units captured
+        // A snippet that starts inside a surrogate pair begins with the pair's low half, which decodes to U+FFFD.
+        let skipped = if offset > 0L && captured > 0 && cursor.Units[0] >= 0xDC00us && cursor.Units[0] <= 0xDFFFus then 1 else 0
+        let text = Native.utf16Decode (if skipped = 0 then cursor.Units else Array.sub cursor.Units skipped (captured - skipped)) (captured - skipped)
         let endState =
             match view.TotalUtf16 with
             | Some total when offset + int64 captured < total -> SnippetEnd.Truncated
             | Some _ -> if view.EndOfFile then SnippetEnd.EndOfFile else SnippetEnd.LineEnd
             | None when cursor.DecodedUnits > requestedOffset + float captured || cursor.BytePosition < min view.ContentEnd view.KnownEnd -> SnippetEnd.Truncated
             | None -> SnippetEnd.MoreTextPending
-        return { Line = view.Number; OffsetUtf16 = offset; Text = text; End = endState }
+        return { Line = view.Number; OffsetUtf16 = offset + int64 skipped; Text = text; End = endState }
     }
 
     let boundPendingPreview (value: PendingPreview option) =
