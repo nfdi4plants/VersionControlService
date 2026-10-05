@@ -871,6 +871,11 @@ let disposeDiffPool (pool: DiffPool.TextDiffPool) =
     pool.Dispose() |> Async.AwaitPromise
 ```
 
+The default `TempRoot` is `os.tmpdir()`. On Linux that folder is shared between users and
+often held in memory, so a Linux host sets `TempRoot` to a per-user folder such as
+`$XDG_CACHE_HOME/<app>` (default `~/.cache/<app>`), and the supervisor creates its
+`text-diff` folder there for the current user only.
+
 The session calls `GitTextDiffOptions.Pool` on a diff `Open` until it returns a pool, and
 keeps the first pool it gets, so the function returns the same pool on every call. When it
 returns `None`, that `Open` fails with `diff_worker_failed` and the next `Open` asks again.
@@ -1312,6 +1317,16 @@ the object materialization, storage policy and maintenance services report their
 dependency status while core Git work carries on. `CheckDependencies` reports all of that at
 runtime, which is why it is worth calling before the user gets far. lakeFS needs no local
 tool and talks to its server over HTTP.
+
+On macOS, `/usr/bin/git` is the Apple Git of the Xcode command line tools. Older releases of the
+tools ship a Git below 2.42 (for example 2.39.5, Apple Git-154). A user who gets the version
+warning installs Git 2.42 or newer with Homebrew (`brew install git`) or MacPorts
+(`sudo port install git`). Git LFS is not part of the command line tools, so macOS users
+install it the same way. An app started from the Finder or
+the Dock gets the PATH `/usr/bin:/bin:/usr/sbin:/sbin`, and only when `git lfs --version` fails
+with the inherited PATH does the provider put `/opt/homebrew/bin`, `/usr/local/bin`,
+`/opt/local/bin`, `/usr/bin` and `/bin`, in that order, in front of the inherited entries. A Git
+in one of the first three folders then wins over `/usr/bin/git`.
 
 Two files in this repository are worth copying from.
 `tests/VersionControlService.PackageConsumer/Program.fs` is the smallest composition root
