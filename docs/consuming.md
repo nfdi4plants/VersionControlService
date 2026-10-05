@@ -559,9 +559,9 @@ The Git provider supplies a working service only when the host passes a worker p
 functions that take no `GitSessionOptions` (`GitWorkspaceSession.createFactory`,
 `createFactoryWithCredentials`, `createSession`, `createSessionWithCredentials` and the
 other credential variants) leave `session.TextDiff` as `None`. Only
-`createFactoryWithOptions` and `createSessionWithOptions` with a `TextDiffPool` in
-`GitSessionOptions.TextDiff` create a session with a working text diff. Options without a
-pool produce a service whose `Open` fails with `diff_worker_failed`. See
+`createFactoryWithOptions` and `createSessionWithOptions` with `GitTextDiffOptions` in
+`GitSessionOptions.TextDiff` create a session with a working text diff. Options without
+`TextDiff` produce a service whose `Open` fails with `diff_worker_failed`. See
 [hosting in Node or Electron](#hosting-in-node-or-electron).
 
 The examples use `valueOf` to keep result handling short. A real caller should match
@@ -827,9 +827,9 @@ match NodeWorkerThreads.parentPort with
 | None -> invalidOp "This file must run in a worker thread."
 ```
 
-Create the supervisor and pool in the Node host. Pass the pool through `GitSessionOptions`
-when creating the Git factory. `WindowOwnerOf` should return a stable id for the window
-that owns each call.
+Create the supervisor and pool in the Node host. Pass a function that returns the pool
+through `GitSessionOptions` when creating the Git factory. `WindowOwnerOf` should return a
+stable id for the window that owns each call.
 
 ```fsharp
 module GitDiffHost
@@ -855,7 +855,7 @@ let createGitFactory workerScriptPath credentials revisionIdentity revisionPolic
     pool.Prewarm()
 
     let textDiffOptions: GitDiffService.GitTextDiffOptions = {
-        Pool = pool
+        Pool = fun () -> Promise.lift (Some pool)
         WindowOwnerOf = fun _ -> "main"
     }
     let options: GitSessions.GitSessionOptions = {
@@ -870,6 +870,12 @@ let createGitFactory workerScriptPath credentials revisionIdentity revisionPolic
 let disposeDiffPool (pool: DiffPool.TextDiffPool) =
     pool.Dispose() |> Async.AwaitPromise
 ```
+
+The session calls `GitTextDiffOptions.Pool` on a diff `Open` until it returns a pool, and
+keeps the first pool it gets, so the function returns the same pool on every call. When it
+returns `None`, that `Open` fails with `diff_worker_failed` and the next `Open` asks again.
+A host that sets the pool up on demand returns `None` while the setup has failed and retries
+it on the next call.
 
 Call `Prewarm` during startup and await `disposeDiffPool` when the app quits. The pool
 disposes its supervisor during shutdown.

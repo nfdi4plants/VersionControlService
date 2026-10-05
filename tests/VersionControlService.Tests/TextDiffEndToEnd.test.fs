@@ -199,13 +199,16 @@ let private bindingFor (repository: string) : WorkspaceBinding =
 
 let private mediaDirectory (repository: string) = NodePath.join [| repository; ".git"; "lfs"; "objects" |]
 
-let private createSession (pool: TextDiffPool.TextDiffPool) (repository: string) =
+let private createSessionWithPoolGetter
+    (getPool: unit -> JS.Promise<TextDiffPool.TextDiffPool option>)
+    (repository: string)
+    =
     GitWorkspaceSession.createSessionWithOptions
         {
             Hooks = GitWorkspaceSession.GitSessionHooks.none
             TextDiff =
                 Some {
-                    Pool = pool
+                    Pool = getPool
                     WindowOwnerOf = fun context ->
                         if context.OperationId.Contains("window-b", StringComparison.Ordinal) then "window-b" else "window-a"
                 }
@@ -214,6 +217,9 @@ let private createSession (pool: TextDiffPool.TextDiffPool) (repository: string)
         GitCredentialStrategy.anonymousIdentity
         RevisionPolicyStrategy.automatic
         (bindingFor repository)
+
+let private createSession (pool: TextDiffPool.TextDiffPool) (repository: string) =
+    createSessionWithPoolGetter (fun () -> Promise.lift (Some pool)) repository
 
 let private serviceFor (session: WorkspaceSession) =
     match session.TextDiff with
@@ -1473,6 +1479,43 @@ Vitest.describe (
                     |> Async.StartAsPromise
                 assertClosedCode "read after Close" later
                 do! session.Close() |> Async.StartAsPromise
+            }
+        )
+
+        Vitest.test (
+            "fails an Open while the pool getter answers None and succeeds on the next Open",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! repository = newRepository ()
+                do! commitText repository "late-pool.txt" "before
+"
+                do! writeText (NodePath.join [| repository; "late-pool.txt" |]) "after
+"
+                let calls = ref 0
+
+                let getPool () =
+                    calls.Value <- calls.Value + 1
+                    Promise.lift (if calls.Value = 1 then None else Some (currentFixture ()).Pool)
+
+                let session = createSessionWithPoolGetter getPool repository
+                let service = serviceFor session
+                let mutable failure = None
+
+                try
+                    let! firstOpen = service.Open (openRequest "late-pool.txt") (context "late-pool-open-one") |> Async.StartAsPromise
+
+                    match firstOpen with
+                    | Failed failed -> Vitest.expect(failed.Code).toBe TextDiffFailureCodes.WorkerFailed
+                    | Succeeded _
+                    | PartiallySucceeded _ -> failwith "The first Open succeeded without a pool."
+
+                    let! _, _, _, first = openedWithFirstPage service (openRequest "late-pool.txt") "late-pool-open-two"
+                    Vitest.expect(pageHasChange first).toBe true
+                    Vitest.expect(calls.Value).toBe 2
+                with error ->
+                    failure <- Some error
+
+                do! closeSession session failure
             }
         )
 

@@ -5835,21 +5835,16 @@ let private createSessionWithTextDiff
                     }
         }
 
-    let textDiff =
+    let textDiff, closeTextDiff =
         match textDiffMode with
-        | NoTextDiff -> None
-        | WithoutPool -> Some GitTextDiffService.unavailable
+        | NoTextDiff -> None, fun () -> async.Return ()
+        | WithoutPool -> Some GitTextDiffService.unavailable, fun () -> async.Return ()
         | WithPool options ->
-            Some(
+            let service, closeWorkspace =
                 GitTextDiffService.create options state.RepoPath (fun context ->
                     resolveSessionMediaDirectory state (fun arguments -> runGit state.Hooks state.RepoPath arguments None context))
-            )
 
-    let closeTextDiff =
-        match textDiffMode with
-        | WithPool options -> fun () -> options.Pool.CloseWorkspace state.RepoPath |> Async.AwaitPromise
-        | NoTextDiff
-        | WithoutPool -> fun () -> async.Return ()
+            Some service, closeWorkspace
 
     {
         WorkspaceSession.createCoreOnly descriptor core with
@@ -5958,8 +5953,8 @@ let createSessionWithCredentialsIdentityAndPolicy
     : WorkspaceSession =
     createSessionWithTextDiff hooks NoTextDiff credentials revisionIdentity revisionPolicy binding
 
-/// Session with a text diff service. The service uses the worker pool from the options, or fails Open with
-/// diff_worker_failed when the options carry no pool.
+/// Session with a text diff service. The service asks the options for the worker pool on each Open until it
+/// gets one. Options with no TextDiff produce a service whose Open fails with diff_worker_failed.
 let createSessionWithOptions
     (options: GitSessionOptions)
     (credentials: GitCredentialStrategy.GitCredentialStrategy)

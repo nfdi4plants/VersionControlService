@@ -631,7 +631,8 @@ Vitest.describe (
                             supervisor
                     )
 
-                let session = sessionWith (Some { Pool = pool; WindowOwnerOf = fun _ -> "window-1" }) repository
+                let session =
+                    sessionWith (Some { Pool = (fun () -> Promise.lift (Some pool)); WindowOwnerOf = fun _ -> "window-1" }) repository
                 let mutable failure = None
 
                 try
