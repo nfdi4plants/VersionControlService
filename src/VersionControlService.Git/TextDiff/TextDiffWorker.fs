@@ -907,6 +907,7 @@ let private createStep (worker: Worker) (host: WorkerHost) (request: OpenDiffReq
                     sleep SpoolPollMs
                 else
                     host.Yield() |> Async.AwaitPromise
+            CheckWrite = fun () -> async.Return None
             CreateTempStore =
                 fun name -> async {
                     let! store =

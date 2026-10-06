@@ -3660,7 +3660,7 @@ type TextDiffSession internal (
             releasePendingLineRead expired
             pendingLineReads.Remove expired.Attempt |> ignore
 
-    let runExpansionRequestCore (pending: PendingExpansion) sequence (cancel: unit -> bool) = async {
+    let runExpansionRequestWork (pending: PendingExpansion) sequence (cancel: unit -> bool) = async {
         let meter = Meter.create host.Clock config.Limits
         let mutable finished = pending.Search.IsNone && pending.PreviousLines.IsSome && pending.CurrentLines.IsSome
         let mutable waiting = false
@@ -3702,6 +3702,13 @@ type TextDiffSession internal (
                 return EngineResult.Ok(Resumable.Scanning(progress (), continuation, preview))
     }
 
+    let runExpansionRequestCore (pending: PendingExpansion) sequence (cancel: unit -> bool) = async {
+        let! refusal = host.CheckWrite()
+        match refusal with
+        | Some(code, message) -> return EngineResult.Failed(code, message, None)
+        | None -> return! runExpansionRequestWork pending sequence cancel
+    }
+
     let runExpansionRequest (pending: PendingExpansion) sequence (cancel: unit -> bool) = async {
         try return! runExpansionRequestCore pending sequence cancel
         finally
@@ -3710,7 +3717,7 @@ type TextDiffSession internal (
             | None -> ()
     }
 
-    let runLineReadRequestCore (pending: PendingLineRead) sequence (cancel: unit -> bool) = async {
+    let runLineReadRequestWork (pending: PendingLineRead) sequence (cancel: unit -> bool) = async {
         let meter = Meter.create host.Clock config.Limits
         let mutable finished = false
         let mutable failed = false
@@ -3764,6 +3771,13 @@ type TextDiffSession internal (
                 do! journal.Append(journalKey 2L sequence, JournalValue.Line result)
                 pending.RequestSequence <- nextSequence
                 return EngineResult.Ok(Resumable.Scanning(progress (), continuation, preview))
+    }
+
+    let runLineReadRequestCore (pending: PendingLineRead) sequence (cancel: unit -> bool) = async {
+        let! refusal = host.CheckWrite()
+        match refusal with
+        | Some(code, message) -> return EngineResult.Failed(code, message, None)
+        | None -> return! runLineReadRequestWork pending sequence cancel
     }
 
     let runLineReadRequest (pending: PendingLineRead) sequence (cancel: unit -> bool) = async {
@@ -3839,7 +3853,11 @@ type TextDiffSession internal (
         | Some(JournalValue.Page value) -> return! presentPageResult (EngineResult.Ok value)
         | Some _ -> return failMismatch ()
         | None when sequence <> requestSequence -> return failMismatch ()
-        | None -> return! advance sequence cancel
+        | None ->
+            let! refusal = host.CheckWrite()
+            match refusal with
+            | Some(code, message) -> return EngineResult.Failed(code, message, None)
+            | None -> return! advance sequence cancel
     }
 
     member _.Progress = progress ()

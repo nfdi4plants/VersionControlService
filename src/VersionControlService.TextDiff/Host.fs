@@ -30,6 +30,10 @@ type EngineHost = {
     Clock: IClock
     Yield: unit -> Async<unit>
     CreateTempStore: string -> Async<ITempStore>
+    /// The session calls this right before a request does work that can write to its temp stores. None means go
+    /// ahead. Some(code, message) refuses the request with that failure. Answers read from the journal are never
+    /// checked. A refusal leaves the session as it was, so the same request can be sent again later.
+    CheckWrite: unit -> Async<(string * string) option>
 }
 
 /// Fable's async trampoline breaks long bind chains with a setTimeout(0) hop, and on Windows each hop waits for

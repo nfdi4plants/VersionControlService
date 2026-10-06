@@ -11,6 +11,7 @@
     <Compile Include="TextDiffStreamingCases.fs" />
     <Compile Include="TextDiffResyncCases.fs" />
     <Compile Include="RowLinesCases.fs" />
+    <Compile Include="MemoryStoreCases.fs" />
     <Compile Include="FnvReferenceTests.fs" />
     <Compile Include="Main.fs" />
   </ItemGroup>

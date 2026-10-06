@@ -678,6 +678,53 @@ module TextDiffSessionCases =
                 current.InsertRange(start, fresh edit amount)
         previous, current.ToArray()
 
+    let private refusalCode = "write_refused"
+
+    let private refusalConfig () =
+        let limits = { Limits.defaults with MaxUnits = 20_000; RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 }
+        config 1 2 64 64 limits
+
+    /// Forty lines with three edits, so the diff has several pages and hidden gaps. Line 0 is long enough for a
+    /// sliced line read. Every call returns fresh sources.
+    let private refusalSources () =
+        let previous =
+            Array.init 40 (fun index ->
+                { Text = (if index = 0 then String('a', 10_000) else "line-" + string index); Ending = LineEnding.LF })
+        let current =
+            previous |> Array.mapi (fun index line ->
+                if index = 3 || index = 20 || index = 36 then { line with Text = "changed-" + string index } else line)
+        sourceSpec (encodeLines previous), sourceSpec (encodeLines current)
+
+    /// A session whose host refuses writes while the returned flag is set. The group counts the stored bytes.
+    let private openRefusable sessionConfig = async {
+        let refuse = ref false
+        let group = MemoryStoreGroup Host.memoryCapBytes
+        let plain = Host.createInMemory (ManualClock 0.0 :> IClock)
+        let host = {
+            plain with
+                CreateTempStore = fun _ -> async.Return(group.Create "test")
+                CheckWrite = fun () -> async.Return(if refuse.Value then Some(refusalCode, "The host refuses writes.") else None)
+        }
+        let previous, current = refusalSources ()
+        let! session = TextDiffSession.create host (Ledger()) sessionConfig (fun _ -> 1) previous current
+        return session, refuse, group
+    }
+
+    /// A session that never refuses. It uses the same config as the refusing session, so ids and pages are
+    /// comparable.
+    let private openReference sessionConfig = async {
+        let previous, current = refusalSources ()
+        return! openSession sessionConfig previous current
+    }
+
+    let private checkRefused (result: EngineResult<'T>) =
+        match result with
+        | EngineResult.Failed(code, _, None) -> Check.equal refusalCode code "The refusal passes the host code through."
+        | other -> failwith $"The refused request returned {other}."
+
+    let private firstHiddenGap pages =
+        allParts pages |> Array.pick (function DiffPart.HiddenEqual gap when gap.PreviousRange.Count >= 8L -> Some gap | _ -> None)
+
     let cases: (string * (unit -> Async<unit>)) list = [
         "a small edit between context rows keeps every line on both sides", fun () -> async {
             let build edited =
@@ -1610,7 +1657,8 @@ module TextDiffSessionCases =
                     previousSource.AdvanceBy 64L
                     currentSource.AdvanceBy 64L
                 }
-                CreateTempStore = fun _ -> async.Return(MemoryTempStore() :> ITempStore)
+                CreateTempStore = fun _ -> async.Return((MemoryStoreGroup Host.memoryCapBytes).Create "test")
+                CheckWrite = fun () -> async.Return None
             }
             let limits = { Limits.defaults with RequestMs = 10.0; QuantumMs = 1_000.0 }
             let sessionConfig = config 100 1_000 64 1_000 limits
@@ -1733,7 +1781,8 @@ module TextDiffSessionCases =
                     previousSource.AdvanceBy 8L
                     currentSource.AdvanceBy 8L
                 }
-                CreateTempStore = fun _ -> async.Return(MemoryTempStore() :> ITempStore)
+                CreateTempStore = fun _ -> async.Return((MemoryStoreGroup Host.memoryCapBytes).Create "test")
+                CheckWrite = fun () -> async.Return None
             }
             let previousBase = sourceSpec previousBytes
             let currentBase = sourceSpec currentBytes
@@ -2870,5 +2919,91 @@ module TextDiffSessionCases =
                     yield "ende\n"
                 ]
             do! checkMixedRows "decode-compare-long" None memorySource (build "Graefin" false) (build "Gräfin" true)
+        }
+        "a refused page request changes nothing and the same request succeeds later", fun () -> async {
+            let sessionConfig = refusalConfig ()
+            let! reference = openReference sessionConfig
+            let! expected = readAll reference (fun () -> false)
+            let! session, refuse, group = openRefusable sessionConfig
+            let! firstResult = session.FirstPage(fun () -> false)
+            let firstPage =
+                match unwrap firstResult with
+                | Resumable.Ready page -> page
+                | Resumable.Scanning _ -> failwith "The first page request returned no finalized row."
+            Check.true' firstPage.NextCursor.IsSome "The first page has a continuation."
+            refuse.Value <- true
+            let stored = group.StoredBytes
+            let! refused = session.ReadPage firstPage.NextCursor.Value (fun () -> false)
+            checkRefused refused
+            Check.equal stored group.StoredBytes "A refused page request writes nothing."
+            let! replay = session.ReplayPage firstPage.PageId
+            Check.equal firstPage.PageId (unwrap replay).PageId "A recorded page replays while writes are refused."
+            refuse.Value <- false
+            let! pages = readAll session (fun () -> false)
+            Check.true' (Unchecked.equals expected pages) "The pages after a refusal equal an uninterrupted run."
+            do! session.Close()
+            do! reference.Close()
+        }
+        "a refused expansion succeeds with the same parts when sent again", fun () -> async {
+            let sessionConfig = refusalConfig ()
+            let! reference = openReference sessionConfig
+            let! referencePages = readAll reference (fun () -> false)
+            let gap = firstHiddenGap referencePages
+            let! referenceInitial = reference.Expand(gap.GapId, true, 4, None, fun () -> false)
+            let! expected = resolveExpansion reference gap.GapId true 4 referenceInitial
+            let! session, refuse, group = openRefusable sessionConfig
+            let! pages = readAll session (fun () -> false)
+            refuse.Value <- true
+            let stored = group.StoredBytes
+            let! refused = session.Expand(gap.GapId, true, 4, None, fun () -> false)
+            checkRefused refused
+            Check.equal stored group.StoredBytes "A refused expansion writes nothing."
+            refuse.Value <- false
+            let! retryInitial = session.Expand(gap.GapId, true, 4, None, fun () -> false)
+            let! retried = resolveExpansion session gap.GapId true 4 retryInitial
+            Check.true' (Unchecked.equals expected retried) "The retried expansion returns the parts of an uninterrupted run."
+            Check.true' (Unchecked.equals referencePages pages) "The pages are unaffected."
+            do! session.Close()
+            do! reference.Close()
+        }
+        "a refused line read succeeds with the same slice when sent again", fun () -> async {
+            let sessionConfig = refusalConfig ()
+            let! reference = openReference sessionConfig
+            let! _ = readAll reference (fun () -> false)
+            let! referenceInitial = reference.ReadLine(DiffSide.Previous, 0L, 0L, 9_000, None, fun () -> false)
+            let! expected = resolveLine reference DiffSide.Previous 0L 0L 9_000 referenceInitial
+            let! session, refuse, group = openRefusable sessionConfig
+            let! _ = readAll session (fun () -> false)
+            refuse.Value <- true
+            let stored = group.StoredBytes
+            let! refused = session.ReadLine(DiffSide.Previous, 0L, 0L, 9_000, None, fun () -> false)
+            checkRefused refused
+            Check.equal stored group.StoredBytes "A refused line read writes nothing."
+            refuse.Value <- false
+            let! retryInitial = session.ReadLine(DiffSide.Previous, 0L, 0L, 9_000, None, fun () -> false)
+            let! retried = resolveLine session DiffSide.Previous 0L 0L 9_000 retryInitial
+            Check.true' (Unchecked.equals expected retried) "The retried line read returns the slice of an uninterrupted run."
+            do! session.Close()
+            do! reference.Close()
+        }
+        "recorded answers are served while writes are refused", fun () -> async {
+            let! session, refuse, _ = openRefusable (refusalConfig ())
+            let! pages = readAll session (fun () -> false)
+            let cursor = pages[0].NextCursor.Value
+            let gap = firstHiddenGap pages
+            let! initial = session.Expand(gap.GapId, true, 4, None, fun () -> false)
+            let! committed = resolveExpansion session gap.GapId true 4 initial
+            refuse.Value <- true
+            let! recordedPage = session.ReadPage cursor (fun () -> false)
+            match unwrap recordedPage with
+            | Resumable.Ready page ->
+                Check.equal pages[1].PageId page.PageId "A cursor that was answered returns its recorded page."
+                Check.true' (Unchecked.equals pages[1].Parts page.Parts) "The recorded page keeps its parts."
+            | Resumable.Scanning _ -> failwith "The recorded page request returned a continuation."
+            let! recordedExpansion = session.Expand(gap.GapId, true, 4, None, fun () -> false)
+            match unwrap recordedExpansion with
+            | Resumable.Ready parts -> Check.true' (Unchecked.equals committed parts) "A committed gap returns its recorded parts."
+            | Resumable.Scanning _ -> failwith "The recorded expansion returned a continuation."
+            do! session.Close()
         }
     ]

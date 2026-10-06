@@ -338,7 +338,7 @@ module TextDiffEngineCases =
             return ()
         }
         "memory temporary storage supports append, positional writes, reads, and disposal", fun () -> async {
-            let store = MemoryTempStore() :> ITempStore
+            let store = (MemoryStoreGroup Host.memoryCapBytes).Create "test"
             let first = bytes [ 1; 2; 3 ]
             let second = bytes [ 8; 9 ]
             let! start = store.Append first 0 first.Length

@@ -7,6 +7,7 @@
   <ItemGroup>
     <Compile Include="Native.fs" />
     <Compile Include="Host.fs" />
+    <Compile Include="MemoryStore.fs" />
     <Compile Include="Meter.fs" />
     <Compile Include="Myers.fs" />
     <Compile Include="Hash.fs" />
