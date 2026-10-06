@@ -61,6 +61,7 @@ let private openRequest: OpenDiffRequest = {
     CurrentEncoding = None
     ContextLines = 3
     Continuation = None
+    Storage = DiffStoragePolicy.PreferDisk(0L, 67108864L)
 }
 
 let private owner: TextDiffOwner = { WorkspaceRoot = "workspace"; LfsMediaDirectory = "media"; WindowOwner = "window-1" }
@@ -82,7 +83,7 @@ let private testHandler (control: Control) =
             Promise.lift (
                 Ok(
                     Resumable.Ready(
-                        OpenDiffResult.Opened({ Id = $"worker-{host.RequestId}"; Version = "1" }, sourceInfo, sourceInfo, Resumable.Ready page)
+                        OpenDiffResult.Opened({ Id = $"worker-{host.RequestId}"; Version = "1" }, sourceInfo, sourceInfo, Resumable.Ready page, DiffStorage.OnDisk)
                     )
                 )
             )
@@ -126,7 +127,7 @@ type private PreparationHandler(issueFirstOpen: bool) =
     let opened (host: WorkerHost) =
         Ok(
             Resumable.Ready(
-                OpenDiffResult.Opened({ Id = host.WorkerId; Version = "1" }, sourceInfo, sourceInfo, Resumable.Ready page)
+                OpenDiffResult.Opened({ Id = host.WorkerId; Version = "1" }, sourceInfo, sourceInfo, Resumable.Ready page, DiffStorage.OnDisk)
             )
         )
 
@@ -326,7 +327,7 @@ let private openedHandle (result: OperationResult<Resumable<OpenDiffResult>>) =
     match result with
     | Succeeded outcome ->
         match outcome.Value with
-        | Resumable.Ready(OpenDiffResult.Opened(handle, _, _, _)) -> handle
+        | Resumable.Ready(OpenDiffResult.Opened(handle, _, _, _, _)) -> handle
         | other -> failwith $"Unexpected open result %A{other}"
     | other -> failwith $"Open failed: %A{other}"
 
@@ -336,7 +337,7 @@ let private failureCode (result: OperationResult<'T>) =
     | other -> failwith $"Expected a failure, got %A{other}"
 
 let private readPage (service: TextDiffService) (handle: DiffHandle) cursor operationContext =
-    service.ReadPage { Handle = handle; Cursor = cursor } operationContext |> run
+    service.ReadPage { Handle = handle; Cursor = cursor; Background = false } operationContext |> run
 
 let private waitUntil (condition: unit -> bool) = promise {
     let started = performanceNow ()
@@ -440,7 +441,7 @@ let private verifyLateOpenCleanup (lateAnswer: string -> int -> TextDiffMessage)
         let secondRequestId, secondGeneration = (openRequestsOf other)[0]
 
         let opened id =
-            Resumable.Ready(OpenDiffResult.Opened({ DiffHandle.Id = id; Version = "1" }, sourceInfo, sourceInfo, Resumable.Ready page))
+            Resumable.Ready(OpenDiffResult.Opened({ DiffHandle.Id = id; Version = "1" }, sourceInfo, sourceInfo, Resumable.Ready page, DiffStorage.OnDisk))
 
         first.Inject(encode (TextDiffMessage.Result(thirdRequestId, thirdGeneration, ResultPayload.Open(opened "third-worker-handle"))))
         other.Inject(encode (TextDiffMessage.Result(secondRequestId, secondGeneration, ResultPayload.Open(opened "second-worker-handle"))))
@@ -523,7 +524,7 @@ Vitest.describe (
                         transport :> ITextDiffWorkerTransport
 
                 let opened id =
-                    Resumable.Ready(OpenDiffResult.Opened({ DiffHandle.Id = id; Version = "1" }, sourceInfo, sourceInfo, Resumable.Ready page))
+                    Resumable.Ready(OpenDiffResult.Opened({ DiffHandle.Id = id; Version = "1" }, sourceInfo, sourceInfo, Resumable.Ready page, DiffStorage.OnDisk))
 
                 withPool 1 factory (fun pool -> promise {
                     let service = pool.Service owner
@@ -938,7 +939,7 @@ Vitest.describe (
             TestOptions(timeout = 60000),
             fun () ->
                 let workerHandle = { DiffHandle.Id = "late-worker-handle"; Version = "1" }
-                let lateOpen = Resumable.Ready(OpenDiffResult.Opened(workerHandle, sourceInfo, sourceInfo, Resumable.Ready page))
+                let lateOpen = Resumable.Ready(OpenDiffResult.Opened(workerHandle, sourceInfo, sourceInfo, Resumable.Ready page, DiffStorage.OnDisk))
                 verifyLateOpenCleanup
                     (fun requestId generation -> TextDiffMessage.Result(requestId, generation, ResultPayload.Open lateOpen))
                     (Some(Some workerHandle))
@@ -1003,7 +1004,7 @@ Vitest.describe (
                         |> Seq.last
 
                     let workerHandle = { DiffHandle.Id = "progress-worker-handle"; Version = "1" }
-                    let opened = Resumable.Ready(OpenDiffResult.Opened(workerHandle, sourceInfo, sourceInfo, Resumable.Ready page))
+                    let opened = Resumable.Ready(OpenDiffResult.Opened(workerHandle, sourceInfo, sourceInfo, Resumable.Ready page, DiffStorage.OnDisk))
                     transport.Inject(encode (TextDiffMessage.Result(openRequestId, openGeneration, ResultPayload.Open opened)))
                     let! openedResult = opening.Result
                     let handle = openedHandle openedResult
@@ -1078,7 +1079,7 @@ Vitest.describe (
                     let workerHandle = { DiffHandle.Id = "worker-handle"; Version = "1" }
                     let opened =
                         Resumable.Ready(
-                            OpenDiffResult.Opened(workerHandle, sourceInfo, sourceInfo, Resumable.Ready page)
+                            OpenDiffResult.Opened(workerHandle, sourceInfo, sourceInfo, Resumable.Ready page, DiffStorage.OnDisk)
                         )
 
                     transport.Inject(encode (TextDiffMessage.Result(openRequestId, openGeneration, ResultPayload.Open opened)))

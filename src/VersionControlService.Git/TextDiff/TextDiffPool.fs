@@ -290,7 +290,7 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
                     forgetSession session
 
                     match result with
-                    | Ok(ResultPayload.Open(Resumable.Ready(OpenDiffResult.Opened(handle, _, _, _)))) ->
+                    | Ok(ResultPayload.Open(Resumable.Ready(OpenDiffResult.Opened(handle, _, _, _, _)))) ->
                         observe (closeAndRelease true session (Some handle)) ignore ignore
                     | Ok(ResultPayload.Open(Resumable.Scanning _)) -> observe (closeAndRelease true session None) ignore ignore
                     | _ -> observe (releaseSlot session) ignore ignore
@@ -636,7 +636,7 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
             match reply with
             | Ok(ResultPayload.Open result) when session.Phase = Opening ->
                 match result with
-                | Resumable.Ready(OpenDiffResult.Opened(handle, previous, current, first)) ->
+                | Resumable.Ready(OpenDiffResult.Opened(handle, previous, current, first, storage)) ->
                     removeRequestAffinity ()
                     let publicHandle = { DiffHandle.Id = $"h{nextHandleId}"; Version = handle.Version }
                     nextHandleId <- nextHandleId + 1
@@ -646,7 +646,7 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
                     handles[publicHandle.Id] <- session
                     // The Open settled while the session was still Opening, so a waiting Open could not evict it yet.
                     if admissions.Count > 0 then pumpAdmission ()
-                    return OperationResult.succeeded (Resumable.Ready(OpenDiffResult.Opened(publicHandle, previous, current, first)))
+                    return OperationResult.succeeded (Resumable.Ready(OpenDiffResult.Opened(publicHandle, previous, current, first, storage)))
                 | Resumable.Scanning(_, continuation, _) ->
                     session.Phase <- Scanning
                     session.Continuation <- Some continuation

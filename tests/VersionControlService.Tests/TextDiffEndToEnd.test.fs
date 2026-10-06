@@ -236,6 +236,7 @@ let private openRequest relativePath = {
     CurrentEncoding = None
     ContextLines = 3
     Continuation = None
+    Storage = DiffStoragePolicy.PreferDisk(0L, 67108864L)
 }
 
 let private operationValue operationName result =
@@ -260,7 +261,7 @@ let private readPageReady
 
         while value.IsNone do
             let! result =
-                service.ReadPage { Handle = handle; Cursor = cursor } (context operationName)
+                service.ReadPage { Handle = handle; Cursor = cursor; Background = false } (context operationName)
                 |> Async.StartAsPromise
 
             let outcome = operationValue "ReadPage" result
@@ -276,9 +277,9 @@ let private openedWithFirstPage service request operationName = promise {
     let! opened = openUntilReady service request operationName
 
     match opened with
-    | OpenDiffResult.Opened(handle, previous, current, Resumable.Ready first) ->
+    | OpenDiffResult.Opened(handle, previous, current, Resumable.Ready first, _) ->
         return handle, previous, current, first
-    | OpenDiffResult.Opened(handle, previous, current, Resumable.Scanning(_, continuation, _)) ->
+    | OpenDiffResult.Opened(handle, previous, current, Resumable.Scanning(_, continuation, _), _) ->
         let! first = readPageReady service handle continuation (operationName + "-first-page")
         return handle, previous, current, first
     | OpenDiffResult.NotDiffable blocker ->
@@ -394,7 +395,7 @@ let private pageHasChange page = page.Parts |> Array.exists partHasChange
 
 let private expectOpened result =
     match result with
-    | OpenDiffResult.Opened(handle, previous, current, first) -> handle, previous, current, first
+    | OpenDiffResult.Opened(handle, previous, current, first, _) -> handle, previous, current, first
     | OpenDiffResult.NotDiffable blocker -> failwith $"Expected Opened, got %A{blocker}."
 
 type private Fixture = {
@@ -1318,7 +1319,7 @@ Vitest.describe (
 
                 while failure.IsNone && cursor.IsSome do
                     let! result =
-                        service.ReadPage { Handle = handle; Cursor = cursor.Value } (context "after-umlaut-page")
+                        service.ReadPage { Handle = handle; Cursor = cursor.Value; Background = false } (context "after-umlaut-page")
                         |> Async.StartAsPromise
 
                     match result with
@@ -1410,7 +1411,7 @@ Vitest.describe (
 
                     do! writeText (NodePath.join [| repository; "changing.txt" |]) (current + "changed-after-open\n")
                     let! result =
-                        service.ReadPage { Handle = handle; Cursor = cursor } (context "source-change-read-window-a")
+                        service.ReadPage { Handle = handle; Cursor = cursor; Background = false } (context "source-change-read-window-a")
                         |> Async.StartAsPromise
 
                     match result with
@@ -1442,12 +1443,12 @@ Vitest.describe (
 
                 let! firstRead =
                     service.ReadPage
-                        { Handle = firstHandle; Cursor = first.NextCursor |> Option.defaultValue "closed" }
+                        { Handle = firstHandle; Cursor = first.NextCursor |> Option.defaultValue "closed"; Background = false }
                         (context "close-all-window-a-read")
                     |> Async.StartAsPromise
                 let! secondRead =
                     service.ReadPage
-                        { Handle = secondHandle; Cursor = "closed" }
+                        { Handle = secondHandle; Cursor = "closed"; Background = false }
                         (context "close-all-window-b-read")
                     |> Async.StartAsPromise
                 assertClosedCode "first handle" firstRead
@@ -1474,7 +1475,7 @@ Vitest.describe (
 
                 let! later =
                     service.ReadPage
-                        { Handle = handle; Cursor = first.NextCursor |> Option.defaultValue "closed" }
+                        { Handle = handle; Cursor = first.NextCursor |> Option.defaultValue "closed"; Background = false }
                         (context "idempotent-read")
                     |> Async.StartAsPromise
                 assertClosedCode "read after Close" later
@@ -1543,7 +1544,7 @@ Vitest.describe (
                 let eventStart = (currentFixture ()).Events.Count
                 let started = performanceNow ()
                 let reading =
-                    service.ReadPage { Handle = handle; Cursor = cursor } (context "terminate-read-window-a")
+                    service.ReadPage { Handle = handle; Cursor = cursor; Background = false } (context "terminate-read-window-a")
                     |> Async.StartAsPromise
 
                 do! delay 25

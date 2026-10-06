@@ -215,6 +215,7 @@ let private openRequest (value: string) : OpenDiffRequest = {
     CurrentEncoding = None
     ContextLines = 3
     Continuation = None
+    Storage = DiffStoragePolicy.PreferDisk(0L, 67108864L)
 }
 
 let private gitProviderId =

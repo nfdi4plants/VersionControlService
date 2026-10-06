@@ -104,6 +104,7 @@ let private openRequest: OpenDiffRequest = {
     CurrentEncoding = None
     ContextLines = 3
     Continuation = None
+    Storage = DiffStoragePolicy.PreferDisk(0L, 67108864L)
 }
 
 let private waitFor (description: string) (timeoutMs: float) (condition: unit -> JS.Promise<bool>) = promise {
@@ -281,7 +282,7 @@ Vitest.describe (
                     let! opened = TextDiffTestSupport.openUntilReady service openRequest (OperationContext.detached "open")
 
                     match opened with
-                    | OpenDiffResult.Opened(handle, _, _, _) ->
+                    | OpenDiffResult.Opened(handle, _, _, _, _) ->
                         transports[0].Post(
                             encode(
                                 TextDiffMessage.Request(

@@ -147,6 +147,7 @@ let private blockers = [|
     DiffBlocker.EncodingRequired(DiffSide.Current, token, [| { Encoding = "windows-1252"; Preview = "caf\u00e9" }; { Encoding = "latin1"; Preview = "" } |])
     DiffBlocker.NotRegularFile DiffSide.Current
     DiffBlocker.ProviderUnsupported
+    DiffBlocker.BlobTooLargeForMemory(DiffSide.Previous, large, Int64.MaxValue)
 |]
 
 let private openRequest: OpenDiffRequest = {
@@ -157,6 +158,7 @@ let private openRequest: OpenDiffRequest = {
     CurrentEncoding = Some "utf-16le"
     ContextLines = 3
     Continuation = Some "continue-1"
+    Storage = DiffStoragePolicy.PreferDisk(large, Int64.MaxValue)
 }
 
 let private owner: TextDiffOwner = {
@@ -227,13 +229,15 @@ Vitest.describe (
                                     PreviousEncoding = None
                                     CurrentEncoding = None
                                     Continuation = None
+                                    Storage = DiffStoragePolicy.MemoryOnly large
                             },
                             owner
                         )
                     )
                 )
 
-                expectRoundTrip (TextDiffMessage.Request("r3", 2, RequestBody.ReadPage { Handle = handle; Cursor = "cursor" }))
+                expectRoundTrip (TextDiffMessage.Request("r3", 2, RequestBody.ReadPage { Handle = handle; Cursor = "cursor"; Background = false }))
+                expectRoundTrip (TextDiffMessage.Request("r3", 2, RequestBody.ReadPage { Handle = handle; Cursor = "cursor"; Background = true }))
                 expectRoundTrip (TextDiffMessage.Request("r4", 2, RequestBody.ReplayPage { Handle = handle; PageId = "page-1" }))
 
                 for continuation in [ Some "c"; None ] do
@@ -272,14 +276,22 @@ Vitest.describe (
                 let result payload = TextDiffMessage.Result("r1", 3, payload)
 
                 expectRoundTrip (
-                    result (ResultPayload.Open(Resumable.Ready(OpenDiffResult.Opened(handle, sourceInfo, absentInfo, Resumable.Ready page))))
+                    result (ResultPayload.Open(Resumable.Ready(OpenDiffResult.Opened(handle, sourceInfo, absentInfo, Resumable.Ready page, DiffStorage.OnDisk))))
+                )
+
+                expectRoundTrip (
+                    result (
+                        ResultPayload.Open(
+                            Resumable.Ready(OpenDiffResult.Opened(handle, sourceInfo, absentInfo, Resumable.Ready page, DiffStorage.InMemory large))
+                        )
+                    )
                 )
 
                 for pending in pendingPreviews do
                     expectRoundTrip (
                         result (
                             ResultPayload.Open(
-                                Resumable.Ready(OpenDiffResult.Opened(handle, absentInfo, sourceInfo, Resumable.Scanning(progress, "c", Some pending)))
+                                Resumable.Ready(OpenDiffResult.Opened(handle, absentInfo, sourceInfo, Resumable.Scanning(progress, "c", Some pending), DiffStorage.OnDisk))
                             )
                         )
                     )
@@ -393,18 +405,18 @@ Vitest.describe (
                 Vitest.expect(decodeMessage (box "text") |> Result.isError).toBe true
                 expectRejected "[]"
                 expectRejected """{"t":"shutdown"}"""
-                expectRejected """{"v":3,"t":"shutdown"}"""
-                expectRejected """{"v":2,"t":"unknown"}"""
-                expectRejected """{"v":2,"t":"cancel","requestId":"r1"}"""
-                expectRejected """{"v":2,"t":"cancel","requestId":"r1","generation":1.5}"""
-                expectRejected """{"v":2,"t":"progress","requestId":"r1","generation":1,"validatedBytes":5,"totalBytes":"5"}"""
-                expectRejected """{"v":2,"t":"progress","requestId":"r1","generation":1,"validatedBytes":"9223372036854775808","totalBytes":"5"}"""
-                expectRejected """{"v":2,"t":"progress","requestId":"r1","generation":1,"validatedBytes":"1e3","totalBytes":"5"}"""
-                expectRejected """{"v":2,"t":"result","requestId":"r1","generation":1,"payload":{"tag":"Missing"}}"""
-                expectRejected """{"v":2,"t":"spawnResult","callId":1,"outcome":{"tag":"Short","exitCode":0,"stdout":"not base64!","stderr":"","error":null}}"""
+                expectRejected """{"v":4,"t":"shutdown"}"""
+                expectRejected """{"v":3,"t":"unknown"}"""
+                expectRejected """{"v":3,"t":"cancel","requestId":"r1"}"""
+                expectRejected """{"v":3,"t":"cancel","requestId":"r1","generation":1.5}"""
+                expectRejected """{"v":3,"t":"progress","requestId":"r1","generation":1,"validatedBytes":5,"totalBytes":"5"}"""
+                expectRejected """{"v":3,"t":"progress","requestId":"r1","generation":1,"validatedBytes":"9223372036854775808","totalBytes":"5"}"""
+                expectRejected """{"v":3,"t":"progress","requestId":"r1","generation":1,"validatedBytes":"1e3","totalBytes":"5"}"""
+                expectRejected """{"v":3,"t":"result","requestId":"r1","generation":1,"payload":{"tag":"Missing"}}"""
+                expectRejected """{"v":3,"t":"spawnResult","callId":1,"outcome":{"tag":"Short","exitCode":0,"stdout":"not base64!","stderr":"","error":null}}"""
 
                 expectRejected
-                    """{"v":2,"t":"open","requestId":"r1","generation":1,"request":{"path":"../escape","previousPath":null,"preparation":null,"previousEncoding":null,"currentEncoding":null,"contextLines":3,"continuation":null},"owner":{"workspaceRoot":"r","lfsMediaDirectory":"m","windowOwner":"k"}}"""
+                    """{"v":3,"t":"open","requestId":"r1","generation":1,"request":{"path":"../escape","previousPath":null,"preparation":null,"previousEncoding":null,"currentEncoding":null,"contextLines":3,"continuation":null,"storage":{"tag":"PreferDisk","minimumFreeBytes":"0","memoryBudgetBytes":"67108864"}},"owner":{"workspaceRoot":"r","lfsMediaDirectory":"m","windowOwner":"k"}}"""
         )
 
         Vitest.test (
@@ -412,7 +424,7 @@ Vitest.describe (
             fun () ->
                 let reason = "\u00e4\u20ac\U0001D11E"
                 let message = encode (TextDiffMessage.WorkerFailure reason)
-                let expected = Encoding.UTF8.GetBytes("""{"v":2,"t":"workerFailure","reason":""}""" + reason).Length
+                let expected = Encoding.UTF8.GetBytes("""{"v":3,"t":"workerFailure","reason":""}""" + reason).Length
                 Vitest.expect(envelopeByteLength message).toBe expected
                 Vitest.expect(expected).toBe (39 + 9)
         )

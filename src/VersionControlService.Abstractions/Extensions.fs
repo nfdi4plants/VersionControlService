@@ -128,7 +128,16 @@ type EncodingCandidate = { Encoding: string; Preview: string }
 /// Binds the selected path, optional previous path, pinned commit, and source identities.
 type PreparationToken = { Id: string }
 
-/// Input for opening a pinned diff session with optional encoding choices and continuation.
+/// How a diff session keeps its temporary data.
+[<RequireQualifiedAccess>]
+type DiffStoragePolicy =
+    /// The session uses temporary files unless the free space of the temp drive is below `minimumFreeBytes`.
+    /// In that case it keeps its data in memory within `memoryBudgetBytes`.
+    | PreferDisk of minimumFreeBytes: int64 * memoryBudgetBytes: int64
+    /// The session always keeps its data in memory within `memoryBudgetBytes`.
+    | MemoryOnly of memoryBudgetBytes: int64
+
+/// Input for opening a pinned diff session with optional encoding choices, continuation, and storage policy.
 type OpenDiffRequest = {
     Path: RepositoryPath
     PreviousPath: RepositoryPath option
@@ -137,6 +146,7 @@ type OpenDiffRequest = {
     CurrentEncoding: string option
     ContextLines: int
     Continuation: string option
+    Storage: DiffStoragePolicy
 }
 
 /// Reason the provider cannot produce a diff for the requested sources.
@@ -147,15 +157,37 @@ type DiffBlocker =
     | EncodingRequired of DiffSide * PreparationToken * EncodingCandidate[]
     | NotRegularFile of DiffSide
     | ProviderUnsupported
+    /// The session keeps its data in memory and the committed Git blob of this side is larger than the session
+    /// may read into memory.
+    | BlobTooLargeForMemory of DiffSide * blobBytes: int64 * limitBytes: int64
 
-/// The result of opening a diff, with either a blocker or a new handle and initial page.
+/// Where an opened session keeps its temporary data.
+[<RequireQualifiedAccess>]
+type DiffStorage =
+    /// The session keeps its data in temporary files.
+    | OnDisk
+    /// The session keeps its data in memory within `budgetBytes`.
+    | InMemory of budgetBytes: int64
+
+/// The result of opening a diff, with either a blocker or a new handle, the storage of the session and an initial page.
 [<RequireQualifiedAccess>]
 type OpenDiffResult =
     | NotDiffable of DiffBlocker
-    | Opened of DiffHandle * previous: DiffSourceInfo * current: DiffSourceInfo * first: Resumable<DiffPage>
+    | Opened of
+        DiffHandle *
+        previous: DiffSourceInfo *
+        current: DiffSourceInfo *
+        first: Resumable<DiffPage> *
+        storage: DiffStorage
 
 /// Request the page that follows a cursor in an opened diff.
-type ReadPageRequest = { Handle: DiffHandle; Cursor: string }
+/// `Background` is true for a read the host makes ahead of the user.
+/// A memory-mode session stops such reads earlier than user reads.
+type ReadPageRequest = {
+    Handle: DiffHandle
+    Cursor: string
+    Background: bool
+}
 
 /// Request a previously returned page again by its identifier.
 type ReplayPageRequest = { Handle: DiffHandle; PageId: string }
@@ -238,6 +270,16 @@ module TextDiffFailureCodes =
     /// The continuation was produced for a request with different fields.
     [<Literal>]
     let ContinuationMismatch = "continuation_mismatch"
+
+    /// The free space of the temp drive is below the minimum that the request named, so the session refused work
+    /// that would write. The session stays usable, recorded answers keep working, and a later request can succeed.
+    [<Literal>]
+    let TempSpaceLow = "diff_temp_space_low"
+
+    /// The memory-mode session reached its budget, or 3/4 of it for a background read. The session stays usable
+    /// and recorded answers keep working.
+    [<Literal>]
+    let MemoryBudgetReached = "diff_memory_budget_reached"
 
 /// Materialization state of one lazily-hydrated object.
 type ObjectState = {

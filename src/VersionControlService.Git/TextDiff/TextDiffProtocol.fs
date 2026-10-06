@@ -12,7 +12,7 @@ module NodeProcess = VersionControlService.Runtime.Node.Process
 module Supervisor = VersionControlService.Git.TextDiff.TextDiffSupervisor
 
 [<Literal>]
-let ProtocolVersion = 2
+let ProtocolVersion = 3
 
 /// The workspace and window that own a diff session. Handles of one owner are never usable by another.
 /// The worker reads LFS objects from the media directory.
@@ -627,6 +627,12 @@ let private encodeBlocker (blocker: DiffBlocker) =
         ]
     | DiffBlocker.NotRegularFile side -> tagged "NotRegularFile" [ "side" ==> encodeSide side ]
     | DiffBlocker.ProviderUnsupported -> tagged "ProviderUnsupported" []
+    | DiffBlocker.BlobTooLargeForMemory(side, blobBytes, limitBytes) ->
+        tagged "BlobTooLargeForMemory" [
+            "side" ==> encodeSide side
+            "blobBytes" ==> encodeInt64 blobBytes
+            "limitBytes" ==> encodeInt64 limitBytes
+        ]
 
 let private decodeBlocker: Decoder<DiffBlocker> =
     decodeTagged (function
@@ -651,17 +657,59 @@ let private decodeBlocker: Decoder<DiffBlocker> =
             })
         | "NotRegularFile" -> Some(fun value -> field "side" decodeSide value |> Result.map DiffBlocker.NotRegularFile)
         | "ProviderUnsupported" -> Some(fun _ -> Ok DiffBlocker.ProviderUnsupported)
+        | "BlobTooLargeForMemory" ->
+            Some(fun value -> decode {
+                let! side = field "side" decodeSide value
+                let! blobBytes = field "blobBytes" decodeInt64 value
+                let! limitBytes = field "limitBytes" decodeInt64 value
+                return DiffBlocker.BlobTooLargeForMemory(side, blobBytes, limitBytes)
+            })
+        | _ -> None)
+
+let private encodeStorage (storage: DiffStorage) =
+    match storage with
+    | DiffStorage.OnDisk -> tagged "OnDisk" []
+    | DiffStorage.InMemory budgetBytes -> tagged "InMemory" [ "budgetBytes" ==> encodeInt64 budgetBytes ]
+
+let private decodeStorage: Decoder<DiffStorage> =
+    decodeTagged (function
+        | "OnDisk" -> Some(fun _ -> Ok DiffStorage.OnDisk)
+        | "InMemory" -> Some(fun value -> field "budgetBytes" decodeInt64 value |> Result.map DiffStorage.InMemory)
+        | _ -> None)
+
+let private encodeStoragePolicy (policy: DiffStoragePolicy) =
+    match policy with
+    | DiffStoragePolicy.PreferDisk(minimumFreeBytes, memoryBudgetBytes) ->
+        tagged "PreferDisk" [
+            "minimumFreeBytes" ==> encodeInt64 minimumFreeBytes
+            "memoryBudgetBytes" ==> encodeInt64 memoryBudgetBytes
+        ]
+    | DiffStoragePolicy.MemoryOnly memoryBudgetBytes ->
+        tagged "MemoryOnly" [ "memoryBudgetBytes" ==> encodeInt64 memoryBudgetBytes ]
+
+let private decodeStoragePolicy: Decoder<DiffStoragePolicy> =
+    decodeTagged (function
+        | "PreferDisk" ->
+            Some(fun value -> decode {
+                let! minimumFreeBytes = field "minimumFreeBytes" decodeInt64 value
+                let! memoryBudgetBytes = field "memoryBudgetBytes" decodeInt64 value
+                return DiffStoragePolicy.PreferDisk(minimumFreeBytes, memoryBudgetBytes)
+            })
+        | "MemoryOnly" ->
+            Some(fun value ->
+                field "memoryBudgetBytes" decodeInt64 value |> Result.map DiffStoragePolicy.MemoryOnly)
         | _ -> None)
 
 let private encodeOpenResult (result: OpenDiffResult) =
     match result with
     | OpenDiffResult.NotDiffable blocker -> tagged "NotDiffable" [ "blocker" ==> encodeBlocker blocker ]
-    | OpenDiffResult.Opened(handle, previous, current, first) ->
+    | OpenDiffResult.Opened(handle, previous, current, first, storage) ->
         tagged "Opened" [
             "handle" ==> encodeHandle handle
             "previous" ==> encodeSourceInfo previous
             "current" ==> encodeSourceInfo current
             "first" ==> encodeResumable encodePage first
+            "storage" ==> encodeStorage storage
         ]
 
 let private decodeOpenResult: Decoder<OpenDiffResult> =
@@ -673,7 +721,8 @@ let private decodeOpenResult: Decoder<OpenDiffResult> =
                 let! previous = field "previous" decodeSourceInfo value
                 let! current = field "current" decodeSourceInfo value
                 let! first = field "first" (decodeResumable decodePage) value
-                return OpenDiffResult.Opened(handle, previous, current, first)
+                let! storage = field "storage" decodeStorage value
+                return OpenDiffResult.Opened(handle, previous, current, first, storage)
             })
         | _ -> None)
 
@@ -810,6 +859,7 @@ let private encodeOpenRequest (request: OpenDiffRequest) =
         "currentEncoding" ==> encodeOption box request.CurrentEncoding
         "contextLines" ==> request.ContextLines
         "continuation" ==> encodeOption box request.Continuation
+        "storage" ==> encodeStoragePolicy request.Storage
     ]
 
 let private decodeOpenRequest: Decoder<OpenDiffRequest> =
@@ -821,6 +871,7 @@ let private decodeOpenRequest: Decoder<OpenDiffRequest> =
         let! currentEncoding = field "currentEncoding" (decodeOption decodeString) value
         let! contextLines = field "contextLines" decodeInt value
         let! continuation = field "continuation" (decodeOption decodeString) value
+        let! storage = field "storage" decodeStoragePolicy value
 
         return {
             Path = path
@@ -830,6 +881,7 @@ let private decodeOpenRequest: Decoder<OpenDiffRequest> =
             CurrentEncoding = currentEncoding
             ContextLines = contextLines
             Continuation = continuation
+            Storage = storage
         }
     })
 
@@ -857,7 +909,15 @@ let private encodeRequestBody (body: RequestBody) : string * (string * obj) list
     match body with
     | RequestBody.Open(request, owner) -> "open", [ "request" ==> encodeOpenRequest request; "owner" ==> encodeOwner owner ]
     | RequestBody.ReadPage request ->
-        "readPage", [ "request" ==> createObj [ "handle" ==> encodeHandle request.Handle; "cursor" ==> request.Cursor ] ]
+        "readPage",
+        [
+            "request"
+            ==> createObj [
+                "handle" ==> encodeHandle request.Handle
+                "cursor" ==> request.Cursor
+                "background" ==> request.Background
+            ]
+        ]
     | RequestBody.ReplayPage request ->
         "replayPage", [ "request" ==> createObj [ "handle" ==> encodeHandle request.Handle; "pageId" ==> request.PageId ] ]
     | RequestBody.Expand request ->
@@ -904,7 +964,13 @@ let private decodeRequestBody (messageType: string) (value: obj) : Result<Reques
                 requestField value (fun request -> decode {
                     let! handle = field "handle" decodeHandle request
                     let! cursor = field "cursor" decodeString request
-                    return { ReadPageRequest.Handle = handle; Cursor = cursor }
+                    let! background = field "background" decodeBool request
+
+                    return {
+                        ReadPageRequest.Handle = handle
+                        Cursor = cursor
+                        Background = background
+                    }
                 })
 
             return RequestBody.ReadPage request

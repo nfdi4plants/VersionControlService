@@ -845,7 +845,7 @@ let private envelopeReserve (host: WorkerHost) (handle: DiffHandle) (previous: D
         Pending = Some pending
     }
 
-    let payload = ResultPayload.Open(Resumable.Ready(OpenDiffResult.Opened(handle, previous, current, Resumable.Ready page)))
+    let payload = ResultPayload.Open(Resumable.Ready(OpenDiffResult.Opened(handle, previous, current, Resumable.Ready page, DiffStorage.OnDisk)))
 
     envelopeByteLength (encode (TextDiffMessage.Result(host.RequestId, host.Generation, payload)))
     + EnvelopeSlack
@@ -935,7 +935,7 @@ let private createStep (worker: Worker) (host: WorkerHost) (request: OpenDiffReq
             slot.Phase <- SlotPhase.Active
             slot.Continuation <- None
             request.Preparation |> Option.iter worker.Tokens.Release
-            return Finish(Ok(Resumable.Ready(OpenDiffResult.Opened(handle, previousInfo, currentInfo, page))))
+            return Finish(Ok(Resumable.Ready(OpenDiffResult.Opened(handle, previousInfo, currentInfo, page, DiffStorage.OnDisk))))
         | EngineResult.Failed(code, _, Some detail) when code = TextDiffFailureCodes.ContentNotText ->
             let! candidates = encodingMismatchCandidates worker slot detail
 
