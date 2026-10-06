@@ -218,7 +218,8 @@ module internal AlignerLimits =
 /// source bytes through NeedRun and ResolveRun. The work is split into steps that each do a bounded amount
 /// of work and charge the meter. A window of a source that is still growing, or a window that can still grow,
 /// passes false for longRunAnchors, because a long equal run in repetitive text can line up at a shifted
-/// position until more lines arrive.
+/// position until more lines arrive. With longRunAnchors or directPass set, a gap that exhausts its step
+/// budget can also be paired by position.
 type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap: int, sameSourceLength: bool, longRunAnchors: bool, directPass: bool, ledger: Ledger) =
     let stepChunk = 512
     let lookaheadLines = 2
@@ -1137,16 +1138,15 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
                     else finishGap ()
                     AlignStep.Running
                 | MyersStepResult.StepLimitExceeded ->
-                    // The gap exceeded its step budget. Rejected spans inside it return as anchors. Without any, the aligner
-                    // reports its lines as one unaligned region.
+                    // The gap exceeded its step budget. Rejected spans inside it return as anchors. Without any, a window that
+                    // cannot grow pairs the gap line by line when both sides have the same line count and at most one line in
+                    // eight differs at the same offset. Otherwise the gap becomes one unaligned region.
                     if directActive then
                         directActive <- false
                         directExceeded <- true
                         stepper <- None
                         phase <- AlignPhase.MiddleStart
                     elif not (tryBeginRestore meter) then
-                        // A window that cannot grow gets no new lines that could split this gap. When both sides of the gap
-                        // have the same line count, the gap is paired line by line if nearly every line matches at the same offset.
                         if (longRunAnchors || directPass) && gapPreviousEnd - gapPreviousStart = gapCurrentEnd - gapCurrentStart then
                             beginGapPositional ()
                         else emitUnaligned ()

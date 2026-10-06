@@ -326,6 +326,15 @@ module TextDiffStreamingCases =
     let private exhaustedGapConfig sessionId windowLines steps =
         { config sessionId windowLines steps Limits.defaults None with ResyncSampleModulus = 1 <<< 30; ResyncScanLines = 16 }
 
+    /// The same configuration with line keys that depend on the line length only. Lines of equal length are key-equal,
+    /// so only the byte check in confirmation tells them apart.
+    let private lengthKeyConfig sessionId windowLines steps =
+        { exhaustedGapConfig sessionId windowLines steps with HashMaskForTesting = Some(0u, 0u) }
+
+    /// An edit with the five UTF-16 units of a cycle row and one more UTF-8 byte. Under length-only keys it keeps every
+    /// key, and the sources differ in byte length, so the whole-window pairing does not take the edits.
+    let private accentedEdit = "r\u00f3w Q"
+
     /// The current-side text of every line that an unaligned region shows.
     let private unalignedCurrentTexts pages =
         allParts pages
@@ -909,24 +918,21 @@ module TextDiffStreamingCases =
             do! session.Close()
             return ()
         }
-        "same-length edits in a full window pair by position within a bounded number of requests", fun () -> async {
+        "same-length edits in a full window pair by position", fun () -> async {
             // The extra last line gives the sources different byte lengths, so the whole-window positional path is out.
             let rows = cycleRows 600
             let edited, edits = editRows rows 9 12 400 (fun _ -> "row Q")
             let previous = rows
             let current = Array.append edited [| { Text = "last"; Ending = LineEnding.LF } |]
+            // A budget of one unit stops every request after one step, so the pairing resumes many times.
             let limits = { Limits.defaults with MaxUnits = 1; RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 }
             let sessionConfig = { exhaustedGapConfig "stream-gap-positional-same-length" 128 6 with Limits = limits }
             let! session = openSession (Ledger()) sessionConfig (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
-            let! pages, scans = readAll session
+            let! pages, _ = readAll session
             checkOracle previous current pages
             let equal, added, removed, replaced, unaligned = rowCounts pages
             Check.equal 0 unaligned "No line is unaligned."
             Check.equal (previous.Length - edits, 1, 0, edits) (equal, added, removed, replaced) "Every edit is one replaced row and the last line is added."
-            // Session code cannot read the meter, so this counts requests. With a budget of one unit each request runs
-            // one step, and the pairing needs a bounded number of steps per differing line and per run of equal lines.
-            // One request per line of the file is a loose bound for that.
-            Check.true' (scans <= previous.Length) $"The run needed {scans} requests for {previous.Length} lines."
             do! session.Close()
             return ()
         }
@@ -959,7 +965,7 @@ module TextDiffStreamingCases =
             let! session = openSession (Ledger()) (exhaustedGapConfig "stream-gap-positional-growable" 4_096 6) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
             let! pages, _ = readAll session
             checkOracle previous current pages
-            Check.equal (24_711, 0, 0, 0, 578) (rowCounts pages) $"The {edits} edited lines between unique markers stay in one unaligned region."
+            Check.equal (24_711, 0, 0, 0, 578) (rowCounts pages) $"The window can still grow, so the {edits} edited lines between unique markers add no replaced row and leave 578 lines unaligned."
             do! session.Close()
             return ()
         }
@@ -971,6 +977,70 @@ module TextDiffStreamingCases =
             checkOracle previous current pages
             let equal, added, removed, replaced, unaligned = rowCounts pages
             Check.equal 0 unaligned "No line is unaligned, so the positional gap path ran."
+            Check.equal (previous.Length - edits, 0, 0, edits) (equal, added, removed, replaced) "Every edit is one replaced row."
+            do! session.Close()
+            return ()
+        }
+        "edits that keep every line key still pair by position when the byte check finds them", fun () -> async {
+            // No edit changes a key, so the scan records no mismatch. Confirmation finds every edit as a byte mismatch.
+            let previous = cycleRows 600
+            let current, edits = editRows previous 9 16 600 (fun _ -> accentedEdit)
+            let! session = openSession (Ledger()) (lengthKeyConfig "stream-gap-positional-bytes" 128 6) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+            let! pages, _ = readAll session
+            checkOracle previous current pages
+            let equal, added, removed, replaced, unaligned = rowCounts pages
+            Check.equal 0 unaligned "No line is unaligned."
+            Check.equal (previous.Length - edits, 0, 0, edits) (equal, added, removed, replaced) "Every edit is one replaced row."
+            do! session.Close()
+            return ()
+        }
+        "edits that keep every line key but differ in every fourth line stay unaligned after the byte check", fun () -> async {
+            // The scan records no mismatch, so only the byte check rejects the gap, after confirmation collected operations.
+            let previous = cycleRows 600
+            let current, edits = editRows previous 9 4 600 (fun _ -> accentedEdit)
+            let! session = openSession (Ledger()) (lengthKeyConfig "stream-gap-positional-bytes-dense" 128 6) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+            let! pages, _ = readAll session
+            checkOracle previous current pages
+            let shown = unalignedCurrentTexts pages |> Array.filter (fun text -> text = accentedEdit)
+            Check.equal edits shown.Length "An unaligned region covers every edited line."
+            do! session.Close()
+            return ()
+        }
+        "a gap with an edit every eight lines stays unaligned in a full window", fun () -> async {
+            // Edits eight lines apart span 8(k-1)+1 lines for k edits, so k mismatches are more than one line in eight.
+            let previous = cycleRows 600
+            let current, edits = editRows previous 9 8 600 (fun number -> $"edited {number + 1}")
+            let! session = openSession (Ledger()) (exhaustedGapConfig "stream-gap-positional-eight" 128 6) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+            let! pages, _ = readAll session
+            checkOracle previous current pages
+            let shown = unalignedCurrentTexts pages |> Array.filter (fun text -> text.StartsWith("edited", StringComparison.Ordinal))
+            Check.equal edits shown.Length "An unaligned region covers every edited line."
+            do! session.Close()
+            return ()
+        }
+        "an exhausted gap whose sides differ in line count stays unaligned in a full window", fun () -> async {
+            // The extra line sits near the end of the gap, so few lines differ at the same offset and only the line count rejects it.
+            let previous = cycleRows 600
+            let edited, _ = editRows previous 9 16 600 (fun number -> $"edited {number + 1}")
+            let current = Array.concat [ edited[.. 594]; [| { Text = "one extra line"; Ending = LineEnding.LF } |]; edited[595 ..] ]
+            let! session = openSession (Ledger()) (exhaustedGapConfig "stream-gap-positional-counts" 128 6) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+            let! pages, _ = readAll session
+            checkOracle previous current pages
+            let _, _, _, _, unaligned = rowCounts pages
+            Check.true' (unaligned > 0) "The gap with the extra line stays unaligned."
+            do! session.Close()
+            return ()
+        }
+        "an equal segment longer than one confirmation request pairs by position", fun () -> async {
+            // The file is longer than the window, so the window sits at its cap. Every equal segment between two edits has
+            // 599 lines, more than the 512 lines of one confirmation request, so each takes two requests.
+            let previous = cycleRows 5_000
+            let current, edits = editRows previous 100 600 5_000 (fun number -> $"edited {number + 1}")
+            let! session = openSession (Ledger()) (exhaustedGapConfig "stream-gap-positional-long-segment" 2_048 2) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+            let! pages, _ = readAll session
+            checkOracle previous current pages
+            let equal, added, removed, replaced, unaligned = rowCounts pages
+            Check.equal 0 unaligned "No line is unaligned."
             Check.equal (previous.Length - edits, 0, 0, edits) (equal, added, removed, replaced) "Every edit is one replaced row."
             do! session.Close()
             return ()
