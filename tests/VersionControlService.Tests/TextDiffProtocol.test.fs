@@ -338,7 +338,8 @@ Vitest.describe (
         Vitest.test (
             "round-trips Git child messages",
             fun () ->
-                expectRoundTrip (TextDiffMessage.SpawnShort(1, childOwner, "C:\\repo", [| "cat-file"; "-s"; "abc" |]))
+                expectRoundTrip (TextDiffMessage.SpawnShort(1, childOwner, "C:\\repo", [| "cat-file"; "-s"; "abc" |], None))
+                expectRoundTrip (TextDiffMessage.SpawnShort(3, childOwner, "C:\\repo", [| "cat-file"; "blob"; "abc" |], Some 1048576))
                 expectRoundTrip (TextDiffMessage.SpawnBlob(2, childOwner, "C:\\repo", "abc", "C:\\temp\\blob.spool"))
 
                 let bytes = Encoding.UTF8.GetBytes("line one\n\u00e4\u0000\u00ff")
@@ -405,18 +406,18 @@ Vitest.describe (
                 Vitest.expect(decodeMessage (box "text") |> Result.isError).toBe true
                 expectRejected "[]"
                 expectRejected """{"t":"shutdown"}"""
-                expectRejected """{"v":4,"t":"shutdown"}"""
-                expectRejected """{"v":3,"t":"unknown"}"""
-                expectRejected """{"v":3,"t":"cancel","requestId":"r1"}"""
-                expectRejected """{"v":3,"t":"cancel","requestId":"r1","generation":1.5}"""
-                expectRejected """{"v":3,"t":"progress","requestId":"r1","generation":1,"validatedBytes":5,"totalBytes":"5"}"""
-                expectRejected """{"v":3,"t":"progress","requestId":"r1","generation":1,"validatedBytes":"9223372036854775808","totalBytes":"5"}"""
-                expectRejected """{"v":3,"t":"progress","requestId":"r1","generation":1,"validatedBytes":"1e3","totalBytes":"5"}"""
-                expectRejected """{"v":3,"t":"result","requestId":"r1","generation":1,"payload":{"tag":"Missing"}}"""
-                expectRejected """{"v":3,"t":"spawnResult","callId":1,"outcome":{"tag":"Short","exitCode":0,"stdout":"not base64!","stderr":"","error":null}}"""
+                expectRejected """{"v":5,"t":"shutdown"}"""
+                expectRejected """{"v":4,"t":"unknown"}"""
+                expectRejected """{"v":4,"t":"cancel","requestId":"r1"}"""
+                expectRejected """{"v":4,"t":"cancel","requestId":"r1","generation":1.5}"""
+                expectRejected """{"v":4,"t":"progress","requestId":"r1","generation":1,"validatedBytes":5,"totalBytes":"5"}"""
+                expectRejected """{"v":4,"t":"progress","requestId":"r1","generation":1,"validatedBytes":"9223372036854775808","totalBytes":"5"}"""
+                expectRejected """{"v":4,"t":"progress","requestId":"r1","generation":1,"validatedBytes":"1e3","totalBytes":"5"}"""
+                expectRejected """{"v":4,"t":"result","requestId":"r1","generation":1,"payload":{"tag":"Missing"}}"""
+                expectRejected """{"v":4,"t":"spawnResult","callId":1,"outcome":{"tag":"Short","exitCode":0,"stdout":"not base64!","stderr":"","error":null}}"""
 
                 expectRejected
-                    """{"v":3,"t":"open","requestId":"r1","generation":1,"request":{"path":"../escape","previousPath":null,"preparation":null,"previousEncoding":null,"currentEncoding":null,"contextLines":3,"continuation":null,"storage":{"tag":"PreferDisk","minimumFreeBytes":"0","memoryBudgetBytes":"67108864"}},"owner":{"workspaceRoot":"r","lfsMediaDirectory":"m","windowOwner":"k"}}"""
+                    """{"v":4,"t":"open","requestId":"r1","generation":1,"request":{"path":"../escape","previousPath":null,"preparation":null,"previousEncoding":null,"currentEncoding":null,"contextLines":3,"continuation":null,"storage":{"tag":"PreferDisk","minimumFreeBytes":"0","memoryBudgetBytes":"67108864"}},"owner":{"workspaceRoot":"r","lfsMediaDirectory":"m","windowOwner":"k"}}"""
         )
 
         Vitest.test (
@@ -424,7 +425,7 @@ Vitest.describe (
             fun () ->
                 let reason = "\u00e4\u20ac\U0001D11E"
                 let message = encode (TextDiffMessage.WorkerFailure reason)
-                let expected = Encoding.UTF8.GetBytes("""{"v":3,"t":"workerFailure","reason":""}""" + reason).Length
+                let expected = Encoding.UTF8.GetBytes("""{"v":4,"t":"workerFailure","reason":""}""" + reason).Length
                 Vitest.expect(envelopeByteLength message).toBe expected
                 Vitest.expect(expected).toBe (39 + 9)
         )

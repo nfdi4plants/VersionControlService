@@ -487,6 +487,57 @@ let private assertClosedCode operation result =
     | Succeeded _
     | PartiallySucceeded _ -> failwith $"{operation} unexpectedly succeeded."
 
+/// The files below the worker folders of the supervisor, as worker/file names.
+let private workerFiles (directory: string) : JS.Promise<string[]> = promise {
+    let names = ResizeArray<string>()
+
+    try
+        let! workerNames = NodeFileSystem.readdirAsync directory
+
+        for workerName in workerNames do
+            let! fileNames = NodeFileSystem.readdirAsync (NodePath.join [| directory; workerName |])
+
+            for fileName in fileNames do
+                names.Add(workerName + "/" + fileName)
+    with _ -> ()
+
+    return names.ToArray()
+}
+
+let private filesAddedSince (before: string[]) (after: string[]) =
+    after |> Array.filter (fun name -> not (Array.contains name before))
+
+/// Previous and current text where every one of the first lines differs and the last lines are equal.
+let private denseDiffText (changedLines: int) (equalLines: int) =
+    let equal = String.concat "" [| for index in 0 .. equalLines - 1 -> $"equal-line-{index}\n" |]
+    let previous = String.concat "" [| for index in 0 .. changedLines - 1 -> $"old-line-{index}\n" |]
+    let current = String.concat "" [| for index in 0 .. changedLines - 1 -> $"new-line-{index}\n" |]
+    previous + equal, current + equal
+
+let private memoryOnly (budgetBytes: int64) = DiffStoragePolicy.MemoryOnly budgetBytes
+
+/// Opens a diff and answers its handle, first page and storage.
+let private openForStorage (service: TextDiffService) (request: OpenDiffRequest) (operationName: string) = promise {
+    let! opened = openUntilReady service request operationName
+
+    match opened with
+    | OpenDiffResult.Opened(handle, _, _, Resumable.Ready first, storage) -> return handle, first, storage
+    | OpenDiffResult.Opened(handle, _, _, Resumable.Scanning(_, continuation, _), storage) ->
+        let! first = readPageReady service handle continuation (operationName + "-first-page")
+        return handle, first, storage
+    | OpenDiffResult.NotDiffable blocker -> return raise (InvalidOperationException($"Expected an opened diff, got %A{blocker}."))
+}
+
+let private readPageRaw (service: TextDiffService) (handle: DiffHandle) (cursor: string) (background: bool) (operationName: string) =
+    service.ReadPage { Handle = handle; Cursor = cursor; Background = background } (context operationName)
+    |> Async.StartAsPromise
+
+/// The cursor after a successful ReadPage answer.
+let private advanceCursor (outcome: OperationOutcome<Resumable<DiffPage>>) : string option =
+    match outcome.Value with
+    | Resumable.Ready page -> page.NextCursor
+    | Resumable.Scanning(_, continuation, _) -> Some continuation
+
 Vitest.describe (
     "Git text diff end to end",
     fun () ->
@@ -1422,6 +1473,186 @@ Vitest.describe (
                     failure <- Some error
 
                 do! closeSession session failure
+            }
+        )
+
+        Vitest.test (
+            "keeps a MemoryOnly session in memory and writes no file in the worker folder",
+            TestOptions(timeout = 180000),
+            fun () -> promise {
+                let! repository = newRepository ()
+                let previous, current = denseDiffText 3000 1000
+                do! commitText repository "memory.txt" previous
+                do! writeText (NodePath.join [| repository; "memory.txt" |]) current
+                let session = createSession (currentFixture ()).Pool repository
+                let service = serviceFor session
+                let directory = (currentFixture ()).Supervisor.InstanceDirectory
+                let mutable failure = None
+
+                try
+                    // A disk session writes its spool and stores into the worker folder, so the check below can fail.
+                    let! diskHandle, _, diskStorage = openForStorage service (openRequest "memory.txt") "memory-control-open"
+                    let! diskFiles = workerFiles directory
+                    Vitest.expect(diskStorage).toEqual DiffStorage.OnDisk
+                    Vitest.expect(diskFiles.Length > 0).toBe true
+                    let! controlClose = service.Close diskHandle (context "memory-control-close") |> Async.StartAsPromise
+                    ignore (operationValue "Close" controlClose)
+
+                    let! before = workerFiles directory
+                    let request = { openRequest "memory.txt" with Storage = memoryOnly 67108864L }
+                    let! handle, first, storage = openForStorage service request "memory-open"
+                    Vitest.expect(storage).toEqual (DiffStorage.InMemory 67108864L)
+                    let! afterOpen = workerFiles directory
+                    Vitest.expect(filesAddedSince before afterOpen).toEqual Array.empty
+
+                    let! pages = readAllPages service handle first "memory-pages"
+                    Vitest.expect(pages.Length > 1).toBe true
+                    let! afterPages = workerFiles directory
+                    Vitest.expect(filesAddedSince before afterPages).toEqual Array.empty
+
+                    let gap =
+                        hiddenGaps (pages |> Array.collect (fun page -> page.Parts))
+                        |> Array.tryHead
+                        |> Option.defaultWith (fun () -> failwith "The fixture has no equal gap.")
+
+                    let! expanded = expandReady service handle gap.GapId true 5 "memory-expand"
+                    Vitest.expect((expandedPreviousLines expanded).Length).toBe 5
+                    let! afterExpansion = workerFiles directory
+                    Vitest.expect(filesAddedSince before afterExpansion).toEqual Array.empty
+
+                    let! memoryClose = service.Close handle (context "memory-close") |> Async.StartAsPromise
+                    ignore (operationValue "Close" memoryClose)
+                with error ->
+                    failure <- Some error
+
+                do! closeSession session failure
+            }
+        )
+
+        Vitest.test (
+            "refuses a page at the memory budget and still replays an earlier page",
+            TestOptions(timeout = 180000),
+            fun () -> promise {
+                let! repository = newRepository ()
+                let previous, current = denseDiffText 6000 0
+                do! commitText repository "budget.txt" previous
+                do! writeText (NodePath.join [| repository; "budget.txt" |]) current
+                let session = createSession (currentFixture ()).Pool repository
+                let service = serviceFor session
+                let mutable failure = None
+
+                try
+                    let request = { openRequest "budget.txt" with Storage = memoryOnly 1048576L }
+                    let! handle, first, _ = openForStorage service request "budget-open"
+                    let mutable cursor = first.NextCursor
+                    let mutable pagesRead = 1
+                    let mutable refusal = None
+
+                    while refusal.IsNone && cursor.IsSome && pagesRead < 100 do
+                        let! result = readPageRaw service handle cursor.Value false $"budget-read-{pagesRead}"
+
+                        match result with
+                        | Succeeded outcome ->
+                            cursor <- advanceCursor outcome
+                            pagesRead <- pagesRead + 1
+                        | Failed failed -> refusal <- Some failed
+                        | PartiallySucceeded _ -> failwith "ReadPage returned partial success."
+
+                    match refusal with
+                    | Some failed -> Vitest.expect(failed.Code).toBe TextDiffFailureCodes.MemoryBudgetReached
+                    | None -> failwith $"No page was refused within {pagesRead} pages."
+
+                    Vitest.expect(pagesRead > 1).toBe true
+                    let! replayed = service.ReplayPage { Handle = handle; PageId = first.PageId } (context "budget-replay") |> Async.StartAsPromise
+                    Vitest.expect(operationValue "ReplayPage" replayed).toEqual first
+                with error ->
+                    failure <- Some error
+
+                do! closeSession session failure
+            }
+        )
+
+        Vitest.test (
+            "stops a background page read before a user read at the same cursor",
+            TestOptions(timeout = 180000),
+            fun () -> promise {
+                let! repository = newRepository ()
+                let previous, current = denseDiffText 6000 0
+                do! commitText repository "background.txt" previous
+                do! writeText (NodePath.join [| repository; "background.txt" |]) current
+                let session = createSession (currentFixture ()).Pool repository
+                let service = serviceFor session
+                let mutable failure = None
+
+                try
+                    let request = { openRequest "background.txt" with Storage = memoryOnly 1048576L }
+                    let! handle, first, _ = openForStorage service request "background-open"
+                    let mutable cursor = first.NextCursor
+                    let mutable pagesRead = 1
+                    let mutable stopped = false
+
+                    while not stopped && cursor.IsSome && pagesRead < 100 do
+                        let! background = readPageRaw service handle cursor.Value true $"background-read-{pagesRead}"
+
+                        match background with
+                        | Succeeded outcome ->
+                            cursor <- advanceCursor outcome
+                            pagesRead <- pagesRead + 1
+                        | Failed failed when failed.Code = TextDiffFailureCodes.MemoryBudgetReached ->
+                            let! user = readPageRaw service handle cursor.Value false $"background-user-read-{pagesRead}"
+
+                            match user with
+                            | Succeeded _ -> stopped <- true
+                            | _ -> failwith "The user read was refused where the background read was."
+                        | _ -> failwith "The background read failed with another error."
+
+                    Vitest.expect(stopped).toBe true
+                with error ->
+                    failure <- Some error
+
+                do! closeSession session failure
+            }
+        )
+
+        Vitest.test (
+            "blocks a committed blob above the memory blob limit with its size and the limit",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! repository = newRepository ()
+                let previous = String.replicate 45455 "0123456789\n"
+                do! commitText repository "huge.txt" previous
+                do! writeText (NodePath.join [| repository; "huge.txt" |]) "changed\n"
+                let session = createSession (currentFixture ()).Pool repository
+                let service = serviceFor session
+                let request = { openRequest "huge.txt" with Storage = memoryOnly 1048576L }
+                let! opened = openUntilReady service request "huge-open"
+
+                match opened with
+                | OpenDiffResult.NotDiffable(DiffBlocker.BlobTooLargeForMemory(side, blobBytes, limitBytes)) ->
+                    Vitest.expect(side).toEqual DiffSide.Previous
+                    Vitest.expect(blobBytes).toEqual (int64 previous.Length)
+                    Vitest.expect(limitBytes).toEqual (448L * 1024L)
+                | other -> failwith $"Expected BlobTooLargeForMemory, got %A{other}."
+
+                do! session.Close() |> Async.StartAsPromise
+            }
+        )
+
+        Vitest.test (
+            "opens in memory with the policy budget when the minimum free space is above the real free space",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! repository = newRepository ()
+                do! commitText repository "low-space.txt" "before\n"
+                do! writeText (NodePath.join [| repository; "low-space.txt" |]) "after\n"
+                let session = createSession (currentFixture ()).Pool repository
+                let service = serviceFor session
+                let oneExbibyte = 1152921504606846976L
+                let request = { openRequest "low-space.txt" with Storage = DiffStoragePolicy.PreferDisk(oneExbibyte, 67108864L) }
+                let! _, first, storage = openForStorage service request "low-space-open"
+                Vitest.expect(storage).toEqual (DiffStorage.InMemory 67108864L)
+                Vitest.expect(pageHasChange first).toBe true
+                do! session.Close() |> Async.StartAsPromise
             }
         )
 

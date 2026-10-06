@@ -386,6 +386,31 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "accepts a continuation whose storage policy changed and keeps the choice of the first Open",
+            TestOptions(timeout = 120000),
+            fun () ->
+                withWorkerPool "slow-preparation" (ResizeArray()) (fun pool _ _ -> promise {
+                    let service = pool.Service(owner ())
+                    let request = { openRequest with Path = path "retained.txt" }
+                    let! initial = service.Open request (OperationContext.detached "storage-change-open") |> Async.StartAsPromise
+
+                    let continuation =
+                        match initial with
+                        | Succeeded { Value = Resumable.Scanning(_, continuation, _) } -> continuation
+                        | other -> failwith $"Expected a Scanning answer, got %A{other}"
+
+                    let changed = { request with Continuation = Some continuation; Storage = DiffStoragePolicy.MemoryOnly 1048576L }
+
+                    let! opened =
+                        TextDiffTestSupport.openUntilReady service changed (OperationContext.detached "storage-change-continue")
+
+                    match opened with
+                    | OpenDiffResult.Opened(_, _, _, _, storage) -> Vitest.expect(storage).toEqual DiffStorage.OnDisk
+                    | other -> failwith $"Expected an opened diff, got %A{other}"
+                })
+        )
+
+        Vitest.test (
             "answers a session closed failure for a continuation without a preparation slot",
             TestOptions(timeout = 120000),
             fun () ->
@@ -532,6 +557,84 @@ Vitest.describe (
                 finally
                     spy.Restore()
                     Async.StartImmediate(restoreHijack original)
+            }
+        )
+)
+
+module TextDiffStorage = VersionControlService.Git.TextDiff.TextDiffStorage
+
+Vitest.describe (
+    "Text diff storage decisions",
+    fun () ->
+        // One request needs this much room beyond the data the session holds.
+        let envelope = 524288.0 + 32768.0
+
+        Vitest.test (
+            "chooses memory for MemoryOnly and from the free space, the minimum and the blob for PreferDisk",
+            fun () ->
+                let choose policy free blob = TextDiffStorage.chooseStorage policy free blob
+                let memory budget = TextDiffStorage.StorageChoice.Memory budget
+                let margin = 524288.0 + 65536.0
+
+                Vitest.expect(choose (DiffStoragePolicy.MemoryOnly 1000L) (Some 1e15) None).toEqual (memory 1000.0)
+                Vitest.expect(choose (DiffStoragePolicy.MemoryOnly 1000L) None None).toEqual (memory 1000.0)
+
+                let preferDisk = DiffStoragePolicy.PreferDisk(1000L, 5000L)
+                Vitest.expect(choose preferDisk None None).toEqual TextDiffStorage.StorageChoice.Disk
+                Vitest.expect(choose preferDisk (Some(1000.0 + margin - 1.0)) None).toEqual (memory 5000.0)
+                Vitest.expect(choose preferDisk (Some(1000.0 + margin)) None).toEqual TextDiffStorage.StorageChoice.Disk
+                Vitest.expect(choose preferDisk (Some(1000.0 + margin + 9999.0)) (Some 10000.0)).toEqual (memory 5000.0)
+                Vitest.expect(choose preferDisk (Some(1000.0 + margin + 10000.0)) (Some 10000.0)).toEqual TextDiffStorage.StorageChoice.Disk
+        )
+
+        Vitest.test (
+            "limits a blob in memory to 16 MiB, half the budget and the budget minus the envelope",
+            fun () ->
+                Vitest.expect(TextDiffStorage.memoryBlobLimit (1048576.0)).toBe (448.0 * 1024.0)
+                Vitest.expect(TextDiffStorage.memoryBlobLimit (8.0 * 1048576.0)).toBe (4.0 * 1048576.0)
+                Vitest.expect(TextDiffStorage.memoryBlobLimit (64.0 * 1048576.0)).toBe (16.0 * 1048576.0)
+        )
+
+        Vitest.test (
+            "refuses a background write at three quarters of the memory budget and a user write at the budget",
+            fun () ->
+                let budget = 4.0 * 1048576.0
+                let refusal stored index blob background = (TextDiffStorage.memoryRefusal stored index blob budget background).IsSome
+                let userLimit = budget - envelope
+                let backgroundLimit = budget * 3.0 / 4.0 - envelope
+
+                Vitest.expect(refusal backgroundLimit 0.0 0.0 true).toBe false
+                Vitest.expect(refusal (backgroundLimit + 1.0) 0.0 0.0 true).toBe true
+                Vitest.expect(refusal (backgroundLimit + 1.0) 0.0 0.0 false).toBe false
+                Vitest.expect(refusal userLimit 0.0 0.0 false).toBe false
+                Vitest.expect(refusal (userLimit + 1.0) 0.0 0.0 false).toBe true
+                // The index length and the blob in memory count against the budget as well.
+                Vitest.expect(refusal (userLimit - 100.0) 50.0 40.0 false).toBe false
+                Vitest.expect(refusal (userLimit - 100.0) 50.0 51.0 false).toBe true
+        )
+
+        Vitest.test (
+            "refuses a disk write that would leave less than the minimum and counts the spool still growing",
+            fun () ->
+                let minimum = 1000000.0
+                let free = Some(minimum + 5000.0 + envelope)
+
+                Vitest.expect(TextDiffStorage.diskRefusal None 0.0 1e15 minimum).toEqual None
+                Vitest.expect(TextDiffStorage.diskRefusal free 5000.0 0.0 minimum).toEqual None
+                Vitest.expect((TextDiffStorage.diskRefusal free 5001.0 0.0 minimum).IsSome).toBe true
+                // The same state passes without the spool term and is refused with it.
+                Vitest.expect(TextDiffStorage.diskRefusal free 2000.0 3000.0 minimum).toEqual None
+                Vitest.expect((TextDiffStorage.diskRefusal free 2000.0 3001.0 minimum).IsSome).toBe true
+        )
+
+        Vitest.test (
+            "reads the free bytes of a folder and answers none for a missing one",
+            fun () -> promise {
+                let! known = NodePositionalFile.tryFreeBytes (systemTempDirectory ())
+                let! missing = NodePositionalFile.tryFreeBytes (NodePath.join [| systemTempDirectory (); "vcs-no-such-folder-for-statfs" |])
+
+                Vitest.expect(known.IsSome && known.Value > 0.0).toBe true
+                Vitest.expect(missing).toEqual None
             }
         )
 )

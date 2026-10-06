@@ -452,6 +452,11 @@ type SpoolSource private (
 
     member _.IsComplete() = not disposed && complete && terminalFailure.IsNone
 
+    /// The bytes the spool still has to receive. It is 0 once the spool is complete or failed. The size seen at the
+    /// last read can be stale, which overstates the rest and so errs on the safe side for a space check.
+    member _.RemainingBytes: float =
+        if complete || terminalFailure.IsSome then 0.0 else float (max 0L (expectedLength - available))
+
     member _.Dispose() : JS.Promise<unit> =
         match closePromise with
         | Some pending -> pending
@@ -568,6 +573,31 @@ type SpoolSource private (
     interface IByteSource with
         member _.IsComplete() = not disposed && complete && terminalFailure.IsNone
         member this.ReadAt position buffer offset count = this.ReadAt position buffer offset count
+
+/// A Git blob that the worker read whole into memory. It is complete from the start and has no file to check.
+type MemoryBlobSource(bytes: byte[]) =
+    do
+        if isNull bytes then nullArg (nameof bytes)
+
+    interface IByteSource with
+        member _.IsComplete() = true
+
+        member _.ReadAt position buffer offset count = async {
+            if position < 0L then invalidArg (nameof position) "The position cannot be negative."
+            if isNull buffer then nullArg (nameof buffer)
+
+            if offset < 0 || count < 0 || offset > buffer.Length - count then
+                invalidArg (nameof offset) "The destination range is invalid."
+
+            if count = 0 then
+                return ReadOutcome.Bytes 0
+            elif position >= int64 bytes.Length then
+                return ReadOutcome.EndOfSource
+            else
+                let amount = int (min (int64 count) (int64 bytes.Length - position))
+                Array.blit bytes (int position) buffer offset amount
+                return ReadOutcome.Bytes amount
+        }
 
 /// Fable turns a ResizeArray of bytes into a plain JavaScript array, and Node writes only typed arrays.
 [<Emit("($0 instanceof Uint8Array ? $0 : Uint8Array.from($0))")>]

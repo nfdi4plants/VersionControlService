@@ -51,9 +51,10 @@ type WorkerHost
     member _.Yield() : JS.Promise<unit> =
         Promise.create (fun resolve _ -> NodeWorkerThreads.setImmediate (fun () -> resolve ()))
 
-    /// Runs a short read-only Git command through the main-process supervisor.
-    member _.SpawnShort(cwd: string, arguments: string[]) : JS.Promise<Supervisor.ShortResult> =
-        call (fun callId -> TextDiffMessage.SpawnShort(callId, owner, cwd, arguments))
+    /// Runs a short read-only Git command through the main-process supervisor. The output limit applies to the
+    /// supervisor only for `cat-file blob <oid>`, which may ask for up to 16 MiB. Other commands keep 64 KiB.
+    member _.SpawnShort(cwd: string, arguments: string[], ?outputLimit: int) : JS.Promise<Supervisor.ShortResult> =
+        call (fun callId -> TextDiffMessage.SpawnShort(callId, owner, cwd, arguments, outputLimit))
         |> Promise.map (fun outcome ->
             match outcome with
             | SpawnOutcome.Short result -> result

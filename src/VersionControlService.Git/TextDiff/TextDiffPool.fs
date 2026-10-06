@@ -333,9 +333,9 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
                     | _ -> ()
                 | TextDiffMessage.Result(requestId, generation, payload) -> completeRunning worker requestId generation (Ok payload)
                 | TextDiffMessage.Error(requestId, generation, failure) -> completeRunning worker requestId generation (Error failure)
-                | TextDiffMessage.SpawnShort(callId, owner, cwd, arguments) ->
+                | TextDiffMessage.SpawnShort(callId, owner, cwd, arguments, outputLimit) ->
                     observe
-                        (attempt (fun () -> supervisor.RunShort(owner, cwd, arguments)))
+                        (attempt (fun () -> supervisor.RunShort(owner, cwd, arguments, ?outputLimit = outputLimit)))
                         (fun result -> answerSpawn worker callId (SpawnOutcome.Short result))
                         (spawnFailed worker callId)
                 | TextDiffMessage.SpawnBlob(callId, owner, cwd, oid, spoolPath) ->

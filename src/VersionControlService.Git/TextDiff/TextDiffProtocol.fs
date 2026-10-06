@@ -12,7 +12,7 @@ module NodeProcess = VersionControlService.Runtime.Node.Process
 module Supervisor = VersionControlService.Git.TextDiff.TextDiffSupervisor
 
 [<Literal>]
-let ProtocolVersion = 3
+let ProtocolVersion = 4
 
 /// The workspace and window that own a diff session. Handles of one owner are never usable by another.
 /// The worker reads LFS objects from the media directory.
@@ -63,7 +63,7 @@ type TextDiffMessage =
     | Progress of requestId: string * generation: int * validatedBytes: int64 * totalBytes: int64
     | Result of requestId: string * generation: int * payload: ResultPayload
     | Error of requestId: string * generation: int * failure: OperationFailure
-    | SpawnShort of callId: int * owner: Supervisor.ChildOwner * cwd: string * arguments: string[]
+    | SpawnShort of callId: int * owner: Supervisor.ChildOwner * cwd: string * arguments: string[] * outputLimit: int option
     | SpawnBlob of callId: int * owner: Supervisor.ChildOwner * cwd: string * oid: string * spoolPath: string
     | SpawnResult of callId: int * outcome: SpawnOutcome
     | ReleaseRequest of owner: Supervisor.ChildOwner
@@ -1160,8 +1160,14 @@ let encode (message: TextDiffMessage) : obj =
         envelope "result" [ "requestId" ==> requestId; "generation" ==> generation; "payload" ==> encodePayload payload ]
     | TextDiffMessage.Error(requestId, generation, failure) ->
         envelope "error" [ "requestId" ==> requestId; "generation" ==> generation; "failure" ==> encodeFailure failure ]
-    | TextDiffMessage.SpawnShort(callId, owner, cwd, arguments) ->
-        envelope "spawnShort" [ "callId" ==> callId; "owner" ==> encodeChildOwner owner; "cwd" ==> cwd; "args" ==> arguments ]
+    | TextDiffMessage.SpawnShort(callId, owner, cwd, arguments, outputLimit) ->
+        envelope "spawnShort" [
+            "callId" ==> callId
+            "owner" ==> encodeChildOwner owner
+            "cwd" ==> cwd
+            "args" ==> arguments
+            "outputLimit" ==> encodeOption box outputLimit
+        ]
     | TextDiffMessage.SpawnBlob(callId, owner, cwd, oid, spoolPath) ->
         envelope "spawnBlob" [
             "callId" ==> callId
@@ -1225,7 +1231,8 @@ let private decodeEnvelope (messageType: string) (value: obj) : Result<TextDiffM
             let! owner = field "owner" decodeChildOwner value
             let! cwd = field "cwd" decodeString value
             let! arguments = field "args" (decodeArray decodeString) value
-            return TextDiffMessage.SpawnShort(callId, owner, cwd, arguments)
+            let! outputLimit = field "outputLimit" (decodeOption decodeInt) value
+            return TextDiffMessage.SpawnShort(callId, owner, cwd, arguments, outputLimit)
         }
     | "spawnBlob" ->
         decode {

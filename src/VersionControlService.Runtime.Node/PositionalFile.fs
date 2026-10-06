@@ -31,7 +31,16 @@ type private BigIntStats =
     abstract member isSymbolicLink: unit -> bool
     abstract member isDirectory: unit -> bool
 
+/// The fields of fs.statfs that the free space needs. Node answers numbers unless bigint is requested.
+[<AllowNullLiteral>]
+type private StatFsResult =
+    abstract member bsize: float
+    abstract member blocks: float
+    abstract member bavail: float
+
 type private FileSystem =
+    abstract member statfs: path: string * callback: Action<NodeError, StatFsResult> -> unit
+
     abstract member ``open``:
         path: string * flags: string * mode: int * callback: Action<NodeError, int> -> unit
 
@@ -201,6 +210,26 @@ let lstat (path: string) : JS.Promise<PositionalFileStats> =
             )
         with error ->
             reject error)
+
+/// The bytes that a non-privileged user can still write on the volume of the given folder. It answers none when
+/// the call fails for any reason or the volume reports no blocks, and it never throws.
+let tryFreeBytes (path: string) : JS.Promise<float option> =
+    JS.Constructors.Promise.Create(fun resolve _ ->
+        try
+            fileSystem.statfs(
+                path,
+                Action<NodeError, StatFsResult>(fun error stats ->
+                    try
+                        if isNull error && not (isNull stats) && stats.blocks > 0.0 then
+                            let free = stats.bavail * stats.bsize
+                            resolve (if Double.IsNaN free || free < 0.0 then None else Some free)
+                        else
+                            resolve None
+                    with _ ->
+                        resolve None)
+            )
+        with _ ->
+            resolve None)
 
 let close (fd: int) : JS.Promise<unit> =
     JS.Constructors.Promise.Create(fun resolve reject ->

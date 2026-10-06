@@ -102,6 +102,21 @@ let private isAllowedShortCommand (arguments: string[]) =
     | [| "cat-file"; "blob"; oid |] -> isObjectId oid
     | _ -> false
 
+/// The stdout and stderr limit of every short command.
+[<Literal>]
+let ShortOutputLimit = 65536
+
+/// The largest stdout that a `cat-file blob <oid>` call may ask for.
+[<Literal>]
+let BlobOutputLimit = 16777216
+
+/// The stdout limit of a short command. Only `cat-file blob <oid>` may raise it, up to BlobOutputLimit. Every
+/// other command keeps ShortOutputLimit whatever the request asks for.
+let shortStdoutLimit (arguments: string[]) (requested: int option) : int =
+    match arguments, requested with
+    | [| "cat-file"; "blob"; oid |], Some limit when isObjectId oid -> max ShortOutputLimit (min BlobOutputLimit limit)
+    | _ -> ShortOutputLimit
+
 let private tryGetInstanceOwnerPid (name: string) =
     match name.Split([| '-' |], StringSplitOptions.None) with
     | [| pidText; randomText |] when randomText.Length = 8 ->
@@ -255,7 +270,7 @@ type TextDiffSupervisor internal (instanceDirectory: string, gitExecutable: stri
                 return directory
         }
 
-    member _.RunShort(owner: ChildOwner, cwd: string, arguments: string[]) : JS.Promise<ShortResult> =
+    member _.RunShort(owner: ChildOwner, cwd: string, arguments: string[], ?outputLimit: int) : JS.Promise<ShortResult> =
         promise {
             let validCommand = isAllowedShortCommand arguments
 
@@ -274,8 +289,8 @@ type TextDiffSupervisor internal (instanceDirectory: string, gitExecutable: stri
                             gitArguments
                             cwd
                             environment
-                            65536
-                            65536
+                            (shortStdoutLimit arguments outputLimit)
+                            ShortOutputLimit
                             (fun pid closed -> registerChild owner pid closed)
 
                     return {

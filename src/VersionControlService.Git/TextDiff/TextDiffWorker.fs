@@ -12,6 +12,7 @@ open VersionControlService.Git.TextDiff.TextDiffWorkerDispatcher
 open VersionControlService.Git.TextDiff.TextDiffSourceResolver
 open VersionControlService.Git.TextDiff.TextDiffPreparation
 open VersionControlService.Git.TextDiff.TextDiffSources
+open VersionControlService.Git.TextDiff.TextDiffStorage
 
 module NodeInterop = VersionControlService.Runtime.Node.Interop
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
@@ -23,10 +24,6 @@ module NodeWorkerThreads = VersionControlService.Runtime.Node.WorkerThreads
 /// Progress messages go out about four times per second.
 [<Literal>]
 let private ProgressIntervalMs = 225
-
-/// The largest response envelope of a page, an Open or an expansion.
-[<Literal>]
-let private PageEnvelopeLimit = 524288
 
 [<Literal>]
 let private SampleLength = 65536
@@ -47,6 +44,10 @@ let private DefaultIdleMs = 900000.0
 
 [<Literal>]
 let private SpoolPollMs = 5
+
+/// How long a write check reuses an answer of the free space of the temp drive.
+[<Literal>]
+let private FreeSpaceCacheMs = 1000.0
 
 /// Room in a page envelope for values the engine adds after it sized the parts.
 [<Literal>]
@@ -174,7 +175,9 @@ type private SpoolStart = {
     SpawnFailure: string option ref
 }
 
-/// One source of a session, with what the worker needs to check and release it.
+/// One source of a session, with what the worker needs to check and release it. A source that is classified from
+/// its first 64 KiB (a spool or a blob in memory) has IsSpool set. SpoolRemaining is the number of bytes that a
+/// still growing spool has yet to receive, and 0 for every other source.
 type private OpenedSide = {
     Resolved: ResolvedSide
     SideLength: int64
@@ -182,6 +185,7 @@ type private OpenedSide = {
     IsSpool: bool
     Check: unit -> Async<unit>
     Release: unit -> JS.Promise<unit>
+    SpoolRemaining: unit -> float
 }
 
 type private SideState =
@@ -221,6 +225,24 @@ type private Slot(generation: int, owner: TextDiffOwner, request: OpenDiffReques
     member val Infos: (DiffSourceInfo * DiffSourceInfo) option = None with get, set
     member val Validated = 0L with get, set
     member val Total = 0L with get, set
+    /// Where the session keeps its data. The first Open chooses it and its continuations keep the choice.
+    member val Storage: StorageChoice option = None with get, set
+    /// The bytes of committed blobs that a memory session holds. The memory budget counts them.
+    member val MemoryBlobBytes = 0.0 with get, set
+    /// The journal index store of the engine session. The write checks read its length.
+    member val IndexStore: ITempStore option = None with get, set
+    /// True while a background ReadPage runs.
+    member val Background = false with get, set
+    /// The free space of the temp drive and the time it was read.
+    member val FreeSpace: (float option * float) option = None with get, set
+
+    /// The bytes that the growing spools of the open sides have yet to receive.
+    member this.SpoolRemaining() : float =
+        [| this.Previous; this.Current |]
+        |> Array.sumBy (fun state ->
+            match state with
+            | SideState.SideOpen side -> side.SpoolRemaining()
+            | _ -> 0.0)
 
     member this.RecordFailure(value: TextDiffSourceFailure) =
         if this.Failure.IsNone then this.Failure <- Some value
@@ -246,7 +268,7 @@ type private Slot(generation: int, owner: TextDiffOwner, request: OpenDiffReques
         | DiffSide.Current -> this.CurrentOutcome <- Some outcome
 
 type private Worker = {
-    RunShort: WorkerHost -> TextDiffOwner -> string[] -> JS.Promise<GitShort>
+    RunShort: WorkerHost -> TextDiffOwner -> string[] -> int option -> JS.Promise<GitShort>
     Tokens: PreparationTokenStore
     BlobLedger: Ledger
     Slots: Dictionary<int, Slot>
@@ -260,6 +282,8 @@ type private Worker = {
 let private noRelease () : JS.Promise<unit> = Promise.lift ()
 
 let private noCheck () : Async<unit> = async.Return()
+
+let private noRemaining () : float = 0.0
 
 let private releaseSide (state: SideState) : Async<unit> = async {
     match state with
@@ -285,6 +309,8 @@ let private releaseResources (worker: Worker) (slot: Slot) : Async<unit> = async
     let current = slot.Current
     slot.Previous <- SideState.NotOpened
     slot.Current <- SideState.NotOpened
+    slot.MemoryBlobBytes <- 0.0
+    slot.IndexStore <- None
     do! releaseSide previous
     do! releaseSide current
 
@@ -382,7 +408,7 @@ let private resolveStep (worker: Worker) (host: WorkerHost) (request: OpenDiffRe
         }
 
         let runGit arguments =
-            worker.RunShort host owner arguments |> Async.AwaitPromise
+            worker.RunShort host owner arguments None |> Async.AwaitPromise
 
         let! outcome = resolve (localFileHostWithCancellation runGit host.IsCanceled) input
 
@@ -423,6 +449,56 @@ let private resolveStep (worker: Worker) (host: WorkerHost) (request: OpenDiffRe
                     | None -> ()
 
                     return Proceed
+}
+
+/// The free space of the temp drive. A write check reuses an answer that is at most a second old.
+let private freeSpace (worker: Worker) (slot: Slot) (directory: string) : Async<float option> = async {
+    let now = worker.Clock.NowMs()
+
+    match slot.FreeSpace with
+    | Some(value, readAt) when now - readAt <= FreeSpaceCacheMs -> return value
+    | _ ->
+        let! value = NodePositionalFile.tryFreeBytes directory |> Async.AwaitPromise
+        slot.FreeSpace <- Some(value, worker.Clock.NowMs())
+        return value
+}
+
+/// Chooses disk or memory at the first Open, once the resolver knows the committed blobs and their sizes. A
+/// continuation finds the choice in the slot and does not read the free space again. A memory session cannot take
+/// a committed blob above the memory blob limit, so that Open ends with a blocker before any blob is read.
+let private storageStep (worker: Worker) (host: WorkerHost) (slot: Slot) : Async<OpenStep> = async {
+    match slot.Storage, slot.Resolved with
+    | None, Some sources ->
+        let blobs =
+            [| DiffSide.Previous, sources.Previous; DiffSide.Current, sources.Current |]
+            |> Array.choose (fun (side, resolved) ->
+                match resolved with
+                | ResolvedSide.GitBlob(_, size) -> Some(side, size)
+                | _ -> None)
+
+        let committedBytes =
+            if blobs.Length = 0 then None else Some(blobs |> Array.sumBy (fun (_, size) -> float size))
+
+        let policy = slot.Request.Storage
+
+        let! free =
+            match policy with
+            | DiffStoragePolicy.PreferDisk _ -> freeSpace worker slot host.TempDirectory
+            | DiffStoragePolicy.MemoryOnly _ -> async.Return None
+
+        let choice = chooseStorage policy free committedBytes
+        slot.Storage <- Some choice
+
+        match choice with
+        | StorageChoice.Memory budget ->
+            let limit = memoryBlobLimit budget
+
+            match blobs |> Array.tryFind (fun (_, size) -> float size > limit) with
+            | Some(side, size) ->
+                return Finish(Ok(Resumable.Ready(OpenDiffResult.NotDiffable(DiffBlocker.BlobTooLargeForMemory(side, size, int64 limit)))))
+            | None -> return Proceed
+        | StorageChoice.Disk -> return Proceed
+    | _ -> return Proceed
 }
 
 /// Starts the blob child of a side and opens its spool once the supervisor has created the file.
@@ -505,12 +581,60 @@ let private openBlobSide
                     IsSpool = true
                     Check = noCheck
                     Release = fun () -> opened.Dispose()
+                    SpoolRemaining = fun () -> opened.RemainingBytes
                 }
             )
 
             return Proceed
         | None, Some step -> return step
         | None, None -> return Pause
+    }
+
+/// Reads a committed blob whole into memory. The supervisor raises the output limit of this one command, and the
+/// length of the answer has to match the size that the resolver learned from cat-file -s.
+let private openMemoryBlobSide
+    (worker: Worker)
+    (host: WorkerHost)
+    (slot: Slot)
+    (side: DiffSide)
+    (resolved: ResolvedSide)
+    (oid: string)
+    (size: int64)
+    (meter: Meter)
+    : Async<OpenStep> =
+    async {
+        let! result = worker.RunShort host slot.Owner [| "cat-file"; "blob"; oid |] (Some(int size)) |> Async.AwaitPromise
+
+        if host.IsCanceled() then
+            return canceledStep
+        else
+            match result.ExitCode, result.Error with
+            | Some 0, None when int64 result.Stdout.Length = size ->
+                Meter.chargeBytes meter result.Stdout.Length
+                slot.MemoryBlobBytes <- slot.MemoryBlobBytes + float size
+
+                slot.SetState(
+                    side,
+                    SideState.SideOpen {
+                        Resolved = resolved
+                        SideLength = size
+                        Src = Some(MemoryBlobSource(result.Stdout) :> IByteSource)
+                        IsSpool = true
+                        Check = noCheck
+                        Release = noRelease
+                        SpoolRemaining = noRemaining
+                    }
+                )
+
+                return Proceed
+            | _ ->
+                let detail =
+                    match result.Error with
+                    | Some message -> message
+                    | None when result.ExitCode = Some 0 -> $"Git returned {result.Stdout.Length} bytes, expected {size}."
+                    | None -> result.Stderr.Trim()
+
+                return Finish(Error(OperationFailure.create ProviderError TextDiffFailureCodes.ReadFailed $"The Git blob for {RepositoryPath.value slot.Request.Path} could not be read into memory. {detail}"))
     }
 
 let private openSide
@@ -540,6 +664,7 @@ let private openSide
                         IsSpool = false
                         Check = noCheck
                         Release = noRelease
+                        SpoolRemaining = noRemaining
                     }
                 )
 
@@ -556,6 +681,7 @@ let private openSide
                         IsSpool = false
                         Check = fun () -> source.CheckIdentity()
                         Release = fun () -> source.Dispose()
+                        SpoolRemaining = noRemaining
                     }
                 )
 
@@ -578,11 +704,15 @@ let private openSide
                         IsSpool = false
                         Check = fun () -> source.CheckIdentity()
                         Release = fun () -> source.Dispose()
+                        SpoolRemaining = noRemaining
                     }
                 )
 
                 return Proceed
-            | ResolvedSide.GitBlob(oid, size) -> return! openBlobSide worker host slot side resolved oid size meter
+            | ResolvedSide.GitBlob(oid, size) ->
+                match slot.Storage with
+                | Some(StorageChoice.Memory _) -> return! openMemoryBlobSide worker host slot side resolved oid size meter
+                | _ -> return! openBlobSide worker host slot side resolved oid size meter
     }
 
 let private openSidesStep (worker: Worker) (host: WorkerHost) (request: OpenDiffRequest) (slot: Slot) (meter: Meter) : Async<OpenStep> = async {
@@ -845,7 +975,7 @@ let private envelopeReserve (host: WorkerHost) (handle: DiffHandle) (previous: D
         Pending = Some pending
     }
 
-    let payload = ResultPayload.Open(Resumable.Ready(OpenDiffResult.Opened(handle, previous, current, Resumable.Ready page, DiffStorage.OnDisk)))
+    let payload = ResultPayload.Open(Resumable.Ready(OpenDiffResult.Opened(handle, previous, current, Resumable.Ready page, DiffStorage.InMemory Int64.MaxValue)))
 
     envelopeByteLength (encode (TextDiffMessage.Result(host.RequestId, host.Generation, payload)))
     + EnvelopeSlack
@@ -899,24 +1029,70 @@ let private createStep (worker: Worker) (host: WorkerHost) (request: OpenDiffReq
                 ContextLines = request.ContextLines
         }
 
-        let engine: EngineHost = {
-            Clock = worker.Clock
-            Yield = fun () ->
-                if slot.SpoolWaitYield then
-                    slot.SpoolWaitYield <- false
-                    sleep SpoolPollMs
-                else
-                    host.Yield() |> Async.AwaitPromise
-            CheckWrite = fun () -> async.Return None
-            CreateTempStore =
-                fun name -> async {
-                    let! store =
-                        NodeTempStore.Create(host.TempDirectory, $"{name}-{NodeInterop.randomUuid()}.tmp")
-                        |> Async.AwaitPromise
+        let indexLength () =
+            match slot.IndexStore with
+            | Some store -> float (store.Length())
+            | None -> 0.0
 
-                    return store :> ITempStore
+        let rememberIndex (name: string) (store: ITempStore) =
+            if name.EndsWith(":journal-index", StringComparison.Ordinal) then
+                slot.IndexStore <- Some store
+
+            store
+
+        let yieldToHost () =
+            if slot.SpoolWaitYield then
+                slot.SpoolWaitYield <- false
+                sleep SpoolPollMs
+            else
+                host.Yield() |> Async.AwaitPromise
+
+        let engine: EngineHost =
+            match slot.Storage with
+            | Some(StorageChoice.Memory budget) ->
+                // The cap only detects bugs. The write check keeps the session well below it.
+                let capBytes = int64 (min 1073741824.0 (2.0 * budget + 1048576.0))
+                let group = MemoryStoreGroup(capBytes)
+
+                {
+                    Clock = worker.Clock
+                    Yield = yieldToHost
+                    CheckWrite =
+                        fun () -> async {
+                            return
+                                memoryRefusal (float group.StoredBytes) (indexLength ()) slot.MemoryBlobBytes budget slot.Background
+                                |> Option.map (fun message -> TextDiffFailureCodes.MemoryBudgetReached, message)
+                        }
+                    CreateTempStore = fun name -> async { return rememberIndex name (group.Create name) }
                 }
-        }
+            | _ ->
+                let directory = host.TempDirectory
+
+                let checkWrite =
+                    match slot.Request.Storage with
+                    | DiffStoragePolicy.PreferDisk(minimumFreeBytes, _) ->
+                        fun () -> async {
+                            let! free = freeSpace worker slot directory
+
+                            return
+                                diskRefusal free (indexLength ()) (slot.SpoolRemaining()) (float minimumFreeBytes)
+                                |> Option.map (fun message -> TextDiffFailureCodes.TempSpaceLow, message)
+                        }
+                    | DiffStoragePolicy.MemoryOnly _ -> fun () -> async.Return None
+
+                {
+                    Clock = worker.Clock
+                    Yield = yieldToHost
+                    CheckWrite = checkWrite
+                    CreateTempStore =
+                        fun name -> async {
+                            let! store =
+                                NodeTempStore.Create(directory, $"{name}-{NodeInterop.randomUuid()}.tmp")
+                                |> Async.AwaitPromise
+
+                            return rememberIndex name (store :> ITempStore)
+                        }
+                }
 
         let! session =
             TextDiffSession.create
@@ -936,7 +1112,12 @@ let private createStep (worker: Worker) (host: WorkerHost) (request: OpenDiffReq
             slot.Phase <- SlotPhase.Active
             slot.Continuation <- None
             request.Preparation |> Option.iter worker.Tokens.Release
-            return Finish(Ok(Resumable.Ready(OpenDiffResult.Opened(handle, previousInfo, currentInfo, page, DiffStorage.OnDisk))))
+            let storage =
+                match slot.Storage with
+                | Some(StorageChoice.Memory budget) -> DiffStorage.InMemory(int64 budget)
+                | _ -> DiffStorage.OnDisk
+
+            return Finish(Ok(Resumable.Ready(OpenDiffResult.Opened(handle, previousInfo, currentInfo, page, storage))))
         | EngineResult.Failed(code, _, Some detail) when code = TextDiffFailureCodes.ContentNotText ->
             let! candidates = encodingMismatchCandidates worker slot detail
 
@@ -971,14 +1152,19 @@ let private runOpen
 
             match resolved with
             | Proceed ->
-                let! opened = openSidesStep worker host request slot meter
+                let! stored = storageStep worker host slot
 
-                match opened with
+                match stored with
                 | Proceed ->
-                    let! classified = classifyStep host slot meter previousChoice currentChoice
+                    let! opened = openSidesStep worker host request slot meter
 
-                    match classified with
-                    | Proceed -> return! createStep worker host request owner slot
+                    match opened with
+                    | Proceed ->
+                        let! classified = classifyStep host slot meter previousChoice currentChoice
+
+                        match classified with
+                        | Proceed -> return! createStep worker host request owner slot
+                        | other -> return other
                     | other -> return other
                 | other -> return other
             | other -> return other
@@ -1046,7 +1232,9 @@ let private openRequest
                 | true, existing when
                     isPreparing existing
                     && existing.Continuation = Some continuation
-                    && existing.Request = stored
+                    // The slot keeps the storage policy of the first Open, so a setting that changed since does not
+                    // turn the continuation into a mismatch.
+                    && existing.Request = { stored with Storage = existing.Request.Storage }
                     && existing.Owner = owner
                     ->
                     return Ok existing
@@ -1209,11 +1397,11 @@ let private callOn
         |> Async.StartAsPromise
 
 /// Runs an engine call that reads source bytes. The sources are checked before and after it.
-let private readingCall
+let private readingCallOn
     (worker: Worker)
     (host: WorkerHost)
     (handle: DiffHandle)
-    (call: TextDiffSession -> Async<EngineResult<'T>>)
+    (call: Slot -> TextDiffSession -> Async<EngineResult<'T>>)
     : JS.Promise<Result<'T, OperationFailure>> =
     callOn worker host handle (fun slot -> async {
         match slot.Session with
@@ -1221,13 +1409,21 @@ let private readingCall
         | Some session ->
             do! checkSources slot
             slot.SpoolWaitYield <- false
-            let! result = call session
+            let! result = call slot session
             do! checkSources slot
             return! settle worker slot result
     })
 
+let private readingCall
+    (worker: Worker)
+    (host: WorkerHost)
+    (handle: DiffHandle)
+    (call: TextDiffSession -> Async<EngineResult<'T>>)
+    : JS.Promise<Result<'T, OperationFailure>> =
+    readingCallOn worker host handle (fun _ session -> call session)
+
 let private createHandler
-    (runShort: WorkerHost -> TextDiffOwner -> string[] -> JS.Promise<GitShort>)
+    (runShort: WorkerHost -> TextDiffOwner -> string[] -> int option -> JS.Promise<GitShort>)
     (idleMs: float)
     : ITextDiffRequestHandler =
     let worker = {
@@ -1246,8 +1442,15 @@ let private createHandler
             openRequest worker host request owner |> Async.StartAsPromise
 
         member _.ReadPage(host, request) =
-            readingCall worker host request.Handle (fun session ->
-                session.ReadPage request.Cursor host.IsCanceled)
+            // Only a page read can run in the background. The flag lets a memory session stop it earlier.
+            readingCallOn worker host request.Handle (fun slot session -> async {
+                slot.Background <- request.Background
+
+                try
+                    return! session.ReadPage request.Cursor host.IsCanceled
+                finally
+                    slot.Background <- false
+            })
 
         member _.ReplayPage(host, request) =
             callOn worker host request.Handle (fun slot -> async {
@@ -1311,14 +1514,17 @@ let private createHandler
 
 /// Creates the handler that opens Git diff sessions. Open resolves both sources, classifies their text and
 /// answers the first page or a blocker. Calls on a handle go to the engine session of that handle. The handler
-/// keeps the preparation tokens and the sessions of its worker.
+/// keeps the preparation tokens and the sessions of its worker. The runner takes no output limit, so a handler
+/// built with it cannot read a blob into memory. Only createDefaultHandler can serve a memory session.
 let createDefaultHandlerWithRunner
     (runShort: WorkerHost -> TextDiffOwner -> string[] -> JS.Promise<GitShort>)
     : ITextDiffRequestHandler =
-    createHandler runShort DefaultIdleMs
+    createHandler (fun host owner arguments _ -> runShort host owner arguments) DefaultIdleMs
 
 let createDefaultHandler () : ITextDiffRequestHandler =
-    createDefaultHandlerWithRunner (fun host owner arguments -> host.SpawnShort(owner.WorkspaceRoot, arguments))
+    createHandler
+        (fun host owner arguments outputLimit -> host.SpawnShort(owner.WorkspaceRoot, arguments, ?outputLimit = outputLimit))
+        DefaultIdleMs
 
 /// Serves text diff requests on the given port with the given handler. It switches the async trampoline of the
 /// whole thread to setImmediate, so it runs only on a worker thread.

@@ -306,6 +306,62 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "raises the stdout limit for a blob read only and keeps 64 KiB for every other command",
+            TestOptions(timeout = 180000),
+            fun () -> promise {
+                let fakeOid = Microsoft.FSharp.Core.String.replicate 40 "a"
+                Vitest.expect(TextDiffSupervisor.shortStdoutLimit [| "cat-file"; "blob"; fakeOid |] None).toBe 65536
+                Vitest.expect(TextDiffSupervisor.shortStdoutLimit [| "cat-file"; "blob"; fakeOid |] (Some 1000)).toBe 65536
+                Vitest.expect(TextDiffSupervisor.shortStdoutLimit [| "cat-file"; "blob"; fakeOid |] (Some 300000)).toBe 300000
+                Vitest.expect(TextDiffSupervisor.shortStdoutLimit [| "cat-file"; "blob"; fakeOid |] (Some 99999999)).toBe 16777216
+                Vitest.expect(TextDiffSupervisor.shortStdoutLimit [| "cat-file"; "-s"; fakeOid |] (Some 300000)).toBe 65536
+
+                let! root = createTempDirectory ()
+                let repo = NodePath.join [| root; "repo" |]
+                let mutable supervisor: TextDiffSupervisor.TextDiffSupervisor option = None
+
+                try
+                    do! initializeRepository repo
+                    let! created = createSupervisor root None
+                    supervisor <- Some created
+                    do! writeLargeTextFile (NodePath.join [| repo; "large.txt" |]) (128L * 1024L)
+                    do! NodePositionalFile.mkdirRecursive (NodePath.join [| repo; "sub" |])
+
+                    for index in 0 .. 1999 do
+                        NodeFileSystem.writeFileSync
+                            (NodePath.join [| repo; "sub"; "file-" + (string index).PadLeft(35, '0') |])
+                            "x\n"
+                            NodeFileSystem.Utf8
+
+                    do! runGitOk repo [| "add"; "--"; "." |]
+                    do! runGitOk repo [| "commit"; "-q"; "-m"; "blob and a wide tree" |]
+                    let! blobOid = runGit repo [| "rev-parse"; "HEAD:large.txt" |]
+                    let! treeOid = runGit repo [| "rev-parse"; "HEAD^{tree}" |]
+                    let owner: TextDiffSupervisor.ChildOwner = { WorkerId = "worker-c"; SessionId = "session-c"; RequestId = "request-c" }
+
+                    let! blob = created.RunShort(owner, repo, [| "cat-file"; "blob"; blobOid.Trim() |], 262144)
+                    Vitest.expect(blob.Error).toBe None
+                    Vitest.expect(blob.Stdout.Length).toBe (128 * 1024)
+
+                    // The listing is above 64 KiB, so the same request limit is ignored for a command other than a blob read.
+                    let! listing = created.RunShort(owner, repo, [| "ls-tree"; "-z"; "--full-tree"; treeOid.Trim(); "--"; "sub/" |], 4194304)
+                    Vitest.expect(listing.Error.IsSome).toBe true
+                    Vitest.expect(listing.Stdout.Length <= 65536).toBe true
+                    do! created.Dispose ()
+                    supervisor <- None
+                with error ->
+                    match supervisor with
+                    | Some created -> do! created.Dispose ()
+                    | None -> ()
+
+                    do! removeDirectory root
+                    return raise error
+
+                do! removeDirectory root
+            }
+        )
+
+        Vitest.test (
             "stops a short command whose request is released while it starts",
             TestOptions(timeout = 180000),
             fun () -> promise {
