@@ -307,6 +307,32 @@ module TextDiffStreamingCases =
 
     let private utf16Spec (bytes: byte[]) = { sourceSpec bytes with Encoding = "utf-16le"; BomLength = 2 }
 
+    let private cycleRows count =
+        Array.init count (fun index -> { Text = [| "row A"; "row B"; "row C" |][index % 3]; Ending = LineEnding.LF })
+
+    /// Replaces every spacing-th row from first up to limit with the text of the edit and returns the edit count.
+    let private editRows (rows: SourceLine array) first spacing limit (text: int -> string) =
+        let edited = Array.copy rows
+        let mutable edits = 0
+        let mutable index = first
+        while index < limit do
+            edited[index] <- { Text = text edits; Ending = LineEnding.LF }
+            edits <- edits + 1
+            index <- index + spacing
+        edited, edits
+
+    /// A small step budget that a gap with several edits exhausts, and a forward search that samples no line and
+    /// gives up after a few lines, so an unaligned gap has the same bounds on every run.
+    let private exhaustedGapConfig sessionId windowLines steps =
+        { config sessionId windowLines steps Limits.defaults None with ResyncSampleModulus = 1 <<< 30; ResyncScanLines = 16 }
+
+    /// The current-side text of every line that an unaligned region shows.
+    let private unalignedCurrentTexts pages =
+        allParts pages
+        |> Array.collect (function
+            | DiffPart.Hunk { Body = HunkBody.UnalignedSides(_, current) } -> current |> Array.map (fun line -> line.Slice.Text)
+            | _ -> [||])
+
     let cases = [
         "an HDF5 signature at 65536 is binary evidence before the first page", fun () -> async {
             let bytes = withSignatureAt "" 100_000 65_536
@@ -869,6 +895,84 @@ module TextDiffStreamingCases =
                 checkOracle previous current pages
                 Check.equal (6_000, 700, 0, 0, 0) (rowCounts pages) $"Growth by {growth} bytes keeps every original line equal and shows only the inserted lines."
                 do! session.Close()
+            return ()
+        }
+        "a gap that exhausts its step budget in a full window pairs the edited lines by position", fun () -> async {
+            let previous = cycleRows 600
+            let current, edits = editRows previous 9 16 600 (fun number -> $"edited {number + 1}")
+            let! session = openSession (Ledger()) (exhaustedGapConfig "stream-gap-positional" 128 6) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+            let! pages, _ = readAll session
+            checkOracle previous current pages
+            let equal, added, removed, replaced, unaligned = rowCounts pages
+            Check.equal 0 unaligned "No line is unaligned."
+            Check.equal (previous.Length - edits, 0, 0, edits) (equal, added, removed, replaced) "Every edit is one replaced row."
+            do! session.Close()
+            return ()
+        }
+        "same-length edits in a full window pair by position within a bounded number of requests", fun () -> async {
+            // The extra last line gives the sources different byte lengths, so the whole-window positional path is out.
+            let rows = cycleRows 600
+            let edited, edits = editRows rows 9 12 400 (fun _ -> "row Q")
+            let previous = rows
+            let current = Array.append edited [| { Text = "last"; Ending = LineEnding.LF } |]
+            let limits = { Limits.defaults with MaxUnits = 1; RequestMs = 1_000_000.0; QuantumMs = 1_000_000.0 }
+            let sessionConfig = { exhaustedGapConfig "stream-gap-positional-same-length" 128 6 with Limits = limits }
+            let! session = openSession (Ledger()) sessionConfig (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+            let! pages, scans = readAll session
+            checkOracle previous current pages
+            let equal, added, removed, replaced, unaligned = rowCounts pages
+            Check.equal 0 unaligned "No line is unaligned."
+            Check.equal (previous.Length - edits, 1, 0, edits) (equal, added, removed, replaced) "Every edit is one replaced row and the last line is added."
+            // Session code cannot read the meter, so this counts requests. With a budget of one unit each request runs
+            // one step, and the pairing needs a bounded number of steps per differing line and per run of equal lines.
+            // One request per line of the file is a loose bound for that.
+            Check.true' (scans <= previous.Length) $"The run needed {scans} requests for {previous.Length} lines."
+            do! session.Close()
+            return ()
+        }
+        "a gap with more than one differing line in eight stays unaligned in a full window", fun () -> async {
+            let previous = cycleRows 600
+            let current, edits = editRows previous 3 4 400 (fun number -> $"edited {number + 1}")
+            let! session = openSession (Ledger()) (exhaustedGapConfig "stream-gap-positional-dense" 128 6) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+            let! pages, _ = readAll session
+            checkOracle previous current pages
+            let shown = unalignedCurrentTexts pages |> Array.filter (fun text -> text.StartsWith("edited", StringComparison.Ordinal))
+            Check.equal edits shown.Length "An unaligned region covers every edited line."
+            do! session.Close()
+            return ()
+        }
+        "a uniform gap with a line removed first and a line added last is a valid diff", fun () -> async {
+            let row text = { Text = text; Ending = LineEnding.LF }
+            let uniform = Array.create 100 (row "row A")
+            let previous = Array.concat [ [| row "head"; row "first row removed" |]; uniform; [| row "tail" |] ]
+            let current = Array.concat [ [| row "head" |]; uniform; [| row "last row added"; row "tail" |] ]
+            let! session = openSession (Ledger()) (exhaustedGapConfig "stream-gap-positional-shifted" 128 6) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+            let! pages, _ = readAll session
+            // The pairing is by position, so a shifted run of equal lines may show as replaced rows. The diff stays valid.
+            checkOracle previous current pages
+            do! session.Close()
+            return ()
+        }
+        "a window that can still grow keeps an exhausted gap between unique lines unaligned", fun () -> async {
+            let previous = cycleRows 25_000 |> Array.mapi (fun index line -> if index % 100 = 99 then { line with Text = $"marker {index}" } else line)
+            let current, edits = editRows previous 10_003 10 10_300 (fun number -> $"edited {number + 1}")
+            let! session = openSession (Ledger()) (exhaustedGapConfig "stream-gap-positional-growable" 4_096 6) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+            let! pages, _ = readAll session
+            checkOracle previous current pages
+            Check.equal (24_711, 0, 0, 0, 578) (rowCounts pages) $"The {edits} edited lines between unique markers stay in one unaligned region."
+            do! session.Close()
+            return ()
+        }
+        "a window that holds both file ends below its cap pairs dense edits by position", fun () -> async {
+            let previous = cycleRows 1_500
+            let current, edits = editRows previous 7 9 1_500 (fun number -> $"edited {number + 1}")
+            let! session = openSession (Ledger()) (exhaustedGapConfig "stream-gap-positional-small-file" 4_096 20) (sourceSpec (encodeLines previous)) (sourceSpec (encodeLines current))
+            let! pages, _ = readAll session
+            checkOracle previous current pages
+            let equal, added, removed, replaced, unaligned = rowCounts pages
+            Check.equal 0 unaligned "No line is unaligned, so the positional gap path ran."
+            Check.equal (previous.Length - edits, 0, 0, edits) (equal, added, removed, replaced) "Every edit is one replaced row."
+            do! session.Close()
             return ()
         }
     ]

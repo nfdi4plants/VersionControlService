@@ -193,6 +193,7 @@ type private AlignPhase =
     | SuffixConfirm
     | MiddleStart
     | PositionalConfirm
+    | GapPositionalScan
     | BuildSlots
     | ProbeCurrent
     | FindCandidates
@@ -247,6 +248,12 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
     let mutable positionalMismatches = 0
     let mutable positionalAttempted = false
     let mutable positionalConfirmed = false
+    // Positional pairing of one gap that exhausted its step budget. The scan records the offsets whose keys differ.
+    let mutable positionalGap = false
+    let mutable positionalRequested = 0
+    let mutable positionalMismatchIndex = 0
+    let mutable gapScanOffset = 0
+    let gapMismatches = ResizeArray<int>()
 
     let mutable slotMask = 0
     let mutable slotPrevious = Array.empty<int>
@@ -694,6 +701,29 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
             phase <- AlignPhase.RestoreConfirm
             true
 
+    let beginGapPositional () =
+        stepper <- None
+        positionalOperations.Clear()
+        gapMismatches.Clear()
+        gapScanOffset <- 0
+        positionalGap <- true
+        phase <- AlignPhase.GapPositionalScan
+
+    let rejectGapPositional () =
+        positionalOperations.Clear()
+        gapMismatches.Clear()
+        positionalGap <- false
+        phase <- AlignPhase.Gaps
+        emitUnaligned ()
+
+    let acceptGapPositional () =
+        for operation in positionalOperations do DiffOperations.appendRaw raw operation
+        positionalOperations.Clear()
+        gapMismatches.Clear()
+        positionalGap <- false
+        phase <- AlignPhase.Gaps
+        finishGap ()
+
     let startGap (meter: Meter) =
         gapCache.Clear()
         pendingRunStart <- 0
@@ -754,6 +784,24 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
                     suffixCurrent <- currentCount
                     suffixLength <- 0
                     phase <- AlignPhase.MiddleStart
+        | AlignPhase.PositionalConfirm when positionalGap ->
+            let confirmed = min positionalRequested matched
+            if confirmed > 0 then
+                positionalOperations.Add(
+                    { DiffOperations.make OperationKind.Equal positionalPrevious positionalCurrent confirmed confirmed with Anchored = true }
+                )
+                positionalPrevious <- positionalPrevious + confirmed
+                positionalCurrent <- positionalCurrent + confirmed
+                positionalRemaining <- positionalRemaining - confirmed
+            if matched < positionalRequested then
+                positionalMismatches <- positionalMismatches + 1
+                positionalOperations.Add(DiffOperations.make OperationKind.Removed positionalPrevious -1 1 0)
+                positionalOperations.Add(DiffOperations.make OperationKind.Added -1 positionalCurrent 0 1)
+                positionalPrevious <- positionalPrevious + 1
+                positionalCurrent <- positionalCurrent + 1
+                positionalRemaining <- positionalRemaining - 1
+            if positionalMismatches * 8 > gapPreviousEnd - gapPreviousStart then rejectGapPositional ()
+            elif positionalRemaining = 0 then acceptGapPositional ()
         | AlignPhase.PositionalConfirm ->
             let available = positionalRemaining
             let confirmed = min available matched
@@ -857,7 +905,41 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
             else
                 startMiddle ()
                 AlignStep.Running
+        | AlignPhase.PositionalConfirm when positionalGap ->
+            let offset = positionalPrevious - gapPreviousStart
+            if positionalRemaining = 0 then
+                acceptGapPositional ()
+                AlignStep.Running
+            elif positionalMismatchIndex < gapMismatches.Count && gapMismatches[positionalMismatchIndex] = offset then
+                positionalOperations.Add(DiffOperations.make OperationKind.Removed positionalPrevious -1 1 0)
+                positionalOperations.Add(DiffOperations.make OperationKind.Added -1 positionalCurrent 0 1)
+                positionalPrevious <- positionalPrevious + 1
+                positionalCurrent <- positionalCurrent + 1
+                positionalRemaining <- positionalRemaining - 1
+                positionalMismatchIndex <- positionalMismatchIndex + 1
+                AlignStep.Running
+            else
+                let stop = if positionalMismatchIndex < gapMismatches.Count then gapMismatches[positionalMismatchIndex] else gapPreviousEnd - gapPreviousStart
+                positionalRequested <- min stepChunk (stop - offset)
+                AlignStep.NeedRun(positionalPrevious, positionalCurrent, positionalRequested)
         | AlignPhase.PositionalConfirm -> AlignStep.NeedRun(positionalPrevious, positionalCurrent, positionalRemaining)
+        | AlignPhase.GapPositionalScan ->
+            let length = gapPreviousEnd - gapPreviousStart
+            let mutable count = 0
+            while gapScanOffset < length && count < stepChunk && gapMismatches.Count * 8 <= length do
+                if not (keysEqual (gapPreviousStart + gapScanOffset) (gapCurrentStart + gapScanOffset)) then gapMismatches.Add gapScanOffset
+                gapScanOffset <- gapScanOffset + 1
+                count <- count + 1
+            Meter.charge meter (count / 8)
+            if gapMismatches.Count * 8 > length then rejectGapPositional ()
+            elif gapScanOffset >= length then
+                positionalPrevious <- gapPreviousStart
+                positionalCurrent <- gapCurrentStart
+                positionalRemaining <- length
+                positionalMismatches <- gapMismatches.Count
+                positionalMismatchIndex <- 0
+                phase <- AlignPhase.PositionalConfirm
+            AlignStep.Running
         | AlignPhase.BuildSlots ->
             let mutable count = 0
             while cursor < middlePreviousEnd && count < stepChunk do
@@ -1062,7 +1144,12 @@ type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap
                         directExceeded <- true
                         stepper <- None
                         phase <- AlignPhase.MiddleStart
-                    elif not (tryBeginRestore meter) then emitUnaligned ()
+                    elif not (tryBeginRestore meter) then
+                        // A window that cannot grow gets no new lines that could split this gap. When both sides of the gap
+                        // have the same line count, the gap is paired line by line if nearly every line matches at the same offset.
+                        if (longRunAnchors || directPass) && gapPreviousEnd - gapPreviousStart = gapCurrentEnd - gapCurrentStart then
+                            beginGapPositional ()
+                        else emitUnaligned ()
                     AlignStep.Running
             | None ->
                 startGap meter
