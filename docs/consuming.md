@@ -660,9 +660,10 @@ A `HunkBody.UnalignedSides` body holds lines whose alignment could not be establ
 This can happen when a gap exceeds the Myers step budget inside a window. It does not happen
 when the window cannot grow, both sides of the gap have the same line count and at most one
 line in eight differs at the same offset. The engine then pairs that gap line by line and shows
-replaced rows. Unaligned lines can also come from a forward search that reaches its configured
-limit, which defaults to 1,000,000 lines or 256 MiB per side through `ResyncScanLines` and
-`ResyncScanBytes`. The search continues after it reaches a limit, from the same line offset
+replaced rows. In repetitive text, a block inserted or deleted inside such a gap can show as
+replaced rows, with the matching repeated lines added or removed further on. Unaligned lines can
+also come from a forward search that reaches its configured limit, which defaults to 1,000,000
+lines or 256 MiB per side through `ResyncScanLines` and `ResyncScanBytes`. The search continues after it reaches a limit, from the same line offset
 between the sides. After an insertion or deletion larger than the limit, the rest of the file
 therefore shows as unaligned regions, like a rewrite, with every line present. A full rewrite
 also produces unaligned regions.
