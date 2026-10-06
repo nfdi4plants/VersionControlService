@@ -597,7 +597,7 @@ let rec private readPageReady
     (cursor: string)
     (context: OperationContext)
     : Async<DiffPage> = async {
-    let! result = service.ReadPage { Handle = handle; Cursor = cursor } context
+    let! result = service.ReadPage { Handle = handle; Cursor = cursor; Background = false } context
 
     match valueOf result with
     | Resumable.Ready page -> return page
@@ -621,13 +621,14 @@ let openDiff (service: TextDiffService) (path: RepositoryPath) (context: Operati
         CurrentEncoding = None
         ContextLines = 3
         Continuation = None
+        Storage = DiffStoragePolicy.PreferDisk(1024L * 1024L * 1024L, 64L * 1024L * 1024L)
     }
 
     let! opened = openReady service request context
 
     match opened with
     | OpenDiffResult.NotDiffable blocker -> return Error blocker
-    | OpenDiffResult.Opened(handle, previous, current, first) ->
+    | OpenDiffResult.Opened(handle, previous, current, first, _) ->
         let! firstPage =
             match first with
             | Resumable.Ready page -> async.Return page
@@ -810,6 +811,8 @@ For `preparation_mismatch`, discard the token and start `Open` again. A continua
 bound to its original request fields. On `continuation_mismatch`, retry with those fields
 or start a new request without that continuation. A `diff_worker_failed` result means the
 Git host could not complete the worker request. Check that it supplied a working pool.
+`diff_temp_space_low` and `diff_memory_budget_reached` leave the handle usable. See
+[temp storage and memory mode](#temp-storage-and-memory-mode).
 
 The Git provider caps a page at 1,000 rows and 32 fragments. `Open`, `ReadPage`,
 `ReplayPage` and `Expand` responses each have a 512 KiB limit. `ReadLine` responses have a
@@ -911,6 +914,80 @@ module.exports = {
 
 Point `workerScriptPath` at the unpacked copy, which sits in the `app.asar.unpacked`
 folder next to `app.asar`.
+
+### Temp storage and memory mode
+
+A session writes a journal of the pages it has read to the worker's folder inside the
+`text-diff` folder of `TempRoot`, together with two index stores, one for the journal and
+one for line pairs. A diff that compares a committed Git blob also spools that blob to a
+file there. The working copy and Git LFS objects are read in place and need no spool.
+
+`OpenDiffRequest.Storage` sets where a session keeps this data. `MemoryOnly budgetBytes`
+keeps it in memory. `PreferDisk(minimumFreeBytes, budgetBytes)` uses temp files, unless the
+free space of the temp folder's drive is below `minimumFreeBytes` plus 512 KiB (one page
+envelope) plus 64 KiB when the first `Open` runs. The worker adds the sizes of the committed
+Git blobs to that sum, because it spools them. In that case the session keeps its data in
+memory within `budgetBytes`. When the free space is unknown, the session uses disk. A
+continuation of an `Open` keeps the choice of the first request, even when its `Storage`
+differs, and a session never switches between disk and memory afterwards.
+`OpenDiffResult.Opened` reports the choice as `DiffStorage.OnDisk` or
+`DiffStorage.InMemory budget`.
+
+A memory session reads each committed Git blob whole into memory. A blob can be at most the
+smallest of 16 MiB, half of the budget and the budget minus 576 KiB (a page envelope plus
+64 KiB). For a larger blob, `Open` returns `NotDiffable` with
+`DiffBlocker.BlobTooLargeForMemory(side, blobBytes, limitBytes)` before it reads any blob.
+`limitBytes` is that smallest value. The host knows whether it chose memory by a setting or
+because of low space, so it words the message for the user. With a budget of 1 to 2 MiB, a
+dense diff shows about one page, and the blob limit at 1 MiB is 448 KiB.
+
+Before a request that can write, the worker checks the session. A request can add at most
+one page envelope (512 KiB) plus 32 KiB for pairs and index growth, and the check keeps
+room for that. A memory session adds up the bytes of its stores, the blobs it holds in
+memory and the current length of its journal index again, which is room for the index to
+double. It refuses the request when that sum plus the room for one request is above the
+budget. For a `ReadPageRequest` with `Background = true`, the limit is 3/4 of the budget,
+so background reads stop early and the last quarter stays for what the user does. Expansions
+and line reads count as user requests. A disk session with a `PreferDisk` policy checks the
+free space of the drive in the same way. It refuses the request when the free space, less
+the journal index length, the room for one request and the bytes that a growing blob spool
+has yet to receive, is below `minimumFreeBytes`. The worker reuses a free space reading for
+up to one second. The check runs for the first page of `Open`, for a page read that has no
+recorded page, and for an expansion or line read that has no journal answer. `ReplayPage`
+and every answer taken from the journal skip it.
+
+A refused request fails with `diff_memory_budget_reached` in a memory session and with
+`diff_temp_space_low` in a disk session. The session stays open and unchanged. Recorded
+pages, replays and committed expansions keep answering, and a later request can succeed.
+After `diff_temp_space_low`, a request succeeds once space is free again. After
+`diff_memory_budget_reached`, a background read stays refused, and a user read can still
+succeed below the full budget. The stored bytes of a session do not shrink, so once a
+request fails at the full budget, every later request that writes fails too. An `Open`
+whose first page is refused fails with the code and returns no handle.
+
+A host reacts by stopping its background reads, keeping the rows it has and showing a note
+where the diff stops. Opening the diff again starts a new session, which chooses its storage
+again. A disk diff that is opened again while space is low becomes a memory diff. It lands at
+most at the pages its budget holds, which can be fewer than the old session showed.
+
+A memory blob crosses the thread boundary as base64 text in a JSON message. A 16 MiB blob
+takes about 75 MB at its peak on the main thread, and the default pool of three workers can
+have three such reads in flight.
+
+The worker reads the free space with `fs.statfs` on its temp folder (Node 18.15 or later)
+and takes `bavail * bsize`, the space available to a non-privileged user. A failed call or a
+volume with zero blocks counts as unknown, so the session uses disk and the check never
+blocks a diff. On Windows, `statfs` reports the drive of the folder. On macOS with APFS it
+does not count purgeable space, so memory mode can start while Finder shows more free
+space. This is untested, because no Mac was available. On Linux, `bavail` excludes the root
+reserve, and `statfs` cannot see user quotas, so a quota hit ends as a write failure. Home
+folders on NFS were not checked, and the free space can be off there if `bsize` differs
+from the fragment size.
+
+A write can still fail after the check passes, for example when another program fills the
+drive in between. A failed page commit then fails the session with `diff_worker_failed` and
+the message of Node's error, and a failed write to a blob spool ends the read with
+`diff_read_failed`.
 
 ## Saving work
 
