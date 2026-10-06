@@ -218,8 +218,8 @@ module internal AlignerLimits =
 /// source bytes through NeedRun and ResolveRun. The work is split into steps that each do a bounded amount
 /// of work and charge the meter. A window of a source that is still growing, or a window that can still grow,
 /// passes false for longRunAnchors, because a long equal run in repetitive text can line up at a shifted
-/// position until more lines arrive. With longRunAnchors or directPass set, a gap that exhausts its step
-/// budget can also be paired by position.
+/// position until more lines arrive. With longRunAnchors or directPass set, the aligner can also pair a gap
+/// that exhausts its step budget by position.
 type internal WindowAligner(previous: LineTable, current: LineTable, stepsPerGap: int, sameSourceLength: bool, longRunAnchors: bool, directPass: bool, ledger: Ledger) =
     let stepChunk = 512
     let lookaheadLines = 2
