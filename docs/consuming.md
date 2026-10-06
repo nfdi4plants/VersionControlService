@@ -656,17 +656,18 @@ Keep a page's `PageId` if the caller may need the page again. `ReplayPage` retur
 as it was first read, except that `Pending` is `None`. A viewer can drop pages it no
 longer shows and read them again later.
 
-A `HunkBody.UnalignedSides` body holds lines whose alignment could not be established.
-This can happen when a gap exceeds the Myers step budget inside a window. It does not happen
-when the window cannot grow, both sides of the gap have the same line count and at most one
-line in eight differs at the same offset. The engine then pairs that gap line by line and shows
+A `HunkBody.UnalignedSides` body holds lines whose alignment could not be established. This can
+happen when a gap exceeds the Myers step budget inside a window. It does not happen when the
+window cannot grow, both sides of the gap have the same line count and at most one line in
+eight differs at the same offset. The engine then pairs that gap line by line and shows
 replaced rows. In repetitive text, a block inserted or deleted inside such a gap can show as
-replaced rows, with the matching repeated lines added or removed further on. Unaligned lines can
-also come from a forward search that reaches its configured limit, which defaults to 1,000,000
-lines or 256 MiB per side through `ResyncScanLines` and `ResyncScanBytes`. The search continues after it reaches a limit, from the same line offset
-between the sides. After an insertion or deletion larger than the limit, the rest of the file
-therefore shows as unaligned regions, like a rewrite, with every line present. A full rewrite
-also produces unaligned regions.
+replaced rows, with the matching repeated lines added or removed further on. Unaligned lines
+can also come from a forward search that reaches its configured limit, which defaults to
+1,000,000 lines or 256 MiB per side through `ResyncScanLines` and `ResyncScanBytes`. The search
+continues after it reaches a limit, from the same line offset between the sides. After an
+insertion or deletion larger than the limit, the rest of the file therefore shows as unaligned
+regions, like a rewrite, with every line present. A full rewrite also produces unaligned
+regions.
 
 ```fsharp
 let replayPage (service: TextDiffService) (handle: DiffHandle) (page: DiffPage) (context: OperationContext) = async {
