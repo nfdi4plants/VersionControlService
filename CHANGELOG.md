@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+-   With `versioncontrolservice.lfs.materializelargeobjects` on, the Git provider's `Update` and `Synchronize` (without `PublishLocalRevisions`) also run `git lfs pull` when there is nothing to merge, that is when the workspace is up to date or only ahead. Before, the large objects were only downloaded after a merge, so a workspace cloned or switched without them stayed with pointers. A failed download is a partial success with the `retry_materialization` recovery, as after a merge.
+
 ## 0.2.0 - 2026-10-08
 
 ### Added

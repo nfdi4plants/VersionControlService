@@ -5692,9 +5692,179 @@ Vitest.describe (
 
 )
 
+let private unhydratedLfsContent = "large binary payload\n"
+
+let private isLfsPullRequest (request: NodeProcess.ProcessRequest) =
+    request.Arguments |> Array.contains "lfs" && request.Arguments |> Array.contains "pull"
+
+/// An origin with one LFS file and a work clone that holds only its pointer, as after a
+/// clone with the large-object setting off. The work clone is level with its upstream.
+let private createUnhydratedLfsClone (hooks: GitWorkspaceSession.GitSessionHooks) = promise {
+    let! root = createTempDirectoryAsync ()
+    let barePath = join [| root; "origin.git" |]
+    let sourcePath = join [| root; "source" |]
+    let workPath = join [| root; "work" |]
+    let! _ = runGitIn root [| "init"; "--bare"; "-b"; "main"; barePath |]
+    let! _ = runGitIn root [| "init"; "-b"; "main"; sourcePath |]
+    let! _ = runGitIn sourcePath [| "config"; "user.name"; "VCS Sync Tests" |]
+    let! _ = runGitIn sourcePath [| "config"; "user.email"; "sync@example.org" |]
+    let! _ = runGitIn sourcePath [| "config"; "core.autocrlf"; "false" |]
+    let! _ = runGitIn sourcePath [| "lfs"; "install"; "--local" |]
+    let! _ = runGitIn sourcePath [| "lfs"; "track"; "*.bin" |]
+    do! writeUtf8FileAsync (join [| sourcePath; "large.bin" |]) unhydratedLfsContent
+    let! _ = runGitIn sourcePath [| "add"; "-A" |]
+    let! _ = runGitIn sourcePath [| "commit"; "-m"; "init: lfs base" |]
+    let! _ = runGitIn sourcePath [| "remote"; "add"; "origin"; barePath |]
+    let! _ = runGitIn sourcePath [| "push"; "-u"; "origin"; "main" |]
+
+    let cloneRequest = {
+        NodeProcess.ProcessRequest.create "git" [| "clone"; "-c"; "core.autocrlf=false"; barePath; workPath |] with
+            WorkingDirectory = Some root
+            Environment = [| "GIT_LFS_SKIP_SMUDGE", "1" |]
+    }
+
+    let! cloneResult = Async.StartAsPromise(NodeProcess.run cloneRequest (ctx "lfs-pointer-clone"))
+
+    match cloneResult with
+    | Succeeded outcome when outcome.Value.ExitCode = 0 -> ()
+    | _ -> failwith "fixture clone without large objects failed"
+
+    let! _ = runGitIn workPath [| "lfs"; "install"; "--local" |]
+    return root, workPath, GitWorkspaceSession.createSession hooks (syncBinding workPath barePath)
+}
+
+let private setMaterializeLargeObjects (workPath: string) (enabled: bool) =
+    runGitIn
+        workPath
+        [|
+            "config"
+            "--local"
+            "versioncontrolservice.lfs.materializelargeobjects"
+            (if enabled then "true" else "false")
+        |]
+
+let private synchronizeWithoutPublish (session: WorkspaceSession) (name: string) = promise {
+    let! status = sessionStatus session
+
+    return!
+        (syncService session).Synchronize
+            {
+                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                ExpectedTargetRevision = None
+                AcceptUpdateRisks = false
+                PublishLocalRevisions = false
+            }
+            (ctx name)
+        |> Async.StartAsPromise
+}
+
 Vitest.describe (
     "Git LFS transfer ordering",
     fun () ->
+        Vitest.test (
+            "synchronization without anything to merge downloads large objects when the setting is on",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, session = createUnhydratedLfsClone GitWorkspaceSession.GitSessionHooks.none
+
+                try
+                    let! pointer = tryReadUtf8FileAsync (join [| workPath; "large.bin" |])
+                    Vitest.expect((pointer = Some unhydratedLfsContent)).toBe false
+
+                    let! _ = setMaterializeLargeObjects workPath true
+                    let! result = synchronizeWithoutPublish session "lfs-up-to-date-download"
+                    expectSucceeded "synchronize without anything to merge" result |> ignore
+
+                    let! content = tryReadUtf8FileAsync (join [| workPath; "large.bin" |])
+                    Vitest.expect(content).toEqual (Some unhydratedLfsContent)
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "synchronization without anything to merge leaves pointers when the setting is off",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let observed = ResizeArray<NodeProcess.ProcessRequest>()
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request processContext ->
+                            observed.Add request
+                            NodeProcess.run request processContext)
+                    Barrier = None
+                }
+
+                let! root, workPath, session = createUnhydratedLfsClone hooks
+
+                try
+                    let! _ = setMaterializeLargeObjects workPath false
+                    let! result = synchronizeWithoutPublish session "lfs-up-to-date-setting-off"
+                    expectSucceeded "synchronize with the setting off" result |> ignore
+
+                    Vitest.expect(observed |> Seq.exists isLfsPullRequest).toBe false
+                    let! content = tryReadUtf8FileAsync (join [| workPath; "large.bin" |])
+                    Vitest.expect((content = Some unhydratedLfsContent)).toBe false
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "update without anything to merge reports a failed download as partial success",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request processContext ->
+                            async {
+                                if isLfsPullRequest request then
+                                    return
+                                        OperationResult.succeeded {
+                                            NodeProcess.ExitCode = 1
+                                            StdOut = ""
+                                            StdErr = "HTTP 401 Unauthorized during LFS hydration"
+                                        }
+                                else
+                                    return! NodeProcess.run request processContext
+                            })
+                    Barrier = None
+                }
+
+                let! root, workPath, session = createUnhydratedLfsClone hooks
+
+                try
+                    let! _ = setMaterializeLargeObjects workPath true
+                    let! status = sessionStatus session
+
+                    let! updateResult =
+                        (syncService session).Update
+                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                            (ctx "lfs-up-to-date-update")
+                        |> Async.StartAsPromise
+
+                    match updateResult with
+                    | PartiallySucceeded(_, failure) ->
+                        Vitest.expect(failure.Category).toEqual Authentication
+                        Vitest.expect(failure.Code).toBe "hydration_failed"
+                        Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "retry_materialization")
+                    | Failed failure -> failwith $"Expected partial download result, received {failure.Code}."
+                    | Succeeded _ -> failwith "Expected the failed download to be reported."
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
         Vitest.test (
             "update skips implicit smudge and reports failed explicit hydration as partial success",
             TestOptions(timeout = 120000),

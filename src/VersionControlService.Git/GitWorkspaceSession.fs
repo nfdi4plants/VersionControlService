@@ -3499,6 +3499,109 @@ let private previewUpdate (state: SessionState) (context: OperationContext) =
         | Succeeded outcome -> return! previewFromState state outcome.Value context
     }
 
+let private readMaterializeLargeObjects (state: SessionState) (context: OperationContext) =
+    async {
+        let! setting =
+            runGit state.Hooks state.RepoPath [| "config"; "--get"; GitService.MaterializeLargeObjectsKey |] None context
+
+        return
+            match setting with
+            | Ok output when output.ExitCode = 0 ->
+                match output.StdOut.Trim().ToLowerInvariant() with
+                | "true"
+                | "1"
+                | "yes"
+                | "on" -> Ok true
+                | _ -> Ok false
+            | Ok _ -> Ok false
+            | Error failure -> Error failure
+    }
+
+/// Downloads the large objects of the checkout from the upstream remote of `targetRef`.
+let private downloadLargeObjects
+    (state: SessionState)
+    (targetRef: LogicalRef option)
+    (operation: string)
+    (context: OperationContext)
+    : Async<Result<unit, OperationFailure>> =
+    async {
+        let! remoteResult =
+            match targetRef with
+            | Some target -> configuredUpstreamRemote state target.Name context
+            | None -> async { return Ok None }
+
+        let! hydration =
+            match remoteResult with
+            | Error failure -> async { return Error failure }
+            | Ok None -> async { return Error(configuredTargetInvalidFailure ()) }
+            | Ok(Some remote) ->
+                async {
+                    let! authentication = fetchAuthenticationForRemote state remote context
+
+                    let hydrationRef =
+                        targetRef
+                        |> Option.bind (fun target ->
+                            let prefix = remote + "/"
+
+                            if target.Name.StartsWith(prefix, StringComparison.Ordinal) then
+                                Some(target.Name.Substring prefix.Length)
+                            else
+                                None)
+
+                    match authentication with
+                    | Error failure -> return Error failure
+                    | Ok authentication ->
+                        return!
+                            runGitEnv
+                                state.Hooks
+                                state.RepoPath
+                                (GitCredentialStrategy.buildLfsTransferArguments
+                                    authentication.ConfigArgs
+                                    [|
+                                        "lfs"
+                                        "pull"
+                                        remote
+                                        yield! hydrationRef |> Option.toArray
+                                    |])
+                                None
+                                [| "GIT_TERMINAL_PROMPT", "0" |]
+                                context
+                }
+
+        match hydration with
+        | Ok output when output.ExitCode = 0 -> return Ok()
+        | Ok output ->
+            let detail = if String.IsNullOrWhiteSpace output.StdErr then output.StdOut else output.StdErr
+            return Error(hydrationFailure operation detail)
+        | Error failure -> return Error { failure with Code = "hydration_failed" }
+    }
+
+/// Without anything to merge, an update still downloads the large objects of the checkout
+/// when the setting is on, so a workspace cloned or switched without them can be completed.
+let private downloadLargeObjectsWithoutUpdate
+    (state: SessionState)
+    (outcome: OperationOutcome<SynchronizationState>)
+    (operation: string)
+    (context: OperationContext)
+    =
+    async {
+        match outcome.Value.Relationship with
+        | UpToDate
+        | LocalAhead ->
+            let! enabled = readMaterializeLargeObjects state context
+
+            match enabled with
+            | Error failure -> return Failed failure
+            | Ok false -> return Succeeded outcome
+            | Ok true ->
+                let! downloaded = downloadLargeObjects state outcome.Value.TargetRef operation context
+
+                match downloaded with
+                | Ok() -> return Succeeded outcome
+                | Error failure -> return OperationResult.partiallySucceeded outcome failure (materializationRecovery failure)
+        | _ -> return Succeeded outcome
+    }
+
 let private updateFromState
     (state: SessionState)
     (syncState: SynchronizationState)
@@ -3507,7 +3610,13 @@ let private updateFromState
     async {
         match syncState.Relationship with
         | UpToDate
-        | LocalAhead
+        | LocalAhead ->
+            return!
+                downloadLargeObjectsWithoutUpdate
+                    state
+                    (OperationOutcome.noOp (Some "The workspace is already up to date.") syncState)
+                    "update"
+                    context
         | NoTarget -> return OperationResult.noOp (Some "The workspace is already up to date.") syncState
         | _ ->
             let targetReference =
@@ -3633,85 +3742,15 @@ let private updateFromState
                     stopInspectionDeadline ()
                     return Failed(inspectionFailure (Some refreshWorkspaceRecovery) failure)
                 | Ok newState ->
-                    let! materializationSetting =
-                        runGit
-                            state.Hooks
-                            state.RepoPath
-                            [| "config"; "--get"; GitService.MaterializeLargeObjectsKey |]
-                            None
-                            inspectionContext
+                    let! materializationSetting = readMaterializeLargeObjects state inspectionContext
                     inspectionCompleted <- true
                     stopInspectionDeadline ()
 
-                    let materializationFailure, materializeLargeObjects =
-                        match materializationSetting with
-                        | Ok setting when setting.ExitCode = 0 ->
-                            None,
-                            match setting.StdOut.Trim().ToLowerInvariant() with
-                            | "true"
-                            | "1"
-                            | "yes"
-                            | "on" -> true
-                            | _ -> false
-                        | Ok _ -> None, false
-                        | Error failure -> Some failure, false
-
-                    if materializationFailure.IsSome then
-                        return Failed(inspectionFailure (Some refreshWorkspaceRecovery) materializationFailure.Value)
-                    elif not materializeLargeObjects then
-                        return OperationResult.succeeded newState
-                    else
-                        let! remoteResult =
-                            match syncState.TargetRef with
-                            | Some target -> configuredUpstreamRemote state target.Name context
-                            | None -> async { return Ok None }
-
-                        let! hydration =
-                            match remoteResult with
-                            | Error failure -> async { return Error failure }
-                            | Ok None ->
-                                async {
-                                    return
-                                        Error(
-                                            OperationFailure.create
-                                                Validation
-                                                "configured_target_invalid"
-                                                "The configured Git upstream does not identify a remote."
-                                        )
-                                }
-                            | Ok(Some remote) ->
-                                async {
-                                    let! authentication = fetchAuthenticationForRemote state remote context
-
-                                    let hydrationRef =
-                                        syncState.TargetRef
-                                        |> Option.bind (fun target ->
-                                            let prefix = remote + "/"
-
-                                            if target.Name.StartsWith(prefix, StringComparison.Ordinal) then
-                                                Some(target.Name.Substring prefix.Length)
-                                            else
-                                                None)
-
-                                    match authentication with
-                                    | Error failure -> return Error failure
-                                    | Ok authentication ->
-                                        return!
-                                            runGitEnv
-                                                state.Hooks
-                                                state.RepoPath
-                                                (GitCredentialStrategy.buildLfsTransferArguments
-                                                    authentication.ConfigArgs
-                                                    [|
-                                                        "lfs"
-                                                        "pull"
-                                                        remote
-                                                        yield! hydrationRef |> Option.toArray
-                                                    |])
-                                                None
-                                                [| "GIT_TERMINAL_PROMPT", "0" |]
-                                                context
-                                }
+                    match materializationSetting with
+                    | Error failure -> return Failed(inspectionFailure (Some refreshWorkspaceRecovery) failure)
+                    | Ok false -> return OperationResult.succeeded newState
+                    | Ok true ->
+                        let! hydration = downloadLargeObjects state syncState.TargetRef "update" context
 
                         let affectedPaths =
                             syncState.RemoteChangedPaths
@@ -3734,22 +3773,8 @@ let private updateFromState
                                 (materializationRecovery failure)
 
                         match hydration with
-                        | Ok hydrationOutput when hydrationOutput.ExitCode = 0 -> return Succeeded outcome
-                        | Ok hydrationOutput ->
-                            let detail =
-                                if String.IsNullOrWhiteSpace hydrationOutput.StdErr then
-                                    hydrationOutput.StdOut
-                                else
-                                    hydrationOutput.StdErr
-
-                            return
-                                partial (hydrationFailure "update" detail)
-                        | Error hydrationFailure ->
-                            return
-                                partial {
-                                    hydrationFailure with
-                                        Code = "hydration_failed"
-                                }
+                        | Ok _ -> return Succeeded outcome
+                        | Error failure -> return partial failure
             | Ok output, Ok start ->
                 reportProgressReset "update-inspection" context
                 let inspectionContext = startInspection ()
@@ -5882,7 +5907,7 @@ let private createSessionWithTextDiff
                         fun request context ->
                             withValidatedMutation state request.ExpectedWorkspaceVersion context (fun () ->
                                 async {
-                                    return!
+                                    let! result =
                                         Synchronization.compose
                                             {
                                                 HasActiveConflictSession = fun context -> activeOperationGuard state context
@@ -5901,6 +5926,13 @@ let private createSessionWithTextDiff
                                             }
                                             request
                                             context
+
+                                    // The composition skips Update when there is nothing to merge, so a
+                                    // synchronization that neither updated nor published downloads here.
+                                    match result with
+                                    | Succeeded({ Effect = NoOp _ } as outcome) when not request.PublishLocalRevisions ->
+                                        return! downloadLargeObjectsWithoutUpdate state outcome "synchronization" context
+                                    | _ -> return result
                                 })
                 }
             ConflictResolution = Some(createConflictService state)
