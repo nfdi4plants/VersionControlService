@@ -499,7 +499,7 @@ let private storageStep (worker: Worker) (host: WorkerHost) (slot: Slot) : Async
             | Some(side, size) ->
                 return Finish(Ok(Resumable.Ready(OpenDiffResult.NotDiffable(DiffBlocker.BlobTooLargeForMemory(side, size, int64 limit)))))
             | None -> return Proceed
-        | StorageChoice.Disk -> return Proceed
+        | StorageChoice.Disk _ -> return Proceed
     | _ -> return Proceed
 }
 
@@ -1013,8 +1013,8 @@ let private sourceSpec (opened: OpenedSide) (settled: SideClass) : SourceSpec = 
 
 /// Creates the engine session and runs its first page.
 let private createStep (worker: Worker) (host: WorkerHost) (request: OpenDiffRequest) (owner: TextDiffOwner) (slot: Slot) : Async<OpenStep> = async {
-    match slot.Previous, slot.Current, slot.PreviousOutcome, slot.CurrentOutcome, slot.Resolved with
-    | SideState.SideOpen previous, SideState.SideOpen current, Some(Settled previousClass), Some(Settled currentClass), Some sources ->
+    match slot.Previous, slot.Current, slot.PreviousOutcome, slot.CurrentOutcome, slot.Resolved, slot.Storage with
+    | SideState.SideOpen previous, SideState.SideOpen current, Some(Settled previousClass), Some(Settled currentClass), Some sources, Some storage ->
         let handle: DiffHandle = { Id = string host.Generation; Version = slot.Version }
         let previousPath = defaultArg request.PreviousPath request.Path
         let previousInfo = describeSide previousPath sources.CommitId previous previousClass
@@ -1050,8 +1050,8 @@ let private createStep (worker: Worker) (host: WorkerHost) (request: OpenDiffReq
                 host.Yield() |> Async.AwaitPromise
 
         let engine: EngineHost =
-            match slot.Storage with
-            | Some(StorageChoice.Memory budget) ->
+            match storage with
+            | StorageChoice.Memory budget ->
                 // The cap only detects bugs. The write check keeps the session well below it.
                 let capBytes = int64 (min 1073741824.0 (2.0 * budget + 1048576.0))
                 let group = MemoryStoreGroup(capBytes)
@@ -1067,25 +1067,20 @@ let private createStep (worker: Worker) (host: WorkerHost) (request: OpenDiffReq
                         }
                     CreateTempStore = fun name -> async { return rememberIndex name (group.Create name) }
                 }
-            | _ ->
+            | StorageChoice.Disk minimumFreeBytes ->
                 let directory = host.TempDirectory
-
-                let checkWrite =
-                    match slot.Request.Storage with
-                    | DiffStoragePolicy.PreferDisk(minimumFreeBytes, _) ->
-                        fun () -> async {
-                            let! free = freeSpace worker slot directory
-
-                            return
-                                diskRefusal free (indexLength ()) (slot.SpoolRemaining()) (float minimumFreeBytes)
-                                |> Option.map (fun message -> TextDiffFailureCodes.TempSpaceLow, message)
-                        }
-                    | DiffStoragePolicy.MemoryOnly _ -> fun () -> async.Return None
 
                 {
                     Clock = worker.Clock
                     Yield = yieldToHost
-                    CheckWrite = checkWrite
+                    CheckWrite =
+                        fun () -> async {
+                            let! free = freeSpace worker slot directory
+
+                            return
+                                diskRefusal free (indexLength ()) (slot.SpoolRemaining()) minimumFreeBytes
+                                |> Option.map (fun message -> TextDiffFailureCodes.TempSpaceLow, message)
+                        }
                     CreateTempStore =
                         fun name -> async {
                             let! store =

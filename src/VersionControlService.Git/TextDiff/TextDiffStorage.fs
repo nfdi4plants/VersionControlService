@@ -24,9 +24,11 @@ let private SafetyMargin = 65536.0
 [<Literal>]
 let private BytesPerMegabyte = 1048576.0
 
+/// Where a session keeps its data. A disk session carries the minimum free space of its policy, so the write check
+/// reads it from the choice.
 [<RequireQualifiedAccess>]
 type StorageChoice =
-    | Disk
+    | Disk of minimumFreeBytes: float
     | Memory of budgetBytes: float
 
 /// The largest committed blob that a memory session reads into memory. A larger blob blocks the Open.
@@ -40,7 +42,7 @@ let chooseStorage (policy: DiffStoragePolicy) (freeBytes: float option) (committ
     | DiffStoragePolicy.MemoryOnly budget -> StorageChoice.Memory(float budget)
     | DiffStoragePolicy.PreferDisk(minimumFreeBytes, budget) ->
         match freeBytes with
-        | None -> StorageChoice.Disk
+        | None -> StorageChoice.Disk(float minimumFreeBytes)
         | Some free ->
             let needed = float minimumFreeBytes + float PageEnvelopeLimit + SafetyMargin
 
@@ -49,7 +51,7 @@ let chooseStorage (policy: DiffStoragePolicy) (freeBytes: float option) (committ
                 | Some blob -> needed + blob
                 | None -> needed
 
-            if free < neededWithBlob then StorageChoice.Memory(float budget) else StorageChoice.Disk
+            if free < neededWithBlob then StorageChoice.Memory(float budget) else StorageChoice.Disk(float minimumFreeBytes)
 
 let private megabytes (bytes: float) : string = $"%.1f{bytes / BytesPerMegabyte}"
 

@@ -933,11 +933,11 @@ differs, and a session never switches between disk and memory afterwards.
 `OpenDiffResult.Opened` reports the choice as `DiffStorage.OnDisk` or
 `DiffStorage.InMemory budget`.
 
-A memory session reads each committed Git blob whole into memory. A blob can be at most the
-smallest of 16 MiB, half of the budget and the budget minus 576 KiB (a page envelope plus
-64 KiB). For a larger blob, `Open` returns `NotDiffable` with
+A memory session reads each committed Git blob whole into memory. A blob can be at most
+`min(16 MiB, budget / 2, budget - 576 KiB)`, where 576 KiB is a page envelope plus 64 KiB.
+For a larger blob, `Open` returns `NotDiffable` with
 `DiffBlocker.BlobTooLargeForMemory(side, blobBytes, limitBytes)` before it reads any blob.
-`limitBytes` is that smallest value. The host knows whether it chose memory by a setting or
+`limitBytes` is that minimum. The host knows whether it chose memory by a setting or
 because of low space, so it words the message for the user. With a budget of 1 to 2 MiB, a
 dense diff shows about one page, and the blob limit at 1 MiB is 448 KiB. The budget must be
 positive. A budget below 576 KiB blocks every committed blob, because the limit is then below
@@ -952,11 +952,12 @@ the budget. For a `ReadPageRequest` with `Background = true`, the limit is 3/4 o
 so background reads stop early and the last quarter stays for what the user does. Expansions
 and line reads count as user requests. A disk session with a `PreferDisk` policy checks the
 free space of the drive in the same way. It refuses the request when the free space, less
-the journal index length, the room for one request and the bytes that a growing blob spool
-has yet to receive, is below `minimumFreeBytes`. The worker reuses a free space reading for
-up to one second. The check runs for the first page of `Open` and for a page read that has
-no recorded page. It also runs for an expansion or line read that has no journal answer.
-`ReplayPage` and every answer taken from the journal skip it.
+the journal index length and the room for one request, is below `minimumFreeBytes`. The
+check also subtracts the bytes that a growing blob spool has yet to receive. The worker
+reuses a free space reading for up to one second. The check runs for the first page of
+`Open` and for a page read that has no recorded page. It also runs for an expansion or line
+read that has no journal answer. `ReplayPage` and every answer taken from the journal skip
+it.
 
 A refused request fails with `diff_memory_budget_reached` in a memory session and with
 `diff_temp_space_low` in a disk session. The session stays open and unchanged. Recorded
@@ -972,9 +973,11 @@ where the diff stops. Opening the diff again starts a new session, which chooses
 again. A disk diff that is opened again while space is low becomes a memory diff. It lands at
 most at the pages its budget holds, which can be fewer than the old session showed.
 
-A memory blob crosses the thread boundary as base64 text in a JSON message. A 16 MiB blob
-takes about 75 MB at its peak on the main thread, and the default pool of three workers can
-have three such reads in flight.
+A memory blob crosses the thread boundary as base64 text in a JSON message. A measurement
+with a 16 MiB blob, read through the short-command path and posted as that message, gave a
+peak resident memory about 91 MB above the process start (Node 22.19.0 on Windows, without
+the receiving thread). The default pool of three workers can have three such reads in
+flight.
 
 The worker reads the free space with `fs.statfs` on its temp folder (Node 18.15 or later)
 and takes `bavail * bsize`, the space available to a non-privileged user. A failed call or a

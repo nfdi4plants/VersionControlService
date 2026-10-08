@@ -26,6 +26,12 @@ let bufferByteAt (buffer: obj) (index: int) : int = jsNative
 [<Emit("Buffer.concat($0)")>]
 let bufferConcat (buffers: obj[]) : obj = jsNative
 
+/// Concatenates the chunks into one Buffer and types it as the byte[] that Fable represents as a Uint8Array.
+/// A Buffer is a Uint8Array subclass, so it needs no conversion element by element. Callers must not rely on
+/// Array.copy or Array.sub returning an independent array, because Buffer.slice returns a view of the same memory.
+[<Emit("Buffer.concat($0)")>]
+let bufferConcatBytes (buffers: obj[]) : byte[] = jsNative
+
 [<Emit("$0.subarray($1, $2)")>]
 let bufferSubarray (buffer: obj) (startIndex: int) (endIndex: int) : obj = jsNative
 

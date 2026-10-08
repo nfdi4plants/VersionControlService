@@ -574,17 +574,19 @@ Vitest.describe (
             fun () ->
                 let choose policy free blob = TextDiffStorage.chooseStorage policy free blob
                 let memory budget = TextDiffStorage.StorageChoice.Memory budget
+                let disk minimumFreeBytes = TextDiffStorage.StorageChoice.Disk minimumFreeBytes
                 let margin = 524288.0 + 65536.0
 
                 Vitest.expect(choose (DiffStoragePolicy.MemoryOnly 1000L) (Some 1e15) None).toEqual (memory 1000.0)
                 Vitest.expect(choose (DiffStoragePolicy.MemoryOnly 1000L) None None).toEqual (memory 1000.0)
 
                 let preferDisk = DiffStoragePolicy.PreferDisk(1000L, 5000L)
-                Vitest.expect(choose preferDisk None None).toEqual TextDiffStorage.StorageChoice.Disk
+                Vitest.expect(choose preferDisk None None).toEqual (disk 1000.0)
+                Vitest.expect(choose (DiffStoragePolicy.PreferDisk(2500L, 5000L)) None None).toEqual (disk 2500.0)
                 Vitest.expect(choose preferDisk (Some(1000.0 + margin - 1.0)) None).toEqual (memory 5000.0)
-                Vitest.expect(choose preferDisk (Some(1000.0 + margin)) None).toEqual TextDiffStorage.StorageChoice.Disk
+                Vitest.expect(choose preferDisk (Some(1000.0 + margin)) None).toEqual (disk 1000.0)
                 Vitest.expect(choose preferDisk (Some(1000.0 + margin + 9999.0)) (Some 10000.0)).toEqual (memory 5000.0)
-                Vitest.expect(choose preferDisk (Some(1000.0 + margin + 10000.0)) (Some 10000.0)).toEqual TextDiffStorage.StorageChoice.Disk
+                Vitest.expect(choose preferDisk (Some(1000.0 + margin + 10000.0)) (Some 10000.0)).toEqual (disk 1000.0)
         )
 
         Vitest.test (

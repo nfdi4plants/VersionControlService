@@ -355,9 +355,6 @@ let private typedProcessGlobal () : TypedProcessGlobal = jsNative
 let private closeDescriptor (descriptor: int) : JS.Promise<unit> =
     VersionControlService.Runtime.Node.PositionalFile.close descriptor
 
-[<Emit("Array.from($0)")>]
-let private bufferToIntegers (_buffer: obj) : int[] = jsNative
-
 [<Emit("$0 && $0.code ? $0.code : ''")>]
 let private nodeErrorCode (_error: obj) : string = jsNative
 
@@ -444,9 +441,7 @@ let private captureBounded
         truncated.Value <- true
 
 let private stdoutBytes (chunks: ResizeArray<obj>) =
-    Interop.bufferConcat (chunks.ToArray())
-    |> bufferToIntegers
-    |> Array.map byte
+    Interop.bufferConcatBytes (chunks.ToArray())
 
 let private stderrText (chunks: ResizeArray<obj>) =
     Interop.bufferConcat (chunks.ToArray()) |> Interop.bufferToUtf8String

@@ -122,10 +122,25 @@ let private waitForGone (pid: int) (timeoutMs: float) : JS.Promise<float option>
     return goneAfter
 }
 
+let private largeTextLine = Encoding.UTF8.GetBytes("text-diff-spool-line-0123456789abcdef\n")
+let private largeTextChunkLength = 64 * 1024
+
+/// The byte at an offset of a file that writeLargeTextFile wrote. Every 64 KiB chunk restarts the line.
+let private largeTextByteAt (offset: int) =
+    largeTextLine[(offset % largeTextChunkLength) % largeTextLine.Length]
+
+/// How many bytes of a read differ from what writeLargeTextFile wrote.
+let private largeTextMismatches (bytes: byte[]) =
+    let mutable count = 0
+
+    for offset in 0 .. bytes.Length - 1 do
+        if bytes[offset] <> largeTextByteAt offset then
+            count <- count + 1
+
+    count
+
 let private writeLargeTextFile (path: string) (size: int64) : JS.Promise<unit> = promise {
-    let line = Encoding.UTF8.GetBytes("text-diff-spool-line-0123456789abcdef\n")
-    let chunk =
-        Microsoft.FSharp.Collections.Array.init (64 * 1024) (fun index -> line[index % line.Length])
+    let chunk = Microsoft.FSharp.Collections.Array.init largeTextChunkLength largeTextByteAt
 
     let! descriptor = NodePositionalFile.openCreateExclusive path
     let mutable position = 0L
@@ -325,6 +340,9 @@ Vitest.describe (
                     let! created = createSupervisor root None
                     supervisor <- Some created
                     do! writeLargeTextFile (NodePath.join [| repo; "large.txt" |]) (128L * 1024L)
+                    // Several MiB that do not end on a chunk boundary of the child's stdout or of the writer.
+                    let bigLength = 4 * 1024 * 1024 + 17
+                    do! writeLargeTextFile (NodePath.join [| repo; "big.txt" |]) (int64 bigLength)
                     do! NodePositionalFile.mkdirRecursive (NodePath.join [| repo; "sub" |])
 
                     for index in 0 .. 1999 do
@@ -342,6 +360,12 @@ Vitest.describe (
                     let! blob = created.RunShort(owner, repo, [| "cat-file"; "blob"; blobOid.Trim() |], 262144)
                     Vitest.expect(blob.Error).toBe None
                     Vitest.expect(blob.Stdout.Length).toBe (128 * 1024)
+
+                    let! bigOid = runGit repo [| "rev-parse"; "HEAD:big.txt" |]
+                    let! big = created.RunShort(owner, repo, [| "cat-file"; "blob"; bigOid.Trim() |], 8 * 1024 * 1024)
+                    Vitest.expect(big.Error).toBe None
+                    Vitest.expect(big.Stdout.Length).toBe bigLength
+                    Vitest.expect(largeTextMismatches big.Stdout).toBe 0
 
                     // The listing is above 64 KiB, so the same request limit is ignored for a command other than a blob read.
                     let! listing = created.RunShort(owner, repo, [| "ls-tree"; "-z"; "--full-tree"; treeOid.Trim(); "--"; "sub/" |], 4194304)
