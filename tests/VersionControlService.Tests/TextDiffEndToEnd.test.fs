@@ -538,6 +538,59 @@ let private advanceCursor (outcome: OperationOutcome<Resumable<DiffPage>>) : str
     | Resumable.Ready page -> page.NextCursor
     | Resumable.Scanning(_, continuation, _) -> Some continuation
 
+/// The previous side lines of a page in order.
+let private previousLines (page: DiffPage) : DiffLine[] =
+    page.Parts
+    |> Array.collect (function
+        | DiffPart.Hunk hunk ->
+            match hunk.Body with
+            | HunkBody.AlignedRows rows -> rows |> Array.choose (fun row -> row.Previous)
+            | HunkBody.UnalignedSides(previous, _) -> previous
+        | _ -> Array.empty)
+
+/// A pool with one worker thread whose free space of the temp drive is the number in the file.
+let private freeSpacePool (freeFile: string) = promise {
+    let! root = mkdtemp (NodePath.join [| (currentFixture ()).Root; "free-space-" |])
+
+    let! supervisor =
+        TextDiffSupervisor.create { TextDiffSupervisor.TextDiffSupervisorOptions.defaults with TempRoot = root }
+
+    // The mode prefix is the one that TextDiffTestWorker reads.
+    let factory: TextDiffWorkerFactory =
+        fun _ ->
+            setWorkerMode ("free-space:" + freeFile)
+
+            try
+                WorkerThreadTransport.create testWorkerPath
+            finally
+                clearWorkerMode ()
+
+    return TextDiffPool.create { TextDiffPool.TextDiffPoolOptions.create factory supervisor with MaxWorkers = 1 }
+}
+
+/// Opens a diff and reads user pages after the first one until a read fails or the diff ends. Answers the number of
+/// successful reads, the failure if any and whether the last page was read. Closes the handle.
+let private readUserPages (service: TextDiffService) (request: OpenDiffRequest) (operationName: string) = promise {
+    let! handle, first, _ = openForStorage service request (operationName + "-open")
+    let mutable cursor = first.NextCursor
+    let mutable served = 0
+    let mutable failure = None
+
+    while failure.IsNone && cursor.IsSome do
+        let! result = readPageRaw service handle cursor.Value false $"{operationName}-read-{served}"
+
+        match result with
+        | Succeeded outcome ->
+            cursor <- advanceCursor outcome
+            served <- served + 1
+        | Failed failed -> failure <- Some failed
+        | PartiallySucceeded _ -> failwith "ReadPage returned partial success."
+
+    let! closed = service.Close handle (context (operationName + "-close")) |> Async.StartAsPromise
+    ignore (operationValue "Close" closed)
+    return served, failure, cursor.IsNone
+}
+
 Vitest.describe (
     "Git text diff end to end",
     fun () ->
@@ -1653,6 +1706,110 @@ Vitest.describe (
                 Vitest.expect(storage).toEqual (DiffStorage.InMemory 67108864L)
                 Vitest.expect(pageHasChange first).toBe true
                 do! session.Close() |> Async.StartAsPromise
+            }
+        )
+
+        Vitest.test (
+            "refuses a fresh page while the free space is low and serves the same request after it recovers",
+            TestOptions(timeout = 180000),
+            fun () -> promise {
+                let! repository = newRepository ()
+                let previous, current = denseDiffText 6000 0
+                do! commitText repository "space.txt" previous
+                do! writeText (NodePath.join [| repository; "space.txt" |]) current
+                let freeFile = NodePath.join [| (currentFixture ()).Root; "free-space.txt" |]
+                let minimumFree = 1048576L
+
+                let setFree (bytes: int64) =
+                    NodeFileSystem.writeFileSync freeFile (string bytes) NodeFileSystem.TextEncoding.Utf8
+
+                setFree 1000000000000L
+                let! pool = freeSpacePool freeFile
+                let session = createSession pool repository
+                let service = serviceFor session
+                let mutable failure = None
+
+                try
+                    let request = { openRequest "space.txt" with Storage = DiffStoragePolicy.PreferDisk(minimumFree, 67108864L) }
+                    let! handle, first, storage = openForStorage service request "space-open"
+                    Vitest.expect(storage).toEqual DiffStorage.OnDisk
+                    let cursor = first.NextCursor.Value
+
+                    // The free space drops below the minimum plus the room of one request. The worker reuses a
+                    // reading for a second, so the new value counts after a wait.
+                    setFree (minimumFree + 1024L)
+                    do! delay 1100
+                    let! refused = readPageRaw service handle cursor false "space-low"
+
+                    match refused with
+                    | Failed failed -> Vitest.expect(failed.Code).toBe TextDiffFailureCodes.TempSpaceLow
+                    | other -> failwith $"Expected diff_temp_space_low, got %A{other}."
+
+                    let! replayed = service.ReplayPage { Handle = handle; PageId = first.PageId } (context "space-replay") |> Async.StartAsPromise
+                    Vitest.expect(operationValue "ReplayPage" replayed).toEqual first
+
+                    setFree 1000000000000L
+                    do! delay 1100
+                    let! second = readPageReady service handle cursor "space-recovered"
+                    let firstLines = previousLines first
+                    let secondLines = previousLines second
+                    Vitest.expect(secondLines.Length > 0).toBe true
+                    Vitest.expect(secondLines[0].Number).toEqual (firstLines[firstLines.Length - 1].Number + 1L)
+
+                    for line in secondLines do
+                        Vitest.expect(line.Slice.Text).toBe $"old-line-{line.Number}"
+                with error ->
+                    failure <- Some error
+
+                // The pool owns a worker thread, so it is disposed even when the close raises.
+                let mutable closeFailure = None
+
+                try
+                    do! closeSession session failure
+                with error ->
+                    closeFailure <- Some error
+
+                do! pool.Dispose()
+
+                match closeFailure with
+                | Some error -> return raise error
+                | None -> ()
+            }
+        )
+
+        Vitest.test (
+            "refuses a page that only the bytes of the committed blob push over the memory budget",
+            TestOptions(timeout = 180000),
+            fun () -> promise {
+                let! repository = newRepository ()
+                let previous, current = denseDiffText 20000 0
+                do! commitText repository "blob-budget.txt" previous
+                do! writeText (NodePath.join [| repository; "blob-budget.txt" |]) current
+                let session = createSession (currentFixture ()).Pool repository
+                let service = serviceFor session
+                let mutable failure = None
+
+                try
+                    let blobBytes = int64 previous.Length
+                    // The diff stores about 1.9 MB over its 41 pages, and its last request needs 0.56 MB of room. It
+                    // fits in a budget of 2.62 MB when the 0.29 MB blob stays out of the sum and crosses it when the blob
+                    // counts. The budget of the second session has room for the blob, so its diff ends.
+                    let budget = 2620000L
+                    let tight = { openRequest "blob-budget.txt" with Storage = memoryOnly budget }
+                    let! servedTight, refusal, _ = readUserPages service tight "blob-tight"
+
+                    match refusal with
+                    | Some failed -> Vitest.expect(failed.Code).toBe TextDiffFailureCodes.MemoryBudgetReached
+                    | None -> failwith $"No page was refused within {servedTight} pages."
+
+                    let roomy = { tight with Storage = memoryOnly (budget + blobBytes) }
+                    let! _, roomyFailure, ended = readUserPages service roomy "blob-roomy"
+                    Vitest.expect(roomyFailure.IsNone).toBe true
+                    Vitest.expect(ended).toBe true
+                with error ->
+                    failure <- Some error
+
+                do! closeSession session failure
             }
         )
 

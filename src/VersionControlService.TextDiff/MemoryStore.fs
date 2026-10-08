@@ -26,7 +26,7 @@ type MemoryStoreGroup(capBytes: int64) =
     member this.Create(name: string) : ITempStore = MemoryChunkStore(this, name) :> ITempStore
 
     member internal _.Grow(name: string, by: int64) =
-        if int64 stored + by > capBytes then
+        if by > capBytes - int64 stored then
             invalidOp (
                 "The memory store group would exceed its cap of " + string capBytes + " bytes while growing '" + name + "'."
             )

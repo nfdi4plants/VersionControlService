@@ -134,7 +134,8 @@ type DiffStoragePolicy =
     /// The session uses temporary files unless the free space of the temp drive is below `minimumFreeBytes`.
     /// In that case it keeps its data in memory within `memoryBudgetBytes`.
     | PreferDisk of minimumFreeBytes: int64 * memoryBudgetBytes: int64
-    /// The session always keeps its data in memory within `memoryBudgetBytes`.
+    /// The session always keeps its data in memory within `memoryBudgetBytes`. The budget must be positive. A budget
+    /// below 576 KiB (a page envelope plus 64 KiB) blocks every committed Git blob.
     | MemoryOnly of memoryBudgetBytes: int64
 
 /// Input for opening a pinned diff session with optional encoding choices, continuation, and storage policy.
@@ -272,7 +273,7 @@ module TextDiffFailureCodes =
     let ContinuationMismatch = "continuation_mismatch"
 
     /// The free space of the temp drive is below the minimum that the request named, so the session refused work
-    /// that would write. The session stays usable, recorded answers keep working, and a later request can succeed.
+    /// that would write. The session stays usable and recorded answers keep working. A later request can succeed.
     [<Literal>]
     let TempSpaceLow = "diff_temp_space_low"
 

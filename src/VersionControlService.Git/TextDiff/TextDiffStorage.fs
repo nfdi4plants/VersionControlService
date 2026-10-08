@@ -8,9 +8,9 @@ open VersionControlService.Abstractions
 [<Literal>]
 let PageEnvelopeLimit = 524288
 
-/// The most that one committed Git blob may take in memory, whatever the budget is.
-[<Literal>]
-let MemoryBlobLimit = 16777216.0
+/// The most that one committed Git blob may take in memory, whatever the budget is. It is the output limit of the
+/// short command that reads the blob.
+let MemoryBlobLimit = float TextDiffSupervisor.BlobOutputLimit
 
 /// One page request can also write up to 24,000 bytes of pairs (24 bytes per range, at most 1,000 ranges) and,
 /// while the journal index is below about 4 KiB, up to about 8 KiB of index growth beyond one doubling.
@@ -71,10 +71,10 @@ let memoryRefusal
 
         if background then
             Some
-                $"A background read stops at three quarters of the memory budget of {megabytes budgetBytes} MB. The diff session holds {held} MB and the next page needs up to {next} MB more."
+                $"A background read stops at three quarters of the memory budget of {megabytes budgetBytes} MB. The diff session holds {held} MB and the next request needs up to {next} MB more."
         else
             Some
-                $"The diff session reached its memory budget of {megabytes budgetBytes} MB. It holds {held} MB and the next page needs up to {next} MB more."
+                $"The diff session reached its memory budget of {megabytes budgetBytes} MB. It holds {held} MB and the next request needs up to {next} MB more."
     else
         None
 
@@ -87,7 +87,15 @@ let diskRefusal (freeBytes: float option) (indexLength: float) (spoolRemaining: 
         let after = free - indexLength - float PageEnvelopeLimit - PairsMargin - spoolRemaining
 
         if after < minimumFreeBytes then
+            let next = megabytes (indexLength + float PageEnvelopeLimit + PairsMargin)
+
+            let need =
+                if spoolRemaining > 0.0 then
+                    $"The diff session still receives {megabytes spoolRemaining} MB of blob data and the next request needs up to {next} MB"
+                else
+                    $"The next request needs up to {next} MB"
+
             Some
-                $"The temp drive has {megabytes free} MB free. The diff session still receives {megabytes spoolRemaining} MB of blob data and the next page needs up to {megabytes (indexLength + float PageEnvelopeLimit + PairsMargin)} MB, so the drive would fall below its minimum of {megabytes minimumFreeBytes} MB free."
+                $"The temp drive has {megabytes free} MB free. {need}, so the drive would fall below its minimum of {megabytes minimumFreeBytes} MB free."
         else
             None

@@ -939,27 +939,29 @@ smallest of 16 MiB, half of the budget and the budget minus 576 KiB (a page enve
 `DiffBlocker.BlobTooLargeForMemory(side, blobBytes, limitBytes)` before it reads any blob.
 `limitBytes` is that smallest value. The host knows whether it chose memory by a setting or
 because of low space, so it words the message for the user. With a budget of 1 to 2 MiB, a
-dense diff shows about one page, and the blob limit at 1 MiB is 448 KiB.
+dense diff shows about one page, and the blob limit at 1 MiB is 448 KiB. The budget must be
+positive. A budget below 576 KiB blocks every committed blob, because the limit is then below
+zero.
 
 Before a request that can write, the worker checks the session. A request can add at most
 one page envelope (512 KiB) plus 32 KiB for pairs and index growth, and the check keeps
-room for that. A memory session adds up the bytes of its stores, the blobs it holds in
-memory and the current length of its journal index again, which is room for the index to
-double. It refuses the request when that sum plus the room for one request is above the
-budget. For a `ReadPageRequest` with `Background = true`, the limit is 3/4 of the budget,
+room for that. A memory session adds up the bytes of its stores and the blobs it holds in
+memory. It adds the current length of its journal index again, which leaves room for the
+index to double. It refuses the request when that sum plus the room for one request is above
+the budget. For a `ReadPageRequest` with `Background = true`, the limit is 3/4 of the budget,
 so background reads stop early and the last quarter stays for what the user does. Expansions
 and line reads count as user requests. A disk session with a `PreferDisk` policy checks the
 free space of the drive in the same way. It refuses the request when the free space, less
 the journal index length, the room for one request and the bytes that a growing blob spool
 has yet to receive, is below `minimumFreeBytes`. The worker reuses a free space reading for
-up to one second. The check runs for the first page of `Open`, for a page read that has no
-recorded page, and for an expansion or line read that has no journal answer. `ReplayPage`
-and every answer taken from the journal skip it.
+up to one second. The check runs for the first page of `Open` and for a page read that has
+no recorded page. It also runs for an expansion or line read that has no journal answer.
+`ReplayPage` and every answer taken from the journal skip it.
 
 A refused request fails with `diff_memory_budget_reached` in a memory session and with
 `diff_temp_space_low` in a disk session. The session stays open and unchanged. Recorded
-pages, replays and committed expansions keep answering, and a later request can succeed.
-After `diff_temp_space_low`, a request succeeds once space is free again. After
+pages and replays keep answering, and so do committed expansions. A later request can
+succeed. After `diff_temp_space_low`, a request succeeds once space is free again. After
 `diff_memory_budget_reached`, a background read stays refused, and a user read can still
 succeed below the full budget. The stored bytes of a session do not shrink, so once a
 request fails at the full budget, every later request that writes fails too. An `Open`

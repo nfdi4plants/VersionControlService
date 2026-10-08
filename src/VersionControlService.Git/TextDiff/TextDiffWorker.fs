@@ -276,6 +276,8 @@ type private Worker = {
     mutable ActiveOpen: WorkerHost option
     Clock: IClock
     IdleMs: float
+    /// Reads the free bytes of a folder. None means unknown. Tests replace it to drive the free space.
+    FreeBytes: string -> JS.Promise<float option>
     mutable Sweeping: bool
 }
 
@@ -458,7 +460,7 @@ let private freeSpace (worker: Worker) (slot: Slot) (directory: string) : Async<
     match slot.FreeSpace with
     | Some(value, readAt) when now - readAt <= FreeSpaceCacheMs -> return value
     | _ ->
-        let! value = NodePositionalFile.tryFreeBytes directory |> Async.AwaitPromise
+        let! value = worker.FreeBytes directory |> Async.AwaitPromise
         slot.FreeSpace <- Some(value, worker.Clock.NowMs())
         return value
 }
@@ -1035,7 +1037,7 @@ let private createStep (worker: Worker) (host: WorkerHost) (request: OpenDiffReq
             | None -> 0.0
 
         let rememberIndex (name: string) (store: ITempStore) =
-            if name.EndsWith(":journal-index", StringComparison.Ordinal) then
+            if name.EndsWith(TempStoreNames.JournalIndexStoreSuffix, StringComparison.Ordinal) then
                 slot.IndexStore <- Some store
 
             store
@@ -1425,6 +1427,7 @@ let private readingCall
 let private createHandler
     (runShort: WorkerHost -> TextDiffOwner -> string[] -> int option -> JS.Promise<GitShort>)
     (idleMs: float)
+    (freeBytes: string -> JS.Promise<float option>)
     : ITextDiffRequestHandler =
     let worker = {
         RunShort = runShort
@@ -1434,6 +1437,7 @@ let private createHandler
         ActiveOpen = None
         Clock = { new IClock with member _.NowMs() = performanceNow () }
         IdleMs = idleMs
+        FreeBytes = freeBytes
         Sweeping = false
     }
 
@@ -1519,12 +1523,17 @@ let private createHandler
 let createDefaultHandlerWithRunner
     (runShort: WorkerHost -> TextDiffOwner -> string[] -> JS.Promise<GitShort>)
     : ITextDiffRequestHandler =
-    createHandler (fun host owner arguments _ -> runShort host owner arguments) DefaultIdleMs
+    createHandler (fun host owner arguments _ -> runShort host owner arguments) DefaultIdleMs NodePositionalFile.tryFreeBytes
 
-let createDefaultHandler () : ITextDiffRequestHandler =
+/// The default handler with its own free space reader, so a test can drive the free space of the temp drive.
+let internal createDefaultHandlerWithFreeBytes (freeBytes: string -> JS.Promise<float option>) : ITextDiffRequestHandler =
     createHandler
         (fun host owner arguments outputLimit -> host.SpawnShort(owner.WorkspaceRoot, arguments, ?outputLimit = outputLimit))
         DefaultIdleMs
+        freeBytes
+
+let createDefaultHandler () : ITextDiffRequestHandler =
+    createDefaultHandlerWithFreeBytes NodePositionalFile.tryFreeBytes
 
 /// Serves text diff requests on the given port with the given handler. It switches the async trampoline of the
 /// whole thread to setImmediate, so it runs only on a worker thread.

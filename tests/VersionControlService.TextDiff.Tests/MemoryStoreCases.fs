@@ -100,4 +100,17 @@ module MemoryStoreCases =
             Check.equal 100L (store.Length()) "A refused write leaves the length alone."
             Check.true' (try (MemoryStoreGroup(2L * 1024L * 1024L * 1024L) |> ignore; false) with _ -> true) "A cap above 1 GiB is rejected."
         }
+        "memory store reports a write near the largest position as a cap error", fun () -> async {
+            let group = MemoryStoreGroup 100L
+            let held = group.Create "held"
+            let target = group.Create "target"
+            let data = pattern 10
+            let! _ = held.Append data 0 data.Length
+            // The growth is Int64.MaxValue, so adding the 10 stored bytes to it overflows an int64.
+            let! refused = thrownMessage (target.WriteAt (Int64.MaxValue - 1L) data 0 1)
+            Check.true' refused.IsSome "A write near the largest position throws."
+            Check.true' (refused.Value.Contains "cap") "The error is the cap error."
+            Check.equal 10L group.StoredBytes "A refused write leaves the stored bytes alone."
+            Check.equal 0L (target.Length()) "A refused write leaves the length alone."
+        }
     ]

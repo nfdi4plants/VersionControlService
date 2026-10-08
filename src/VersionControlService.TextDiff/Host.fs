@@ -36,6 +36,12 @@ type EngineHost = {
     CheckWrite: unit -> Async<(string * string) option>
 }
 
+/// The names that the engine gives the temp stores of a session, for a host that has to recognize one.
+module TempStoreNames =
+    /// The journal index store of a session is named after the session id and then this suffix.
+    [<Literal>]
+    let JournalIndexStoreSuffix = ":journal-index"
+
 /// Fable's async trampoline breaks long bind chains with a setTimeout(0) hop, and on Windows each hop waits for
 /// a timer tick of 11 to 15 ms. A diff takes thousands of hops. The .NET build has no trampoline.
 module AsyncTrampoline =

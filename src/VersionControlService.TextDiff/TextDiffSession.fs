@@ -560,7 +560,7 @@ type TextDiffSession internal (
     let mutable textCount = 0
 
     let builder = HunkBuilder(config.ContextLines, config.PageMaxRows)
-    let journal = Journal(store, ledger, config.JournalCacheBytes, fun () -> host.CreateTempStore(config.SessionId + ":journal-index"))
+    let journal = Journal(store, ledger, config.JournalCacheBytes, fun () -> host.CreateTempStore(config.SessionId + TempStoreNames.JournalIndexStoreSuffix))
     let pairings = PairingIndex(ledger, fun () -> host.CreateTempStore(config.SessionId + ":pairs"))
 
     let checkpoints =
