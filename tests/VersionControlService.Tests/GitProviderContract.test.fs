@@ -4557,3 +4557,102 @@ Vitest.describe (
             }
         )
 )
+
+Vitest.describe (
+    "Git / LFS listing has no idle time limit",
+    fun () ->
+        // A fake `git lfs ls-files -j` that stays silent for VCS_TEST_LS_DELAY_MS, then prints an empty listing.
+        let listWithSilentFakeGit (delayMs: int) (cancelAfterMs: int option) = promise {
+            let harness = createGitHarness ()
+            let! fakeRoot = createTempDirectoryAsync ()
+
+            try
+                let! workspace = harness.CreateWorkspace()
+                let fakeGitPath = join [| fakeRoot; if isWindowsProcess () then "git.exe" else "git" |]
+
+                if isWindowsProcess () then
+                    let! _ = fsPromisesDynamic?copyFile (nodeExecutablePath, fakeGitPath) |> unbox<JS.Promise<obj>>
+                    ()
+                else
+                    do!
+                        writeUtf8FileAsync
+                            fakeGitPath
+                            $"#!/bin/sh\nscript=\"$1\"\nshift\nexec '{nodeExecutablePath}' \"$VCS_TEST_LS_DISPATCH_ROOT/$script\" \"$@\"\n"
+
+                    let! _ = fsPromisesDynamic?chmod (fakeGitPath, 493) |> unbox<JS.Promise<obj>>
+                    ()
+
+                // The fake runs as `git lfs ls-files -j`, so node loads the script named "lfs" from the workspace.
+                do!
+                    writeUtf8FileAsync
+                        (join [| workspace.Binding.WorkspaceRoot; "lfs" |])
+                        "setTimeout(() => process.stdout.write('{\"files\":[]}'), Number(process.env.VCS_TEST_LS_DELAY_MS));\n"
+
+                let materialization =
+                    workspace.Session.ObjectMaterialization
+                    |> Option.defaultWith (fun () -> failwith "Expected Git object materialization.")
+
+                let cancellation = OperationCancellation.Source()
+                let context = OperationContext.create "lfs-list-silent" cancellation.Cancellation ignore
+                let originalPath = currentProcessPath ()
+                let originalWorkingDirectory = currentProcessWorkingDirectory ()
+                let originalDelay = tryGetProcessEnvironment "VCS_TEST_LS_DELAY_MS" |> Option.ofObj
+                let originalRoot = tryGetProcessEnvironment "VCS_TEST_LS_DISPATCH_ROOT" |> Option.ofObj
+                let startedAt = DateTime.UtcNow
+
+                let! result =
+                    promise {
+                        try
+                            setCurrentProcessPath (fakeRoot + pathDelimiter + originalPath)
+                            setCurrentProcessWorkingDirectory workspace.Binding.WorkspaceRoot
+                            setProcessEnvironment "VCS_TEST_LS_DELAY_MS" (string delayMs)
+                            setProcessEnvironment "VCS_TEST_LS_DISPATCH_ROOT" workspace.Binding.WorkspaceRoot
+
+                            cancelAfterMs
+                            |> Option.iter (fun ms ->
+                                Fable.Core.JS.setTimeout (fun () -> cancellation.Cancel()) ms |> ignore)
+
+                            return! materialization.ListObjects context |> Async.StartAsPromise
+                        finally
+                            setCurrentProcessWorkingDirectory originalWorkingDirectory
+                            setCurrentProcessPath originalPath
+
+                            match originalDelay with
+                            | Some value -> setProcessEnvironment "VCS_TEST_LS_DELAY_MS" value
+                            | None -> clearProcessEnvironment "VCS_TEST_LS_DELAY_MS"
+
+                            match originalRoot with
+                            | Some value -> setProcessEnvironment "VCS_TEST_LS_DISPATCH_ROOT" value
+                            | None -> clearProcessEnvironment "VCS_TEST_LS_DISPATCH_ROOT"
+                    }
+
+                let elapsedMs = (DateTime.UtcNow - startedAt).TotalMilliseconds
+                do! harness.Cleanup()
+                do! removeDirectoryAsync fakeRoot
+                return result, elapsedMs
+            with error ->
+                do! harness.Cleanup()
+                do! removeDirectoryAsync fakeRoot
+                return raise error
+        }
+
+        Vitest.test (
+            "a listing that is silent for longer than 15 seconds still succeeds",
+            TestOptions(timeout = 90000),
+            fun () -> promise {
+                let! result, _ = listWithSilentFakeGit 17000 None
+                Vitest.expect(expectProviderValue "silent LFS listing" result).toEqual [||]
+            }
+        )
+
+        Vitest.test (
+            "canceling the context ends a running listing promptly",
+            TestOptions(timeout = 90000),
+            fun () -> promise {
+                let! result, elapsedMs = listWithSilentFakeGit 60000 (Some 1000)
+                let failure = expectProviderFailure "canceled silent LFS listing" result
+                Vitest.expect(failure.Category).toEqual Canceled
+                Vitest.expect(elapsedMs < 15000.0).toBe true
+            }
+        )
+)
