@@ -4561,8 +4561,14 @@ Vitest.describe (
 Vitest.describe (
     "Git / LFS listing has no idle time limit",
     fun () ->
-        // A fake `git lfs ls-files -j` that stays silent for VCS_TEST_LS_DELAY_MS, then prints an empty listing.
-        let listWithSilentFakeGit (delayMs: int) (cancelAfterMs: int option) = promise {
+        let sleepMs (ms: int) =
+            Promise.create (fun resolve _ -> Fable.Core.JS.setTimeout (fun () -> resolve ()) ms |> ignore)
+
+        // A fake `git lfs ls-files -j` that writes a "started" marker, stays silent for VCS_TEST_LS_DELAY_MS,
+        // then writes a "finished" marker and prints an empty listing. With cancelOnStart the test cancels
+        // the context once the started marker exists, then waits past the delay to see whether the process
+        // survived. The result carries whether the started and finished markers exist.
+        let listWithSilentFakeGit (delayMs: int) (cancelOnStart: bool) = promise {
             let harness = createGitHarness ()
             let! fakeRoot = createTempDirectoryAsync ()
 
@@ -4586,7 +4592,13 @@ Vitest.describe (
                 do!
                     writeUtf8FileAsync
                         (join [| workspace.Binding.WorkspaceRoot; "lfs" |])
-                        "setTimeout(() => process.stdout.write('{\"files\":[]}'), Number(process.env.VCS_TEST_LS_DELAY_MS));\n"
+                        ("const fs = require('fs');\n"
+                         + "const dir = process.env.VCS_TEST_LS_MARKER_DIR;\n"
+                         + "fs.writeFileSync(dir + '/started', 'x');\n"
+                         + "setTimeout(() => {\n"
+                         + "  fs.writeFileSync(dir + '/finished', 'x');\n"
+                         + "  process.stdout.write('{\"files\":[]}');\n"
+                         + "}, Number(process.env.VCS_TEST_LS_DELAY_MS));\n")
 
                 let materialization =
                     workspace.Session.ObjectMaterialization
@@ -4598,6 +4610,9 @@ Vitest.describe (
                 let originalWorkingDirectory = currentProcessWorkingDirectory ()
                 let originalDelay = tryGetProcessEnvironment "VCS_TEST_LS_DELAY_MS" |> Option.ofObj
                 let originalRoot = tryGetProcessEnvironment "VCS_TEST_LS_DISPATCH_ROOT" |> Option.ofObj
+                let originalMarkerDir = tryGetProcessEnvironment "VCS_TEST_LS_MARKER_DIR" |> Option.ofObj
+                let startedMarker = join [| fakeRoot; "started" |]
+                let finishedMarker = join [| fakeRoot; "finished" |]
                 let startedAt = DateTime.UtcNow
 
                 let! result =
@@ -4607,10 +4622,18 @@ Vitest.describe (
                             setCurrentProcessWorkingDirectory workspace.Binding.WorkspaceRoot
                             setProcessEnvironment "VCS_TEST_LS_DELAY_MS" (string delayMs)
                             setProcessEnvironment "VCS_TEST_LS_DISPATCH_ROOT" workspace.Binding.WorkspaceRoot
+                            setProcessEnvironment "VCS_TEST_LS_MARKER_DIR" fakeRoot
 
-                            cancelAfterMs
-                            |> Option.iter (fun ms ->
-                                Fable.Core.JS.setTimeout (fun () -> cancellation.Cancel()) ms |> ignore)
+                            if cancelOnStart then
+                                let rec cancelWhenStarted (attempt: int) : JS.Promise<unit> = promise {
+                                    if NodeFileSystem.existsSync startedMarker || attempt >= 400 then
+                                        cancellation.Cancel()
+                                    else
+                                        do! sleepMs 25
+                                        return! cancelWhenStarted (attempt + 1)
+                                }
+
+                                cancelWhenStarted 0 |> ignore
 
                             return! materialization.ListObjects context |> Async.StartAsPromise
                         finally
@@ -4624,12 +4647,23 @@ Vitest.describe (
                             match originalRoot with
                             | Some value -> setProcessEnvironment "VCS_TEST_LS_DISPATCH_ROOT" value
                             | None -> clearProcessEnvironment "VCS_TEST_LS_DISPATCH_ROOT"
+
+                            match originalMarkerDir with
+                            | Some value -> setProcessEnvironment "VCS_TEST_LS_MARKER_DIR" value
+                            | None -> clearProcessEnvironment "VCS_TEST_LS_MARKER_DIR"
                     }
 
                 let elapsedMs = (DateTime.UtcNow - startedAt).TotalMilliseconds
+                let startedSeen = NodeFileSystem.existsSync startedMarker
+
+                if cancelOnStart then
+                    // A surviving process writes the finished marker when its delay ends.
+                    do! sleepMs (delayMs + 1500)
+
+                let finished = NodeFileSystem.existsSync finishedMarker
                 do! harness.Cleanup()
                 do! removeDirectoryAsync fakeRoot
-                return result, elapsedMs
+                return result, elapsedMs, startedSeen, finished
             with error ->
                 do! harness.Cleanup()
                 do! removeDirectoryAsync fakeRoot
@@ -4640,19 +4674,25 @@ Vitest.describe (
             "a listing that is silent for longer than 15 seconds still succeeds",
             TestOptions(timeout = 90000),
             fun () -> promise {
-                let! result, _ = listWithSilentFakeGit 17000 None
+                let! result, _, _, finished = listWithSilentFakeGit 17000 false
                 Vitest.expect(expectProviderValue "silent LFS listing" result).toEqual [||]
+                Vitest.expect(finished).toBe true
             }
         )
 
         Vitest.test (
-            "canceling the context ends a running listing promptly",
+            "canceling the context ends the listing and its git-lfs process",
             TestOptions(timeout = 90000),
             fun () -> promise {
-                let! result, elapsedMs = listWithSilentFakeGit 60000 (Some 1000)
+                let! result, elapsedMs, startedSeen, finished = listWithSilentFakeGit 4000 true
                 let failure = expectProviderFailure "canceled silent LFS listing" result
                 Vitest.expect(failure.Category).toEqual Canceled
-                Vitest.expect(elapsedMs < 15000.0).toBe true
+                // The fake had started, so the cancellation hit a live process.
+                Vitest.expect(startedSeen).toBe true
+                // The listing returns before the fake's 4 s delay ends.
+                Vitest.expect(elapsedMs < 3500.0).toBe true
+                // A process that survived the cancellation would have written this marker by now.
+                Vitest.expect(finished).toBe false
             }
         )
 )
