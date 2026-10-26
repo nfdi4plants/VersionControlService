@@ -4589,10 +4589,16 @@ Vitest.describe (
                     ()
 
                 // The fake runs as `git lfs ls-files -j`, so node loads the script named "lfs" from the workspace.
+                // On Linux and macOS each spawn first runs `git lfs --version` synchronously to check PATH,
+                // so the fake answers that at once and only the listing writes markers and stays silent.
                 do!
                     writeUtf8FileAsync
                         (join [| workspace.Binding.WorkspaceRoot; "lfs" |])
-                        ("const fs = require('fs');\n"
+                        ("if (process.argv.includes('--version')) {\n"
+                         + "  process.stdout.write('git-lfs/3.0.0 (fake)\\n');\n"
+                         + "  process.exit(0);\n"
+                         + "}\n"
+                         + "const fs = require('fs');\n"
                          + "const dir = process.env.VCS_TEST_LS_MARKER_DIR;\n"
                          + "fs.writeFileSync(dir + '/started', 'x');\n"
                          + "setTimeout(() => {\n"
