@@ -31,9 +31,6 @@ type OutboundPushPlan =
 let private maxLfsPointerProbeBytes = 1024L
 let mutable private cachedSystemInstalled = false
 
-[<Literal>]
-let private lfsLsFilesTimeoutMs = 15000
-
 [<Emit("console.warn($0)")>]
 let private warn (message: string) : unit = jsNative
 
@@ -923,6 +920,9 @@ let private extractLsFilesFailureMessage (result: GitSpawnResult) =
 
     redactToken message
 
+/// Runs `git lfs ls-files -j` and indexes the result by repository-relative path.
+/// The command prints its JSON only at the end, so an idle timeout would cap the whole
+/// listing. It has no time limit, and callers stop it by canceling the `OperationContext`.
 let readLsFilesByRelativePath
     (repoRoot: string)
     (context: OperationContext)
@@ -947,7 +947,7 @@ let readLsFilesByRelativePath
                     Environment = None
                     StandardInput = None
                     CancelCheck = Some context.Cancellation.IsCancellationRequested
-                    TimeoutMs = Some lfsLsFilesTimeoutMs
+                    TimeoutMs = None
                 }
 
             if commandResult.ExitCode <> 0 || commandResult.TimedOut then
