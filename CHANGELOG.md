@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## 0.2.2 - 2026-10-26
+
 ### Fixed
 
 -   The Git provider no longer stops `git lfs ls-files -j` after 15 seconds without output. The command writes its JSON at the end, so large repositories failed with `lfs_listing_failed`. The listing has no time limit now in `ObjectMaterialization.ListObjects`, `Materialize` and `Dematerialize`, including the download that `Materialize` runs. Each of these takes an `OperationContext`, and canceling it ends the git-lfs process and returns a `Canceled` failure.
