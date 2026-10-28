@@ -400,6 +400,7 @@ let createGitHarness () : ProviderTestHarness =
             "synchronization"
             "conflicts"
             "materialization"
+            "batch-materialization"
             "storage-policy"
             "maintenance"
             "browser"

@@ -5817,6 +5817,18 @@ let private createSessionWithTextDiff
         LfsMediaDirectory = None
     }
 
+    // A Save in the middle of a Free or Download could commit the file while it is missing
+    // or half written, so these bodies take the mutation lock like every other workspace change.
+    // The lock is not re-entrant, and nothing inside these bodies takes it again.
+    let serializeLargeObjectWork (body: unit -> Async<OperationResult<unit>>) = async {
+        do! state.Lock.Acquire()
+
+        try
+            return! body ()
+        finally
+            state.Lock.Release()
+    }
+
     let core: CoreVersionControl = {
         GetStatus = fun context -> getWorkspaceStatus state context
         ListRefs = fun context -> listRefs state context
@@ -5947,17 +5959,17 @@ let private createSessionWithTextDiff
                         state.Credentials
                         state.ConnectionProfileId
                         (preflightIndexLock state)
-                        // A Save in the middle of a Free or Download could commit the file while it is missing
-                        // or half written, so these bodies take the mutation lock like every other workspace change.
-                        // The lock is not re-entrant, and nothing inside these bodies takes it again.
-                        (fun body -> async {
-                            do! state.Lock.Acquire()
-
-                            try
-                                return! body ()
-                            finally
-                                state.Lock.Release()
-                        })
+                        serializeLargeObjectWork
+                )
+            ObjectBatchMaterialization =
+                Some(
+                    GitLfsExtensions.createObjectBatchMaterialization
+                        state.RepoPath
+                        (fun arguments context -> runGit state.Hooks state.RepoPath arguments None context)
+                        state.Credentials
+                        state.ConnectionProfileId
+                        (preflightIndexLock state)
+                        serializeLargeObjectWork
                 )
             StoragePolicy =
                 Some(

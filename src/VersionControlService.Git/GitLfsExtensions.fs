@@ -429,6 +429,188 @@ let createObjectMaterialization
                         }))
 }
 
+/// How a batch operation reports an incomplete run.
+type private BatchAction = {
+    /// Code of a failure when some paths fail.
+    IncompleteCode: string
+    /// Recovery of a partial success.
+    Recovery: RecoveryAction
+}
+
+let private batchMaterializeAction = {
+    IncompleteCode = "batch_materialization_incomplete"
+    Recovery = {
+        Code = "retry_materialization"
+        Instructions = Some "Materialize the path again to replace the pointer with the object's content."
+    }
+}
+
+let private batchDematerializeAction = {
+    IncompleteCode = "batch_dematerialization_incomplete"
+    Recovery = {
+        Code = "retry_dematerialization"
+        Instructions = Some "Free the path again after the reported problem is fixed."
+    }
+}
+
+let private batchNoOpReason = "Every path is already in the requested state."
+
+/// Collapses the outcomes of the paths into one result. The failure of a run with failed paths names
+/// them in AffectedPaths and Details, and it takes its category and retry flag from the first of them.
+let private toBatchResult (action: BatchAction) (outcomes: GitService.LfsPathOutcome[]) : OperationResult<unit> =
+    let changed =
+        outcomes
+        |> Array.choose (fun outcome ->
+            match outcome.Result with
+            | Ok GitService.Changed -> Some outcome.Path
+            | _ -> None)
+
+    let failed =
+        outcomes
+        |> Array.choose (fun outcome ->
+            match outcome.Result with
+            | Error failure -> Some(outcome.Path, failure)
+            | Ok _ -> None)
+
+    if failed.Length = 0 then
+        if changed.Length = 0 then
+            OperationResult.noOp (Some batchNoOpReason) ()
+        else
+            Succeeded {
+                OperationOutcome.performed () with
+                    AffectedPaths = changed
+            }
+    else
+        let failures = failed |> Array.map (fun (path, failure) -> path, toOperationFailure failure)
+        let first = snd failures[0]
+        let allCanceled = failed |> Array.forall (fun (_, failure) -> failure.Kind = GitFailureKind.Canceled)
+
+        let failure = {
+            first with
+                Category = if allCanceled then Canceled else first.Category
+                Code = if allCanceled then "operation_canceled" else action.IncompleteCode
+                Message = $"{failed.Length} of {outcomes.Length} paths failed: {first.Message}"
+                StateChanged = changed.Length > 0 || (failures |> Array.exists (fun (_, item) -> item.StateChanged))
+                AffectedPaths = failures |> Array.map fst
+                Details = failures |> Array.map (fun (path, item) -> $"{path}: {item.Message}")
+        }
+
+        if changed.Length > 0 then
+            OperationResult.partiallySucceeded
+                {
+                    OperationOutcome.performed () with
+                        AffectedPaths = changed
+                }
+                failure
+                action.Recovery
+        else
+            Failed failure
+
+/// Runs a batch operation under the session lock, after the preflight. An empty request needs neither.
+let private runBatch
+    (preflight: OperationContext -> Async<Result<unit, OperationFailure>>)
+    (serialize: (unit -> Async<OperationResult<unit>>) -> Async<OperationResult<unit>>)
+    (phaseCode: string)
+    (action: BatchAction)
+    (operation: string[] -> OperationContext -> JS.Promise<GitService.GitResult<GitService.LfsPathOutcome[]>>)
+    (paths: RepositoryPath[])
+    (context: OperationContext)
+    : Async<OperationResult<unit>> =
+    if paths.Length = 0 then
+        async { return OperationResult.noOp (Some batchNoOpReason) () }
+    else
+        serialize (fun () ->
+            async {
+                if context.Cancellation.IsCancellationRequested() then
+                    return OperationResult.canceled "Git LFS operation canceled."
+                else
+                    let! preflightResult = preflight context
+
+                    match preflightResult with
+                    | Error failure when failure.Category = Canceled -> return OperationResult.canceled failure.Message
+                    | Error failure -> return Failed failure
+                    | Ok() ->
+                        context.ReportProgress {
+                            PhaseCode = phaseCode
+                            Item = None
+                            Completed = None
+                            Total = None
+                            DisplayMessage = None
+                        }
+
+                        if context.Cancellation.IsCancellationRequested() then
+                            return OperationResult.canceled "Git LFS operation canceled."
+                        else
+                            let! result =
+                                Async.AwaitPromise(operation (paths |> Array.map RepositoryPath.value) context)
+
+                            match result with
+                            | Error failure -> return toOperationResult failure
+                            | Ok outcomes -> return toBatchResult action outcomes
+            })
+
+/// The batch variant of createObjectMaterialization. Both operations read the Git LFS listing once, and the
+/// download fetches the objects of many paths together. A path that fails does not stop the others.
+let createObjectBatchMaterialization
+    (repoPath: string)
+    (runGit: string[] -> OperationContext -> Async<Result<NodeProcess.ProcessOutput, OperationFailure>>)
+    (credentials: GitCredentialStrategy.GitCredentialStrategy)
+    (connectionProfileId: string option)
+    (preflight: OperationContext -> Async<Result<unit, OperationFailure>>)
+    (serialize: (unit -> Async<OperationResult<unit>>) -> Async<OperationResult<unit>>)
+    : ObjectBatchMaterializationService = {
+    Materialize =
+        runBatch
+            preflight
+            serialize
+            "lfs-materialize"
+            batchMaterializeAction
+            (fun requestedPaths context ->
+                GitService.downloadLfsFiles
+                    repoPath
+                    requestedPaths
+                    credentials
+                    connectionProfileId
+                    context.ReportProgress
+                    context)
+    Dematerialize =
+        runBatch
+            preflight
+            serialize
+            "lfs-dematerialize"
+            batchDematerializeAction
+            (fun requestedPaths context ->
+                promise {
+                    let! result =
+                        GitService.freeLfsFiles
+                            repoPath
+                            requestedPaths
+                            credentials
+                            connectionProfileId
+                            context.ReportProgress
+                            context
+
+                    match result with
+                    | Error failure -> return Error failure
+                    | Ok outcomes ->
+                        // The cleanup also covers a run that stopped on cancellation, because the files
+                        // that were already freed stay freed.
+                        let freedPaths =
+                            outcomes
+                            |> Array.choose (fun outcome ->
+                                match outcome.Result with
+                                | Ok GitService.Changed -> Some outcome.Path
+                                | _ -> None)
+
+                        if freedPaths.Length > 0 then
+                            do!
+                                deleteCachedObjectsOfFreedPaths repoPath runGit context freedPaths
+                                |> Async.StartAsPromise
+
+                        return Ok outcomes
+                })
+}
+
 let createStoragePolicy
     (repoPath: string)
     (runGit: string[] -> OperationContext -> Async<Result<NodeProcess.ProcessOutput, OperationFailure>>)

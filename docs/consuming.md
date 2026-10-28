@@ -550,6 +550,12 @@ degrade quietly. Keep them absent when the interface changes shape per provider,
 a host must never offer an action the provider cannot carry out. Two hosts can make
 opposite choices against the same provider, which is the intent.
 
+Use `ObjectBatchMaterialization` when an action covers many paths, for example a folder,
+because one call is faster than one `ObjectMaterialization` call per path. When the
+provider does not supply it, call `ObjectMaterialization.Materialize` or `Dematerialize`
+for each path instead. A filled session always has the service, but its fallback changes
+nothing, so read the `service_unavailable` warning before you treat the result as done.
+
 ## Paged text diffs
 
 `TextDiff` is an optional service on `WorkspaceSession`. Read it from `session.TextDiff`
