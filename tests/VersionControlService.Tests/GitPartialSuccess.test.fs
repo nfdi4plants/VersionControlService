@@ -13,6 +13,7 @@ module GitExecution = VersionControlService.Git.GitExecution
 module GitLfsService = VersionControlService.Git.GitLfsService
 module GitLfsAdapter = VersionControlService.Git.GitLfsAdapter
 module GitInternals = VersionControlService.Git.GitInternals
+module GitCredentialStrategy = VersionControlService.Git.GitCredentialStrategy
 module NodeProcess = VersionControlService.Runtime.Node.Process
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 
@@ -364,6 +365,66 @@ let private createPublishFixture hooks = promise {
     }
 
     return root, workPath, barePath, GitWorkspaceSession.createSession hooks binding
+}
+
+let private lfsDownloadFiles = [|
+    "data/a.bin", "content of a\n"
+    "data/b.bin", "content of b\n"
+    "other/c.bin", "content of c\n"
+|]
+
+/// A work repository whose origin holds the objects of lfsDownloadFiles. The working tree has
+/// only their pointers and the local object cache is empty.
+let private createFreedLfsFixture () = promise {
+    let! root, workPath, barePath, session = createPublishFixture GitWorkspaceSession.GitSessionHooks.none
+    let! _ = runGitOk workPath [| "lfs"; "track"; "*.bin" |]
+
+    for folder in [| "data"; "other" |] do
+        NodeFileSystem.mkdirSync (join [| workPath; folder |]) (NodeFileSystem.MkdirOptions(recursive = true))
+
+    for relativePath, content in lfsDownloadFiles do
+        do! writeUtf8FileAsync (join [| workPath; relativePath |]) content
+
+    let! _ = runGitOk workPath [| "add"; "-A" |]
+    let! _ = runGitOk workPath [| "commit"; "-m"; "test: LFS files to download" |]
+    let! _ = runGitOk workPath [| "push"; "origin"; "main" |]
+
+    let materialization =
+        session.ObjectMaterialization
+        |> Option.defaultWith (fun () -> failwith "Expected the object-materialization service.")
+
+    for relativePath, _ in lfsDownloadFiles do
+        let! freed =
+            materialization.Dematerialize (repositoryPath relativePath) (ctx $"free-{relativePath}")
+            |> Async.StartAsPromise
+
+        match freed with
+        | Succeeded _ -> ()
+        | PartiallySucceeded(_, failure)
+        | Failed failure -> failwith $"Dematerialization failed for '{relativePath}' ({failure.Code})."
+
+        // The remote check of a free on a local remote refetches the object into the cache.
+        let! objectPath = lfsObjectPathForHeadFile workPath relativePath
+
+        if NodeFileSystem.existsSync objectPath then
+            NodeFileSystem.unlinkSync objectPath
+
+    return root, workPath, barePath
+}
+
+let private downloadLfsPaths (workPath: string) (paths: string[]) (reports: ResizeArray<OperationProgress>) = promise {
+    let! result =
+        GitService.downloadLfsFiles
+            workPath
+            paths
+            GitCredentialStrategy.anonymous
+            None
+            reports.Add
+            (ctx "download-lfs-paths")
+
+    match result with
+    | Ok outcomes -> return outcomes
+    | Error failure -> return failwith $"The download failed as a whole: {failure.Message}"
 }
 
 let private createPathspecFixture () = promise {
@@ -2314,6 +2375,220 @@ Vitest.describe (
 
                         let! siblingObjectExists = pathExistsAsync siblingObjectPath
                         Vitest.expect(siblingObjectExists).toBe false
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "materialization of several files fetches them in one transfer and checks them out",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let! root, workPath, _ = createFreedLfsFixture ()
+
+                    try
+                        let reports = ResizeArray<OperationProgress>()
+                        let paths = lfsDownloadFiles |> Array.map fst
+                        let! outcomes = downloadLfsPaths workPath paths reports
+
+                        Vitest.expect(outcomes |> Array.map (fun outcome -> outcome.Path)).toEqual paths
+
+                        Vitest
+                            .expect(outcomes |> Array.forall (fun outcome -> outcome.Result = Ok GitService.Changed))
+                            .toBe true
+
+                        for relativePath, content in lfsDownloadFiles do
+                            let! actual = tryReadUtf8FileAsync (join [| workPath; relativePath |])
+                            Vitest.expect(actual).toEqual (Some content)
+
+                        let! listingJson = runGitOk workPath [| "lfs"; "ls-files"; "-j" |]
+                        let listing = GitLfsService.parseLsFiles listingJson
+                        Vitest.expect(listing.Length).toBe lfsDownloadFiles.Length
+                        Vitest.expect(listing |> Array.forall (fun file -> file.checkout)).toBe true
+
+                        // Three paths in two folders share one fetch, which names no single item.
+                        let transfers =
+                            reports
+                            |> Seq.filter (fun report -> report.PhaseCode = "lfs-materialize-transfer")
+                            |> Seq.toArray
+
+                        Vitest.expect(transfers.Length).toBe 1
+                        Vitest.expect(transfers[0].Item.IsNone).toBe true
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "materialization of several files leaves a path with local changes alone and downloads the others",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let! root, workPath, _ = createFreedLfsFixture ()
+
+                    try
+                        let dirtyPath = "data/b.bin"
+                        let dirtyContent = "dirty pointer replacement\n"
+                        do! writeUtf8FileAsync (join [| workPath; dirtyPath |]) dirtyContent
+
+                        let! outcomes =
+                            downloadLfsPaths workPath (lfsDownloadFiles |> Array.map fst) (ResizeArray<OperationProgress>())
+
+                        let resultOf path =
+                            outcomes |> Array.find (fun outcome -> outcome.Path = path) |> _.Result
+
+                        Vitest.expect(resultOf "data/a.bin" = Ok GitService.Changed).toBe true
+                        Vitest.expect(resultOf "other/c.bin" = Ok GitService.Changed).toBe true
+
+                        match resultOf dirtyPath with
+                        | Error failure -> Vitest.expect(failure.Message.Contains $"'{dirtyPath}' has local changes").toBe true
+                        | Ok _ -> failwith "A path with local changes must not be downloaded."
+
+                        let! dirtyAfter = tryReadUtf8FileAsync (join [| workPath; dirtyPath |])
+                        Vitest.expect(dirtyAfter).toEqual (Some dirtyContent)
+
+                        let! cleanAfter = tryReadUtf8FileAsync (join [| workPath; "data/a.bin" |])
+                        Vitest.expect(cleanAfter).toEqual (Some "content of a\n")
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "materialization of several files names the file whose content the remote lacks and downloads the others",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let! root, workPath, barePath = createFreedLfsFixture ()
+
+                    try
+                        let missingPath = "other/c.bin"
+                        let! missingObjectPath = lfsObjectPathForHeadFile workPath missingPath
+                        let missingOid = missingObjectPath.Split [| '/'; '\\' |] |> Array.last
+
+                        let! remoteEntries =
+                            fsPromisesDynamic?readdir (barePath, createObj [ "recursive" ==> true ])
+                            |> unbox<JS.Promise<string[]>>
+
+                        let remoteObjects = remoteEntries |> Array.filter (fun entry -> entry.EndsWith(missingOid))
+                        Vitest.expect(remoteObjects.Length).toBe 1
+
+                        for entry in remoteObjects do
+                            do! fsPromisesDynamic?rm (join [| barePath; entry |]) |> unbox<JS.Promise<unit>>
+
+                        let! outcomes =
+                            downloadLfsPaths
+                                workPath
+                                [| "data/a.bin"; missingPath; "data/b.bin" |]
+                                (ResizeArray<OperationProgress>())
+
+                        let resultOf path =
+                            outcomes |> Array.find (fun outcome -> outcome.Path = path) |> _.Result
+
+                        Vitest.expect(resultOf "data/a.bin" = Ok GitService.Changed).toBe true
+                        Vitest.expect(resultOf "data/b.bin" = Ok GitService.Changed).toBe true
+
+                        match resultOf missingPath with
+                        | Error failure ->
+                            Vitest.expect(failure.Message.Contains $"does not have the content of '{missingPath}'").toBe true
+                        | Ok _ -> failwith "A file whose content the remote lacks must not be downloaded."
+
+                        let! missingAfter = tryReadUtf8FileAsync (join [| workPath; missingPath |])
+
+                        Vitest
+                            .expect(
+                                missingAfter
+                                |> Option.exists (fun text -> text.StartsWith("version https://git-lfs", StringComparison.Ordinal))
+                            )
+                            .toBe true
+
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "materialization of several files reports a materialized file as already in state",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let! root, workPath, _ = createFreedLfsFixture ()
+
+                    try
+                        let reports = ResizeArray<OperationProgress>()
+                        let! first = downloadLfsPaths workPath [| "data/a.bin" |] reports
+                        Vitest.expect(first |> Array.map (fun outcome -> outcome.Result) = [| Ok GitService.Changed |]).toBe true
+
+                        let! second = downloadLfsPaths workPath [| "data/a.bin"; "data/b.bin" |] reports
+
+                        Vitest
+                            .expect(
+                                second |> Array.map (fun outcome -> outcome.Result) = [|
+                                    Ok GitService.AlreadyInState
+                                    Ok GitService.Changed
+                                |]
+                            )
+                            .toBe true
+
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "materialization of several files counts a repeated path once",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let! root, workPath, _ = createFreedLfsFixture ()
+
+                    try
+                        let! outcomes =
+                            downloadLfsPaths
+                                workPath
+                                [| "data/a.bin"; "data/b.bin"; "data/a.bin" |]
+                                (ResizeArray<OperationProgress>())
+
+                        Vitest.expect(outcomes |> Array.map (fun outcome -> outcome.Path)).toEqual [|
+                            "data/a.bin"
+                            "data/b.bin"
+                        |]
+
+                        Vitest
+                            .expect(outcomes |> Array.forall (fun outcome -> outcome.Result = Ok GitService.Changed))
+                            .toBe true
+
                         do! removeDirectoryAsync root
                     with error ->
                         do! removeDirectoryAsync root

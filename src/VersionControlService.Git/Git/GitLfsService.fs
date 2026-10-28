@@ -114,6 +114,24 @@ let isMissingOnRemote (output: string) =
         || output.IndexOf("remote missing object", StringComparison.OrdinalIgnoreCase) >= 0
         || Regex.IsMatch(output, @"\[[0-9a-f]{64}\][^\r\n]*\[404\]"))
 
+/// Object ids that fetch output reports as missing on the remote. A line counts when
+/// isMissingOnRemote accepts it, and every 64-digit hex token on it is an id.
+let missingOnRemoteObjectIds (output: string) : Set<string> =
+    let isHexDigit (character: char) =
+        (character >= '0' && character <= '9') || (character >= 'a' && character <= 'f')
+
+    if String.IsNullOrWhiteSpace output then
+        Set.empty
+    else
+        output.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
+        |> Array.filter isMissingOnRemote
+        |> Array.collect (fun line ->
+            line
+            |> String.map (fun character -> if isHexDigit character then character else ' ')
+            |> fun hexOnly -> hexOnly.Split([| ' ' |], StringSplitOptions.RemoveEmptyEntries)
+            |> Array.filter (fun token -> token.Length = 64))
+        |> Set.ofArray
+
 let private redactDiagnosticText (text: string) =
     if String.IsNullOrWhiteSpace text then
         text
@@ -1127,15 +1145,20 @@ let private buildPointerInput (listing: GitLfsLsFileInfo) =
 
     $"version {listing.version}\noid {listing.``oid_type``}:{listing.oid}\nsize {sizeText}\n"
 
-let private buildDownloadObjectArgs (relativePath: string) = [|
-    "-c"
-    "lfs.fetchrecentalways=false"
-    "lfs"
-    "fetch"
-    $"--include={lfsPathPattern relativePath}"
-    "origin"
-    "HEAD"
-|]
+/// git-lfs reads one comma-separated list from --include and keeps only the last of repeated
+/// flags. lfsPathPattern never leaves a comma in a pattern, so joining the patterns is safe.
+let buildDownloadObjectArgs (relativePaths: string[]) =
+    let includePatterns = relativePaths |> Array.map lfsPathPattern |> String.concat ","
+
+    [|
+        "-c"
+        "lfs.fetchrecentalways=false"
+        "lfs"
+        "fetch"
+        $"--include={includePatterns}"
+        "origin"
+        "HEAD"
+    |]
 
 let private extractSpawnFailureMessage (result: GitSpawnResult) =
     let stderrText =
@@ -1162,15 +1185,19 @@ let private extractSpawnFailureMessage (result: GitSpawnResult) =
     else
         "Git command failed."
 
-let buildCheckoutArgs (relativePath: string) = [| "lfs"; "checkout"; "--"; lfsPathPattern relativePath |]
+/// The fixed arguments of `git lfs checkout`. The patterns of lfsPathPattern follow them.
+let checkoutArgsPrefix = [| "lfs"; "checkout"; "--" |]
+
+let buildCheckoutArgs (relativePath: string) =
+    Array.append checkoutArgsPrefix [| lfsPathPattern relativePath |]
 
 // Checkout has no timeout or cancellation because git-lfs holds the index lock while it refreshes the index.
 // Stopping it midway leaves a stale lock and a checked-out file.
-let checkoutPath (repoPath: string) (relativePath: string) : JS.Promise<Result<unit, exn>> = promise {
+let checkoutPatterns (repoPath: string) (patterns: string[]) : JS.Promise<Result<unit, exn>> = promise {
     let! result =
         runGitCaptured {
             WorkingDirectory = Some repoPath
-            Arguments = buildCheckoutArgs relativePath
+            Arguments = Array.append checkoutArgsPrefix patterns
             Environment = None
             StandardInput = None
             CancelCheck = None
@@ -1504,16 +1531,20 @@ let fetchRefetchForPath
                 Error(exn failureMessage)
     }
 
-/// Downloads the object of `listing` into the local cache.
-/// By default one fetch of the path pattern downloads it. The pattern can also match files whose
-/// names differ from the requested one only at special characters. For those, `exactObjectOnly`
-/// switches to `git lfs smudge`, which downloads only the object named in the pointer on stdin.
-let downloadObjectFromListing
+/// Chooses how downloadObjects fetches objects into the local cache.
+type ObjectDownload =
+    /// One fetch for the path patterns of these paths.
+    | FetchPaths of relativePaths: string[]
+    /// One `git lfs smudge` for the object named by the listing. A fetch of the path pattern also
+    /// downloads files whose names differ from the requested one only at special characters,
+    /// and the smudge takes just this object.
+    | SmudgeObject of relativePath: string * listing: GitLfsLsFileInfo
+
+/// Downloads objects into the local cache.
+let downloadObjects
     (repoPath: string)
     (commandAuth: GitCommandAuthentication)
-    (relativePath: string)
-    (listing: GitLfsLsFileInfo)
-    (exactObjectOnly: bool)
+    (download: ObjectDownload)
     (cancelCheck: (unit -> bool) option)
     (onStarted: unit -> unit)
     : JS.Promise<Result<unit, exn>> =
@@ -1521,12 +1552,12 @@ let downloadObjectFromListing
         let transferEnvironment = withFetchExcludeCleared commandAuth.Environment
 
         let arguments, standardInput, environment =
-            if exactObjectOnly then
+            match download with
+            | SmudgeObject(relativePath, listing) ->
                 buildSmudgePointerArgs relativePath,
                 Some(buildPointerInput listing),
                 withLfsSmudgeEnabled transferEnvironment
-            else
-                buildDownloadObjectArgs relativePath, None, transferEnvironment
+            | FetchPaths relativePaths -> buildDownloadObjectArgs relativePaths, None, transferEnvironment
 
         let! result =
             runGitDiscardingStdoutWithStarted onStarted {
