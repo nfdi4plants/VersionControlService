@@ -1189,6 +1189,16 @@ let dryRunCoversObject (output: string) (oid: string) : bool =
     output.Split '\n'
     |> Array.exists (fun line -> line.Trim().StartsWith(prefix, StringComparison.Ordinal))
 
+/// The text of a failed dry run without its listing lines. A listing line holds an object id and a
+/// path, and either can contain a word that the failure classification reads as the cause. A text with
+/// nothing but listing lines stays as it is, so the failure keeps a message.
+let dropDryRunListingLines (text: string) : string =
+    let remaining =
+        text.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
+        |> Array.filter (fun line -> not (Regex.IsMatch(line, @"^\s*fetch [0-9a-f]{64} => ")))
+
+    if remaining.Length = 0 then text else String.concat "\n" remaining
+
 let private buildSmudgePointerArgs (relativePath: string) = [|
     "-c"
     "lfs.fetchinclude="
@@ -1588,7 +1598,7 @@ let fetchRefetchForPaths
                     else
                         outputMessage
 
-                Error(exn failureMessage)
+                Error(exn (if dryRun then dropDryRunListingLines failureMessage else failureMessage))
     }
 
 /// Chooses how downloadObjects fetches objects into the local cache.

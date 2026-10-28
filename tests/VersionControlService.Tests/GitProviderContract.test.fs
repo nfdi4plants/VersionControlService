@@ -611,7 +611,7 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "classifies Windows connection failure texts as network or timeout",
+            "classifies connection failure texts as network or timeout",
             fun () ->
                 let refused =
                     GitService.classifyFailureKind
@@ -623,9 +623,22 @@ Vitest.describe (
                     GitService.classifyFailureKind
                         "connectex: A connection attempt failed because the connected party did not properly respond after a period of time, or established connection failed because connected host has failed to respond."
 
+                let reset =
+                    GitService.classifyFailureKind
+                        "read tcp 127.0.0.1:50000->127.0.0.1:1: wsarecv: An existing connection was forcibly closed by the remote host."
+
+                let closedByServer =
+                    GitService.classifyFailureKind
+                        "Fetching reference refs/heads/main\nbatch response: Post \"http://127.0.0.1:1/origin.git/info/lfs/objects/batch\": EOF\nerror: failed to fetch some objects from 'http://127.0.0.1:1/origin.git/info/lfs'"
+
+                let bareEof = GitService.classifyFailureKind "error: unexpected EOF while reading the file"
+
                 Vitest.expect(refused).toEqual (GitEngineTypes.GitFailureKind.Network)
                 Vitest.expect(unknownHost).toEqual (GitEngineTypes.GitFailureKind.Network)
                 Vitest.expect(unanswered).toEqual (GitEngineTypes.GitFailureKind.Timeout)
+                Vitest.expect(reset).toEqual (GitEngineTypes.GitFailureKind.Network)
+                Vitest.expect(closedByServer).toEqual (GitEngineTypes.GitFailureKind.Network)
+                Vitest.expect(bareEof).toEqual (GitEngineTypes.GitFailureKind.Unknown)
         )
 
         Vitest.test (

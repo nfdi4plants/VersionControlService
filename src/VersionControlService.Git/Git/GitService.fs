@@ -103,6 +103,14 @@ let classifyFailureKind (message: string) =
             && (lfsExecutableMissingTokens |> Array.exists line.Contains)
         )
 
+    // A server that closes the connection mid-request gives "batch response: Post ...: EOF".
+    // A bare EOF elsewhere says nothing about the network.
+    let batchResponseEndsWithEof =
+        normalizedMessage.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
+        |> Array.exists (fun line ->
+            line.Contains("batch response:") && line.TrimEnd().EndsWith(": eof", StringComparison.Ordinal)
+        )
+
     if
         containsAny lfsInstallRequiredTokens
         || (containsAny lfsFilterFailureTokens && gitLfsExecutableCouldNotStart)
@@ -145,9 +153,11 @@ let classifyFailureKind (message: string) =
             "connection reset"
             "connection refused"
             "actively refused"
+            "forcibly closed"
             "no such host"
             "unable to access"
         |]
+        || batchResponseEndsWithEof
     then
         GitFailureKind.Network
     else
@@ -2774,6 +2784,8 @@ type private LfsConfirmation =
     | RemoteHasObject
     | RemoteLacksCoverage
     | ConfirmationFailed of exn
+    /// A failure that every other path meets again, such as an unreachable remote.
+    | ConfirmationRemoteWideFailed of exn
     | ConfirmationCanceled
 
 let private lfsConfirmationFailureMessage (safePath: string) (error: exn) =
@@ -2933,7 +2945,7 @@ let rec private confirmLfsChunk
                 return answers.ToArray()
             // An object id can contain "401" or "403", so output that names missing objects is not classified.
             elif missingObjectIds.IsEmpty && isRemoteWideFailure error then
-                return chunk |> Array.map (fun _ -> ConfirmationFailed error)
+                return chunk |> Array.map (fun _ -> ConfirmationRemoteWideFailed error)
             else
                 return! confirmLfsPathsOneByOne arcPath session usesServer chunk reportProgress context
         }
@@ -2973,8 +2985,9 @@ let rec private confirmLfsChunk
 }
 
 /// Asks the remote about every candidate, one dry run per chunk of patterns. A candidate that the
-/// remote lacks settles with its failure. The result holds the confirmed candidates in request order.
-/// The error is a cancellation.
+/// remote lacks settles with its failure. When a chunk fails for a problem that every path meets again,
+/// such as an unreachable remote, the remaining chunks settle with that failure and skip the remote.
+/// The result holds the confirmed candidates in request order. The error is a cancellation.
 let private confirmLfsCandidates
     (arcPath: string)
     (session: AuthenticatedGitSession)
@@ -2992,11 +3005,19 @@ let private confirmLfsCandidates
     let patternChunks = GitPathTransport.chunkArguments fixedArguments (Seq.toArray groups.Keys)
     let confirmed = ResizeArray<LfsPathCandidate>()
     let mutable canceled = false
+    let mutable remoteWideFailure: exn option = None
+
+    let settleFailed (candidate: LfsPathCandidate) (error: exn) =
+        results[candidate.Requested] <- Error(lfsFailure (lfsConfirmationFailureMessage candidate.SafePath error))
 
     for patterns in patternChunks do
         if not canceled then
             let chunk = patterns |> Array.collect (fun pattern -> groups[pattern].ToArray())
-            let! answers = confirmLfsChunk arcPath session usesServer chunk true reportProgress context
+
+            let! answers =
+                match remoteWideFailure with
+                | Some error -> promise { return chunk |> Array.map (fun _ -> ConfirmationRemoteWideFailed error) }
+                | None -> confirmLfsChunk arcPath session usesServer chunk true reportProgress context
 
             for index in 0 .. chunk.Length - 1 do
                 let candidate = chunk[index]
@@ -3010,9 +3031,10 @@ let private confirmLfsCandidates
                             lfsFailure
                                 $"Could not check whether the remote has '{candidate.SafePath}', so its local copy stays."
                         )
-                | ConfirmationFailed error ->
-                    results[candidate.Requested] <-
-                        Error(lfsFailure (lfsConfirmationFailureMessage candidate.SafePath error))
+                | ConfirmationFailed error -> settleFailed candidate error
+                | ConfirmationRemoteWideFailed error ->
+                    remoteWideFailure <- Some error
+                    settleFailed candidate error
 
     if canceled then
         return canceledLfsResult ()

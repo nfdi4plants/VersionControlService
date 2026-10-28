@@ -522,6 +522,32 @@ let private openBatchMaterialization (workPath: string) (barePath: string) : Obj
         session.ObjectBatchMaterialization
         |> Option.defaultWith (fun () -> failwith "Expected the object batch materialization service.")
 
+/// The batch materialization service of a session whose credential strategy hands out a token for the remote at `remoteUrl`.
+let private openBatchMaterializationWithToken (workPath: string) (remoteUrl: string) : ObjectBatchMaterializationService =
+    let strategy: GitCredentialStrategy.GitCredentialStrategy = {
+        ResolveCredential =
+            fun _host _profileId -> async { return Some { Username = "oauth2"; Secret = "unreachable-token" } }
+    }
+
+    let binding: WorkspaceBinding = {
+        SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
+        ProviderId = gitProviderId
+        WorkspaceRoot = workPath
+        ProviderStateRef = None
+        Location = {
+            ProviderId = gitProviderId
+            DisplayName = None
+            ProviderLocation = remoteUrl
+            ConnectionProfileId = Some "token-profile"
+        }
+        ConnectionProfileId = Some "token-profile"
+    }
+
+    GitWorkspaceSession.createSessionWithCredentials GitWorkspaceSession.GitSessionHooks.none strategy binding
+    |> fun session ->
+        session.ObjectBatchMaterialization
+        |> Option.defaultWith (fun () -> failwith "Expected the object batch materialization service.")
+
 [<Emit("Date.now()")>]
 let private nowMilliseconds () : float = jsNative
 
@@ -1432,6 +1458,25 @@ Vitest.describe (
                             "batch response: Repository or object not found: https://example.org/info/lfs/objects/batch"
                     )
                     .toBe false
+        )
+
+        Vitest.test (
+            "a failed dry run keeps its listing lines out of the failure classification",
+            fun () ->
+                let oid = "403" + String.replicate 61 "a"
+
+                let failureText =
+                    $"Fetching reference refs/heads/main\nfetch {oid} => data/a.bin\nerror: failed to fetch some objects from 'https://example.org/origin.git/info/lfs'"
+
+                let cleaned = GitLfsService.dropDryRunListingLines failureText
+
+                Vitest.expect(GitService.classifyFailureKind failureText).toEqual (GitEngineTypes.GitFailureKind.Forbidden)
+                Vitest.expect(GitService.classifyFailureKind cleaned).toEqual (GitEngineTypes.GitFailureKind.Unknown)
+
+                Vitest
+                    .expect(cleaned)
+                    .toEqual
+                        "Fetching reference refs/heads/main\nerror: failed to fetch some objects from 'https://example.org/origin.git/info/lfs'"
         )
 
         Vitest.test (
@@ -3309,35 +3354,7 @@ Vitest.describe (
                         let remoteUrl = "https://127.0.0.1:1/origin.git"
                         let! _ = runGitOk workPath [| "remote"; "set-url"; "origin"; remoteUrl |]
 
-                        let strategy: GitCredentialStrategy.GitCredentialStrategy = {
-                            ResolveCredential =
-                                fun _host _profileId ->
-                                    async { return Some { Username = "oauth2"; Secret = "unreachable-token" } }
-                        }
-
-                        let binding: WorkspaceBinding = {
-                            SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
-                            ProviderId = gitProviderId
-                            WorkspaceRoot = workPath
-                            ProviderStateRef = None
-                            Location = {
-                                ProviderId = gitProviderId
-                                DisplayName = None
-                                ProviderLocation = remoteUrl
-                                ConnectionProfileId = Some "token-profile"
-                            }
-                            ConnectionProfileId = Some "token-profile"
-                        }
-
-                        let batch =
-                            GitWorkspaceSession.createSessionWithCredentials
-                                GitWorkspaceSession.GitSessionHooks.none
-                                strategy
-                                binding
-                            |> fun session ->
-                                session.ObjectBatchMaterialization
-                                |> Option.defaultWith (fun () -> failwith "Expected the object batch materialization service.")
-
+                        let batch = openBatchMaterializationWithToken workPath remoteUrl
                         let paths = lfsDownloadFiles |> Array.map fst
 
                         stopObserving.Value <- observeGitSpawnArguments observedCommands
@@ -3375,6 +3392,84 @@ Vitest.describe (
                             let! worktreeText = tryReadUtf8FileAsync (join [| workPath; relativePath |])
                             Vitest.expect(worktreeText).toEqual (Some content)
 
+                            let! objectPath = lfsObjectPathForHeadFile workPath relativePath
+                            let! objectExists = pathExistsAsync objectPath
+                            Vitest.expect(objectExists).toBe true
+
+                        do! removeDirectoryAsync root
+                    with error ->
+                        stopObserving.Value ()
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "batch dematerialization skips the remote for later chunks once an unreachable remote failed a chunk",
+            TestOptions(timeout = 600000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let! root, workPath, _, _ = createPublishFixture GitWorkspaceSession.GitSessionHooks.none
+
+                    let observedCommands = ResizeArray<string[]>()
+                    let stopObserving: (unit -> unit) ref = ref ignore
+
+                    try
+                        do! commitAndPushLfsFiles workPath manyLfsFiles
+
+                        // The long paths need two chunks of patterns. Nothing listens on port 1.
+                        let remoteUrl = "https://127.0.0.1:1/origin.git"
+                        let! _ = runGitOk workPath [| "remote"; "set-url"; "origin"; remoteUrl |]
+
+                        let batch = openBatchMaterializationWithToken workPath remoteUrl
+                        let paths = manyLfsFiles |> Array.map (fun (_, relativePath, _) -> relativePath)
+
+                        stopObserving.Value <- observeGitSpawnArguments observedCommands
+
+                        let! result =
+                            batch.Dematerialize
+                                (paths |> Array.map repositoryPath)
+                                (ctx "batch-dematerialize-unreachable-chunks")
+                            |> Async.StartAsPromise
+
+                        stopObserving.Value ()
+                        stopObserving.Value <- ignore
+
+                        match result with
+                        | Failed failure ->
+                            Vitest.expect(failure.Category).toEqual Network
+                            Vitest.expect(failure.AffectedPaths).toEqual paths
+                            Vitest.expect(failure.Details.Length).toBe paths.Length
+
+                            let lastPath = Array.last paths
+
+                            Vitest
+                                .expect(
+                                    (Array.last failure.Details)
+                                        .Contains $"Could not confirm that the remote has '{lastPath}'"
+                                )
+                                .toBe true
+                        | Succeeded _
+                        | PartiallySucceeded _ -> failwith "Expected a failure for every path when the remote cannot be reached."
+
+                        let fetches =
+                            observedCommands
+                            |> Seq.filter (fun arguments ->
+                                arguments |> Array.contains "lfs" && arguments |> Array.contains "fetch")
+                            |> Seq.toArray
+
+                        Vitest.expect(fetches.Length).toBe 1
+                        Vitest.expect(fetches[0] |> Array.contains "--dry-run").toBe true
+
+                        for _, relativePath, content in manyLfsFiles do
+                            let! worktreeText = tryReadUtf8FileAsync (join [| workPath; relativePath |])
+                            Vitest.expect(worktreeText).toEqual (Some content)
+
+                        for relativePath in [| paths[0]; Array.last paths |] do
                             let! objectPath = lfsObjectPathForHeadFile workPath relativePath
                             let! objectExists = pathExistsAsync objectPath
                             Vitest.expect(objectExists).toBe true

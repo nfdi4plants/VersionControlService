@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
--   The Git provider now gives a failure the category `Network` when the text says "actively refused" (a refused connection on Windows) or "no such host", and the category `Timeout` when it says "did not properly respond" (a connection attempt that gets no answer on Windows). Before, these failures had the category `ProviderError`, so a caller could not tell an unreachable remote from a rejected request. The texts of other platforms, such as "connection refused" and "i/o timeout", already had these categories.
+-   The Git provider now gives a failure the category `Network` when the text says "actively refused" (a refused connection on Windows) or "no such host", and the category `Timeout` when it says "did not properly respond" (a connection attempt that gets no answer on Windows). The category is `Network` also for "forcibly closed" (a reset connection on Windows) and for a Git LFS "batch response:" line that ends with ": EOF" (a server that closes the connection). Before, these failures had the category `ProviderError`, so a caller could not tell an unreachable remote from a rejected request. The texts of other platforms, such as "connection refused" and "i/o timeout", already had these categories.
 
 ## 0.2.2 - 2026-10-26
 
