@@ -611,6 +611,24 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "classifies Windows connection failure texts as network or timeout",
+            fun () ->
+                let refused =
+                    GitService.classifyFailureKind
+                        "dial tcp 127.0.0.1:1: connectex: No connection could be made because the target machine actively refused it."
+
+                let unknownHost = GitService.classifyFailureKind "dial tcp: lookup nohost.invalid: no such host"
+
+                let unanswered =
+                    GitService.classifyFailureKind
+                        "connectex: A connection attempt failed because the connected party did not properly respond after a period of time, or established connection failed because connected host has failed to respond."
+
+                Vitest.expect(refused).toEqual (GitEngineTypes.GitFailureKind.Network)
+                Vitest.expect(unknownHost).toEqual (GitEngineTypes.GitFailureKind.Network)
+                Vitest.expect(unanswered).toEqual (GitEngineTypes.GitFailureKind.Timeout)
+        )
+
+        Vitest.test (
             "preserves current and tracking flags across branch states",
             TestOptions(timeout = 120000),
             fun () -> promise {

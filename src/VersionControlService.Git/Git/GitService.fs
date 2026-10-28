@@ -122,7 +122,7 @@ let classifyFailureKind (message: string) =
     // Process kills are classified structurally before any text reaches this function.
     elif containsAny [| "cancelled"; "canceled" |] then
         GitFailureKind.Canceled
-    elif containsAny [| "timed out"; "timeout"; "time out" |] then
+    elif containsAny [| "timed out"; "timeout"; "time out"; "did not properly respond" |] then
         GitFailureKind.Timeout
     elif containsAny [| "forbidden"; "403" |] then
         GitFailureKind.Forbidden
@@ -144,6 +144,8 @@ let classifyFailureKind (message: string) =
             "failed to connect"
             "connection reset"
             "connection refused"
+            "actively refused"
+            "no such host"
             "unable to access"
         |]
     then
@@ -2858,11 +2860,23 @@ let private confirmLfsPathsOneByOne
     return answers.ToArray()
 }
 
+/// True when the failure classifies as a network, timeout, authentication or authorization problem.
+/// The remote gives the same problem again for each path of a chunk, so asking path by path only waits longer.
+let private isRemoteWideFailure (error: exn) =
+    match classifyFailureKind error.Message with
+    | GitFailureKind.Network
+    | GitFailureKind.Timeout
+    | GitFailureKind.Unauthorized
+    | GitFailureKind.Forbidden -> true
+    | _ -> false
+
 /// Asks the remote about the paths of one chunk with a single dry run. The chunk counts as
 /// confirmed when the dry run succeeds and, without the batch API, so does the refetch. When either
 /// fails, its output may name the objects that the remote lacks. Those paths settle with the message of
-/// a single-file free, and the rest of the chunk asks again once. A failure that names no object, or a
-/// second failure, sends each path to ask on its own, so every path keeps the message of a single-file free.
+/// a single-file free, and the rest of the chunk asks again once. After a failure that names no object, a
+/// network, timeout, authentication or authorization problem settles every path of the chunk at once,
+/// each with the message of a single-file free. Any other failure, and a second failure that names
+/// objects, sends each path to ask on its own, so every path keeps that message.
 let rec private confirmLfsChunk
     (arcPath: string)
     (session: AuthenticatedGitSession)
@@ -2917,6 +2931,9 @@ let rec private confirmLfsChunk
                         next <- next + 1
 
                 return answers.ToArray()
+            // An object id can contain "401" or "403", so output that names missing objects is not classified.
+            elif missingObjectIds.IsEmpty && isRemoteWideFailure error then
+                return chunk |> Array.map (fun _ -> ConfirmationFailed error)
             else
                 return! confirmLfsPathsOneByOne arcPath session usesServer chunk reportProgress context
         }

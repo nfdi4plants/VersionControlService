@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -   `WorkspaceSession` and `ServiceAvailability` have a new `ObjectBatchMaterialization` field, so code that builds these records has to set it. `WorkspaceSession.createCoreOnly` sets it to `None`.
 -   The Git provider's `Materialize` and `Dematerialize` now read the Git LFS listing once per call and check `git status` only for the requested path. Before, a download listed every Git LFS file of the repository four times and read the status of the whole working tree twice, which made single-file actions slow in large repositories. A file that is deleted while its download runs now fails with the local-changes message and stays deleted.
 
+### Fixed
+
+-   The Git provider now gives a failure the category `Network` when the text says "actively refused" (a refused connection on Windows) or "no such host", and the category `Timeout` when it says "did not properly respond" (a connection attempt that gets no answer on Windows). Before, these failures had the category `ProviderError`, so a caller could not tell an unreachable remote from a rejected request. The texts of other platforms, such as "connection refused" and "i/o timeout", already had these categories.
+
 ## 0.2.2 - 2026-10-26
 
 ### Fixed
