@@ -406,7 +406,7 @@ ordering.
 
 ## Optional services
 
-Every session has `Descriptor`, `Core` and `Close`. The seven services are `option`, and a
+Every session has `Descriptor`, `Core` and `Close`. The eight services are `option`, and a
 provider leaves one absent when it has nothing to offer there. Feature discovery is an
 `Option.isSome` check, and there are two reasonable ways to write a host against that.
 
@@ -445,7 +445,7 @@ let describe (session: WorkspaceSession) (context: OperationContext) = async {
 ```
 
 `WorkspaceSession.availability` returns a `ServiceAvailability` record with one boolean
-per service, which is easier to hand to a view model than seven options.
+per service, which is easier to hand to a view model than eight options.
 
 ### Filled: every service present, no-ops where the provider has nothing
 
@@ -476,7 +476,8 @@ The text diff fallback returns `NotDiffable ProviderUnsupported` from `Open`. It
 lakeFS has no text diff service, so it gets this fallback.
 
 A fallback write also succeeds and changes nothing. `Materialize`, `Dematerialize`,
-`SetPathPolicy` and `SetSettings` return `Succeeded` with the same warning. Read the
+`SetPathPolicy` and `SetSettings` return `Succeeded` with the same warning. The
+`Materialize` and `Dematerialize` of the batch service do the same. Read the
 warning before you treat one of these as done. The storage settings reseed in
 [provider authoring](provider-authoring.md) shows why this matters. It tells a host to
 write its saved threshold through `SetSettings` and mark the migration complete only

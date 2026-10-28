@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+-   `ObjectBatchMaterializationService` is a new optional service in `WorkspaceSession.ObjectBatchMaterialization`. Its `Materialize` and `Dematerialize` take an array of paths and download or free many large objects in one operation, for providers that can do this faster than one call per path. Paths are exact keys and a duplicate counts once. An empty array, or paths that are already in the target state, give `Succeeded` with a `NoOp` effect. When some paths fail and others changed, the result is `PartiallySucceeded`, and when none changed it is `Failed`. The failure lists the failed paths in `AffectedPaths` and one `<path>: <message>` line per failed path in `Details`, and the outcome's `AffectedPaths` lists the changed paths. `ServiceAvailability.ObjectBatchMaterialization` reports whether the provider supplies it, and `WorkspaceSession.withFallbackServices` fills an absent service with a fallback whose two operations succeed with a `NoOp` effect and a `service_unavailable` warning.
+
+### Changed
+
+-   `WorkspaceSession` and `ServiceAvailability` have a new `ObjectBatchMaterialization` field, so code that builds these records has to set it. `WorkspaceSession.createCoreOnly` sets it to `None`.
+
 ## 0.2.2 - 2026-10-26
 
 ### Fixed

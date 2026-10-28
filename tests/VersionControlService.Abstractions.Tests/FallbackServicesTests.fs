@@ -69,6 +69,11 @@ let private expectUnsupported reason (result: OperationResult<'T>) =
 let private require name (service: 'T option) : 'T =
     service |> Option.defaultWith (fun () -> failtest $"The {name} service is absent.")
 
+let private batchMaterialization: ObjectBatchMaterializationService = {
+    Materialize = fun _ _ -> async { return OperationResult.succeeded () }
+    Dematerialize = fun _ _ -> async { return OperationResult.succeeded () }
+}
+
 [<Tests>]
 let fallbackServicesTests =
     testList "FallbackServices" [
@@ -82,6 +87,7 @@ let fallbackServicesTests =
             Expect.isSome filled.TextDiff "Text diff is present."
             Expect.isSome filled.ConflictResolution "Conflict resolution is present."
             Expect.isSome filled.ObjectMaterialization "Object materialization is present."
+            Expect.isSome filled.ObjectBatchMaterialization "Object batch materialization is present."
             Expect.isSome filled.StoragePolicy "Storage policy is present."
             Expect.isSome filled.Maintenance "Storage maintenance is present."
             Expect.isSome filled.RepositoryBrowser "Repository browser is present."
@@ -102,6 +108,7 @@ let fallbackServicesTests =
                 TextDiff = false
                 ConflictResolution = false
                 ObjectMaterialization = false
+                ObjectBatchMaterialization = false
                 StoragePolicy = false
                 Maintenance = false
                 RepositoryBrowser = false
@@ -116,6 +123,7 @@ let fallbackServicesTests =
                 TextDiff = true
                 ConflictResolution = true
                 ObjectMaterialization = true
+                ObjectBatchMaterialization = true
                 StoragePolicy = true
                 Maintenance = true
                 RepositoryBrowser = true
@@ -132,6 +140,18 @@ let fallbackServicesTests =
             |> WorkspaceSession.withFallbackServices
             |> WorkspaceSession.availability
             |> fun availability -> Expect.equal availability allAvailable "A filled session reports every service."
+
+        testCase "availability reports the batch materialization service only when the provider supplies it"
+        <| fun () ->
+            let coreOnly = WorkspaceSession.createCoreOnly descriptor (FakeProvider.createCore ())
+            let withBatch = { coreOnly with ObjectBatchMaterialization = Some batchMaterialization }
+
+            Expect.isFalse
+                (WorkspaceSession.availability coreOnly).ObjectBatchMaterialization
+                "A core-only session has no batch materialization."
+            Expect.isTrue
+                (WorkspaceSession.availability withBatch).ObjectBatchMaterialization
+                "A supplied batch materialization service is reported."
 
         testCaseAsync "the paged text diff fallback opens without a provider and rejects later page reads"
         <| async {
@@ -233,6 +253,18 @@ let fallbackServicesTests =
             expectNoOp policyReason setSettingsResult |> ignore
         }
 
+        testCaseAsync "the batch materialization fallback returns a warned no-op for both operations"
+        <| async {
+            let session = WorkspaceSession.withFallbackServices (WorkspaceSession.createCoreOnly descriptor (FakeProvider.createCore ()))
+            let batch = require "object batch materialization" session.ObjectBatchMaterialization
+
+            let reason = "The provider has no object batch materialization service."
+            let! materializeResult = batch.Materialize [| path |] context
+            let! dematerializeResult = batch.Dematerialize [| path |] context
+            expectNoOp reason materializeResult |> ignore
+            expectNoOp reason dematerializeResult |> ignore
+        }
+
         testCaseAsync "synchronization operations and conflict mutations fail as unsupported"
         <| async {
             let session = WorkspaceSession.withFallbackServices (WorkspaceSession.createCoreOnly descriptor (FakeProvider.createCore ()))
@@ -314,6 +346,7 @@ let fallbackServicesTests =
                         TextDiff = true
                         ConflictResolution = true
                         ObjectMaterialization = true
+                        ObjectBatchMaterialization = true
                         StoragePolicy = true
                         Maintenance = true
                         RepositoryBrowser = true
@@ -357,6 +390,7 @@ let fallbackServicesTests =
                         TextDiff = true
                         ConflictResolution = true
                         ObjectMaterialization = true
+                        ObjectBatchMaterialization = true
                         StoragePolicy = true
                         Maintenance = true
                         RepositoryBrowser = true
