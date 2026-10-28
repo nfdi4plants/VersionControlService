@@ -458,7 +458,7 @@ let private batchNoOpReason = "Every path is already in the requested state."
 /// Collapses the outcomes of the paths into one result. The failure of a run with failed paths names
 /// them in AffectedPaths and Details. It takes its category and retry flag from the first failure that
 /// is not a cancellation, and has the category Canceled only when every failure is a cancellation.
-let internal toBatchResult(action: BatchAction) (outcomes: GitService.LfsPathOutcome[]) : OperationResult<unit> =
+let internal toBatchResult (action: BatchAction) (outcomes: GitService.LfsPathOutcome[]) : OperationResult<unit> =
     let changed =
         outcomes
         |> Array.choose (fun outcome ->
