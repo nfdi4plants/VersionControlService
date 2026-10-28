@@ -91,6 +91,27 @@ let tryFindLsFileInfoByRelativePath (filesByRelativePath: Dictionary<string, Git
                 None
         )
 
+/// Builds the lookup of tryFindLsFileInfoByRelativePath once, for many paths. An exact key wins, and
+/// otherwise the first listed path that equals the request ignoring case does, as pathsEqual decides.
+let createListingLookup (filesByRelativePath: Dictionary<string, GitLfsLsFileInfo>) : string -> GitLfsLsFileInfo option =
+    let byComparisonKey = Dictionary<string, GitLfsLsFileInfo>()
+
+    for entry in filesByRelativePath do
+        let comparisonKey = PathHelpers.normalizeForComparison entry.Key
+
+        if not (byComparisonKey.ContainsKey comparisonKey) then
+            byComparisonKey[comparisonKey] <- entry.Value
+
+    fun relativePath ->
+        let normalizedPath = PathHelpers.normalizeSeparators relativePath
+
+        match filesByRelativePath.TryGetValue normalizedPath with
+        | true, info -> Some info
+        | false, _ ->
+            match byComparisonKey.TryGetValue(PathHelpers.normalizeForComparison normalizedPath) with
+            | true, info -> Some info
+            | false, _ -> None
+
 let buildLsFilesJsonArgs () = [| "lfs"; "ls-files"; "-j" |]
 
 /// Chooses the most useful text from a Git LFS adapter result for user-facing errors.
@@ -1043,7 +1064,7 @@ let storageDedupArgs = [| "lfs"; "dedup" |]
 
 /// git-lfs has no working escape for these characters.
 /// The root-anchored pattern can also match a few files whose names differ only at special characters.
-/// A download checks for such files with pathPatternMatchesOtherListedPath.
+/// A download checks for such files with pathPatternMatchesIndexedPath.
 let lfsPathPattern (path: string) : string =
     let pattern =
         path
@@ -1054,18 +1075,13 @@ let lfsPathPattern (path: string) : string =
 
     "/" + pattern
 
-/// Tells whether a pattern from lfsPathPattern matches a repository path. A `?` matches one
-/// character other than `/`, and every other character matches itself. The leading `/` anchors
-/// the pattern at the root. The comparison ignores case, and a pattern that matches a directory
-/// also matches the files below it. Both err toward reporting a match, which only costs the
-/// caller the slower exact-object download.
-let lfsPathPatternMatches (pattern: string) (path: string) : bool =
-    let body =
-        (if pattern.StartsWith("/", StringComparison.Ordinal) then pattern.Substring 1 else pattern)
-            .ToLowerInvariant()
+/// The pattern without its leading `/`, in lower case.
+let private lfsPatternBody (pattern: string) : string =
+    (if pattern.StartsWith("/", StringComparison.Ordinal) then pattern.Substring 1 else pattern)
+        .ToLowerInvariant()
 
-    let candidate = (PathHelpers.normalizeSeparators path).ToLowerInvariant()
-
+/// The matching of lfsPathPatternMatches on a pattern body and a path that are both in lower case.
+let private lfsPathPatternMatchesLowered (body: string) (candidate: string) : bool =
     let rec matchesFrom index =
         if index = body.Length then
             true
@@ -1081,18 +1097,57 @@ let lfsPathPatternMatches (pattern: string) (path: string) : bool =
     && matchesFrom 0
     && (candidate.Length = body.Length || candidate.[body.Length] = '/')
 
-/// Tells whether the path pattern of `relativePath` also matches another path in the LFS listing.
-let pathPatternMatchesOtherListedPath
-    (filesByRelativePath: Dictionary<string, GitLfsLsFileInfo>)
-    (relativePath: string)
-    : bool =
-    let pattern = lfsPathPattern relativePath
-    let normalizedPath = PathHelpers.normalizeSeparators relativePath
+/// Tells whether a pattern from lfsPathPattern matches a repository path. A `?` matches one
+/// character other than `/`, and every other character matches itself. The leading `/` anchors
+/// the pattern at the root. The comparison ignores case, and a pattern that matches a directory
+/// also matches the files below it. Both err toward reporting a match, which only costs the
+/// caller the slower exact-object download.
+let lfsPathPatternMatches (pattern: string) (path: string) : bool =
+    lfsPathPatternMatchesLowered (lfsPatternBody pattern) ((PathHelpers.normalizeSeparators path).ToLowerInvariant())
 
-    filesByRelativePath.Keys
-    |> Seq.exists (fun listedPath ->
-        not (String.Equals(listedPath, normalizedPath, StringComparison.Ordinal))
-        && lfsPathPatternMatches pattern listedPath)
+/// Lower-case views of listed paths. They are built once, so that many paths can ask whether their
+/// pattern matches a listed path without scanning the listing each time.
+type ListedPathIndex = {
+    /// Every listed path, in listing order.
+    LowerPaths: string[]
+    LowerPathSet: HashSet<string>
+    /// Every directory above a listed path.
+    LowerDirectories: HashSet<string>
+}
+
+/// Indexes the listed paths that a pattern may match. A caller leaves out the paths it asks about, so that
+/// a path never matches itself.
+let createListedPathIndex (listedPaths: string seq) : ListedPathIndex =
+    let lowerPaths =
+        listedPaths
+        |> Seq.map (fun listedPath -> (PathHelpers.normalizeSeparators listedPath).ToLowerInvariant())
+        |> Seq.toArray
+
+    let directories = HashSet<string>()
+
+    for lowerPath in lowerPaths do
+        let mutable separator = lowerPath.IndexOf '/'
+
+        while separator >= 0 do
+            directories.Add(lowerPath.Substring(0, separator)) |> ignore
+            separator <- lowerPath.IndexOf('/', separator + 1)
+
+    {
+        LowerPaths = lowerPaths
+        LowerPathSet = HashSet<string>(lowerPaths)
+        LowerDirectories = directories
+    }
+
+/// Tells whether the path pattern of `relativePath` also matches a path of the index. Only a path with a
+/// character that lfsPathPattern turns into a wildcard needs the scan. Any other pattern matches a
+/// listed path that equals it, or lies below it as a directory, ignoring case.
+let pathPatternMatchesIndexedPath (index: ListedPathIndex) (relativePath: string) : bool =
+    let body = lfsPatternBody (lfsPathPattern relativePath)
+
+    if relativePath.IndexOfAny([| '*'; '?'; '['; ']'; '{'; '}'; ',' |]) >= 0 then
+        index.LowerPaths |> Array.exists (fun lowerPath -> lfsPathPatternMatchesLowered body lowerPath)
+    else
+        index.LowerPathSet.Contains body || index.LowerDirectories.Contains body
 
 /// The fixed arguments of a refetch. The comma-joined include patterns of lfsPathPattern follow them.
 let buildFetchRefetchArgsForPaths (dryRun: bool) (relativePaths: string[]) =

@@ -310,7 +310,8 @@ type ObjectMaterializationService = {
 /// are already in the target state give Succeeded with a NoOp effect. When some paths fail and others
 /// changed, the result is PartiallySucceeded. When none changed, it is Failed. A failure lists the failed
 /// paths in AffectedPaths and one "<path>: <message>" line per failed path in Details. The outcome's
-/// AffectedPaths lists the changed paths.
+/// AffectedPaths lists the changed paths. A canceled run reports the paths that finished as changed and
+/// fails the others with a Canceled failure (PartiallySucceeded when some changed, Failed when none).
 type ObjectBatchMaterializationService = {
     /// Replaces the pointers of the given paths with their content.
     Materialize: RepositoryPath[] -> OperationContext -> Async<OperationResult<unit>>

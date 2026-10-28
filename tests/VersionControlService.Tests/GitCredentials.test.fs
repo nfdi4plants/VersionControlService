@@ -447,6 +447,125 @@ Vitest.describe (
                         return raise error
             }
         )
+
+        Vitest.test (
+            "a single Materialize lists the Git LFS files once and reads the status of its own path",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGitIn "." [| "lfs"; "version" |]
+
+                if String.IsNullOrWhiteSpace lfsProbe then
+                    failwith "Expected Git LFS to be available."
+                else
+                    let! root = createTempDirectoryAsync ()
+                    let workPath = join [| root; "work" |]
+                    let remoteUrl = "https://127.0.0.1:1/origin.git"
+                    let relativePath = "materialized.bin"
+                    let observedCommands = ResizeArray<string[]>()
+                    let stopObserving = ref ignore
+
+                    try
+                        let! _ = runGitIn root [| "init"; "-b"; "main"; workPath |]
+                        let! _ = runGitIn workPath [| "config"; "user.name"; "VCS Cred Tests" |]
+                        let! _ = runGitIn workPath [| "config"; "user.email"; "cred@example.org" |]
+                        let! _ = runGitIn workPath [| "config"; "core.autocrlf"; "false" |]
+                        let! _ = runGitIn workPath [| "lfs"; "install"; "--local" |]
+                        let! _ = runGitIn workPath [| "lfs"; "track"; relativePath |]
+                        do! writeUtf8FileAsync (join [| workPath; relativePath |]) "cached LFS content\n"
+                        let! _ = runGitIn workPath [| "add"; "-A" |]
+                        let! _ = runGitIn workPath [| "commit"; "-m"; "test: cached materialization" |]
+                        let! _ = runGitIn workPath [| "remote"; "add"; "origin"; remoteUrl |]
+                        let! pointer = runGitIn workPath [| "show"; $"HEAD:{relativePath}" |]
+                        do! writeUtf8FileAsync (join [| workPath; relativePath |]) pointer
+
+                        let! _ =
+                            runGitIn workPath [|
+                                "-c"
+                                "filter.lfs.smudge="
+                                "-c"
+                                "filter.lfs.process="
+                                "-c"
+                                "filter.lfs.required=false"
+                                "checkout"
+                                "HEAD"
+                                "--"
+                                relativePath
+                            |]
+
+                        let strategy: GitCredentialStrategy.GitCredentialStrategy = {
+                            ResolveCredential =
+                                fun _host _profileId ->
+                                    async {
+                                        return
+                                            Some {
+                                                Username = "oauth2"
+                                                Secret = testSecret
+                                            }
+                                    }
+                        }
+
+                        let binding: WorkspaceBinding = {
+                            SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
+                            ProviderId = gitProviderId
+                            WorkspaceRoot = workPath
+                            ProviderStateRef = None
+                            Location = {
+                                ProviderId = gitProviderId
+                                DisplayName = None
+                                ProviderLocation = remoteUrl
+                                ConnectionProfileId = Some "token-profile"
+                            }
+                            ConnectionProfileId = Some "token-profile"
+                        }
+
+                        let session =
+                            GitWorkspaceSession.createSessionWithCredentials
+                                GitWorkspaceSession.GitSessionHooks.none
+                                strategy
+                                binding
+
+                        let materialization =
+                            session.ObjectMaterialization
+                            |> Option.defaultWith (fun () -> failwith "Expected Git object materialization.")
+
+                        stopObserving.Value <- observeGitSpawnArguments observedCommands
+
+                        let! materializeResult =
+                            materialization.Materialize
+                                (RepositoryPath.tryCreate relativePath |> Result.defaultWith failwith)
+                                (ctx "listing-once-materialize")
+                            |> Async.StartAsPromise
+
+                        stopObserving.Value ()
+                        stopObserving.Value <- ignore
+                        expectValue "materialization with one listing" materializeResult |> ignore
+
+                        let listingCommands =
+                            observedCommands
+                            |> Seq.filter (fun arguments ->
+                                arguments |> Array.contains "lfs" && arguments |> Array.contains "ls-files")
+                            |> Seq.toArray
+
+                        Vitest.expect(listingCommands.Length).toBe 1
+
+                        let statusCommands =
+                            observedCommands
+                            |> Seq.filter (fun arguments -> arguments |> Array.contains "status")
+                            |> Seq.toArray
+
+                        Vitest.expect(statusCommands.Length > 0).toBe true
+
+                        for arguments in statusCommands do
+                            let separator = arguments |> Array.findIndex (fun argument -> argument = "--")
+                            Vitest.expect(arguments |> Array.skip (separator + 1)).toEqual [| $":(literal){relativePath}" |]
+
+                        do! removeDirectoryAsync root
+                    with error ->
+                        stopObserving.Value ()
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
 )
 
 Vitest.describe (

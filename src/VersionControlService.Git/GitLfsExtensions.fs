@@ -482,14 +482,19 @@ let private toBatchResult (action: BatchAction) (outcomes: GitService.LfsPathOut
             }
     else
         let failures = failed |> Array.map (fun (path, failure) -> path, toOperationFailure failure)
-        let first = snd failures[0]
         let allCanceled = failed |> Array.forall (fun (_, failure) -> failure.Kind = GitFailureKind.Canceled)
 
+        // A cancellation says little about why other paths failed, so the first failure that is
+        // not a cancellation gives the category, the retry flag and the message.
+        let basis =
+            match failed |> Array.tryFindIndex (fun (_, failure) -> failure.Kind <> GitFailureKind.Canceled) with
+            | Some index -> snd failures[index]
+            | None -> snd failures[0]
+
         let failure = {
-            first with
-                Category = if allCanceled then Canceled else first.Category
+            basis with
                 Code = if allCanceled then "operation_canceled" else action.IncompleteCode
-                Message = $"{failed.Length} of {outcomes.Length} paths failed: {first.Message}"
+                Message = $"{failed.Length} of {outcomes.Length} paths failed: {basis.Message}"
                 StateChanged = changed.Length > 0 || (failures |> Array.exists (fun (_, item) -> item.StateChanged))
                 AffectedPaths = failures |> Array.map fst
                 Details = failures |> Array.map (fun (path, item) -> $"{path}: {item.Message}")

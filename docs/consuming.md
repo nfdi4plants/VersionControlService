@@ -1352,6 +1352,8 @@ and a host needs a path for it. The recovery codes a Git update can report are l
 
 The Git provider runs `git lfs ls-files -j` with no time limit, because that command prints nothing until it has listed every file. This applies to `ObjectMaterialization.ListObjects`, `Materialize` (including its download step) and `Dematerialize`. Each of them takes an `OperationContext`. Cancel the context to stop one that runs too long. The cancellation ends the git-lfs process and the operation returns a `Canceled` failure.
 
+The `Materialize` and `Dematerialize` of `ObjectBatchMaterialization` behave the same way, and a canceled batch reports the paths that finished as changed.
+
 `OperationProgress` carries a stable `PhaseCode` such as `transfer`, an optional item,
 completed and total counts, and a sanitized `DisplayMessage`. Counts are `float` because
 JavaScript has no native 64-bit integer, so a float is what carries byte totals above two
