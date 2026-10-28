@@ -2197,7 +2197,7 @@ let private tryReadFileSize (absolutePath: string) : JS.Promise<float option> = 
 
 /// Tells whether the file at the path still holds a Git LFS pointer. A pointer has the size of a small
 /// object, so a size check alone cannot tell the two apart.
-let private isLfsPointerFile (absolutePath: string) : bool =
+let internal isLfsPointerFile (absolutePath: string) : bool =
     try
         (readFileSync absolutePath Utf8).StartsWith("version https://git-lfs", StringComparison.Ordinal)
     with _ ->
@@ -2215,7 +2215,7 @@ type LfsPathOutcome = {
 }
 
 /// A requested path that still needs its content. `Key` is the spelling of the Git LFS listing,
-/// which git uses for status, patterns and checkout. `SafePath` is the validated spelling of the
+/// which git uses for status and for the fetch and checkout patterns. `SafePath` is the validated spelling of the
 /// request, which messages and progress reports use.
 type private LfsPathCandidate = {
     Requested: string

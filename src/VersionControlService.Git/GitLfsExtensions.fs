@@ -430,14 +430,14 @@ let createObjectMaterialization
 }
 
 /// How a batch operation reports an incomplete run.
-type private BatchAction = {
+type internal BatchAction = {
     /// Code of a failure when some paths fail.
     IncompleteCode: string
     /// Recovery of a partial success.
     Recovery: RecoveryAction
 }
 
-let private batchMaterializeAction = {
+let internal batchMaterializeAction = {
     IncompleteCode = "batch_materialization_incomplete"
     Recovery = {
         Code = "retry_materialization"
@@ -456,8 +456,9 @@ let private batchDematerializeAction = {
 let private batchNoOpReason = "Every path is already in the requested state."
 
 /// Collapses the outcomes of the paths into one result. The failure of a run with failed paths names
-/// them in AffectedPaths and Details, and it takes its category and retry flag from the first of them.
-let private toBatchResult (action: BatchAction) (outcomes: GitService.LfsPathOutcome[]) : OperationResult<unit> =
+/// them in AffectedPaths and Details. It takes its category and retry flag from the first failure that
+/// is not a cancellation, and has the category Canceled only when every failure is a cancellation.
+let internal toBatchResult(action: BatchAction) (outcomes: GitService.LfsPathOutcome[]) : OperationResult<unit> =
     let changed =
         outcomes
         |> Array.choose (fun outcome ->
@@ -484,8 +485,8 @@ let private toBatchResult (action: BatchAction) (outcomes: GitService.LfsPathOut
         let failures = failed |> Array.map (fun (path, failure) -> path, toOperationFailure failure)
         let allCanceled = failed |> Array.forall (fun (_, failure) -> failure.Kind = GitFailureKind.Canceled)
 
-        // A cancellation says little about why other paths failed, so the first failure that is
-        // not a cancellation gives the category, the retry flag and the message.
+        // A cancellation says little about why other paths failed. The first failure that is not a
+        // cancellation therefore supplies the message and the category with its retry flag.
         let basis =
             match failed |> Array.tryFindIndex (fun (_, failure) -> failure.Kind <> GitFailureKind.Canceled) with
             | Some index -> snd failures[index]
