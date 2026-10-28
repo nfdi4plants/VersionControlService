@@ -2874,8 +2874,9 @@ let private confirmLfsPathsOneByOne
 
 /// True when the failure classifies as a network, timeout, authentication or authorization problem.
 /// The remote gives the same problem again for each path of a chunk, so asking path by path only waits longer.
-/// The progress line names the branch and the trailer names the LFS endpoint. Both are left out of the
-/// decision, so a name such as "fix-403-page" cannot turn another failure into a remote-wide one.
+/// The progress line names the branch, and the trailer and the error lines carry URLs with the repository
+/// name. The decision reads neither those two lines nor any URL, so a name such as "fix-403-page" or
+/// "gene-regulatory-network" cannot turn another failure into a remote-wide one.
 let internal isRemoteWideFailure (error: exn) =
     let isProgressOrTrailer (line: string) =
         let text = line.Trim()
@@ -2892,6 +2893,7 @@ let internal isRemoteWideFailure (error: exn) =
     let decisionText =
         error.Message.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
         |> Array.filter (isProgressOrTrailer >> not)
+        |> Array.map (fun line -> Text.RegularExpressions.Regex.Replace(line, @"https?://[^\s""']+", ""))
         |> String.concat "\n"
 
     match classifyFailureKind decisionText with

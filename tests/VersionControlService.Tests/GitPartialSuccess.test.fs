@@ -1484,7 +1484,7 @@ Vitest.describe (
             fun () ->
                 let serverError branch endpoint =
                     exn
-                        $"Fetching reference refs/heads/{branch}\nbatch response: Fatal error: Server error HTTP 502\nerror: failed to fetch some objects from '{endpoint}'"
+                        $"Fetching reference refs/heads/{branch}\nbatch response: Fatal error: Server error {endpoint}/objects/batch from HTTP 502\nerror: failed to fetch some objects from '{endpoint}'"
 
                 Vitest
                     .expect(
