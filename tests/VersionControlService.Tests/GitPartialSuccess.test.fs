@@ -1480,6 +1480,42 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "a branch or endpoint name does not make a failed dry run remote-wide",
+            fun () ->
+                let serverError branch endpoint =
+                    exn
+                        $"Fetching reference refs/heads/{branch}\nbatch response: Fatal error: Server error HTTP 502\nerror: failed to fetch some objects from '{endpoint}'"
+
+                Vitest
+                    .expect(
+                        GitService.isRemoteWideFailure (
+                            serverError "fix-403-page" "https://example.org/origin.git/info/lfs"
+                        )
+                    )
+                    .toBe
+                    false
+
+                Vitest
+                    .expect(
+                        GitService.isRemoteWideFailure (
+                            serverError "main" "https://example.org/gene-regulatory-network.git/info/lfs"
+                        )
+                    )
+                    .toBe
+                    false
+
+                Vitest
+                    .expect(
+                        GitService.isRemoteWideFailure (
+                            exn
+                                "Fetching reference refs/heads/main\nbatch response: Post \"https://example.org/info/lfs/objects/batch\": EOF\nerror: failed to fetch some objects from 'https://example.org/info/lfs'"
+                        )
+                    )
+                    .toBe
+                    true
+        )
+
+        Vitest.test (
             "Git LFS endpoint parsing prefers origin and trims auth annotations",
             fun () -> promise {
                 Vitest.expect(
