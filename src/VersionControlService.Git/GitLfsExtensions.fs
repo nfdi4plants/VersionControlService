@@ -217,6 +217,91 @@ let private wrapUnitWithPreflight
             | Ok() -> return! wrapUnit context beginOperation operation
     }
 
+/// Removes the cached objects of files that were just freed. An object stays when an unpushed commit
+/// adds it, because git-lfs needs the local object to push that commit. The same holds for a custom
+/// lfs.storage, which other clones can share and which prune refuses too. Every error is ignored,
+/// because a cached object that stays only costs disk space.
+let deleteCachedObjectsOfFreedPaths
+    (repoPath: string)
+    (runGit: string[] -> OperationContext -> Async<Result<NodeProcess.ProcessOutput, OperationFailure>>)
+    (context: OperationContext)
+    (relativePaths: string[])
+    : Async<unit> =
+    async {
+        let detachedContext = { context with Cancellation = OperationCancellation.none }
+
+        let hasNoOutput (result: Result<NodeProcess.ProcessOutput, OperationFailure>) =
+            match result with
+            | Ok output -> output.ExitCode = 0 && String.IsNullOrWhiteSpace output.StdOut
+            | Error _ -> false
+
+        try
+            let pointers = ResizeArray<GitLfsObjects.LfsPointerInfo>()
+
+            for relativePath in relativePaths do
+                let! pointerResult = GitLfsObjects.readWorktreePointer repoPath relativePath
+
+                match pointerResult with
+                | Ok(Some pointer) -> pointers.Add pointer
+                | Error _
+                | Ok None -> ()
+
+            if pointers.Count > 0 then
+                let! mediaDirectoryResult =
+                    GitLfsObjects.resolveLocalMediaDirectory (fun arguments -> runGit arguments detachedContext) repoPath
+
+                match mediaDirectoryResult with
+                | Error _ -> ()
+                | Ok mediaDirectory ->
+                    let! storageResult = runGit [| "config"; "--get"; "lfs.storage" |] detachedContext
+
+                    match storageResult with
+                    | Ok output when not (String.IsNullOrWhiteSpace(output.StdOut.Trim())) -> ()
+                    | _ ->
+                        // One question answers it for every object when no commit is unpushed.
+                        // The search covers HEAD too, so a commit on a detached HEAD keeps its objects.
+                        let! unpushedCommitsResult =
+                            runGit [| "rev-list"; "-1"; "HEAD"; "--branches"; "--not"; "--remotes=origin" |] detachedContext
+
+                        for pointer in pointers do
+                            let! isUnreferenced =
+                                async {
+                                    if hasNoOutput unpushedCommitsResult then
+                                        return true
+                                    else
+                                        let! unpushedResult =
+                                            runGit
+                                                [|
+                                                    "-c"
+                                                    "log.diffMerges=separate"
+                                                    "log"
+                                                    "-m"
+                                                    "HEAD"
+                                                    "--branches"
+                                                    "--not"
+                                                    "--remotes=origin"
+                                                    "--format=%H"
+                                                    "-1"
+                                                    ("-Soid sha256:" + pointer.Oid)
+                                                |]
+                                                detachedContext
+
+                                        return hasNoOutput unpushedResult
+                                }
+
+                            if isUnreferenced then
+                                // One object that cannot be removed does not keep the others.
+                                try
+                                    let objectPath = GitLfsObjects.objectPath mediaDirectory pointer.Oid
+
+                                    if NodeFileSystem.existsSync objectPath then
+                                        NodeFileSystem.unlinkSync objectPath
+                                with _ ->
+                                    ()
+        with _ ->
+            ()
+    }
+
 let createObjectMaterialization
     (repoPath: string)
     (runGit: string[] -> OperationContext -> Async<Result<NodeProcess.ProcessOutput, OperationFailure>>)
@@ -334,62 +419,9 @@ let createObjectMaterialization
 
                             match result with
                             | Ok true ->
-                                let detachedContext = { context with Cancellation = OperationCancellation.none }
-
-                                try
-                                    let! pointerResult =
-                                        GitLfsObjects.readWorktreePointer repoPath (RepositoryPath.value path)
-                                        |> Async.StartAsPromise
-
-                                    match pointerResult with
-                                    | Ok(Some pointer) ->
-                                        let! mediaDirectoryResult =
-                                            GitLfsObjects.resolveLocalMediaDirectory
-                                                (fun arguments -> runGit arguments detachedContext)
-                                                repoPath
-                                            |> Async.StartAsPromise
-
-                                        match mediaDirectoryResult with
-                                        | Ok mediaDirectory ->
-                                            let! storageResult =
-                                                runGit [| "config"; "--get"; "lfs.storage" |] detachedContext
-                                                |> Async.StartAsPromise
-
-                                            match storageResult with
-                                            // Other clones can share a custom lfs.storage, so its objects stay. Prune refuses such storage too.
-                                            | Ok output when not (String.IsNullOrWhiteSpace(output.StdOut.Trim())) -> ()
-                                            | _ ->
-                                                // git-lfs needs the local object to push an unpushed commit that adds it.
-                                                // The search covers HEAD too, so a commit on a detached HEAD keeps the object.
-                                                let! unpushedResult =
-                                                    runGit
-                                                        [|
-                                                            "-c"
-                                                            "log.diffMerges=separate"
-                                                            "log"
-                                                            "-m"
-                                                            "HEAD"
-                                                            "--branches"
-                                                            "--not"
-                                                            "--remotes=origin"
-                                                            "--format=%H"
-                                                            "-1"
-                                                            ("-Soid sha256:" + pointer.Oid)
-                                                        |]
-                                                        detachedContext
-                                                    |> Async.StartAsPromise
-
-                                                match unpushedResult with
-                                                | Ok output when output.ExitCode = 0 && String.IsNullOrWhiteSpace output.StdOut ->
-                                                    let objectPath = GitLfsObjects.objectPath mediaDirectory pointer.Oid
-
-                                                    if NodeFileSystem.existsSync objectPath then
-                                                        NodeFileSystem.unlinkSync objectPath
-                                                | _ -> ()
-                                        | Error _ -> ()
-                                    | Error _
-                                    | Ok None -> ()
-                                with _ -> ()
+                                do!
+                                    deleteCachedObjectsOfFreedPaths repoPath runGit context [| RepositoryPath.value path |]
+                                    |> Async.StartAsPromise
 
                                 return Ok()
                             | Ok false -> return Ok()

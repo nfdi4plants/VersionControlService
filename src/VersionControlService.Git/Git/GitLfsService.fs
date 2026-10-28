@@ -1094,14 +1094,19 @@ let pathPatternMatchesOtherListedPath
         not (String.Equals(listedPath, normalizedPath, StringComparison.Ordinal))
         && lfsPathPatternMatches pattern listedPath)
 
-let buildFetchRefetchArgs (dryRun: bool) (relativePath: string) =
+/// The fixed arguments of a refetch. The comma-joined include patterns of lfsPathPattern follow them.
+let buildFetchRefetchArgsForPaths (dryRun: bool) (relativePaths: string[]) =
     let dryRunArguments = if dryRun then [| "--dry-run" |] else [||]
+    let includePatterns = relativePaths |> Array.map lfsPathPattern |> String.concat ","
 
     Array.concat [|
         [| "lfs"; "fetch"; "--refetch" |]
         dryRunArguments
-        [| $"--include={lfsPathPattern relativePath}"; "origin"; "HEAD" |]
+        [| $"--include={includePatterns}"; "origin"; "HEAD" |]
     |]
+
+let buildFetchRefetchArgs (dryRun: bool) (relativePath: string) =
+    buildFetchRefetchArgsForPaths dryRun [| relativePath |]
 
 /// A configured lfs.fetchexclude wins over --include, so the fetch clears it. The override goes
 /// through git's GIT_CONFIG_COUNT variables (git 2.31 or newer), which git-lfs reads as config.
@@ -1489,10 +1494,10 @@ let internal runAuthenticatedMaintenance
                 Error(exn (extractSpawnFailureMessage result))
     }
 
-let fetchRefetchForPath
+let fetchRefetchForPaths
     (repoPath: string)
     (commandAuth: GitCommandAuthentication)
-    (relativePath: string)
+    (relativePaths: string[])
     (dryRun: bool)
     (cancelCheck: (unit -> bool) option)
     (onStarted: unit -> unit)
@@ -1506,7 +1511,7 @@ let fetchRefetchForPath
                     Arguments =
                         GitCredentialStrategy.buildLfsTransferArguments
                             commandAuth.ConfigArgs
-                            (buildFetchRefetchArgs dryRun relativePath)
+                            (buildFetchRefetchArgsForPaths dryRun relativePaths)
                     Environment = Some(withFetchExcludeCleared commandAuth.Environment)
                     StandardInput = None
                     CancelCheck = cancelCheck
