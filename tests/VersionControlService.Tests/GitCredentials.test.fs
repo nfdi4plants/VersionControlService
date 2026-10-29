@@ -1467,3 +1467,67 @@ Vitest.describe (
             }
         )
 )
+
+let private lfsEndpointArguments (remoteUrl: string) : string[] =
+    let credential: GitCredentialStrategy.GitCredential option =
+        Some {
+            Username = "oauth2"
+            Secret = testSecret
+        }
+
+    let authentication = GitCredentialStrategy.buildScopedCommandAuthentication "origin" remoteUrl credential
+
+    authentication.ConfigArgs
+    |> Array.filter (fun argument ->
+        argument.StartsWith("lfs.url=", StringComparison.Ordinal)
+        || argument.StartsWith("remote.origin.lfsurl=", StringComparison.Ordinal))
+
+let private expectLfsEndpoint (remoteUrl: string) (endpoint: string) =
+    Vitest.expect(lfsEndpointArguments remoteUrl).toEqual [|
+        $"remote.origin.lfsurl={endpoint}"
+        $"lfs.url={endpoint}"
+    |]
+
+Vitest.describe (
+    "Git LFS endpoint of a credentialed remote",
+    fun () ->
+        Vitest.test (
+            "adds .git to a remote URL without the suffix, as git-lfs server discovery does",
+            fun () ->
+                expectLfsEndpoint
+                    $"https://{testHost}/group/proj"
+                    $"https://oauth2:{testSecret}@{testHost}/group/proj.git/info/lfs"
+        )
+
+        Vitest.test (
+            "keeps a remote URL that already ends in .git from getting the suffix twice",
+            fun () ->
+                expectLfsEndpoint
+                    $"https://{testHost}/group/proj.git"
+                    $"https://oauth2:{testSecret}@{testHost}/group/proj.git/info/lfs"
+
+                expectLfsEndpoint
+                    $"https://{testHost}/group/proj.GIT"
+                    $"https://oauth2:{testSecret}@{testHost}/group/proj.GIT/info/lfs"
+        )
+
+        Vitest.test (
+            "trims a trailing slash before it appends the endpoint path",
+            fun () ->
+                expectLfsEndpoint
+                    $"https://{testHost}/group/proj/"
+                    $"https://oauth2:{testSecret}@{testHost}/group/proj.git/info/lfs"
+
+                expectLfsEndpoint
+                    $"https://{testHost}/group/proj.git/"
+                    $"https://oauth2:{testSecret}@{testHost}/group/proj.git/info/lfs"
+        )
+
+        Vitest.test (
+            "replaces the userinfo of the remote URL with the resolved credential in the endpoint",
+            fun () ->
+                expectLfsEndpoint
+                    $"https://someone:old-secret@{testHost}/group/proj"
+                    $"https://oauth2:{testSecret}@{testHost}/group/proj.git/info/lfs"
+        )
+)
