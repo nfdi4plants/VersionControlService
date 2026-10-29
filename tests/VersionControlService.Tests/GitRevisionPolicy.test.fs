@@ -908,6 +908,77 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "unmarking reports the index lock when Git LFS ends the checkout with success but could not update the index",
+            TestOptions(timeout = 180000),
+            fun () ->
+                withGitFixture RevisionPolicyStrategy.automatic (Some "\n") (fun fixture -> promise {
+                    let path = "manual/unmark-index-error.bin"
+                    let absolutePath = join [| fixture.WorkPath; path |]
+                    let lockPath = join [| fixture.WorkPath; ".git"; "index.lock" |]
+                    do! writeUtf8FileAsync absolutePath "local object content\n"
+
+                    let! initial = createRevision fixture "test: commit path before the index error" [| path |]
+                    expectSucceeded "initial plain revision" initial |> ignore
+
+                    let storagePolicy =
+                        fixture.Session.StoragePolicy
+                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
+
+                    let! markResult =
+                        storagePolicy.SetPathPolicy (repositoryPath path) true (context "mark-index-error")
+                        |> Async.StartAsPromise
+
+                    expectSucceeded "mark before the index error" markResult |> ignore
+
+                    let! lfsRevision =
+                        createRevision fixture "test: commit path with LFS before the index error" [| path; ".gitattributes" |]
+
+                    expectSucceeded "LFS revision before the index error" lfsRevision |> ignore
+                    let! pointer = runGitOk fixture.WorkPath [| "cat-file"; "-p"; $"HEAD:{path}" |]
+                    do! writeUtf8FileAsync absolutePath pointer
+
+                    // git-lfs 3.7.0 with a held lock: the lock message goes to its log, and the exit code is 0.
+                    let hooks = {
+                        GitWorkspaceSession.GitSessionHooks.none with
+                            RunProcess =
+                                Some(fun request processContext ->
+                                    async {
+                                        match request.Arguments with
+                                        | [| "lfs"; "checkout"; "--"; _ |] ->
+                                            do! writeUtf8FileAsync lockPath "held by another process\n" |> Async.AwaitPromise
+
+                                            return
+                                                OperationResult.succeeded {
+                                                    ExitCode = 0
+                                                    StdOut = ""
+                                                    StdErr = "Error updating the Git index:\n\n\nErrors logged to 'x.log'."
+                                                }
+                                        | _ -> return! NodeProcess.run request processContext
+                                    })
+                    }
+
+                    let hookedStoragePolicy =
+                        (GitWorkspaceSession.createSession hooks fixture.Binding).StoragePolicy
+                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
+
+                    let! unmarkResult =
+                        hookedStoragePolicy.SetPathPolicy (repositoryPath path) false (context "unmark-index-error")
+                        |> Async.StartAsPromise
+
+                    match unmarkResult with
+                    | Failed failure ->
+                        Vitest.expect(failure.Code).toBe "index_locked"
+                        Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "remove_index_lock")
+                        Vitest.expect(failure.StateChanged).toBe false
+                        Vitest.expect(failure.AffectedPaths).toEqual [| path |]
+                    | Succeeded _
+                    | PartiallySucceeded _ -> failwith "Expected unmarking to fail while the index lock is held."
+
+                    Vitest.expect(NodeFileSystem.existsSync lockPath).toBe true
+                })
+        )
+
+        Vitest.test (
             "unmarking a root file leaves a same-named subfolder pointer untouched",
             TestOptions(timeout = 180000),
             fun () ->

@@ -6130,6 +6130,64 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "a checkout that ends with success but could not update the index is a failed hydration with the lock recovery",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable lockPath = ""
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request processContext ->
+                            async {
+                                if isLfsCheckoutRequest request then
+                                    do! writeUtf8FileAsync lockPath "held by another process\n" |> Async.AwaitPromise
+
+                                    // git-lfs 3.7.0 prints this to stderr when the lock is held, and exits with 0.
+                                    // The text does not name the lock, so only the lock file shows the cause.
+                                    return
+                                        OperationResult.succeeded {
+                                            NodeProcess.ExitCode = 0
+                                            StdOut = ""
+                                            StdErr = "Error updating the Git index:\n\n\nErrors logged to 'x.log'."
+                                        }
+                                else
+                                    return! NodeProcess.run request processContext
+                            })
+                    Barrier = None
+                }
+
+                let! root, workPath, session = createUnhydratedLfsClone hooks
+
+                try
+                    lockPath <- join [| workPath; ".git"; "index.lock" |]
+                    let! _ = setMaterializeLargeObjects workPath true
+                    let! status = sessionStatus session
+
+                    let! updateResult =
+                        (syncService session).Update
+                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                            (ctx "lfs-checkout-index-error-exit-0")
+                        |> Async.StartAsPromise
+
+                    match updateResult with
+                    | PartiallySucceeded(_, failure) ->
+                        Vitest.expect(failure.Code).toBe "hydration_failed"
+                        Vitest.expect(failure.Message.Contains "Error updating the Git index").toBe true
+                        Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "remove_index_lock")
+                    | Failed failure -> failwith $"Expected a partial result, received {failure.Code}."
+                    | Succeeded _ -> failwith "Expected the checkout that could not update the index to be reported."
+
+                    let! lockExists = pathExistsAsync lockPath
+                    Vitest.expect(lockExists).toBe true
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
             "a checkout that fails after a failed fetch keeps the fetch failure and adds its own text to the details",
             TestOptions(timeout = 120000),
             fun () -> promise {

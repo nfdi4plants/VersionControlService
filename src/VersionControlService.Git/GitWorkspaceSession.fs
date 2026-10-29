@@ -298,12 +298,28 @@ let private runLfsHydration
             let checkoutPhaseCode = phaseCode + "-checkout"
             reportStepStart checkoutPhaseCode "Checking out large files" context
 
-            let! checkout =
+            let! finishedCheckout =
                 run
                     checkoutPhaseCode
                     [| "lfs"; "checkout" |]
                     { context with
                         Cancellation = OperationCancellation.none }
+
+            // A held index.lock makes git-lfs write the files, report the index error and exit with 0.
+            // That run counts as a failed checkout, so its output carries the error text and a nonzero exit.
+            let checkout =
+                match finishedCheckout with
+                | Ok output when output.ExitCode = 0 ->
+                    match GitLfsService.lfsCheckoutIndexUpdateFailed output.StdOut output.StdErr with
+                    | Some text ->
+                        Ok {
+                            output with
+                                ExitCode = 1
+                                StdOut = String.Empty
+                                StdErr = text
+                        }
+                    | None -> finishedCheckout
+                | _ -> finishedCheckout
 
             let checkoutFailure =
                 match checkout with
@@ -2357,7 +2373,33 @@ let private materializeLocalLfsObject
             match checkoutResult with
             | Error failure -> return LocalLfsCheckoutFailed failure
             | Ok output when output.ExitCode = 0 ->
-                return LocalLfsCheckoutCompleted(isMaterializedLfsObject state pathValue sizeBytes)
+                match GitLfsService.lfsCheckoutIndexUpdateFailed output.StdOut output.StdErr with
+                | None -> return LocalLfsCheckoutCompleted(isMaterializedLfsObject state pathValue sizeBytes)
+                | Some text ->
+                    // The checkout wrote the file, so the size check would pass. The lookup has no
+                    // cancellation, because the checkout ran to its end.
+                    let! lockPathResult =
+                        resolveGitStatePathAt
+                            state.Hooks
+                            state.RepoPath
+                            "index.lock"
+                            { context with
+                                Cancellation = OperationCancellation.none }
+
+                    match lockPathResult with
+                    | Ok(Some lockPath) when NodeFileSystem.existsSync lockPath ->
+                        return
+                            LocalLfsCheckoutFailed(
+                                GitInternals.indexLockFailure lockPath (GitInternals.tryFileAgeSeconds lockPath)
+                            )
+                    | _ ->
+                        return
+                            LocalLfsCheckoutFailed(
+                                OperationFailure.createRedacted
+                                    ProviderError
+                                    "lfs_checkout_failed"
+                                    $"Git LFS checkout failed: {text}"
+                            )
             | Ok output ->
                 let detail =
                     if String.IsNullOrWhiteSpace output.StdErr then
@@ -5626,7 +5668,14 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                                         when context.Cancellation.IsCancellationRequested() ->
                                                                         return Ok([||], Some(canceledMaterializationFailure failure.Message))
                                                                     | LocalLfsCheckoutFailed failure ->
-                                                                        return Ok([||], Some(materializationFailure failure.Message))
+                                                                        return
+                                                                            Ok(
+                                                                                [||],
+                                                                                Some {
+                                                                                    materializationFailure failure.Message with
+                                                                                        RecoveryAction = failure.RecoveryAction
+                                                                                }
+                                                                            )
                                                                 | _ -> return Ok(objectNotMaterialized (), None)
                                                 }
 
@@ -5665,7 +5714,8 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                             OperationResult.partiallySucceeded
                                                                 outcome
                                                                 failure
-                                                                (localMaterializationRecovery ())
+                                                                (failure.RecoveryAction
+                                                                 |> Option.defaultWith localMaterializationRecovery)
                 })
         Finalize =
             fun request context ->

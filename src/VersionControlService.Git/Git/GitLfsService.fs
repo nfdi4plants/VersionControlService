@@ -1264,6 +1264,67 @@ let private extractSpawnFailureMessage (result: GitSpawnResult) =
     else
         "Git command failed."
 
+/// The error text of a `git lfs checkout` that wrote its files but could not update the Git index.
+/// With a held index.lock, git-lfs 3.7.0 prints "Error updating the Git index:" to stderr and still exits
+/// with 0. The files then read as modified and the lock stays, so the exit code alone reports success for
+/// a failed run. The error stream is read before the output stream, and meter lines are dropped from both.
+let lfsCheckoutIndexUpdateFailed (stdout: string) (stderr: string) : string option =
+    [| stderr; stdout |]
+    |> Array.tryPick (fun stream ->
+        let text =
+            stream
+            |> Option.ofObj
+            |> Option.defaultValue String.Empty
+            |> NodeProcess.dropProgressMeterLines
+            |> _.Trim()
+
+        if text.IndexOf("Error updating the Git index", StringComparison.Ordinal) >= 0 then
+            Some text
+        else
+            None)
+
+/// The path of the index lock when its file exists. `gitPathOutput` is the stdout of
+/// `git rev-parse --git-path index.lock` run in `repoPath`, and a relative answer is relative to it.
+let internal heldIndexLockPath (repoPath: string) (gitPathOutput: string) : string option =
+    let rawPath = gitPathOutput |> Option.ofObj |> Option.defaultValue String.Empty |> _.Trim()
+
+    if String.IsNullOrWhiteSpace rawPath then
+        None
+    else
+        let lockPath = NodePath.resolve [| repoPath; rawPath |]
+
+        if NodeFileSystem.existsSync lockPath then Some lockPath else None
+
+/// Looks for a held index lock through Git, so a linked worktree reports its own lock path. The lookup
+/// has no cancellation, because it runs after a checkout that a cancel could not stop. A lookup that
+/// fails finds nothing.
+let internal tryFindHeldIndexLock (repoPath: string) : JS.Promise<string option> = promise {
+    let! result =
+        runGitCaptured {
+            WorkingDirectory = Some repoPath
+            Arguments = [| "rev-parse"; "--git-path"; "index.lock" |]
+            Environment = None
+            StandardInput = None
+            CancelCheck = None
+            TimeoutMs = Some DefaultTimeoutMs
+            Output = None
+        }
+
+    return
+        if result.ExitCode = 0 && not result.TimedOut then
+            heldIndexLockPath repoPath result.StdoutText
+        else
+            None
+}
+
+/// Git-lfs ends its index error without the lock message of Git, so the text alone does not name the
+/// lock. With a held lock, the text gets that message in Git's words, which the failure mapping of the
+/// callers reads to report the lock.
+let internal withHeldIndexLockMessage (text: string) (lockPath: string option) : string =
+    match lockPath with
+    | Some path -> $"{text}\nfatal: Unable to create '{path}': File exists."
+    | None -> text
+
 /// The fixed arguments of `git lfs checkout`. The patterns of lfsPathPattern follow them.
 let checkoutArgsPrefix = [| "lfs"; "checkout"; "--" |]
 
@@ -1304,11 +1365,15 @@ let checkoutPatterns
 
     flushOutput ()
 
-    return
-        if result.ExitCode = 0 && not result.TimedOut then
-            Ok()
-        else
-            Error(exn (extractSpawnFailureMessage result))
+    if result.ExitCode = 0 && not result.TimedOut then
+        match lfsCheckoutIndexUpdateFailed result.StdoutText result.StderrText with
+        | None -> return Ok()
+        | Some text when text.IndexOf("index.lock", StringComparison.Ordinal) >= 0 -> return Error(exn text)
+        | Some text ->
+            let! heldLock = tryFindHeldIndexLock repoPath
+            return Error(exn (withHeldIndexLockMessage text heldLock))
+    else
+        return Error(exn (extractSpawnFailureMessage result))
 }
 
 let private resolvePushRefSpec

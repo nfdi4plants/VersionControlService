@@ -130,6 +130,33 @@ let private observeGitSpawnArguments (_observed: ResizeArray<string[]>) : unit -
 """)>]
 let private observeGitSpawnForcedProgress (_observed: ResizeArray<string[] * string>) : unit -> unit = jsNative
 
+// Replaces every `git lfs checkout` with a process that creates the lock file, prints the error text to
+// stderr and exits with 0, which is what git-lfs 3.7.0 does when the index lock is held. An empty lock
+// path creates no lock.
+[<Emit("""
+(() => {
+    const childProcess = require('node:child_process');
+    const moduleApi = require('node:module');
+    const originalSpawn = childProcess.spawn;
+    const lockPath = $0;
+    const errorText = $1;
+    const createLock = lockPath ? 'require("node:fs").writeFileSync(' + JSON.stringify(lockPath) + ', "held by another process");' : '';
+    const script = createLock + 'process.stderr.write(' + JSON.stringify(errorText) + ');';
+    childProcess.spawn = function(command, args, options) {
+        const list = Array.from(args || []);
+        if (String(command).toLowerCase() === 'git' && list.includes('lfs') && list.includes('checkout'))
+            return originalSpawn.call(childProcess, process.execPath, ['-e', script], options);
+        return originalSpawn.call(childProcess, command, args, options);
+    };
+    moduleApi.syncBuiltinESMExports();
+    return () => {
+        childProcess.spawn = originalSpawn;
+        moduleApi.syncBuiltinESMExports();
+    };
+})()
+""")>]
+let private fakeLfsCheckoutWithIndexError (_lockPath: string) (_errorText: string) : unit -> unit = jsNative
+
 // The listener goes on the child before the caller adds its own close handler, so the append
 // finishes before the caller sees the hash result.
 [<Emit("""
@@ -3264,6 +3291,100 @@ Vitest.describe (
                         Vitest.expect(dirtyAfter).toEqual (Some dirtyContent)
                         do! removeDirectoryAsync root
                     with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "batch materialization reports a checkout that ended with success but could not update the index as a lock failure",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let! root, workPath, barePath = createFreedLfsFixture ()
+                    let lockPath = join [| workPath; ".git"; "index.lock" |]
+                    let stopFaking: (unit -> unit) ref = ref ignore
+
+                    try
+                        let batch = openBatchMaterialization workPath barePath
+
+                        // The preflight passes because the lock appears only with the checkout. The text is what
+                        // git-lfs 3.7.0 prints, and it does not name the lock.
+                        stopFaking.Value <-
+                            fakeLfsCheckoutWithIndexError
+                                lockPath
+                                "Error updating the Git index:\n\n\nErrors logged to 'x.log'."
+
+                        let! result =
+                            batch.Materialize
+                                (lfsDownloadFiles |> Array.map (fst >> repositoryPath))
+                                (ctx "batch-materialize-index-error-exit-0")
+                            |> Async.StartAsPromise
+
+                        stopFaking.Value ()
+                        stopFaking.Value <- ignore
+
+                        match result with
+                        | Failed failure ->
+                            Vitest.expect(failure.Code).toBe "batch_materialization_incomplete"
+                            Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "remove_index_lock")
+                            Vitest.expect(failure.AffectedPaths.Length).toBe lfsDownloadFiles.Length
+                        | Succeeded _
+                        | PartiallySucceeded _ -> failwith "Expected a failure for a checkout that could not update the index."
+
+                        let! lockExists = pathExistsAsync lockPath
+                        Vitest.expect(lockExists).toBe true
+                        do! removeDirectoryAsync root
+                    with error ->
+                        stopFaking.Value ()
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "batch materialization keeps the plain failure when a checkout that ended with success could not update the index and no lock exists",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let! root, workPath, barePath = createFreedLfsFixture ()
+                    let stopFaking: (unit -> unit) ref = ref ignore
+
+                    try
+                        let batch = openBatchMaterialization workPath barePath
+
+                        stopFaking.Value <-
+                            fakeLfsCheckoutWithIndexError "" "Error updating the Git index:\n\n\nErrors logged to 'x.log'."
+
+                        let! result =
+                            batch.Materialize
+                                (lfsDownloadFiles |> Array.map (fst >> repositoryPath))
+                                (ctx "batch-materialize-index-error-no-lock")
+                            |> Async.StartAsPromise
+
+                        stopFaking.Value ()
+                        stopFaking.Value <- ignore
+
+                        match result with
+                        | Failed failure ->
+                            Vitest.expect(failure.Code).toBe "batch_materialization_incomplete"
+                            Vitest.expect(failure.RecoveryAction).toEqual None
+                            Vitest.expect(failure.AffectedPaths.Length).toBe lfsDownloadFiles.Length
+                            Vitest.expect(failure.Message.Contains "Error updating the Git index").toBe true
+                        | Succeeded _
+                        | PartiallySucceeded _ -> failwith "Expected a failure for a checkout that could not update the index."
+
+                        do! removeDirectoryAsync root
+                    with error ->
+                        stopFaking.Value ()
                         do! removeDirectoryAsync root
                         return raise error
             }
