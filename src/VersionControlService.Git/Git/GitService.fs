@@ -2128,6 +2128,14 @@ let private createLfsCheckoutFailure safePath trackedByAttributes =
 
 let private lfsFailure (message: string) : GitFailure = toFailure (exn message)
 
+/// The refusal of a path with local changes. Hosts decide by its kind, because the message names the path
+/// and the path can carry words that the text classifier reads as another kind.
+let private localChangesFailure (message: string) : GitFailure =
+    {
+        lfsFailure message with
+            Kind = GitFailureKind.LocalChanges
+    }
+
 /// Reads the status records of the `paths` that have changes, with one `git status` per chunk
 /// of literal pathspecs. The read has no timeout and ends when the context is canceled.
 let private readDirtyFiles
@@ -2621,7 +2629,7 @@ let private downloadLfsCandidates
                         if (tryLstatSync candidate.AbsolutePath).IsNone then
                             results[candidate.Requested] <-
                                 Error(
-                                    lfsFailure
+                                    localChangesFailure
                                         $"'{candidate.SafePath}' has local changes. Save, discard, or commit them before downloading the Git LFS file."
                                 )
                         else
@@ -2798,7 +2806,7 @@ let private readLfsCandidates
                         | None -> safePath
 
                     if dirtyPaths.Contains statusPath && not (repairedPaths.Contains statusPath) then
-                        results[requested] <- Error(lfsFailure (dirtyMessage safePath))
+                        results[requested] <- Error(localChangesFailure (dirtyMessage safePath))
                     else
                         match info with
                         | None ->

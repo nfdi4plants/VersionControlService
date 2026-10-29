@@ -99,6 +99,7 @@ let private categoryOfKind (kind: GitFailureKind) =
     | GitFailureKind.LfsBackupRetained -> ProviderError
     | GitFailureKind.InvalidLfsThreshold -> Validation
     | GitFailureKind.RemoteProjectAlreadyExists -> ProviderError
+    | GitFailureKind.LocalChanges -> ProviderError
     | GitFailureKind.Unknown -> ProviderError
 
 let private codeOfKind (kind: GitFailureKind) =
@@ -112,6 +113,7 @@ let private codeOfKind (kind: GitFailureKind) =
     | GitFailureKind.LfsBackupRetained -> "lfs_backup_retained"
     | GitFailureKind.InvalidLfsThreshold -> "invalid_lfs_threshold"
     | GitFailureKind.RemoteProjectAlreadyExists -> "remote_project_exists"
+    | GitFailureKind.LocalChanges -> "local_changes"
     | GitFailureKind.Unknown -> "git_failure"
 
 let private toOperationFailure (failure: GitService.GitFailure) : OperationFailure =

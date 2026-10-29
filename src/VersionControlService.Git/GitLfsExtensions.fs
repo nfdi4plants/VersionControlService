@@ -29,6 +29,7 @@ let private categoryOfKind (kind: GitFailureKind) =
     | GitFailureKind.LfsBackupRetained -> ProviderError
     | GitFailureKind.InvalidLfsThreshold -> Validation
     | GitFailureKind.RemoteProjectAlreadyExists -> ProviderError
+    | GitFailureKind.LocalChanges -> ProviderError
     | GitFailureKind.Unknown -> ProviderError
 
 let private toOperationFailure (failure: GitService.GitFailure) : OperationFailure =
@@ -42,6 +43,8 @@ let private toOperationFailure (failure: GitService.GitFailure) : OperationFailu
                 OperationFailure.createRedacted ProviderError "lfs_backup_retained" failure.Message with
                     StateChanged = true
             }
+        | None when failure.Kind = GitFailureKind.LocalChanges ->
+            OperationFailure.createRedacted (categoryOfKind failure.Kind) "local_changes" failure.Message
         | None ->
             OperationFailure.createRedacted (categoryOfKind failure.Kind) "lfs_operation_failed" failure.Message
 
@@ -506,7 +509,9 @@ let private batchNoOpReason = "Every path is already in the requested state."
 
 /// Collapses the outcomes of the paths into one result. The failure of a run with failed paths names
 /// them in AffectedPaths and Details. It takes its category and retry flag from the first failure that
-/// is not a cancellation, and has the category Canceled only when every failure is a cancellation.
+/// is not a cancellation, and has the category Canceled only when every failure is a cancellation. The
+/// code is operation_canceled when every failure is a cancellation and local_changes when every failure is
+/// the refusal of a path with local changes. Any other mix has the code of the action.
 let internal toBatchResult (action: BatchAction) (outcomes: GitService.LfsPathOutcome[]) : OperationResult<unit> =
     let changed =
         outcomes
@@ -534,6 +539,9 @@ let internal toBatchResult (action: BatchAction) (outcomes: GitService.LfsPathOu
         let failures = failed |> Array.map (fun (path, failure) -> path, toOperationFailure failure)
         let allCanceled = failed |> Array.forall (fun (_, failure) -> failure.Kind = GitFailureKind.Canceled)
 
+        let allLocalChanges =
+            failed |> Array.forall (fun (_, failure) -> failure.Kind = GitFailureKind.LocalChanges)
+
         // A cancellation says little about why other paths failed. The first failure that is not a
         // cancellation therefore supplies the message and the category with its retry flag.
         let basis =
@@ -543,7 +551,10 @@ let internal toBatchResult (action: BatchAction) (outcomes: GitService.LfsPathOu
 
         let failure = {
             basis with
-                Code = if allCanceled then "operation_canceled" else action.IncompleteCode
+                Code =
+                    if allCanceled then "operation_canceled"
+                    elif allLocalChanges then "local_changes"
+                    else action.IncompleteCode
                 Message = $"{failed.Length} of {outcomes.Length} paths failed: {basis.Message}"
                 StateChanged = changed.Length > 0 || (failures |> Array.exists (fun (_, item) -> item.StateChanged))
                 AffectedPaths = failures |> Array.map fst

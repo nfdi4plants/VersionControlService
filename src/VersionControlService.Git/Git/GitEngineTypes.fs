@@ -59,6 +59,8 @@ type GitFailureKind =
     | LfsBackupRetained
     | InvalidLfsThreshold
     | RemoteProjectAlreadyExists
+    /// A Git LFS download or free refused a path that has local changes.
+    | LocalChanges
     | Unknown
 
 [<StringEnum(CaseRules.None)>]

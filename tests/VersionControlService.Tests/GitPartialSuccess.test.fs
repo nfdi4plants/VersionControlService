@@ -601,6 +601,11 @@ let private openBatchMaterialization (workPath: string) (barePath: string) : Obj
     (openSession workPath barePath).ObjectBatchMaterialization
     |> Option.defaultWith (fun () -> failwith "Expected the object batch materialization service.")
 
+/// The single-path materialization service of a new session over a work repository whose origin is `barePath`.
+let private openMaterialization (workPath: string) (barePath: string) : ObjectMaterializationService =
+    (openSession workPath barePath).ObjectMaterialization
+    |> Option.defaultWith (fun () -> failwith "Expected the object-materialization service.")
+
 /// The batch materialization service of a session whose credential strategy hands out a token for the remote at `remoteUrl`.
 let private openBatchMaterializationWithToken (workPath: string) (remoteUrl: string) : ObjectBatchMaterializationService =
     let strategy: GitCredentialStrategy.GitCredentialStrategy = {
@@ -3584,6 +3589,182 @@ Vitest.describe (
                     with error ->
                         do! removeDirectoryAsync root
                         return raise error
+            }
+        )
+
+        Vitest.test (
+            "materialization of a file with local changes fails with the code local_changes",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let! root, workPath, barePath = createFreedLfsFixture ()
+
+                    try
+                        let editedPath = "data/a.bin"
+                        do! writeUtf8FileAsync (join [| workPath; editedPath |]) "content of X\n"
+
+                        let! result =
+                            (openMaterialization workPath barePath).Materialize
+                                (repositoryPath editedPath)
+                                (ctx "materialize-local-changes")
+                            |> Async.StartAsPromise
+
+                        match result with
+                        | Failed failure ->
+                            Vitest.expect(failure.Code).toBe "local_changes"
+                            Vitest.expect(failure.Category).toEqual ProviderError
+                        | Succeeded _
+                        | PartiallySucceeded _ -> failwith "A file with local changes must not be materialized."
+
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "dematerialization of a file with local changes fails with the code local_changes",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let! root, workPath = createPushedLfsFixture false
+
+                    try
+                        let editedPath = "data/a.bin"
+                        do! writeUtf8FileAsync (join [| workPath; editedPath |]) "content of X\n"
+
+                        let! result =
+                            (openMaterialization workPath (join [| root; "origin.git" |])).Dematerialize
+                                (repositoryPath editedPath)
+                                (ctx "dematerialize-local-changes")
+                            |> Async.StartAsPromise
+
+                        match result with
+                        | Failed failure -> Vitest.expect(failure.Code).toBe "local_changes"
+                        | Succeeded _
+                        | PartiallySucceeded _ -> failwith "A file with local changes must not be freed."
+
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "batch materialization in which every path has local changes fails with the code local_changes",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let! root, workPath, barePath = createFreedLfsFixture ()
+
+                    try
+                        let editedPaths = [| "data/a.bin"; "data/b.bin" |]
+
+                        for editedPath in editedPaths do
+                            do! writeUtf8FileAsync (join [| workPath; editedPath |]) "content of X\n"
+
+                        let! result =
+                            (openBatchMaterialization workPath barePath).Materialize
+                                (editedPaths |> Array.map repositoryPath)
+                                (ctx "batch-materialize-local-changes")
+                            |> Async.StartAsPromise
+
+                        match result with
+                        | Failed failure ->
+                            Vitest.expect(failure.Code).toBe "local_changes"
+                            Vitest.expect(failure.AffectedPaths).toEqual editedPaths
+                            Vitest.expect(failure.Details.Length).toBe 2
+                        | Succeeded _
+                        | PartiallySucceeded _ -> failwith "Expected a failure when every path has local changes."
+
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "batch materialization with one path with local changes and one other failure keeps the incomplete code",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let! root, workPath, barePath = createFreedLfsFixture ()
+
+                    try
+                        let editedPath = "data/a.bin"
+                        do! writeUtf8FileAsync (join [| workPath; editedPath |]) "content of X\n"
+
+                        // The listing of Git LFS lacks this path, which is a failure of another kind.
+                        let unlistedPath = "data/unlisted.bin"
+
+                        let! result =
+                            (openBatchMaterialization workPath barePath).Materialize
+                                ([| editedPath; unlistedPath |] |> Array.map repositoryPath)
+                                (ctx "batch-materialize-local-changes-and-unlisted")
+                            |> Async.StartAsPromise
+
+                        match result with
+                        | Failed failure ->
+                            Vitest.expect(failure.Code).toBe "batch_materialization_incomplete"
+                            Vitest.expect(failure.AffectedPaths).toEqual [| editedPath; unlistedPath |]
+                        | Succeeded _
+                        | PartiallySucceeded _ -> failwith "Expected a failure when no path changed."
+
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "a partial batch result in which every failed path has local changes has the code local_changes",
+            fun () -> promise {
+                let localChanges (path: string) =
+                    ({
+                        Path = path
+                        Result =
+                            Error(
+                                {
+                                    Kind = GitEngineTypes.GitFailureKind.LocalChanges
+                                    Message = $"'{path}' has local changes."
+                                }: GitService.GitFailure
+                            )
+                    }: GitService.LfsPathOutcome)
+
+                let changed =
+                    ({ Path = "c.bin"; Result = Ok GitService.Changed }: GitService.LfsPathOutcome)
+
+                match
+                    GitLfsExtensions.toBatchResult
+                        GitLfsExtensions.batchMaterializeAction
+                        [| localChanges "a.bin"; localChanges "b.bin"; changed |]
+                with
+                | PartiallySucceeded(outcome, failure) ->
+                    Vitest.expect(failure.Code).toBe "local_changes"
+                    Vitest.expect(failure.AffectedPaths).toEqual [| "a.bin"; "b.bin" |]
+                    Vitest.expect(outcome.AffectedPaths).toEqual [| "c.bin" |]
+                | Succeeded _
+                | Failed _ -> failwith "Expected a partial success for a run with one changed path."
             }
         )
 
