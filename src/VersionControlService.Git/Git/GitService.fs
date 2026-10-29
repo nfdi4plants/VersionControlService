@@ -18,6 +18,7 @@ open VersionControlService.Git.GitInternals
 
 module FileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodeProcess = VersionControlService.Runtime.Node.Process
+module NodeOutput = VersionControlService.Runtime.Node.OutputReporter
 module NodeCancellation = VersionControlService.Runtime.Node.Cancellation
 module GitCredentialStrategy = VersionControlService.Git.GitCredentialStrategy
 
@@ -567,6 +568,7 @@ let private resolveLfsBackupDirectory (arcPath: string) : JS.Promise<GitResult<s
             StandardInput = None
             CancelCheck = None
             TimeoutMs = Some GitLfsService.DefaultTimeoutMs
+            Output = None
         }
 
     let gitPath = result.StdoutText |> Option.ofObj |> Option.defaultValue String.Empty |> _.Trim()
@@ -674,6 +676,7 @@ let private ensureFileMatchesLfsOid
                 StandardInput = None
                 CancelCheck = Some context.Cancellation.IsCancellationRequested
                 TimeoutMs = None
+                Output = NodeOutput.OutputTarget.ofContext context
             }
 
         let generatedPointer =
@@ -741,6 +744,7 @@ let private moveVerifiedFileToLfsBackup
                     StandardInput = None
                     CancelCheck = Some context.Cancellation.IsCancellationRequested
                     TimeoutMs = Some GitLfsService.DefaultTimeoutMs
+                    Output = NodeOutput.OutputTarget.ofContext context
                 }
 
             if context.Cancellation.IsCancellationRequested() then
@@ -1109,6 +1113,7 @@ let private getConfiguredLfsThresholdMb (arcPath: string) : JS.Promise<GitResult
             StandardInput = None
             CancelCheck = None
             TimeoutMs = Some 5000
+            Output = None
         }
 
     let values =
@@ -1822,6 +1827,7 @@ let prepareExplicitLfsPush
     (fetchAuth: GitCommandAuthentication)
     (commandAuth: GitCommandAuthentication)
     (progressCallback: GitProgressCallback option)
+    (outputTarget: NodeOutput.OutputTarget option)
     (cancelCheck: unit -> bool)
     : JS.Promise<GitResult<bool>> =
     promise {
@@ -1834,7 +1840,7 @@ let prepareExplicitLfsPush
                 applyCommandAuthentication
                     (fun currentOptions ->
                         createGit currentOptions
-                        |> withGitOutputProgress progressCallback)
+                        |> withGitOutput progressCallback outputTarget commandAuth.ConfigArgs)
                     options
                     commandAuth
 
@@ -1842,7 +1848,7 @@ let prepareExplicitLfsPush
                 applyCommandAuthentication
                     (fun currentOptions ->
                         createGit currentOptions
-                        |> withGitOutputProgress progressCallback)
+                        |> withGitOutput progressCallback outputTarget fetchAuth.ConfigArgs)
                     options
                     fetchAuth
 
@@ -1852,6 +1858,8 @@ let prepareExplicitLfsPush
                     {
                         request with
                             CancelCheck = Some cancelCheck
+                            // A request that names its own target keeps it. The plan probes get stderr only.
+                            Output = request.Output |> Option.orElse outputTarget
                     }
 
             reportPhase progressCallback "lfs" "Checking Git LFS objects"
@@ -1888,6 +1896,7 @@ let prepareExplicitLfsPush
                             remoteName
                             branchName
                             objectIds
+                            outputTarget
 
                     return
                         match uploadResult with
@@ -2180,6 +2189,7 @@ let private resolveLfsMediaDirectory (arcPath: string) : JS.Promise<GitResult<st
                 StandardInput = None
                 CancelCheck = None
                 TimeoutMs = Some GitLfsService.DefaultTimeoutMs
+                Output = None
             }
             |> Async.AwaitPromise
 
@@ -2294,6 +2304,7 @@ let private downloadLfsObjects
     (context: OperationContext)
     : JS.Promise<GitResult<unit>> = promise {
     let cancelCheck = Some context.Cancellation.IsCancellationRequested
+    let outputTarget = NodeOutput.OutputTarget.ofContext context
     let mutable canceled = false
 
     let reportTransfer (item: string option) () =
@@ -2329,6 +2340,7 @@ let private downloadLfsObjects
                     cancelCheck
                     reportProgress
                     (reportTransfer (Some candidate.SafePath))
+                    outputTarget
 
             match result with
             | _ when context.Cancellation.IsCancellationRequested() -> canceled <- true
@@ -2362,6 +2374,7 @@ let private downloadLfsObjects
                         cancelCheck
                         reportProgress
                         (reportTransfer item)
+                        outputTarget
 
                 match result with
                 | _ when context.Cancellation.IsCancellationRequested() -> canceled <- true
@@ -2411,7 +2424,12 @@ let private checkoutLfsCandidates
                 for candidate in chunkCandidates do
                     results[candidate.Requested] <- Error(canceledLfsFailure ())
         else
-            let! checkoutResult = GitLfsService.checkoutPatterns arcPath patterns reportProgress
+            let! checkoutResult =
+                GitLfsService.checkoutPatterns
+                    arcPath
+                    patterns
+                    reportProgress
+                    (NodeOutput.OutputTarget.ofContext context)
 
             match checkoutResult with
             | Error error ->
@@ -2874,6 +2892,7 @@ let private confirmLfsPath
                     true
                     cancelCheck
                     onTransferStarted
+                    (NodeOutput.OutputTarget.ofContext context)
 
             match dryRunResult with
             | Error error -> return Error error
@@ -2888,6 +2907,7 @@ let private confirmLfsPath
                         false
                         cancelCheck
                         onTransferStarted
+                        (NodeOutput.OutputTarget.ofContext context)
 
                 return Result.map Some refetchResult
         }
@@ -3021,7 +3041,14 @@ let rec private confirmLfsChunk
         }
 
         let! dryRunResult =
-            GitLfsService.fetchRefetchForPaths arcPath session.CommandAuth keys true cancelCheck onTransferStarted
+            GitLfsService.fetchRefetchForPaths
+                arcPath
+                session.CommandAuth
+                keys
+                true
+                cancelCheck
+                onTransferStarted
+                (NodeOutput.OutputTarget.ofContext context)
 
         match dryRunResult with
         | Error _ when isCanceled () -> return canceledAnswers
@@ -3043,6 +3070,7 @@ let rec private confirmLfsChunk
                         false
                         cancelCheck
                         onTransferStarted
+                        (NodeOutput.OutputTarget.ofContext context)
 
             match refetchResult with
             | Error _ when isCanceled () -> return canceledAnswers

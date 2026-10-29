@@ -1328,7 +1328,8 @@ let createContext (operationId: string) (onProgress: OperationProgress -> unit) 
 
 `OperationContext.create` catches and drops exceptions from the progress callback, so a
 callback that reports to a closed window cannot fail the operation it watches. The guard
-belongs to `create`. A context built as a record literal calls the callback unguarded.
+belongs to `create` and `createWithOutput`. A context built as a record literal calls the
+callbacks unguarded and has to set `ReportOutput`, which is `None` when the host asks for no output.
 
 The host calls `source.Cancel()` from wherever the user asks, such as a stop button. A
 canceled operation comes back as a `Canceled` failure that describes what the
@@ -1408,6 +1409,80 @@ A batch call also reports how many of its files are done. `Materialize` of
 as soon as its checkout ends, before the check of its content. `Completed` only rises, and it reaches
 `Total` when the call returns a result. These count events exist only for batch calls with more than
 one path. A call with a single path keeps its earlier progress sequence and reports none.
+
+### Raw output of subprocesses
+
+A host that wants to show what git and git-lfs print, for example in a folded "Show logs" section,
+builds its context with `OperationContext.createWithOutput`. The last argument receives batches of
+`OperationOutput`:
+
+```fsharp
+let createContextWithLogs
+    (operationId: string)
+    (onProgress: OperationProgress -> unit)
+    (onOutput: OperationOutput[] -> unit)
+    =
+    let source = OperationCancellation.Source()
+
+    let context =
+        OperationContext.createWithOutput operationId source.Cancellation onProgress onOutput
+
+    context, source
+```
+
+The channel is opt-in. `create` and `detached` leave `ReportOutput` at `None`, and the provider then
+does no work for output. Progress stays what it was, and no raw line ever becomes a progress event.
+The callback runs on the thread that runs the operation, so it should only queue the entries and
+render them later. An exception from it is dropped.
+
+Each entry has a `Kind` and a `Text` without a line terminator. `CommandId` groups the entries of one
+subprocess and is unique within the operation. A notice that concerns the whole operation has an empty
+`CommandId`.
+
+| Kind | Content |
+| --- | --- |
+| `Command` | The header of a subprocess, such as `git lfs fetch origin HEAD`. The provider sends one before the subprocess starts. It leaves out the leading `-c key=value` pairs, which can hold credentials, and it shows at most twelve arguments and then `...`. |
+| `StdErr` | A line from stderr. Every subprocess of the operation reports it, including probes whose failure the operation expects. Such a line does not mean that the operation failed. |
+| `StdOut` | A line from stdout. Only calls whose stdout is diagnostic text report it. |
+| `Notice` | A message from the library, for example that a long line was omitted or that lines were dropped. |
+
+Stdout is diagnostic text for the large-object download that Clone and the synchronizing operations
+run (`git lfs fetch` and `git lfs checkout`), for the download of `Materialize` (the same two
+commands) and for the `git lfs push` of a publish. The stdout of every other call is data, such as
+`git lfs ls-files -j`, `git status -z`, object content or the output of `git cat-file`, and it never
+reaches the channel.
+
+Git rewrites a progress meter in place with carriage returns, and the provider collapses these
+rewrites. A line that is still being rewritten arrives as a snapshot with `IsPartial` set, at most
+every 250 ms. The next entry with the same `CommandId` and `Kind` replaces a partial entry in the
+host's view, whether that next entry is partial or complete. When the line ends, or the subprocess
+ends for any reason, the final text arrives with `IsPartial` unset.
+
+The text is a redacted diagnostic and the channel keeps no transcript. The provider strips terminal
+escape sequences and control characters, skips blank lines, and replaces the credentials of the call
+with `[REDACTED]`. These are the values of credential-bearing configuration arguments, the token
+and the decoded `user:secret` parts of an Authorization header, the userinfo of URLs and the values
+of credential-looking environment variables. A secret the provider cannot know, for example one that
+a git hook prints, cannot be recognized. The order of stdout and stderr lines relative to each other is
+not promised, and the provider keeps no history. The host decides how many lines to keep.
+
+The channel has these limits:
+
+| Limit | Behavior |
+| --- | --- |
+| 4096 UTF-16 units per line | A longer line is dropped and a notice says so. |
+| 20 entries per batch, 10 batches per second | Entries wait in a queue between batches. |
+| 128 waiting entries | The oldest entries are dropped, and a notice reports how many. |
+| End of a subprocess | Everything that waits is delivered, at once if needed, before the operation completes. |
+
+The Git provider reports the subprocesses of Refresh, Update, Synchronize, Publish, Clone and Bind, the
+large-object listing, download and free of `ObjectMaterialization` and `ObjectBatchMaterialization`, and
+the LFS upload of a publish. It does not report the text diff workers, the byte-exact object reads, the
+cleanup of the LFS cache (prune and dedup) or the few configuration probes that run without an operation
+context. The lakeFS provider runs no subprocesses and reports no output.
+
+Show the output only in a folded or secondary view. Never use a raw line as the headline of an
+operation. The headline comes from progress and from the result.
 
 ## Building against the packages
 

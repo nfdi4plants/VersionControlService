@@ -199,4 +199,6 @@ The published records are intentionally small. Add new capability as a new optio
 
 `ServiceAvailability` is the exception to the rule about published records: a new optional service adds a required field to it, and that is a deliberate breaking change so a consumer's availability report can never be silently incomplete.
 
+`OperationContext` is the second exception. It is an observation record that the host builds, and 0.3.0 adds the field `ReportOutput` to it. Code that builds the record as a literal has to add `ReportOutput = None`. Code that calls `OperationContext.create`, `createWithOutput` or `detached`, and a provider that only reads the context, compile as before. A provider that runs subprocesses reports their output only when `context.ReportOutput` is `Some`, and it redacts every line first, as the [consuming guide](consuming.md#raw-output-of-subprocesses) describes.
+
 Run the shared conformance profiles before publishing an external provider. The harness contract and profile expectations are described in [conformance-profiles.md](conformance-profiles.md).

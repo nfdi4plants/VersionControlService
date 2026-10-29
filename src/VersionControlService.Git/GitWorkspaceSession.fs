@@ -17,6 +17,7 @@ module GitLfsExtensions = VersionControlService.Git.GitLfsExtensions
 module GitProvisioningService = VersionControlService.Git.GitProvisioningService
 module GitTextDiffService = VersionControlService.Git.TextDiff.GitTextDiffService
 module NodeProcess = VersionControlService.Runtime.Node.Process
+module NodeOutput = VersionControlService.Runtime.Node.OutputReporter
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodePath = VersionControlService.Runtime.Node.Path
 module NodeInterop = VersionControlService.Runtime.Node.Interop
@@ -164,7 +165,7 @@ let private mergeGitEnvironment (requestEnvironment: (string * string)[]) =
         requestEnvironment
 
 /// Runs git with a progress phase code for its meter lines. Stderr meters are always read. Stdout is
-/// read only when `observeStdout` is set, because the stdout of most calls is data.
+/// read and reported to the output channel only when `observeStdout` is set, because the stdout of most calls is data.
 let private runGitWithProgress
     (phaseCode: string)
     (observeStdout: bool)
@@ -183,6 +184,7 @@ let private runGitWithProgress
                 Environment = mergeGitEnvironment environment
                 ProgressPhase = phaseCode
                 ObserveStdoutProgress = observeStdout
+                ReportStdoutOutput = observeStdout
         }
 
         let runner = hooks.RunProcess |> Option.defaultValue NodeProcess.run
@@ -311,13 +313,8 @@ let private runHookedBytesProcess
 
 /// The summary leaves out the leading `-c` pairs because they can hold credentials, and redacting a header would take Git's reason with it.
 let private commandSummary (arguments: string[]) =
-    let mutable firstRemainingArgument = 0
-
-    while firstRemainingArgument + 1 < arguments.Length && arguments[firstRemainingArgument] = "-c" do
-        firstRemainingArgument <- firstRemainingArgument + 2
-
     arguments
-    |> Array.skip firstRemainingArgument
+    |> NodeOutput.withoutLeadingConfig
     |> Array.truncate 3
     |> String.concat " "
 
@@ -4347,6 +4344,7 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                             fetchAuthentication
                                             authentication
                                             (Some reportLfsProgress)
+                                            (NodeOutput.OutputTarget.ofContext context)
                                             context.Cancellation.IsCancellationRequested
                                         |> Async.AwaitPromise
 

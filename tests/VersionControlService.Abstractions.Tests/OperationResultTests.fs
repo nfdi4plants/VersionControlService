@@ -39,6 +39,38 @@ let operationResultTests =
 
             Expect.equal calls 1 "The callback ran once and its exception was dropped."
 
+        testCase "create gives a context without an output callback"
+        <| fun () ->
+            let created = OperationContext.create "output-none" OperationCancellation.none ignore
+            Expect.isNone created.ReportOutput "create sets no output callback."
+
+            Expect.isNone (OperationContext.detached "output-none-detached").ReportOutput "detached sets none either."
+
+        testCase "createWithOutput delivers batches and drops an exception from the callback"
+        <| fun () ->
+            let delivered = ResizeArray<OperationOutput[]>()
+
+            let reporting =
+                OperationContext.createWithOutput "output-some" OperationCancellation.none ignore delivered.Add
+
+            let entry = {
+                CommandId = "1"
+                Kind = OperationOutputKind.StdErr
+                Text = "fatal: example"
+                IsPartial = false
+            }
+
+            reporting.ReportOutput |> Option.iter (fun report -> report [| entry |])
+            Expect.equal (delivered |> Seq.toList) [ [| entry |] ] "The batch reached the callback."
+
+            let throwing =
+                OperationContext.createWithOutput "output-throws" OperationCancellation.none ignore (fun _ ->
+                    failwith "Object has been destroyed")
+
+            match throwing.ReportOutput with
+            | Some report -> report [| entry |]
+            | None -> failtest "Expected an output callback."
+
         testCase "noOp keeps its reason"
         <| fun () ->
             match OperationResult.noOp (Some "already up to date") "value" with

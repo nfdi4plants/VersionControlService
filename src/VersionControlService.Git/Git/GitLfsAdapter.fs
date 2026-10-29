@@ -9,6 +9,7 @@ open VersionControlService.Runtime.Node.Interop
 open VersionControlService.Git.GitAuthAdapter
 
 module GitExecution = VersionControlService.Git.GitExecution
+module NodeOutput = VersionControlService.Runtime.Node.OutputReporter
 
 [<Literal>]
 let private repoValidationTimeoutMs = 5000
@@ -69,6 +70,8 @@ type GitSpawnRequest = {
     StandardInput: string option
     CancelCheck: (unit -> bool) option
     TimeoutMs: int option
+    /// Where the process reports its output lines. None when the operation's host did not ask for them.
+    Output: NodeOutput.OutputTarget option
 }
 
 /// Captured process result for spawned git commands, including raw stdout for binary-safe batch parsing.
@@ -121,11 +124,25 @@ let private runGitProcess
     promise {
     let! result =
         Fable.Core.JS.Constructors.Promise.Create(fun resolve _ ->
+            let environment = resolveGitEnvironment request.Environment
+
+            // The header is queued before the spawn. Nothing is computed when the host asked for no output.
+            let commandOutput =
+                request.Output
+                |> Option.map (fun target ->
+                    NodeOutput.beginCommand
+                        target.Channel
+                        "git"
+                        request.Arguments
+                        request.Arguments
+                        (NodeOutput.environmentEntries environment)
+                        target.ReportStdout)
+
             let spawnOptions =
                 createObj [
                     "shell" ==> false
                     "windowsHide" ==> true
-                    "env" ==> resolveGitEnvironment request.Environment
+                    "env" ==> environment
                     "detached" ==> not (isWindows ())
 
                     match request.WorkingDirectory with
@@ -164,6 +181,8 @@ let private runGitProcess
                 if not finished then
                     finished <- true
                     clearTimers ()
+                    // The host has the output before the operation sees the result.
+                    commandOutput |> Option.iter (fun output -> output.Finish())
                     let effectiveExitCode = if cancelRequested && exitCode = 0 then -1 else exitCode
 
                     let stdoutBuffer =
@@ -231,12 +250,24 @@ let private runGitProcess
                         )
                 | _ -> ()
 
+            // One decoder per stream keeps a multi-byte character that spans two chunks whole.
+            let stdoutDecoder = createUtf8StringDecoder ()
+            let stderrDecoder = createUtf8StringDecoder ()
+
+            let observeStdout (text: string) =
+                output.OnStdout text
+                commandOutput |> Option.iter (fun command -> command.ObserveStdout text)
+
+            let observeStderr (text: string) =
+                stderrChunks.Add text
+                output.OnStderr text
+                commandOutput |> Option.iter (fun command -> command.ObserveStderr text)
+
             proc?stdout?on (
                 "data",
                 fun d ->
                     resetIdleTimer ()
-                    let text = d?toString ("utf8") |> unbox<string>
-                    output.OnStdout text
+                    observeStdout (decodeUtf8Chunk stdoutDecoder d)
 
                     if captureStdout then
                         stdoutChunks.Add d
@@ -247,9 +278,7 @@ let private runGitProcess
                 "data",
                 fun d ->
                     resetIdleTimer ()
-                    let text = d?toString ("utf8") |> unbox<string>
-                    stderrChunks.Add text
-                    output.OnStderr text
+                    observeStderr (decodeUtf8Chunk stderrDecoder d)
             )
             |> ignore
 
@@ -288,6 +317,13 @@ let private runGitProcess
             proc?on (
                 "close",
                 fun code ->
+                    if not finished then
+                        for decoder, observe in [ stdoutDecoder, observeStdout; stderrDecoder, observeStderr ] do
+                            let tail = finishUtf8Decoding decoder
+
+                            if not (String.IsNullOrEmpty tail) then
+                                observe tail
+
                     finish (if isNull code then -1 else int (unbox<float> code))
             )
             |> ignore
@@ -381,6 +417,7 @@ let tryExecGitText (workingDirectory: string option) (timeoutMs: int) (args: str
             StandardInput = None
             CancelCheck = None
             TimeoutMs = Some timeoutMs
+            Output = None
         }
 
     if result.ExitCode = 0 && not result.TimedOut then
@@ -425,6 +462,7 @@ let checkFilterAttributes
                     StandardInput = Some(String.concat "\000" (relativePaths |> Seq.distinct |> Seq.toArray))
                     CancelCheck = None
                     TimeoutMs = Some repoValidationTimeoutMs
+                    Output = None
                 }
 
             if result.ExitCode <> 0 || result.TimedOut then
@@ -511,6 +549,7 @@ type NodeGitLfsAdapter() =
                                 StandardInput = None
                                 CancelCheck = Some cancelCheck
                                 TimeoutMs = timeoutMs
+                                Output = None
                             }
 
                     return {

@@ -8091,3 +8091,204 @@ Vitest.describe (
             }
         )
 )
+
+let private outputContext (name: string) (batches: ResizeArray<OperationOutput[]>) =
+    OperationContext.createWithOutput name OperationCancellation.none ignore batches.Add
+
+let private outputEntries (batches: ResizeArray<OperationOutput[]>) =
+    batches |> Seq.collect id |> Seq.toArray
+
+Vitest.describe (
+    "Git output channel",
+    fun () ->
+        Vitest.test (
+            "synchronize reports the header and the stderr lines of its fetch",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, _, barePath, session = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+
+                try
+                    do! advanceTarget root barePath [ "target.txt", "target content\n" ]
+                    let batches = ResizeArray<OperationOutput[]>()
+
+                    let! result = synchronizeWithoutPublishIn session (outputContext "output-fetch" batches)
+                    expectSucceeded "synchronize with output" result |> ignore
+
+                    let entries = outputEntries batches
+
+                    let fetchHeader =
+                        entries
+                        |> Array.tryFind (fun entry ->
+                            entry.Kind = OperationOutputKind.Command && entry.Text = "git fetch --progress origin")
+
+                    Vitest.expect(fetchHeader.IsSome).toBe true
+
+                    // The ref update line is what git prints to stderr when the fetch brings something new.
+                    let fetchLines =
+                        entries
+                        |> Array.filter (fun entry ->
+                            entry.CommandId = fetchHeader.Value.CommandId
+                            && entry.Kind = OperationOutputKind.StdErr)
+
+                    Vitest.expect(fetchLines |> Array.exists (fun entry -> entry.Text.Contains "origin/main")).toBe true
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "hydration reports the stdout of lfs fetch and lfs checkout",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let meterScript (label: string) =
+                    "process.stdout.write('" + label + ":  50% (1/2), 1 B | 1 B/s\\r" +
+                    label + ": 100% (2/2), 2 B | 1 B/s, done.\\n');"
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request processContext ->
+                            if isLfsFetchRequest request then
+                                NodeProcess.run
+                                    { request with
+                                        Command = nodeExecutablePath
+                                        Arguments = [| "-e"; meterScript "Downloading LFS objects" |] }
+                                    processContext
+                            elif isLfsCheckoutRequest request then
+                                NodeProcess.run
+                                    { request with
+                                        Command = nodeExecutablePath
+                                        Arguments = [| "-e"; meterScript "Checking out LFS objects" |] }
+                                    processContext
+                            else
+                                NodeProcess.run request processContext)
+                    Barrier = None
+                }
+
+                let! root, workPath, session = createUnhydratedLfsClone hooks
+
+                try
+                    let! _ = setMaterializeLargeObjects workPath true
+                    let batches = ResizeArray<OperationOutput[]>()
+
+                    let! result = synchronizeWithoutPublishIn session (outputContext "output-hydration" batches)
+                    expectSucceeded "synchronize with a metered hydration" result |> ignore
+
+                    let stdoutTexts =
+                        outputEntries batches
+                        |> Array.filter (fun entry -> entry.Kind = OperationOutputKind.StdOut && not entry.IsPartial)
+                        |> Array.map (fun entry -> entry.Text)
+
+                    Vitest.expect(stdoutTexts).toEqual [|
+                        "Downloading LFS objects: 100% (2/2), 2 B | 1 B/s, done."
+                        "Checking out LFS objects: 100% (2/2), 2 B | 1 B/s, done."
+                    |]
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "the LFS listing reports its header and never its JSON stdout",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, _, session = createUnhydratedLfsClone GitWorkspaceSession.GitSessionHooks.none
+
+                try
+                    let batches = ResizeArray<OperationOutput[]>()
+
+                    let materialization =
+                        session.ObjectMaterialization
+                        |> Option.defaultWith (fun () -> failwith "Expected Git object materialization.")
+
+                    let! listResult =
+                        materialization.ListObjects(outputContext "output-listing" batches)
+                        |> Async.StartAsPromise
+
+                    expectValue "listing" listResult |> ignore
+                    let entries = outputEntries batches
+
+                    Vitest.expect(
+                        entries
+                        |> Array.exists (fun entry ->
+                            entry.Kind = OperationOutputKind.Command && entry.Text = "git lfs ls-files -j")
+                    )
+                        .toBe true
+
+                    Vitest.expect(entries |> Array.exists (fun entry -> entry.Kind = OperationOutputKind.StdOut)).toBe false
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "publish reports the header and the stdout of the explicit LFS upload",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, _, session = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+
+                try
+                    do!
+                        writeUtf8FileAsync
+                            (join [| workPath; "publish-large.bin" |])
+                            (String.replicate (1024 * 1024) "p")
+
+                    let! saveStatus = sessionStatus session
+
+                    let! revisionResult =
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: publish explicit LFS object"
+                                Paths = [| mkPath "publish-large.bin" |]
+                                ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+                            }
+                            (ctx "output-publish-revision")
+                        |> Async.StartAsPromise
+
+                    expectValue "LFS revision" revisionResult |> ignore
+                    let batches = ResizeArray<OperationOutput[]>()
+                    let! publishStatus = sessionStatus session
+
+                    let! publishResult =
+                        (syncService session).Publish
+                            {
+                                ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                            }
+                            (outputContext "output-publish" batches)
+                        |> Async.StartAsPromise
+
+                    expectValue "publish" publishResult |> ignore
+                    let entries = outputEntries batches
+
+                    let upload =
+                        entries
+                        |> Array.tryFind (fun entry ->
+                            entry.Kind = OperationOutputKind.Command
+                            && entry.Text = "git lfs push --object-id origin --stdin")
+
+                    Vitest.expect(upload.IsSome).toBe true
+
+                    Vitest.expect(
+                        entries
+                        |> Array.exists (fun entry ->
+                            entry.CommandId = upload.Value.CommandId
+                            && entry.Kind = OperationOutputKind.StdOut
+                            && entry.Text.Contains "Uploading LFS objects")
+                    )
+                        .toBe true
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+)

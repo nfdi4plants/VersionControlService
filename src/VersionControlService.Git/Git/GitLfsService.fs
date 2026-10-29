@@ -17,6 +17,7 @@ module GitCredentialStrategy = VersionControlService.Git.GitCredentialStrategy
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodePath = VersionControlService.Runtime.Node.Path
 module NodeProcess = VersionControlService.Runtime.Node.Process
+module NodeOutput = VersionControlService.Runtime.Node.OutputReporter
 
 /// Default timeout for interactive Git LFS commands launched by the service process.
 [<Literal>]
@@ -210,6 +211,7 @@ let private requireGitLfsForLiteralPolicy (repoPath: string) : JS.Promise<Result
             StandardInput = None
             CancelCheck = None
             TimeoutMs = Some DefaultTimeoutMs
+            Output = None
         }
 
     return
@@ -250,6 +252,7 @@ let tryGetLfsEndpoint (repoPath: string) : JS.Promise<string option> = promise {
             StandardInput = None
             CancelCheck = None
             TimeoutMs = Some DefaultTimeoutMs
+            Output = None
         }
 
     if result.ExitCode <> 0 || result.TimedOut then
@@ -268,6 +271,7 @@ let tryHasStandaloneTransferAgent (repoPath: string) : JS.Promise<bool> = promis
                 StandardInput = None
                 CancelCheck = None
                 TimeoutMs = Some 5000
+                Output = None
             }
 
         return result.ExitCode = 0 && not result.TimedOut && not (String.IsNullOrWhiteSpace result.StdoutText)
@@ -987,6 +991,8 @@ let readLsFilesByRelativePath
                     StandardInput = None
                     CancelCheck = Some context.Cancellation.IsCancellationRequested
                     TimeoutMs = None
+                    // The listing is JSON data, so only stderr reaches the output channel.
+                    Output = NodeOutput.OutputTarget.ofContext context
                 }
 
             if commandResult.ExitCode <> 0 || commandResult.TimedOut then
@@ -1280,6 +1286,7 @@ let checkoutPatterns
     (repoPath: string)
     (patterns: string[])
     (reportProgress: OperationProgress -> unit)
+    (outputTarget: NodeOutput.OutputTarget option)
     : JS.Promise<Result<unit, exn>> = promise {
     let output, flushOutput = createPhaseMeterOutput "lfs-materialize-checkout" reportProgress
 
@@ -1291,6 +1298,8 @@ let checkoutPatterns
             StandardInput = None
             CancelCheck = None
             TimeoutMs = None
+            // The stdout of `lfs checkout` is its transfer summary, so it is diagnostic text.
+            Output = NodeOutput.OutputTarget.withStdout outputTarget
         }
 
     flushOutput ()
@@ -1569,6 +1578,7 @@ let internal runAuthenticatedMaintenance
                     StandardInput = None
                     CancelCheck = Some cancelCheck
                     TimeoutMs = None
+                    Output = None
                 }
 
         flushOutput ()
@@ -1587,6 +1597,7 @@ let fetchRefetchForPaths
     (dryRun: bool)
     (cancelCheck: (unit -> bool) option)
     (onStarted: unit -> unit)
+    (outputTarget: NodeOutput.OutputTarget option)
     : JS.Promise<Result<string, exn>> =
     promise {
         let! result =
@@ -1602,6 +1613,8 @@ let fetchRefetchForPaths
                     StandardInput = None
                     CancelCheck = cancelCheck
                     TimeoutMs = None
+                    // The stdout of the dry run is a listing of objects, so only stderr is reported.
+                    Output = outputTarget
                 }
 
         return
@@ -1639,23 +1652,26 @@ let downloadObjects
     (cancelCheck: (unit -> bool) option)
     (reportProgress: OperationProgress -> unit)
     (onStarted: unit -> unit)
+    (outputTarget: NodeOutput.OutputTarget option)
     : JS.Promise<Result<unit, exn>> =
     promise {
         let transferEnvironment = withFetchExcludeCleared commandAuth.Environment
 
         // Only the fetch reports meters. The smudge moves a single object, and its stdout holds the file content.
-        let arguments, standardInput, environment, (output, flushOutput) =
+        let arguments, standardInput, environment, (output, flushOutput), spawnOutput =
             match download with
             | SmudgeObject(relativePath, listing) ->
                 buildSmudgePointerArgs relativePath,
                 Some(buildPointerInput listing),
                 withLfsSmudgeEnabled transferEnvironment,
-                (OutputObservers.none, ignore)
+                (OutputObservers.none, ignore),
+                outputTarget
             | FetchPaths relativePaths ->
                 buildDownloadObjectArgs relativePaths,
                 None,
                 withForcedLfsProgress transferEnvironment,
-                createPhaseMeterOutput "lfs-materialize-transfer" reportProgress
+                createPhaseMeterOutput "lfs-materialize-transfer" reportProgress,
+                NodeOutput.OutputTarget.withStdout outputTarget
 
         let! result =
             runGitDiscardingStdoutWithStartedAndOutput onStarted output {
@@ -1665,6 +1681,7 @@ let downloadObjects
                 StandardInput = standardInput
                 CancelCheck = cancelCheck
                 TimeoutMs = None
+                Output = spawnOutput
             }
 
         flushOutput ()
@@ -1705,6 +1722,7 @@ let private filterResolvableRemoteTipIds
                     StandardInput = Some(String.concat "\n" [| yield! distinctRemoteTipIds; yield "" |])
                     CancelCheck = None
                     TimeoutMs = Some DefaultTimeoutMs
+                    Output = None
                 }
 
             if batchCheckResult.ExitCode <> 0 then
@@ -1804,6 +1822,7 @@ let private tryGetOptimizedLfsObjectIds
                 StandardInput = Some(buildRevListStandardInput refSpec remoteTipIds)
                 CancelCheck = None
                 TimeoutMs = Some DefaultTimeoutMs
+                Output = None
             }
 
         if revListResult.ExitCode <> 0 then
@@ -1827,6 +1846,7 @@ let private tryGetOptimizedLfsObjectIds
                         StandardInput = Some(String.concat "\n" [| yield! candidateBlobIds; yield "" |])
                         CancelCheck = None
                         TimeoutMs = Some DefaultTimeoutMs
+                        Output = None
                     }
 
                 if catFileResult.ExitCode <> 0 then
@@ -1864,6 +1884,7 @@ let private getOutboundObjectIdsFromRemoteTips
                 StandardInput = Some(buildRevListStandardInput refSpec remoteTipIds)
                 CancelCheck = None
                 TimeoutMs = Some DefaultTimeoutMs
+                Output = None
             }
 
         if revListResult.ExitCode = 0 then
@@ -1987,6 +2008,7 @@ let uploadObjects
     (remoteName: string)
     (refSpec: string)
     (lfsObjectIds: string[])
+    (outputTarget: NodeOutput.OutputTarget option)
     : JS.Promise<Result<unit, exn>> =
     promise {
         if lfsObjectIds.Length = 0 then
@@ -2010,6 +2032,8 @@ let uploadObjects
                     StandardInput = Some(String.concat "\n" [| yield! lfsObjectIds; yield "" |])
                     CancelCheck = Some cancelCheck
                     TimeoutMs = None
+                    // The stdout of `lfs push` is its transfer summary, so it is diagnostic text.
+                    Output = NodeOutput.OutputTarget.withStdout outputTarget
                 }
 
             if exactUploadResult.ExitCode = 0 then
@@ -2029,6 +2053,7 @@ let uploadObjects
                             StandardInput = None
                             CancelCheck = Some cancelCheck
                             TimeoutMs = None
+                            Output = NodeOutput.OutputTarget.withStdout outputTarget
                         }
 
                     return
