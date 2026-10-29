@@ -3327,7 +3327,7 @@ Vitest.describe (
                 match lfsProbe with
                 | Error _ -> Vitest.expect(true).toBe true
                 | Ok _ ->
-                    let! root, workPath, _ = createFreedLfsFixture ()
+                    let! root, workPath, barePath = createFreedLfsFixture ()
 
                     try
                         let stalePaths = [| "data/a.bin"; "data/b.bin" |]
@@ -3336,18 +3336,39 @@ Vitest.describe (
                         let! statusBefore = statusLinesOf workPath
                         Vitest.expect(statusBefore).toEqual [| " M data/a.bin"; " M data/b.bin" |]
 
+                        let batch = openBatchMaterialization workPath barePath
                         let reports = ResizeArray<OperationProgress>()
-                        let! outcomes = downloadLfsPaths workPath stalePaths reports
 
-                        Vitest.expect(outcomes |> Array.map (fun outcome -> outcome.Path)).toEqual stalePaths
+                        let! result =
+                            batch.Materialize
+                                (stalePaths |> Array.map repositoryPath)
+                                (OperationContext.create "batch-materialize-stale-index" OperationCancellation.none reports.Add)
+                            |> Async.StartAsPromise
 
-                        Vitest
-                            .expect(outcomes |> Array.forall (fun outcome -> outcome.Result = Ok GitService.AlreadyInState))
-                            .toBe true
+                        match result with
+                        | Succeeded outcome ->
+                            Vitest.expect(outcome.Effect = Performed).toBe true
+                            Vitest.expect(outcome.AffectedPaths).toEqual stalePaths
+                        | PartiallySucceeded _
+                        | Failed _ -> failwith "Expected the batch materialization to repair the stale index entries."
 
                         Vitest
                             .expect(reports |> Seq.exists (fun report -> report.PhaseCode = "lfs-materialize-transfer"))
                             .toBe false
+
+                        for relativePath in stalePaths do
+                            let size = float (lfsDownloadFiles |> Array.find (fun (path, _) -> path = relativePath) |> snd).Length
+
+                            Vitest
+                                .expect(
+                                    reports
+                                    |> Seq.exists (fun report ->
+                                        report.PhaseCode = "lfs-materialize"
+                                        && report.Item = Some relativePath
+                                        && report.Completed = Some size
+                                        && report.Total = Some size)
+                                )
+                                .toBe true
 
                         let! statusAfter = statusLinesOf workPath
                         Vitest.expect(statusAfter).toEqual [||]
@@ -3394,7 +3415,7 @@ Vitest.describe (
                             |> Async.StartAsPromise
 
                         match result with
-                        | Succeeded _ -> ()
+                        | Succeeded outcome -> Vitest.expect(outcome.Effect = Performed).toBe true
                         | PartiallySucceeded(_, failure)
                         | Failed failure -> failwith $"Expected the stale index entry to be repaired ({failure.Code})."
 
@@ -3436,7 +3457,7 @@ Vitest.describe (
                         | Error failure -> Vitest.expect(failure.Message.Contains $"'{editedPath}' has local changes").toBe true
                         | Ok _ -> failwith "A file with other content must not count as materialized."
 
-                        Vitest.expect(outcomes[1].Result = Ok GitService.AlreadyInState).toBe true
+                        Vitest.expect(outcomes[1].Result = Ok GitService.Changed).toBe true
 
                         let! statusAfter = statusLinesOf workPath
                         Vitest.expect(statusAfter).toEqual [| " M data/a.bin" |]

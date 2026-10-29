@@ -1505,10 +1505,14 @@ Vitest.describe (
                 expectLfsEndpoint
                     $"https://{testHost}/group/proj.git"
                     $"https://oauth2:{testSecret}@{testHost}/group/proj.git/info/lfs"
+        )
 
+        Vitest.test (
+            "compares the .git suffix case-sensitively, as git-lfs does",
+            fun () ->
                 expectLfsEndpoint
                     $"https://{testHost}/group/proj.GIT"
-                    $"https://oauth2:{testSecret}@{testHost}/group/proj.GIT/info/lfs"
+                    $"https://oauth2:{testSecret}@{testHost}/group/proj.GIT.git/info/lfs"
         )
 
         Vitest.test (

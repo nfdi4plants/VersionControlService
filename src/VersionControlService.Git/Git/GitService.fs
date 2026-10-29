@@ -2717,15 +2717,15 @@ let private repairStaleLfsIndexEntries
 /// Reads the Git LFS listing once. It settles the paths that need no action and fails the paths with
 /// changes or without a listing entry. The rest are the candidates. A request that names an
 /// already listed path again, for example in another case, is dropped from `order`, because a
-/// duplicate counts once. With `repairStaleIndex`, a path whose only change is a stale index entry
-/// is repaired and counts as already in state.
+/// duplicate counts once. With `reportRepaired`, a path whose only change is a stale index entry is
+/// repaired. The repair changed the index, so the path settles as changed and `reportRepaired` reports it.
 let private readLfsCandidates
     (arcPath: string)
     (resolvedPaths: (string * string)[])
     (dirtyMessage: string -> string)
     (isAlreadyInState: GitLfsLsFileInfo -> bool)
     (reportAlreadyInState: string -> GitLfsLsFileInfo -> unit)
-    (repairStaleIndex: bool)
+    (reportRepaired: (string -> GitLfsLsFileInfo -> unit) option)
     (context: OperationContext)
     (results: LfsPathResults)
     (order: ResizeArray<string>)
@@ -2777,7 +2777,7 @@ let private readLfsCandidates
             let dirtyPaths = dirtyPathsOf dirtyFiles
 
             let! repairResult =
-                if repairStaleIndex && dirtyFiles.Length > 0 then
+                if reportRepaired.IsSome && dirtyFiles.Length > 0 then
                     repairStaleLfsIndexEntries
                         arcPath
                         dirtyFiles
@@ -2806,7 +2806,10 @@ let private readLfsCandidates
                                 Error(
                                     lfsFailure $"'{safePath}' The file is not listed by Git LFS in the current checkout."
                                 )
-                        | Some listed when repairedPaths.Contains listed.name || isAlreadyInState listed ->
+                        | Some listed when repairedPaths.Contains listed.name ->
+                            results[requested] <- Ok Changed
+                            reportRepaired |> Option.iter (fun report -> report safePath listed)
+                        | Some listed when isAlreadyInState listed ->
                             results[requested] <- Ok AlreadyInState
                             reportAlreadyInState safePath listed
                         | Some listed ->
@@ -2849,7 +2852,14 @@ let private runLfsDownload
                     Total = Some listed.size
                     DisplayMessage = Some "Git LFS file is already materialized"
                 })
-            true
+            (Some(fun safePath listed ->
+                reportProgress {
+                    PhaseCode = "lfs-materialize"
+                    Item = Some safePath
+                    Completed = Some listed.size
+                    Total = Some listed.size
+                    DisplayMessage = Some "Git LFS file materialized"
+                }))
             context
             results
             order
@@ -3449,7 +3459,7 @@ let private runLfsFree
                     Total = Some listed.size
                     DisplayMessage = Some "Git LFS file is already dematerialized"
                 })
-            false
+            None
             context
             results
             order
