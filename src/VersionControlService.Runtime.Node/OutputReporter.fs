@@ -18,7 +18,7 @@ let MaxLineLength = 4096
 [<Literal>]
 let MaxBatchEntries = 20
 
-/// Most entries waiting for delivery. A full queue drops its oldest entry.
+/// Most entries waiting for delivery. A full queue drops its oldest line.
 [<Literal>]
 let MaxQueuedEntries = 128
 
@@ -77,7 +77,8 @@ let private escapeSequencePattern =
 // Tab stays. Line terminators never reach the pattern, because the framer splits on them.
 let private controlCharacterPattern = Regex(@"[\u0000-\u0008\u000b-\u001f\u007f-\u009f]")
 
-let private urlUserInfoPattern = Regex(@"://(?<userinfo>[^/@\s]+)@")
+// A user name can hold an "@" (an e-mail address), so the userinfo ends at the last "@" before the first "/".
+let private urlUserInfoPattern = Regex(@"://(?<userinfo>[^/\s]+)@")
 
 let private headerValuePattern =
     Regex(
@@ -182,22 +183,31 @@ let withoutLeadingConfig (arguments: string[]) : string[] =
     arguments |> Array.skip first
 
 /// The header line of a command: the program and its arguments without the leading configuration pairs.
-/// It shows at most twelve arguments and then "...". Redact it before use.
-let commandHeader (command: string) (arguments: string[]) : string =
+/// It shows at most twelve arguments and then "...". The header redacts each argument with the secrets
+/// before it cuts the argument to 200 characters, because a cut could leave a part of a long secret that
+/// no longer matches.
+let commandHeader (secrets: string[]) (command: string) (arguments: string[]) : string =
     let shown = withoutLeadingConfig arguments
 
     let clip (argument: string) =
-        if argument.Length > MaxHeaderArgumentLength then
-            argument.Substring(0, MaxHeaderArgumentLength) + "..."
-        else
-            argument
+        let redacted = redactText secrets argument
 
-    let words = Array.append [| command |] (shown |> Array.truncate MaxHeaderArguments |> Array.map clip)
+        if redacted.Length > MaxHeaderArgumentLength then
+            redacted.Substring(0, MaxHeaderArgumentLength) + "..."
+        else
+            redacted
+
+    let words =
+        Array.append [| redactText secrets command |] (shown |> Array.truncate MaxHeaderArguments |> Array.map clip)
+
     let header = String.Join(" ", words)
 
     if shown.Length > MaxHeaderArguments then header + " ..." else header
 
-/// The batching queue of one operation. Entries wait here until the rate limit lets a batch go.
+/// The batching queue of one operation. Entries wait here until the rate limit lets a batch go. A full
+/// queue drops its oldest line and keeps the command headers, unless it holds nothing but headers. Flush
+/// bypasses the rate limit, so the end of each subprocess delivers its pending entries at once. Within a
+/// subprocess the limit holds.
 [<AllowNullLiteral>]
 type OutputChannel(clock: OutputClock, deliver: OperationOutput[] -> unit) =
     let queue = ResizeArray<OperationOutput>()
@@ -215,7 +225,7 @@ type OutputChannel(clock: OutputClock, deliver: OperationOutput[] -> unit) =
             batch.Add {
                 CommandId = ""
                 Kind = OperationOutputKind.Notice
-                Text = $"{omitted} output lines were omitted."
+                Text = if omitted = 1 then "1 output line was omitted." else $"{omitted} output lines were omitted."
                 IsPartial = false
             }
 
@@ -275,15 +285,22 @@ type OutputChannel(clock: OutputClock, deliver: OperationOutput[] -> unit) =
             queue[index] <- entry
         else
             if queue.Count >= MaxQueuedEntries then
-                queue.RemoveAt 0
+                // A header names the subprocess that the lines after it belong to, so a line goes first.
+                let victim =
+                    queue
+                    |> Seq.tryFindIndex (fun waiting -> waiting.Kind <> OperationOutputKind.Command)
+                    |> Option.defaultValue 0
+
+                queue.RemoveAt victim
                 omitted <- omitted + 1
 
             queue.Add entry
 
         pump ()
 
-    /// Delivers everything that waits, in batches of at most twenty, and ignores the rate limit.
-    /// A runner calls this when a process ends, so the host has the output before the operation completes.
+    /// Delivers everything that waits, in batches of at most twenty, and ignores the rate limit. A runner
+    /// calls this when a process ends, so the host has the output before the operation completes. The
+    /// pending entries of a subprocess therefore arrive at once, whatever the rate was before.
     member _.Flush() =
         cancelTimer |> Option.iter (fun cancel -> cancel ())
         cancelTimer <- None
@@ -311,6 +328,11 @@ type private LineFramer
     let mutable lastPartial: string = null
     let mutable partialAt = -1.0e12
     let mutable finished = false
+    let mutable cancelSnapshotTimer: (unit -> unit) option = None
+
+    let stopSnapshotTimer () =
+        cancelSnapshotTimer |> Option.iter (fun cancel -> cancel ())
+        cancelSnapshotTimer <- None
 
     let clean (raw: string) =
         if isNull raw then
@@ -341,8 +363,15 @@ type private LineFramer
         overlong <- false
         current.Clear() |> ignore
 
+    // The host keeps a partial entry until a complete one with the same command and kind replaces it.
+    let closePartial () =
+        if not (isNull lastPartial) then
+            emit lastPartial false
+            lastPartial <- null
+
     // The latest segment is the line. A blank line is dropped, except that it closes a snapshot already sent.
     let completeLine () =
+        stopSnapshotTimer ()
         let latest = clean (current.ToString())
         let text = if String.IsNullOrWhiteSpace latest then clean held else latest
 
@@ -360,6 +389,8 @@ type private LineFramer
     let endSegment () =
         if overlong then
             omitLongLine ()
+            // A line feed right after this segment must not complete the text of an earlier segment.
+            held <- null
         elif current.Length > 0 then
             held <- current.ToString()
             current.Clear() |> ignore
@@ -368,25 +399,36 @@ type private LineFramer
 
     let endLine () =
         if overlong then
+            stopSnapshotTimer ()
+            closePartial ()
             omitLongLine ()
             held <- null
-            lastPartial <- null
         else
             completeLine ()
 
         afterCarriageReturn <- false
 
-    let publishSnapshot () =
-        if not (isNull held) then
+    // A snapshot that the interval holds back goes out when the interval ends, even if no more text comes.
+    let rec publishSnapshot () =
+        if not finished && not (isNull held) then
             let now = clock.Now()
+            let waited = now - partialAt
 
-            if now - partialAt >= SnapshotIntervalMilliseconds then
+            if waited >= SnapshotIntervalMilliseconds then
+                stopSnapshotTimer ()
                 let text = clean held
 
                 if not (String.IsNullOrWhiteSpace text) && text <> lastPartial then
                     emit text true
                     lastPartial <- text
                     partialAt <- now
+            elif cancelSnapshotTimer.IsNone then
+                cancelSnapshotTimer <-
+                    Some(
+                        clock.Schedule (SnapshotIntervalMilliseconds - waited) (fun () ->
+                            cancelSnapshotTimer <- None
+                            publishSnapshot ())
+                    )
 
     member _.Push(text: string) =
         if not finished then
@@ -411,11 +453,18 @@ type private LineFramer
     member _.Finish() =
         if not finished then
             finished <- true
+            stopSnapshotTimer ()
 
-            if overlong then omitLongLine () else completeLine ()
+            if overlong then
+                closePartial ()
+                omitLongLine ()
+                held <- null
+            else
+                completeLine ()
 
 /// The output of one subprocess. The runner passes the decoded text of each stream to it and calls Finish
-/// once the process has ended, whatever the reason.
+/// once the process has ended, whatever the reason. Finish flushes the channel, so the end of every
+/// subprocess delivers its pending entries at once and the batch rate holds only within a subprocess.
 [<AllowNullLiteral>]
 type CommandOutput(channel: OutputChannel, commandId: string, secrets: string[], reportStdout: bool) =
     let stdoutFramer =
@@ -511,7 +560,7 @@ let beginCommand
     channel.Enqueue {
         CommandId = commandId
         Kind = OperationOutputKind.Command
-        Text = redactText secrets (commandHeader command headerArguments)
+        Text = commandHeader secrets command headerArguments
         IsPartial = false
     }
 

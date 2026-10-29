@@ -501,7 +501,8 @@ let internal toBatchResult (action: BatchAction) (outcomes: GitService.LfsPathOu
                 Details = failures |> Array.map (fun (path, item) -> $"{path}: {item.Message}")
         }
 
-        // A lock blocks every later path, so a lock recovery of any failed path replaces the retry.
+        // A lock blocks every later path, so a lock recovery of any failed path replaces the retry
+        // and is also the recovery of a run in which every path failed.
         let lockRecovery =
             failures
             |> Array.tryPick (fun (_, item) ->
@@ -516,7 +517,13 @@ let internal toBatchResult (action: BatchAction) (outcomes: GitService.LfsPathOu
                 failure
                 (lockRecovery |> Option.defaultValue action.Recovery)
         else
-            Failed failure
+            Failed(
+                match lockRecovery with
+                | Some recovery ->
+                    { failure with
+                        RecoveryAction = Some recovery }
+                | None -> failure
+            )
 
 /// Runs a batch operation under the session lock, after the preflight. An empty request needs neither.
 let private runBatch

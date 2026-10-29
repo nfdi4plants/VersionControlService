@@ -244,13 +244,27 @@ let private reportStepStart (phaseCode: string) (message: string) (context: Oper
         DisplayMessage = Some message
     }
 
+let private outputFailureText (output: NodeProcess.ProcessOutput) =
+    if String.IsNullOrWhiteSpace output.StdErr then output.StdOut else output.StdErr
+
+/// How runLfsHydration ended. `Output` is the output of the step that ended the sequence, and for a fetch
+/// that failed it is the fetch. `CheckoutFailed` is set when the checkout ran and failed. `Details` holds
+/// the failure text of a checkout that failed after a failed fetch, for the Details of the failure.
+type private LfsHydrationRun = {
+    Output: Result<NodeProcess.ProcessOutput, OperationFailure>
+    CheckoutFailed: bool
+    Details: string[]
+}
+
 /// Downloads the large objects of a checkout with `git lfs fetch` and then `git lfs checkout`, which is
 /// what `git lfs pull` does in one process. A canceled pull kills git-lfs while it holds the index lock
 /// and leaves `.git/index.lock` behind. The fetch takes no lock, so a cancel stops it cleanly. The
 /// checkout is local and runs to its end, because stopping it midway is what leaves the lock. A cancel
-/// that arrives during the checkout takes effect afterwards, and the work it finished counts. The fetch
-/// reports under `phaseCode` and the checkout under `phaseCode` plus "-checkout". The result is the
-/// output of the step that ended the sequence.
+/// that arrives during the checkout takes effect afterwards, and the work it finished counts. The
+/// checkout runs after every fetch that ended without a cancel, whatever its exit code, because git-lfs
+/// fetches the objects it can reach before it reports one that is missing, and those objects belong in the
+/// working tree. The failure of such a fetch stays the result. The fetch reports under `phaseCode` and the
+/// checkout under `phaseCode` plus "-checkout".
 let private runLfsHydration
     (phaseCode: string)
     (hooks: GitSessionHooks)
@@ -258,7 +272,7 @@ let private runLfsHydration
     (authenticationArguments: string[])
     (fetchTarget: string[])
     (context: OperationContext)
-    : Async<Result<NodeProcess.ProcessOutput, OperationFailure>> =
+    : Async<LfsHydrationRun> =
     async {
         // Git LFS writes its meters to stdout, and only when asked to.
         let run code arguments runContext =
@@ -273,28 +287,66 @@ let private runLfsHydration
 
         let! fetched = run phaseCode [| "lfs"; "fetch"; yield! fetchTarget |] context
 
+        let endedWith output = {
+            Output = output
+            CheckoutFailed = false
+            Details = [||]
+        }
+
         match fetched with
+        | Ok fetchOutput when not (context.Cancellation.IsCancellationRequested()) ->
+            let checkoutPhaseCode = phaseCode + "-checkout"
+            reportStepStart checkoutPhaseCode "Checking out large files" context
+
+            let! checkout =
+                run
+                    checkoutPhaseCode
+                    [| "lfs"; "checkout" |]
+                    { context with
+                        Cancellation = OperationCancellation.none }
+
+            let checkoutFailure =
+                match checkout with
+                | Ok output when output.ExitCode = 0 -> None
+                | Ok output -> Some((outputFailureText output).Trim())
+                | Error failure -> Some failure.Message
+
+            if fetchOutput.ExitCode = 0 then
+                return {
+                    endedWith checkout with
+                        CheckoutFailed = checkoutFailure.IsSome
+                }
+            else
+                return {
+                    endedWith fetched with
+                        CheckoutFailed = checkoutFailure.IsSome
+                        Details =
+                            checkoutFailure
+                            |> Option.map (fun text -> $"The checkout after the failed fetch also failed: {text}")
+                            |> Option.toArray
+                }
         | Ok output when output.ExitCode = 0 ->
-            if context.Cancellation.IsCancellationRequested() then
-                return
+            return
+                endedWith (
                     Error(
                         OperationFailure.create
                             Canceled
                             "operation_canceled"
                             "The large-object download was canceled before the checkout started."
                     )
-            else
-                let checkoutPhaseCode = phaseCode + "-checkout"
-                reportStepStart checkoutPhaseCode "Checking out large files" context
-
-                return!
-                    run
-                        checkoutPhaseCode
-                        [| "lfs"; "checkout" |]
-                        { context with
-                            Cancellation = OperationCancellation.none }
-        | _ -> return fetched
+                )
+        | _ -> return endedWith fetched
     }
+
+/// The failure of a hydration that ended with a nonzero exit, named after the operation whose Git
+/// transfer had worked. Failure text of a checkout that followed a failed fetch goes to the Details.
+let private hydrationOutputFailure (operation: string) (output: NodeProcess.ProcessOutput) (details: string[]) =
+    let failure = hydrationFailure operation (outputFailureText output)
+
+    if details.Length = 0 then
+        failure
+    else
+        OperationFailure.withDetails details failure
 
 let private runHookedBytesProcess
     (hooks: GitSessionHooks)
@@ -1583,33 +1635,46 @@ let private resolveGitStatePath (state: SessionState) (name: string) (context: O
     resolveGitStatePathAt state.Hooks state.RepoPath name context
 
 /// Recovery for a large-object download that failed or was canceled after the Git transfer itself
-/// worked. An index.lock left in the repository blocks the download, so it is reported first. The
-/// library never deletes a lock, because nothing here shows who owns it. The lookup runs on a copy of
-/// the context without its cancellation, because the process runner starts nothing on a canceled
-/// context. A lookup that fails falls back to the plain retry.
+/// worked. It names the index.lock when Git reported one in the failure text, and when the checkout
+/// step failed while a lock file exists. A lock next to a failed fetch proves nothing, because the
+/// fetch takes no lock, so that failure gets the plain retry. The library never deletes a lock, because
+/// nothing here shows who owns it. The lookup runs on a copy of the context without its cancellation,
+/// because the process runner starts nothing on a canceled context. A lookup that fails falls back to
+/// the plain retry.
 let private hydrationRecovery
     (hooks: GitSessionHooks)
     (repoPath: string)
     (failure: OperationFailure)
+    (checkoutFailed: bool)
     (context: OperationContext)
     : Async<RecoveryAction> =
     async {
-        let lookupContext = {
-            context with
-                Cancellation = OperationCancellation.none
+        let removeLock = {
+            Code = "remove_index_lock"
+            Instructions =
+                Some
+                    "An index.lock in the repository blocks the checkout of large files. Make sure no git process is running on the repository and remove the lock file if it is still there. Then retry the download."
         }
 
-        let! lockPathResult = resolveGitStatePathAt hooks repoPath "index.lock" lookupContext
+        let namedByGit =
+            Array.append [| failure.Message |] failure.Details
+            |> Array.exists (fun text -> (GitInternals.tryIndexLockFailure text).IsSome)
 
-        match lockPathResult with
-        | Ok(Some lockPath) when NodeFileSystem.existsSync lockPath ->
-            return {
-                Code = "remove_index_lock"
-                Instructions =
-                    Some
-                        "An index.lock in the repository blocks the download of large files. Make sure no git process is running on the repository and remove the lock file. Then retry the download."
+        if namedByGit then
+            return removeLock
+        elif not checkoutFailed then
+            return materializationRecovery failure
+        else
+            let lookupContext = {
+                context with
+                    Cancellation = OperationCancellation.none
             }
-        | _ -> return materializationRecovery failure
+
+            let! lockPathResult = resolveGitStatePathAt hooks repoPath "index.lock" lookupContext
+
+            match lockPathResult with
+            | Ok(Some lockPath) when NodeFileSystem.existsSync lockPath -> return removeLock
+            | _ -> return materializationRecovery failure
     }
 
 let private preflightIndexLock (state: SessionState) (context: OperationContext) : Async<Result<unit, OperationFailure>> =
@@ -3658,13 +3723,14 @@ let private readMaterializeLargeObjects (state: SessionState) (context: Operatio
             | Error failure -> Error failure
     }
 
-/// Downloads the large objects of the checkout from the upstream remote of `targetRef`.
+/// Downloads the large objects of the checkout from the upstream remote of `targetRef`. A failure comes
+/// with the recovery that fits it.
 let private downloadLargeObjects
     (state: SessionState)
     (targetRef: LogicalRef option)
     (operation: string)
     (context: OperationContext)
-    : Async<Result<unit, OperationFailure>> =
+    : Async<Result<unit, OperationFailure * RecoveryAction>> =
     async {
         let! remoteResult =
             match targetRef with
@@ -3694,7 +3760,7 @@ let private downloadLargeObjects
                     | Ok authentication ->
                         reportStepStart "lfs-pull" "Downloading large files" context
 
-                        return!
+                        let! run =
                             runLfsHydration
                                 "lfs-pull"
                                 state.Hooks
@@ -3702,14 +3768,23 @@ let private downloadLargeObjects
                                 authentication.ConfigArgs
                                 [| remote; yield! hydrationRef |> Option.toArray |]
                                 context
+
+                        return Ok run
                 }
 
+        let failedWith (failure: OperationFailure) (checkoutFailed: bool) = async {
+            let! recovery = hydrationRecovery state.Hooks state.RepoPath failure checkoutFailed context
+            return Error(failure, recovery)
+        }
+
         match hydration with
-        | Ok output when output.ExitCode = 0 -> return Ok()
-        | Ok output ->
-            let detail = if String.IsNullOrWhiteSpace output.StdErr then output.StdOut else output.StdErr
-            return Error(hydrationFailure operation detail)
-        | Error failure -> return Error { failure with Code = "hydration_failed" }
+        | Error failure -> return! failedWith { failure with Code = "hydration_failed" } false
+        | Ok run ->
+            match run.Output with
+            | Ok output when output.ExitCode = 0 -> return Ok()
+            | Ok output ->
+                return! failedWith (hydrationOutputFailure operation output run.Details) run.CheckoutFailed
+            | Error failure -> return! failedWith { failure with Code = "hydration_failed" } run.CheckoutFailed
     }
 
 /// Without anything to merge, an update still downloads the large objects of the checkout
@@ -3734,9 +3809,7 @@ let private downloadLargeObjectsWithoutUpdate
 
                 match downloaded with
                 | Ok() -> return Succeeded outcome
-                | Error failure ->
-                    let! recovery = hydrationRecovery state.Hooks state.RepoPath failure context
-                    return OperationResult.partiallySucceeded outcome failure recovery
+                | Error(failure, recovery) -> return OperationResult.partiallySucceeded outcome failure recovery
         | _ -> return Succeeded outcome
     }
 
@@ -3905,9 +3978,7 @@ let private updateFromState
 
                         match hydration with
                         | Ok _ -> return Succeeded outcome
-                        | Error failure ->
-                            let! recovery = hydrationRecovery state.Hooks state.RepoPath failure context
-
+                        | Error(failure, recovery) ->
                             return
                                 OperationResult.partiallySucceeded
                                     outcome
@@ -6726,14 +6797,17 @@ let private createFactoryWithSessions
                         // that hides the changed workspace.
                         let! hydration =
                             if context.Cancellation.IsCancellationRequested() then
-                                async.Return(
-                                    Error(
-                                        OperationFailure.create
-                                            Canceled
-                                            "operation_canceled"
-                                            "The clone was canceled before large-object download started."
-                                    )
-                                )
+                                async.Return {
+                                    Output =
+                                        Error(
+                                            OperationFailure.create
+                                                Canceled
+                                                "operation_canceled"
+                                                "The clone was canceled before large-object download started."
+                                        )
+                                    CheckoutFailed = false
+                                    Details = [||]
+                                }
                             else
                                 reportProgressReset "clone-lfs-pull" context
 
@@ -6745,18 +6819,14 @@ let private createFactoryWithSessions
                                     [| "origin" |]
                                     context
 
-                        match hydration with
+                        match hydration.Output with
                         | Ok hydrationOutput when hydrationOutput.ExitCode = 0 ->
                             return OperationResult.succeeded binding
                         | Ok hydrationOutput ->
-                            let detail =
-                                if String.IsNullOrWhiteSpace hydrationOutput.StdErr then
-                                    hydrationOutput.StdOut
-                                else
-                                    hydrationOutput.StdErr
+                            let failure = hydrationOutputFailure "clone" hydrationOutput hydration.Details
 
-                            let failure = hydrationFailure "clone" detail
-                            let! recovery = hydrationRecovery hooks request.TargetPath failure context
+                            let! recovery =
+                                hydrationRecovery hooks request.TargetPath failure hydration.CheckoutFailed context
 
                             return
                                 OperationResult.partiallySucceeded
@@ -6771,7 +6841,13 @@ let private createFactoryWithSessions
 
                                 return Failed(withResidue canceledFailure cleanupError)
                             else
-                                let! recovery = hydrationRecovery hooks request.TargetPath hydrationFailure context
+                                let! recovery =
+                                    hydrationRecovery
+                                        hooks
+                                        request.TargetPath
+                                        hydrationFailure
+                                        hydration.CheckoutFailed
+                                        context
 
                                 return
                                     OperationResult.partiallySucceeded

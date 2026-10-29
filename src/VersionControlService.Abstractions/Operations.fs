@@ -216,8 +216,9 @@ module Redaction =
     open System.Text.RegularExpressions
 
     let private replacements = [
-        // URL credentials: https://user:secret@host or https://token@host
-        Regex(@"://[^/@\s]+@", RegexOptions.None), "://[REDACTED]@"
+        // URL credentials: https://user:secret@host or https://token@host. A user name can hold an "@",
+        // so the userinfo runs to the last "@" before the first "/".
+        Regex(@"://[^/\s]+@", RegexOptions.None), "://[REDACTED]@"
         // Authorization / token headers keep the field name, lose the value.
         Regex(@"(authorization\s*:)[^\r\n]+", RegexOptions.IgnoreCase), "$1 [REDACTED]"
         Regex(@"(private-token\s*:)[^\r\n]+", RegexOptions.IgnoreCase), "$1 [REDACTED]"

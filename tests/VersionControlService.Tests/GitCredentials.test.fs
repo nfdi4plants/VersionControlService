@@ -1214,6 +1214,18 @@ let private runWithOutput (request: NodeProcess.ProcessRequest) = promise {
     return batches |> Seq.collect id |> Seq.toArray
 }
 
+// A stand-in for `git clone <url>` that prints the URL to stderr, like git does in a failure message.
+let private runCloneStandIn (url: string) =
+    runWithOutput (
+        NodeProcess.ProcessRequest.create nodeExecutablePath [|
+            "-e"
+            "console.error(process.argv[process.argv.length - 1])"
+            "--"
+            "clone"
+            url
+        |]
+    )
+
 Vitest.describe (
     "Git output channel redaction",
     fun () ->
@@ -1303,13 +1315,48 @@ Vitest.describe (
                 ).toEqual [| "git config --bool fixture.missing" |]
 
                 let manyArguments = [| for number in 1..14 -> $"argument{number}" |]
-                let header = NodeOutput.commandHeader "git" manyArguments
+                let header = NodeOutput.commandHeader [||] "git" manyArguments
 
                 Vitest.expect(header).toBe (
                     "git "
                     + (manyArguments |> Array.truncate NodeOutput.MaxHeaderArguments |> String.concat " ")
                     + " ..."
                 )
+            }
+        )
+
+        Vitest.test (
+            "the command header redacts a long token in a clone URL before it cuts the argument",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                // The URL is well over 200 characters, the length at which the header cuts an argument.
+                let token = String.replicate 25 "aB3dEf9hIj"
+                let! entries = runCloneStandIn $"https://oauth2:{token}@{testHost}/origin.git"
+
+                Vitest.expect(entries |> Array.exists (fun entry -> entry.Kind = OperationOutputKind.Command)).toBe true
+
+                for entry in entries do
+                    for start in 0 .. token.Length - 20 do
+                        Vitest.expect(entry.Text.Contains(token.Substring(start, 20))).toBe false
+            }
+        )
+
+        Vitest.test (
+            "a user name with an at sign does not leak the rest of the URL userinfo into the output",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! entries = runCloneStandIn $"https://me@mail.com:s3cr3tTokenValue@{testHost}/origin.git"
+
+                Vitest.expect(
+                    entries
+                    |> Array.exists (fun entry ->
+                        entry.Kind = OperationOutputKind.Command && entry.Text.Contains $"[REDACTED]@{testHost}")
+                )
+                    .toBe true
+
+                for entry in entries do
+                    Vitest.expect(entry.Text.Contains "s3cr3tTokenValue").toBe false
+                    Vitest.expect(entry.Text.Contains "mail.com").toBe false
             }
         )
 

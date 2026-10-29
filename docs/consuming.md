@@ -179,7 +179,7 @@ let cloneWorkspace (factory: ProviderFactory) location targetPath (context: Oper
 }
 ```
 
-A clone canceled before it completes rolls back and fails as `Canceled`. A pre-existing empty target is cleaned by removing its entries, so entries another program adds to that folder during the clone are removed too. A clone that finished before cancellation took effect succeeds. A download failure that is not a cancellation returns `PartiallySucceeded` with `retry_materialization`, so the workspace exists and its large objects are not materialized. The download is `git lfs fetch` followed by `git lfs checkout`. A cancel stops the fetch and rolls the clone back. A cancel that arrives during the checkout waits for the checkout to end, and the clone succeeds. When a `.git/index.lock` is present after a failed download, the recovery is `remove_index_lock` instead of `retry_materialization`. Remove the lock once no git process runs, then materialize again.
+A clone canceled before it completes rolls back and fails as `Canceled`. A pre-existing empty target is cleaned by removing its entries, so entries another program adds to that folder during the clone are removed too. A clone that finished before cancellation took effect succeeds. A download failure that is not a cancellation returns `PartiallySucceeded` with `retry_materialization`, so the workspace exists and its large objects are not materialized. The download is `git lfs fetch` followed by `git lfs checkout`. A cancel stops the fetch and rolls the clone back. A cancel that arrives during the checkout waits for the checkout to end, and the clone succeeds. A fetch that fails without a cancel still runs the checkout, so the files whose objects arrived are checked out, and the result is the failure of the fetch. When the checkout fails and a `.git/index.lock` is present, or when Git names the lock in its failure text, the recovery is `remove_index_lock` instead of `retry_materialization`. Remove the lock once no git process runs, then materialize again.
 
 A clone whose rollback cannot remove the target returns `Failed` with `StateChanged = true` and the recovery code `remove_clone_target`, with category `Canceled` when the user canceled. Ask the user to clear the target folder before retrying.
 
@@ -1351,7 +1351,7 @@ process leaves its `index.lock` behind, so `remove_index_lock` is the usual reco
 and a host needs a path for it. The recovery codes a Git update can report are listed in
 [provider authoring](provider-authoring.md).
 
-The large-object download of an Update or a Synchronize (with `versioncontrolservice.lfs.materializelargeobjects` on) is `git lfs fetch` followed by `git lfs checkout`. A cancel kills only the fetch, and no checkout starts. The checkout is local and holds the index lock while it runs, so the provider never kills it. A cancel that arrives during the checkout takes effect when the checkout ends, and the call reports the work that finished, which is `Succeeded` when every file is checked out. A canceled fetch returns `PartiallySucceeded` with category `Canceled`, code `hydration_failed` and the recovery `retry_materialization`. The provider never deletes a lock file. When an `index.lock` exists after a failed or canceled download, the partial result reports `remove_index_lock` instead. Remove the lock once no git process runs, then retry the download.
+The large-object download of an Update or a Synchronize (with `versioncontrolservice.lfs.materializelargeobjects` on) is `git lfs fetch` followed by `git lfs checkout`. A cancel kills only the fetch, and no checkout starts. The checkout is local and holds the index lock while it runs, so the provider never kills it. A cancel that arrives during the checkout takes effect when the checkout ends, and the call reports the work that finished, which is `Succeeded` when every file is checked out. A canceled fetch returns `PartiallySucceeded` with category `Canceled`, code `hydration_failed` and the recovery `retry_materialization`. A fetch that fails without a cancel, for example because the server lost one object, still runs the checkout, so the files whose objects arrived are checked out, and the result is the failure of the fetch. The provider never deletes a lock file. When the checkout fails and an `index.lock` exists, or when Git names the lock in its failure text, the partial result reports `remove_index_lock` instead. A failed fetch keeps `retry_materialization`, because the fetch takes no lock. Remove the lock once no git process runs, then retry the download.
 
 The Git provider runs `git lfs ls-files -j` with no time limit, because that command prints nothing until it has listed every file. This applies to `ObjectMaterialization.ListObjects`, `Materialize` (including its download step) and `Dematerialize`. Each of them takes an `OperationContext`. Cancel the context to stop one that runs too long. The cancellation ends the git-lfs process and the operation returns a `Canceled` failure.
 
@@ -1454,26 +1454,27 @@ reaches the channel.
 
 Git rewrites a progress meter in place with carriage returns, and the provider collapses these
 rewrites. A line that is still being rewritten arrives as a snapshot with `IsPartial` set, at most
-every 250 ms. The next entry with the same `CommandId` and `Kind` replaces a partial entry in the
+every 250 ms. A snapshot that this rate holds back arrives when the 250 ms end, even if no more text
+comes. The next entry with the same `CommandId` and `Kind` replaces a partial entry in the
 host's view, whether that next entry is partial or complete. When the line ends, or the subprocess
 ends for any reason, the final text arrives with `IsPartial` unset.
 
 The text is a redacted diagnostic and the channel keeps no transcript. The provider strips terminal
-escape sequences and control characters, skips blank lines, and replaces the credentials of the call
+escape sequences and control characters and skips blank lines. It replaces the credentials of the call
 with `[REDACTED]`. These are the values of credential-bearing configuration arguments, the token
 and the decoded `user:secret` parts of an Authorization header, the userinfo of URLs and the values
-of credential-looking environment variables. A secret the provider cannot know, for example one that
-a git hook prints, cannot be recognized. The order of stdout and stderr lines relative to each other is
-not promised, and the provider keeps no history. The host decides how many lines to keep.
+of credential-looking environment variables. The provider cannot recognize a secret it has no way to
+know, for example one that a git hook prints. The order of stdout and stderr lines relative to each
+other is not promised, and the provider keeps no history. The host decides how many lines to keep.
 
 The channel has these limits:
 
 | Limit | Behavior |
 | --- | --- |
-| 4096 UTF-16 units per line | A longer line is dropped and a notice says so. |
-| 20 entries per batch, 10 batches per second | Entries wait in a queue between batches. |
-| 128 waiting entries | The oldest entries are dropped, and a notice reports how many. |
-| End of a subprocess | Everything that waits is delivered, at once if needed, before the operation completes. |
+| 4096 UTF-16 units per line | A longer line is dropped and a notice says so. A partial entry that is open at that moment ends with its last text. |
+| 20 entries per batch, 10 batches per second | Entries wait in a queue between batches. The rate holds within a subprocess. |
+| 128 waiting entries | The oldest lines are dropped, the command headers stay, and a notice reports how many lines were left out. |
+| End of a subprocess | Everything that waits is delivered at once, without waiting for the batch rate, before the operation completes. |
 
 The Git provider reports the subprocesses of Refresh, Update, Synchronize, Publish, Clone and Bind, the
 large-object listing, download and free of `ObjectMaterialization` and `ObjectBatchMaterialization`, and

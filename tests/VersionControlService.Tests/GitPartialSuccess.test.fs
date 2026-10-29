@@ -3928,6 +3928,33 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "a batch result in which every path failed recommends removing the index lock when a path hit one",
+            fun () -> promise {
+                let failed (path: string) (message: string) =
+                    ({
+                        Path = path
+                        Result = Error({ Kind = GitEngineTypes.GitFailureKind.Unknown; Message = message }: GitService.GitFailure)
+                    }: GitService.LfsPathOutcome)
+
+                // The first failure is not the lock one, so it supplies the message and the lock only decides the recovery.
+                match
+                    GitLfsExtensions.toBatchResult
+                        GitLfsExtensions.batchMaterializeAction
+                        [|
+                            failed "a.bin" "object store is unreadable"
+                            failed "b.bin" "fatal: Unable to create '/work/.git/index.lock': File exists."
+                        |]
+                with
+                | Failed failure ->
+                    Vitest.expect(failure.Code).toBe "batch_materialization_incomplete"
+                    Vitest.expect(failure.Message).toBe "2 of 2 paths failed: object store is unreadable"
+                    Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "remove_index_lock")
+                | Succeeded _
+                | PartiallySucceeded _ -> failwith "Expected a failure when every path failed."
+            }
+        )
+
+        Vitest.test (
             "a workspace mutation waits until a running dematerialization finishes",
             TestOptions(timeout = 120000),
             fun () -> promise {

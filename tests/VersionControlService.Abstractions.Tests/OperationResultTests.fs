@@ -198,4 +198,15 @@ let operationResultTests =
 
             Expect.isFalse (failure.Message.Contains "password1") "Message credentials removed."
             Expect.isTrue (failure.Message.Contains "[REDACTED]") "Redaction marker present."
+
+        testCase "redaction removes the whole userinfo of a URL whose user name holds an at sign"
+        <| fun () ->
+            let redacted =
+                Redaction.redact
+                    "fatal: unable to access 'https://me@mail.com:s3cr3tTokenValue@host.example/repo.git/@v2'"
+
+            Expect.equal
+                redacted
+                "fatal: unable to access 'https://[REDACTED]@host.example/repo.git/@v2'"
+                "The userinfo ends at the last at sign before the first slash."
     ]

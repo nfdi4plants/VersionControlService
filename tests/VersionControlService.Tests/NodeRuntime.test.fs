@@ -946,6 +946,98 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "a full queue keeps its command headers, drops lines first and counts the lines",
+            fun () ->
+                let channel, batches = newOutputChannel (FakeClock())
+                // The first header goes out at once and starts the rate limit, so the second one waits in the queue.
+                beginOutputCommand channel |> ignore
+                let command = beginOutputCommand channel
+                let lines = [ for number in 1..200 -> $"line {number}\n" ] |> String.concat ""
+
+                command.ObserveStderr lines
+                command.Finish()
+
+                let entries = allEntries batches
+                let notice = entries |> Array.find (fun entry -> entry.Kind = OperationOutputKind.Notice)
+                let texts = stderrEntries batches |> Array.map (fun entry -> entry.Text)
+
+                let headers = entries |> Array.filter (fun entry -> entry.Kind = OperationOutputKind.Command)
+
+                Vitest.expect(headers.Length).toBe 2
+                Vitest.expect(notice.CommandId).toBe ""
+                Vitest.expect(notice.Text.Contains "73").toBe true
+                Vitest.expect(texts[0]).toBe "line 74"
+                Vitest.expect(texts[texts.Length - 1]).toBe "line 200"
+        )
+
+        Vitest.test (
+            "publishes a snapshot that the 250 ms rule held back once the interval ends",
+            fun () ->
+                let clock = FakeClock()
+                let channel, batches = newOutputChannel clock
+                let command = beginOutputCommand channel
+
+                command.ObserveStderr "Receiving objects:  10% (1/10)\r"
+                clock.Advance 100.0
+                command.ObserveStderr "Receiving objects:  50% (5/10)\r"
+                clock.Advance 100.0
+
+                // No chunk arrives after the second one, and 200 ms since the first snapshot is too early.
+                Vitest.expect(stderrEntries batches |> Array.map (fun entry -> entry.Text)).toEqual [|
+                    "Receiving objects:  10% (1/10)"
+                |]
+
+                clock.Advance 50.0
+                let lines = stderrEntries batches
+
+                Vitest.expect(lines |> Array.map (fun entry -> entry.Text)).toEqual [|
+                    "Receiving objects:  10% (1/10)"
+                    "Receiving objects:  50% (5/10)"
+                |]
+
+                Vitest.expect(lines |> Array.forall (fun entry -> entry.IsPartial)).toBe true
+        )
+
+        Vitest.test (
+            "an overlong segment that ends with a carriage return leaves no earlier segment to complete",
+            fun () ->
+                let channel, batches = newOutputChannel (FakeClock())
+                let command = beginOutputCommand channel
+                let tooLong = String.replicate (NodeOutput.MaxLineLength + 1) "x"
+
+                command.ObserveStderr("Receiving objects:  10% (1/10)\r" + tooLong + "\r\n")
+                channel.Flush()
+
+                let entries = allEntries batches |> Array.filter (fun entry -> entry.Kind <> OperationOutputKind.Command)
+
+                Vitest.expect(entries |> Array.map (fun entry -> entry.Kind)).toEqual [| OperationOutputKind.Notice |]
+        )
+
+        Vitest.test (
+            "an overlong line closes the partial entry that is still open",
+            fun () ->
+                let clock = FakeClock()
+                let channel, batches = newOutputChannel clock
+                let command = beginOutputCommand channel
+                let tooLong = String.replicate (NodeOutput.MaxLineLength + 1) "x"
+
+                command.ObserveStderr "Receiving objects:  10% (1/10)\r"
+                clock.Advance 100.0
+                command.ObserveStderr(tooLong + "\n")
+                channel.Flush()
+
+                let lines = stderrEntries batches
+
+                // The host replaces a partial entry only with an entry of the same command and kind.
+                Vitest.expect(lines |> Array.map (fun entry -> entry.Text, entry.IsPartial)).toEqual [|
+                    "Receiving objects:  10% (1/10)", true
+                    "Receiving objects:  10% (1/10)", false
+                |]
+
+                Vitest.expect(allEntries batches |> Array.exists (fun entry -> entry.Kind = OperationOutputKind.Notice)).toBe true
+        )
+
+        Vitest.test (
             "delivers at most twenty entries per batch and ten batches per second",
             fun () ->
                 let clock = FakeClock()
