@@ -179,7 +179,7 @@ let cloneWorkspace (factory: ProviderFactory) location targetPath (context: Oper
 }
 ```
 
-A clone canceled before it completes rolls back and fails as `Canceled`. A pre-existing empty target is cleaned by removing its entries, so entries another program adds to that folder during the clone are removed too. A clone that finished before cancellation took effect succeeds. A download failure that is not a cancellation returns `PartiallySucceeded` with `retry_materialization`, so the workspace exists and its large objects are not materialized.
+A clone canceled before it completes rolls back and fails as `Canceled`. A pre-existing empty target is cleaned by removing its entries, so entries another program adds to that folder during the clone are removed too. A clone that finished before cancellation took effect succeeds. A download failure that is not a cancellation returns `PartiallySucceeded` with `retry_materialization`, so the workspace exists and its large objects are not materialized. The download is `git lfs fetch` followed by `git lfs checkout`. A cancel stops the fetch and rolls the clone back. A cancel that arrives during the checkout waits for the checkout to end, and the clone succeeds. When a `.git/index.lock` is present after a failed download, the recovery is `remove_index_lock` instead of `retry_materialization`. Remove the lock once no git process runs, then materialize again.
 
 A clone whose rollback cannot remove the target returns `Failed` with `StateChanged = true` and the recovery code `remove_clone_target`, with category `Canceled` when the user canceled. Ask the user to clear the target folder before retrying.
 
@@ -1350,6 +1350,8 @@ process leaves its `index.lock` behind, so `remove_index_lock` is the usual reco
 and a host needs a path for it. The recovery codes a Git update can report are listed in
 [provider authoring](provider-authoring.md).
 
+The large-object download of an Update or a Synchronize (with `versioncontrolservice.lfs.materializelargeobjects` on) is `git lfs fetch` followed by `git lfs checkout`. A cancel kills only the fetch, and no checkout starts. The checkout is local and holds the index lock while it runs, so the provider never kills it. A cancel that arrives during the checkout takes effect when the checkout ends, and the call reports the work that finished, which is `Succeeded` when every file is checked out. A canceled fetch returns `PartiallySucceeded` with category `Canceled`, code `hydration_failed` and the recovery `retry_materialization`. The provider never deletes a lock file. When an `index.lock` exists after a failed or canceled download, the partial result reports `remove_index_lock` instead. Remove the lock once no git process runs, then retry the download.
+
 The Git provider runs `git lfs ls-files -j` with no time limit, because that command prints nothing until it has listed every file. This applies to `ObjectMaterialization.ListObjects`, `Materialize` (including its download step) and `Dematerialize`. Each of them takes an `OperationContext`. Cancel the context to stop one that runs too long. The cancellation ends the git-lfs process and the operation returns a `Canceled` failure.
 
 The `Materialize` and `Dematerialize` of `ObjectBatchMaterialization` behave the same way, and a canceled batch reports the paths that finished as changed.
@@ -1374,8 +1376,10 @@ These calls report their meters, each under its own phase code:
 | --- | --- |
 | `git fetch` of Refresh, Update, Synchronize, Publish and Bind | `fetch` |
 | `git clone` | `clone` |
-| `git lfs pull` after a clone | `clone-lfs-pull` |
-| `git lfs pull` that downloads the large objects of an Update or a Synchronize | `lfs-pull` |
+| `git lfs fetch` after a clone | `clone-lfs-pull` |
+| `git lfs checkout` after that fetch | `clone-lfs-pull-checkout` |
+| `git lfs fetch` that downloads the large objects of an Update or a Synchronize | `lfs-pull` |
+| `git lfs checkout` after that fetch | `lfs-pull-checkout` |
 | `git lfs fetch` of `Materialize` | `lfs-materialize-transfer` |
 | `git lfs checkout` of `Materialize` | `lfs-materialize-checkout` |
 
@@ -1385,14 +1389,17 @@ their stdout for meters. It leaves the dry runs and the listings alone. The fail
 that printed meters has none of the meter lines.
 
 A step of Synchronize, and of the Refresh and Update inside it, reports an event without numbers
-when it starts. A host can show the step before the first meter arrives. Three of these events carry
+when it starts. A host can show the step before the first meter arrives. Four of these events carry
 a `DisplayMessage`:
 
 | Phase code | `DisplayMessage` | Reported before |
 | --- | --- | --- |
 | `fetch` | Fetching online changes | the `git fetch` of the refresh |
 | `merge` | Merging online changes | the `git merge` of the update |
-| `lfs-pull` | Downloading large files | the `git lfs pull` that follows an update |
+| `lfs-pull` | Downloading large files | the `git lfs fetch` that follows an update |
+| `lfs-pull-checkout` | Checking out large files | the `git lfs checkout` that follows that fetch |
+
+The checkout after the fetch of a clone reports the same event under `clone-lfs-pull-checkout`.
 
 A batch call also reports how many of its files are done. `Materialize` of
 `ObjectBatchMaterialization` uses the phase code `lfs-materialize-files`, and `Dematerialize` uses

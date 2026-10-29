@@ -501,6 +501,12 @@ let internal toBatchResult (action: BatchAction) (outcomes: GitService.LfsPathOu
                 Details = failures |> Array.map (fun (path, item) -> $"{path}: {item.Message}")
         }
 
+        // A lock blocks every later path, so a lock recovery of any failed path replaces the retry.
+        let lockRecovery =
+            failures
+            |> Array.tryPick (fun (_, item) ->
+                item.RecoveryAction |> Option.filter (fun recovery -> recovery.Code = "remove_index_lock"))
+
         if changed.Length > 0 then
             OperationResult.partiallySucceeded
                 {
@@ -508,7 +514,7 @@ let internal toBatchResult (action: BatchAction) (outcomes: GitService.LfsPathOu
                         AffectedPaths = changed
                 }
                 failure
-                action.Recovery
+                (lockRecovery |> Option.defaultValue action.Recovery)
         else
             Failed failure
 

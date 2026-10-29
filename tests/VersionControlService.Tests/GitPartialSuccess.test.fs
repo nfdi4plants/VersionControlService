@@ -651,10 +651,14 @@ let private commitPathspecFixtureFiles (workPath: string) (message: string) = pr
     return ()
 }
 
-let private isLfsPullRequest (request: NodeProcess.ProcessRequest) =
+let private isLfsCommandRequest (command: string) (request: NodeProcess.ProcessRequest) =
     request.Arguments
     |> Array.windowed 2
-    |> Array.exists (fun pair -> pair.[0] = "lfs" && pair.[1] = "pull")
+    |> Array.exists (fun pair -> pair.[0] = "lfs" && pair.[1] = command)
+
+let private isLfsFetchRequest = isLfsCommandRequest "fetch"
+let private isLfsCheckoutRequest = isLfsCommandRequest "checkout"
+let private isLfsPullRequest = isLfsCommandRequest "pull"
 
 let private isGitCloneRequest (request: NodeProcess.ProcessRequest) =
     request.Arguments |> Array.contains "clone"
@@ -1017,12 +1021,12 @@ Vitest.describe (
                             GitWorkspaceSession.GitSessionHooks.none with
                                 RunProcess =
                                     Some(fun request context ->
-                                        if isLfsPullRequest request then
+                                        if isLfsFetchRequest request then
                                             async.Return(
                                                 OperationResult.succeeded {
                                                     ExitCode = 2
                                                     StdOut = ""
-                                                    StdErr = "injected lfs pull failure"
+                                                    StdErr = "injected lfs fetch failure"
                                                 }
                                             )
                                         else
@@ -1100,7 +1104,7 @@ Vitest.describe (
                             GitWorkspaceSession.GitSessionHooks.none with
                                 RunProcess =
                                     Some(fun request context ->
-                                        if isLfsPullRequest request then
+                                        if isLfsFetchRequest request then
                                             NodeProcess.run blockedTransfer context
                                         else
                                             NodeProcess.run request context)
@@ -1247,7 +1251,7 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "cancellation between clone and LFS pull removes the created target",
+            "cancellation between clone and the large-object download removes the created target",
             TestOptions(timeout = 120000),
             fun () -> promise {
                 let! lfsProbe = runGit "." [| "lfs"; "version" |]
@@ -1259,14 +1263,14 @@ Vitest.describe (
 
                     try
                         let source = OperationCancellation.Source()
-                        let mutable lfsPullSeen = false
+                        let mutable lfsFetchSeen = false
 
                         let hooks = {
                             GitWorkspaceSession.GitSessionHooks.none with
                                 RunProcess =
                                     Some(fun request context ->
-                                        if isLfsPullRequest request then
-                                            lfsPullSeen <- true
+                                        if isLfsFetchRequest request then
+                                            lfsFetchSeen <- true
                                             NodeProcess.run request context
                                         elif isGitCloneRequest request then
                                             async {
@@ -1307,7 +1311,7 @@ Vitest.describe (
                         | Succeeded _
                         | PartiallySucceeded _ -> failwith "Expected the clone to be canceled."
 
-                        Vitest.expect(lfsPullSeen).toBe (false)
+                        Vitest.expect(lfsFetchSeen).toBe (false)
                         let! targetExists = pathExistsAsync targetPath
                         Vitest.expect(targetExists).toBe (false)
                         do! removeDirectoryAsync root
@@ -1318,7 +1322,7 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "cancellation after LFS pull exits preserves clone success",
+            "cancellation during the clone's LFS checkout preserves clone success after fetch and checkout ran",
             TestOptions(timeout = 120000),
             fun () -> promise {
                 let! lfsProbe = runGit "." [| "lfs"; "version" |]
@@ -1330,20 +1334,25 @@ Vitest.describe (
 
                     try
                         let source = OperationCancellation.Source()
-                        let mutable lfsPullSeen = false
+                        let lfsCommands = ResizeArray<string>()
 
                         let hooks = {
                             GitWorkspaceSession.GitSessionHooks.none with
                                 RunProcess =
                                     Some(fun request context ->
-                                        if isLfsPullRequest request then
+                                        if isLfsCheckoutRequest request then
                                             async {
-                                                let! result = NodeProcess.run request context
-                                                lfsPullSeen <- true
+                                                lfsCommands.Add "checkout"
+                                                // The cancel arrives as the checkout starts. The checkout still runs to its end.
                                                 source.Cancel()
-                                                return result
+                                                return! NodeProcess.run request context
                                             }
                                         else
+                                            if isLfsFetchRequest request then
+                                                lfsCommands.Add "fetch"
+                                            elif isLfsPullRequest request then
+                                                lfsCommands.Add "pull"
+
                                             NodeProcess.run request context)
                         }
 
@@ -1375,9 +1384,11 @@ Vitest.describe (
                             failwith $"Expected clone success after late cancellation ({failure.Code})."
                         | PartiallySucceeded _ -> failwith "Expected clone success after late cancellation."
 
-                        Vitest.expect(lfsPullSeen).toBe (true)
+                        Vitest.expect(lfsCommands.ToArray()).toEqual [| "fetch"; "checkout" |]
                         let! targetExists = pathExistsAsync targetPath
                         Vitest.expect(targetExists).toBe (true)
+                        let! content = tryReadUtf8FileAsync (join [| targetPath; "large.bin" |])
+                        Vitest.expect(content).toEqual (Some "large binary payload\n")
                         do! removeDirectoryAsync root
                     with error ->
                         do! removeDirectoryAsync root
@@ -3887,6 +3898,32 @@ Vitest.describe (
                     Vitest.expect(failure.Code).toBe "operation_canceled"
                 | Succeeded _
                 | PartiallySucceeded _ -> failwith "Expected a failure when every path was canceled."
+            }
+        )
+
+        Vitest.test (
+            "a partial batch result recommends removing the index lock when a path hit one",
+            fun () -> promise {
+                let lockFailure =
+                    ({
+                        Path = "a.bin"
+                        Result =
+                            Error(
+                                {
+                                    Kind = GitEngineTypes.GitFailureKind.Unknown
+                                    Message = "fatal: Unable to create '/work/.git/index.lock': File exists."
+                                }: GitService.GitFailure
+                            )
+                    }: GitService.LfsPathOutcome)
+
+                let changed =
+                    ({ Path = "c.bin"; Result = Ok GitService.Changed }: GitService.LfsPathOutcome)
+
+                match GitLfsExtensions.toBatchResult GitLfsExtensions.batchMaterializeAction [| lockFailure; changed |] with
+                | PartiallySucceeded(_, failure) ->
+                    Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "remove_index_lock")
+                | Succeeded _
+                | Failed _ -> failwith "Expected a partial success for a run with one changed path."
             }
         )
 
