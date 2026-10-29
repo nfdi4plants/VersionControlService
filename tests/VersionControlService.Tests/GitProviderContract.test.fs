@@ -4029,7 +4029,7 @@ Vitest.describe (
                         GitWorkspaceSession.GitSessionHooks.none with
                             RunProcess =
                                 Some(fun request context ->
-                                    if request.Arguments = [| "fetch"; "origin" |] then
+                                    if request.Arguments |> Array.contains "fetch" then
                                         async {
                                             fetchObserved <- true
                                             return

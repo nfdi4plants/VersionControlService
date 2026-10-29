@@ -80,6 +80,32 @@ type GitSpawnResult = {
     TimedOut: bool
 }
 
+/// Receives the decoded text of each stdout and stderr chunk of a spawned git process. An observer
+/// that keeps a line buffer needs one buffer per stream, because a chunk of one stream can arrive
+/// inside a split line of the other.
+type OutputObservers = {
+    OnStdout: string -> unit
+    OnStderr: string -> unit
+}
+
+module OutputObservers =
+
+    let none: OutputObservers = { OnStdout = ignore; OnStderr = ignore }
+
+    /// One callback for both streams, for observers that keep no line buffer.
+    let both (observe: string -> unit) : OutputObservers = { OnStdout = observe; OnStderr = observe }
+
+    /// Reports the progress meter lines of both streams to `reportLine`, each stream with its own
+    /// line buffer. The returned function flushes the buffers after the process has ended.
+    let meters (reportLine: string -> unit) : OutputObservers * (unit -> unit) =
+        let observeStdout, flushStdout = VersionControlService.Runtime.Node.Process.createMeterObserver reportLine
+        let observeStderr, flushStderr = VersionControlService.Runtime.Node.Process.createMeterObserver reportLine
+
+        { OnStdout = observeStdout; OnStderr = observeStderr },
+        fun () ->
+            flushStdout ()
+            flushStderr ()
+
 let private resolveGitEnvironment (environment: obj option) =
     environment
     |> Option.defaultWith createNonInteractiveEnv
@@ -89,7 +115,7 @@ let private resolveGitEnvironment (environment: obj option) =
 let private runGitProcess
     (captureStdout: bool)
     (onStarted: unit -> unit)
-    (onOutput: string -> unit)
+    (output: OutputObservers)
     (request: GitSpawnRequest)
     : Promise<GitSpawnResult> =
     promise {
@@ -210,7 +236,7 @@ let private runGitProcess
                 fun d ->
                     resetIdleTimer ()
                     let text = d?toString ("utf8") |> unbox<string>
-                    onOutput text
+                    output.OnStdout text
 
                     if captureStdout then
                         stdoutChunks.Add d
@@ -223,7 +249,7 @@ let private runGitProcess
                     resetIdleTimer ()
                     let text = d?toString ("utf8") |> unbox<string>
                     stderrChunks.Add text
-                    onOutput text
+                    output.OnStderr text
             )
             |> ignore
 
@@ -299,41 +325,50 @@ let private runGitProcess
 }
 
 /// Runs `git` without a shell and captures stdout/stderr for callers that need exact output or stdin support.
-let runGitCaptured (request: GitSpawnRequest) : Promise<GitSpawnResult> = runGitProcess true ignore ignore request
+let runGitCaptured (request: GitSpawnRequest) : Promise<GitSpawnResult> = runGitProcess true ignore OutputObservers.none request
 
 /// Runs `git` with a notification after the child process and its cancellation handlers are active.
 let runGitCapturedWithStarted
     (onStarted: unit -> unit)
     (request: GitSpawnRequest)
     : Promise<GitSpawnResult> =
-    runGitProcess true onStarted ignore request
+    runGitProcess true onStarted OutputObservers.none request
 
 /// Assembly-internal streaming variant used by explicit LFS transfers so
 /// provider progress originates from the real child process.
 let internal runGitCapturedWithOutput
-    (onOutput: string -> unit)
+    (output: OutputObservers)
     (request: GitSpawnRequest)
     : Promise<GitSpawnResult> =
-    runGitProcess true ignore onOutput request
+    runGitProcess true ignore output request
 
 /// Assembly-internal streaming variant used by maintenance operations so
 /// provider progress originates from the real child process.
 let internal runGitCapturedWithStartedAndOutput
     (onStarted: unit -> unit)
-    (onOutput: string -> unit)
+    (output: OutputObservers)
     (request: GitSpawnRequest)
     : Promise<GitSpawnResult> =
-    runGitProcess true onStarted onOutput request
+    runGitProcess true onStarted output request
 
 /// Runs `git` while draining and discarding stdout.
 /// This is used for commands such as `git lfs smudge`, whose stdout may contain a large file.
-let runGitDiscardingStdout (request: GitSpawnRequest) : Promise<GitSpawnResult> = runGitProcess false ignore ignore request
+let runGitDiscardingStdout (request: GitSpawnRequest) : Promise<GitSpawnResult> = runGitProcess false ignore OutputObservers.none request
 
 let runGitDiscardingStdoutWithStarted
     (onStarted: unit -> unit)
     (request: GitSpawnRequest)
     : Promise<GitSpawnResult> =
-    runGitProcess false onStarted ignore request
+    runGitProcess false onStarted OutputObservers.none request
+
+/// Drains and discards stdout like runGitDiscardingStdoutWithStarted, and still hands every chunk of both
+/// streams to the observers, so the meters of a transfer reach the caller although its stdout is not kept.
+let internal runGitDiscardingStdoutWithStartedAndOutput
+    (onStarted: unit -> unit)
+    (output: OutputObservers)
+    (request: GitSpawnRequest)
+    : Promise<GitSpawnResult> =
+    runGitProcess false onStarted output request
 
 /// Runs a small git command and returns stdout text, or None on command failure.
 /// Used for feature probes where failure should not surface as a user-facing Git error.
@@ -468,7 +503,7 @@ type NodeGitLfsAdapter() =
                         runGitProcess
                             true
                             ignore
-                            onProgress
+                            (OutputObservers.both onProgress)
                             {
                                 WorkingDirectory = workingDirectory
                                 Arguments = args |> List.toArray

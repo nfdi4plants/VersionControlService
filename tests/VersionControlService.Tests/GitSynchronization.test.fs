@@ -85,6 +85,9 @@ let private buffersEqual (_left: obj) (_right: obj) : bool = jsNative
 """)>]
 let private observeGitSpawnArguments (_observed: ResizeArray<string[]>) : unit -> unit = jsNative
 
+[<Emit("process.execPath")>]
+let private nodeExecutablePath: string = jsNative
+
 /// The git subcommand of a spawn, skipping global options such as `-c key=value`.
 let private gitSubcommand (arguments: string[]) =
     let rec find index =
@@ -5743,7 +5746,7 @@ let private setMaterializeLargeObjects (workPath: string) (enabled: bool) =
             (if enabled then "true" else "false")
         |]
 
-let private synchronizeWithoutPublish (session: WorkspaceSession) (name: string) = promise {
+let private synchronizeWithoutPublishIn (session: WorkspaceSession) (context: OperationContext) = promise {
     let! status = sessionStatus session
 
     return!
@@ -5754,9 +5757,12 @@ let private synchronizeWithoutPublish (session: WorkspaceSession) (name: string)
                 AcceptUpdateRisks = false
                 PublishLocalRevisions = false
             }
-            (ctx name)
+            context
         |> Async.StartAsPromise
 }
+
+let private synchronizeWithoutPublish (session: WorkspaceSession) (name: string) =
+    synchronizeWithoutPublishIn session (ctx name)
 
 Vitest.describe (
     "Git LFS transfer ordering",
@@ -6247,6 +6253,210 @@ Vitest.describe (
                     let! unrelatedObjectPresent = pathExistsAsync (lfsObjectPath unrelatedOid)
                     Vitest.expect(publishedObjectPresent).toBe true
                     Vitest.expect(unrelatedObjectPresent).toBe false
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+)
+
+Vitest.describe (
+    "Git transfer progress",
+    fun () ->
+        Vitest.test (
+            "hydration pull reads stdout meters under its own phase code with Git LFS progress forced",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let observed = ResizeArray<NodeProcess.ProcessRequest>()
+
+                let meterScript =
+                    "process.stdout.write('Downloading LFS objects:  50% (1/2), 1 B | 1 B/s\\r" +
+                    "Downloading LFS objects: 100% (2/2), 2 B | 1 B/s, done.\\n');"
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request processContext ->
+                            observed.Add request
+
+                            if isLfsPullRequest request then
+                                // The request keeps its phase code and its stdout opt-in. Only the program changes.
+                                NodeProcess.run
+                                    { request with
+                                        Command = nodeExecutablePath
+                                        Arguments = [| "-e"; meterScript |] }
+                                    processContext
+                            else
+                                NodeProcess.run request processContext)
+                    Barrier = None
+                }
+
+                let! root, workPath, session = createUnhydratedLfsClone hooks
+
+                try
+                    let! _ = setMaterializeLargeObjects workPath true
+                    let reports = ResizeArray<OperationProgress>()
+
+                    let! result =
+                        synchronizeWithoutPublishIn
+                            session
+                            (OperationContext.create "lfs-hydration-meters" OperationCancellation.none reports.Add)
+
+                    expectSucceeded "synchronize with a metered hydration" result |> ignore
+
+                    let pullRequest = observed |> Seq.find isLfsPullRequest
+                    Vitest.expect(pullRequest.Environment |> Array.contains ("GIT_LFS_FORCE_PROGRESS", "1")).toBe true
+                    Vitest.expect(pullRequest.ObserveStdoutProgress).toBe true
+
+                    let meters =
+                        reports
+                        |> Seq.filter (fun report -> report.PhaseCode = "lfs-pull" && report.Completed.IsSome)
+                        |> Seq.map (fun report -> report.Completed)
+                        |> Seq.toArray
+
+                    Vitest.expect(meters).toEqual [| Some 50.0; Some 100.0 |]
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "fetch and clone ask git for progress",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let observed = ResizeArray<NodeProcess.ProcessRequest>()
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request processContext ->
+                            observed.Add request
+                            NodeProcess.run request processContext)
+                    Barrier = None
+                }
+
+                let! root, _, barePath, session = createSyncFixture hooks
+
+                try
+                    let! refreshResult = (syncService session).Refresh(ctx "progress-refresh") |> Async.StartAsPromise
+                    expectValue "refresh" refreshResult |> ignore
+
+                    let fetchRequest =
+                        observed |> Seq.find (fun request -> gitSubcommand request.Arguments = Some "fetch")
+
+                    Vitest.expect(fetchRequest.Arguments |> Array.contains "--progress").toBe true
+
+                    let factory = GitWorkspaceSession.createFactory hooks
+
+                    let! cloneResult =
+                        factory.Clone
+                            {
+                                Location = {
+                                    ProviderId = gitProviderId
+                                    DisplayName = None
+                                    ProviderLocation = barePath
+                                    ConnectionProfileId = None
+                                }
+                                TargetPath = join [| root; "progress-clone" |]
+                                TargetRef = None
+                                MaterializeAllObjects = false
+                            }
+                            (ctx "progress-clone")
+                        |> Async.StartAsPromise
+
+                    expectValue "clone" cloneResult |> ignore
+
+                    let cloneRequest =
+                        observed |> Seq.find (fun request -> gitSubcommand request.Arguments = Some "clone")
+
+                    Vitest.expect(cloneRequest.Arguments |> Array.contains "--progress").toBe true
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "a failing fetch whose stderr holds meter lines reports a failure message without them",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request processContext ->
+                            if gitSubcommand request.Arguments = Some "fetch" then
+                                async {
+                                    return
+                                        OperationResult.succeeded {
+                                            NodeProcess.ExitCode = 128
+                                            StdOut = ""
+                                            StdErr =
+                                                "Receiving objects:  10% (1/10)\rReceiving objects: 100% (10/10), done.\n"
+                                                + "fatal: injected fetch failure\n"
+                                        }
+                                }
+                            else
+                                NodeProcess.run request processContext)
+                    Barrier = None
+                }
+
+                let! root, _, _, session = createSyncFixture hooks
+
+                try
+                    let! refreshResult = (syncService session).Refresh(ctx "progress-failed-fetch") |> Async.StartAsPromise
+                    let failure = expectProviderFailure "refresh" refreshResult
+
+                    Vitest.expect(failure.Message.Contains "fatal: injected fetch failure").toBe true
+                    Vitest.expect(failure.Message.Contains "Receiving objects").toBe false
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "synchronize reports its step events in order for an update that downloads large objects",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, barePath, session = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+
+                try
+                    let! _ = setMaterializeLargeObjects workPath true
+                    do! advanceTarget root barePath [ "target.txt", "target content\n" ]
+                    let reports = ResizeArray<OperationProgress>()
+
+                    let! result =
+                        synchronizeWithoutPublishIn
+                            session
+                            (OperationContext.create "step-events" OperationCancellation.none reports.Add)
+
+                    match result with
+                    | Failed failure -> failwith $"Synchronize failed ({failure.Code}): {failure.Message}"
+                    | Succeeded _
+                    | PartiallySucceeded _ -> ()
+
+                    let steps = [| "fetch"; "refresh-state"; "merge"; "update-inspection"; "lfs-pull" |]
+
+                    let reportedSteps =
+                        reports
+                        |> Seq.map (fun report -> report.PhaseCode)
+                        |> Seq.filter (fun code -> Array.contains code steps)
+                        |> Seq.distinct
+                        |> Seq.toArray
+
+                    Vitest.expect(reportedSteps).toEqual steps
+
+                    for code in [| "fetch"; "merge"; "lfs-pull" |] do
+                        let first = reports |> Seq.find (fun report -> report.PhaseCode = code)
+                        Vitest.expect(first.Completed).toEqual None
+                        Vitest.expect(first.Total).toEqual None
+                        Vitest.expect(first.DisplayMessage.IsSome).toBe true
+
                     do! removeDirectoryAsync root
                 with error ->
                     do! removeDirectoryAsync root

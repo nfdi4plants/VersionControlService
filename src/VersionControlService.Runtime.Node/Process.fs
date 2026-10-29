@@ -19,6 +19,10 @@ type ProcessRequest = {
     Environment: (string * string)[]
     /// Stable progress phase code attached to parsed meter events.
     ProgressPhase: string
+    /// Also reads meter lines from stdout. Stderr is always read. Stdout is off by default because
+    /// plumbing output such as `status -z` is data. Only a few tools print meters there, such as
+    /// git-lfs with GIT_LFS_FORCE_PROGRESS.
+    ObserveStdoutProgress: bool
 }
 
 module ProcessRequest =
@@ -30,6 +34,7 @@ module ProcessRequest =
         StdinData = None
         Environment = [||]
         ProgressPhase = "process"
+        ObserveStdoutProgress = false
     }
 
 type ProcessOutput = {
@@ -110,16 +115,38 @@ let progressMeterCompletedTotal (meter: ProgressMeter) =
     | Some(_, 1) -> None
     | _ -> Some(meter.Percent, 100.0)
 
-let private reportProgressMeter (phaseCode: string) (context: OperationContext) (meter: ProgressMeter) =
+/// The progress event of a parsed meter under the given phase code. The display text is redacted.
+let progressOfMeter (phaseCode: string) (meter: ProgressMeter) : OperationProgress =
     let completedTotal = progressMeterCompletedTotal meter
 
-    context.ReportProgress {
+    {
         PhaseCode = phaseCode
         Item = None
         Completed = completedTotal |> Option.map fst
         Total = completedTotal |> Option.map snd
         DisplayMessage = Some(Redaction.redact (formatProgressMeter meter))
     }
+
+let private reportProgressMeter (phaseCode: string) (context: OperationContext) (meter: ProgressMeter) =
+    context.ReportProgress(progressOfMeter phaseCode meter)
+
+let private lineWithTerminatorPattern = Regex(@"[^\r\n]*(?:\r\n|\r|\n|$)")
+
+/// Removes every line that tryParseProgressMeter accepts, with its terminator, so each CR-separated
+/// redraw of a meter goes. The other lines keep their text and terminators. A failure message built
+/// from a transfer that printed meters uses this, because a meter line says nothing about the cause.
+let dropProgressMeterLines (text: string) : string =
+    if String.IsNullOrEmpty text then
+        text
+    else
+        lineWithTerminatorPattern.Replace(
+            text,
+            MatchEvaluator(fun matched ->
+                if (tryParseProgressMeter matched.Value).IsSome then
+                    String.Empty
+                else
+                    matched.Value)
+        )
 
 let createMeterObserver (reportLine: string -> unit) =
     let pending = System.Text.StringBuilder()
@@ -217,6 +244,8 @@ let run (request: ProcessRequest) (context: OperationContext) : Async<OperationR
                     tryParseProgressMeter line
                     |> Option.iter (reportProgressMeter request.ProgressPhase context)
 
+                // One observer per stream, so a chunk of one stream never lands inside a split line of the other.
+                let observeStdout, flushStdout = createMeterObserver reportLine
                 let observeStderr, flushStderr = createMeterObserver reportLine
 
                 let observeStream
@@ -232,7 +261,12 @@ let run (request: ProcessRequest) (context: OperationContext) : Async<OperationR
                             observeProgress |> Option.iter (fun observe -> observe text))
                         |> ignore
 
-                observeStream child?stdout stdoutDecoder stdout None
+                observeStream
+                    child?stdout
+                    stdoutDecoder
+                    stdout
+                    (if request.ObserveStdoutProgress then Some observeStdout else None)
+
                 observeStream child?stderr stderrDecoder stderr (Some observeStderr)
 
                 child?on ("exit", fun (code: obj) ->
@@ -273,12 +307,16 @@ let run (request: ProcessRequest) (context: OperationContext) : Async<OperationR
                                     buffer.Append tail |> ignore
                                 tail
 
-                            finishStream stdoutDecoder stdout |> ignore
+                            let stdoutTail = finishStream stdoutDecoder stdout
                             let stderrTail = finishStream stderrDecoder stderr
+
+                            if request.ObserveStdoutProgress && not (String.IsNullOrEmpty stdoutTail) then
+                                observeStdout stdoutTail
 
                             if not (String.IsNullOrEmpty stderrTail) then
                                 observeStderr stderrTail
 
+                            flushStdout ()
                             flushStderr ()
 
                             resolve (

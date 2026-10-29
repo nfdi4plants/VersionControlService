@@ -110,6 +110,26 @@ let private injectNextFileHandleSyncFailureAfterAttributesEdit
 """)>]
 let private observeGitSpawnArguments (_observed: ResizeArray<string[]>) : unit -> unit = jsNative
 
+// Records the arguments of every git spawn with the GIT_LFS_FORCE_PROGRESS value of its environment.
+[<Emit("""
+(() => {
+    const childProcess = require('node:child_process');
+    const moduleApi = require('node:module');
+    const originalSpawn = childProcess.spawn;
+    childProcess.spawn = function(command, args, options) {
+        if (String(command).toLowerCase() === 'git')
+            $0.push([Array.from(args || []), String((options && options.env && options.env.GIT_LFS_FORCE_PROGRESS) || '')]);
+        return originalSpawn.call(childProcess, command, args, options);
+    };
+    moduleApi.syncBuiltinESMExports();
+    return () => {
+        childProcess.spawn = originalSpawn;
+        moduleApi.syncBuiltinESMExports();
+    };
+})()
+""")>]
+let private observeGitSpawnForcedProgress (_observed: ResizeArray<string[] * string>) : unit -> unit = jsNative
+
 // The listener goes on the child before the caller adds its own close handler, so the append
 // finishes before the caller sees the hash result.
 [<Emit("""
@@ -461,20 +481,30 @@ let private createPushedLfsFixture (unpushedLast: bool) = promise {
     return root, workPath
 }
 
-let private freeLfsPaths (workPath: string) (paths: string[]) = promise {
+let private freeLfsPathsReporting (workPath: string) (paths: string[]) (reports: ResizeArray<OperationProgress>) = promise {
     let! result =
         GitService.freeLfsFiles
             workPath
             paths
             GitCredentialStrategy.anonymous
             None
-            ignore
+            reports.Add
             (ctx "free-lfs-paths")
 
     match result with
     | Ok outcomes -> return outcomes
     | Error failure -> return failwith $"The free failed as a whole: {failure.Message}"
 }
+
+let private freeLfsPaths (workPath: string) (paths: string[]) =
+    freeLfsPathsReporting workPath paths (ResizeArray<OperationProgress>())
+
+/// The file counts a batch call reported, as Completed and Total pairs.
+let private fileCountsOf (phaseCode: string) (reports: ResizeArray<OperationProgress>) =
+    reports
+    |> Seq.filter (fun report -> report.PhaseCode = phaseCode)
+    |> Seq.map (fun report -> report.Completed, report.Total)
+    |> Seq.toArray
 
 /// Removes the cached objects of freed paths, as the object-materialization service does after a free.
 let private removeCachedObjectsOfFreedPaths (workPath: string) (paths: string[]) = promise {
@@ -1569,6 +1599,24 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "git output meters keep one line buffer per stream",
+            fun () ->
+                let lines = ResizeArray<string>()
+                let observers, flush = GitLfsAdapter.OutputObservers.meters lines.Add
+
+                // A stderr line arrives while a stdout meter is still split across chunks.
+                observers.OnStdout "Uploading LFS objects:  5"
+                observers.OnStderr "warning: slow link\n"
+                observers.OnStdout "0% (1/3), 1 B | 1 B/s\n"
+                flush ()
+
+                Vitest.expect(lines.ToArray()).toEqual [|
+                    "warning: slow link"
+                    "Uploading LFS objects:  50% (1/3), 1 B | 1 B/s"
+                |]
+        )
+
+        Vitest.test (
             "LFS push planning excludes each remote tip with a caret line in rev-list input",
             TestOptions(timeout = 120000),
             fun () -> promise {
@@ -2646,14 +2694,116 @@ Vitest.describe (
                         Vitest.expect(listing.Length).toBe lfsDownloadFiles.Length
                         Vitest.expect(listing |> Array.forall (fun file -> file.checkout)).toBe true
 
-                        // Three paths in two folders share one fetch, which names no single item.
-                        let transfers =
+                        // Three paths in two folders share one fetch, which names no single item. The start
+                        // event has no message, and the meters of the fetch that follow it have one.
+                        let transferReports =
                             reports
                             |> Seq.filter (fun report -> report.PhaseCode = "lfs-materialize-transfer")
                             |> Seq.toArray
 
+                        let transfers = transferReports |> Array.filter (fun report -> report.DisplayMessage.IsNone)
+
                         Vitest.expect(transfers.Length).toBe 1
                         Vitest.expect(transfers[0].Item.IsNone).toBe true
+                        Vitest.expect(transferReports[0].DisplayMessage).toEqual None
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "materialization of several files forces Git LFS progress on its fetch and checkout",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let! root, workPath, _ = createFreedLfsFixture ()
+
+                    try
+                        let spawned = ResizeArray<string[] * string>()
+                        let stopObserving = observeGitSpawnForcedProgress spawned
+
+                        try
+                            let! _ = downloadLfsPaths workPath (lfsDownloadFiles |> Array.map fst) (ResizeArray<OperationProgress>())
+                            ()
+                        finally
+                            stopObserving ()
+
+                        let forcedValuesOf (subcommand: string) =
+                            spawned
+                            |> Seq.filter (fun (arguments, _) ->
+                                arguments |> Array.contains "lfs" && arguments |> Array.contains subcommand)
+                            |> Seq.map snd
+                            |> Seq.toArray
+
+                        let fetchValues = forcedValuesOf "fetch"
+                        let checkoutValues = forcedValuesOf "checkout"
+                        Vitest.expect(fetchValues.Length).toBe 1
+                        Vitest.expect(checkoutValues.Length).toBe 1
+                        Vitest.expect(fetchValues[0]).toBe "1"
+                        Vitest.expect(checkoutValues[0]).toBe "1"
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "materialization of several files reports how many files are done",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let! root, workPath, _ = createFreedLfsFixture ()
+
+                    try
+                        let reports = ResizeArray<OperationProgress>()
+                        let! _ = downloadLfsPaths workPath (lfsDownloadFiles |> Array.map fst) reports
+
+                        let counts = fileCountsOf "lfs-materialize-files" reports
+                        let completed = counts |> Array.map (fun (completed, _) -> completed.Value)
+
+                        Vitest.expect(counts.Length > 1).toBe true
+                        Vitest.expect(counts |> Array.forall (fun (_, total) -> total = Some 3.0)).toBe true
+                        Vitest.expect(Array.last completed).toBe 3.0
+
+                        for index = 1 to completed.Length - 1 do
+                            Vitest.expect(completed[index] > completed[index - 1]).toBe true
+
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "a download or a free of one path reports no file counts",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let! root, workPath, _ = createFreedLfsFixture ()
+
+                    try
+                        let reports = ResizeArray<OperationProgress>()
+                        let! _ = downloadLfsPaths workPath [| "data/a.bin" |] reports
+                        let! _ = freeLfsPathsReporting workPath [| "data/a.bin" |] reports
+
+                        Vitest.expect(fileCountsOf "lfs-materialize-files" reports).toEqual [||]
+                        Vitest.expect(fileCountsOf "lfs-dematerialize-files" reports).toEqual [||]
                         do! removeDirectoryAsync root
                     with error ->
                         do! removeDirectoryAsync root
@@ -2862,6 +3012,74 @@ Vitest.describe (
 
                         let! status = runGitOk workPath [| "status"; "--porcelain" |]
                         Vitest.expect(status.Trim()).toBe ""
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "dematerialization of several files reports how many files are done",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let! root, workPath = createPushedLfsFixture false
+
+                    try
+                        let reports = ResizeArray<OperationProgress>()
+                        let! _ = freeLfsPathsReporting workPath (lfsDownloadFiles |> Array.map fst) reports
+
+                        let counts = fileCountsOf "lfs-dematerialize-files" reports
+                        let completed = counts |> Array.map (fun (completed, _) -> completed.Value)
+
+                        Vitest.expect(counts.Length > 1).toBe true
+                        Vitest.expect(counts |> Array.forall (fun (_, total) -> total = Some 3.0)).toBe true
+                        Vitest.expect(Array.last completed).toBe 3.0
+
+                        for index = 1 to completed.Length - 1 do
+                            Vitest.expect(completed[index] > completed[index - 1]).toBe true
+
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "dematerialization of several files leaves the dry run of its remote check without forced progress",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let! root, workPath = createPushedLfsFixture false
+
+                    try
+                        let spawned = ResizeArray<string[] * string>()
+                        let stopObserving = observeGitSpawnForcedProgress spawned
+
+                        try
+                            let! _ = freeLfsPaths workPath (lfsDownloadFiles |> Array.map fst)
+                            ()
+                        finally
+                            stopObserving ()
+
+                        let dryRunValues =
+                            spawned
+                            |> Seq.filter (fun (arguments, _) -> arguments |> Array.contains "--dry-run")
+                            |> Seq.map snd
+                            |> Seq.toArray
+
+                        Vitest.expect(dryRunValues.Length > 0).toBe true
+                        Vitest.expect(dryRunValues |> Array.forall (fun value -> value <> "1")).toBe true
                         do! removeDirectoryAsync root
                     with error ->
                         do! removeDirectoryAsync root

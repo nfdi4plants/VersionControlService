@@ -972,14 +972,14 @@ let readLsFilesByRelativePath
         try
             let! commandResult =
                 runGitCapturedWithOutput
-                    (fun _ ->
+                    (OutputObservers.both (fun _ ->
                         context.ReportProgress {
                             PhaseCode = "lfs-list-transfer"
                             Item = None
                             Completed = Some 0.0
                             Total = None
                             DisplayMessage = None
-                        })
+                        }))
                     {
                     WorkingDirectory = Some normalizedRepoRoot
                     Arguments = buildLsFilesJsonArgs ()
@@ -1231,16 +1231,19 @@ let buildDownloadObjectArgs (relativePaths: string[]) =
     |]
 
 let private extractSpawnFailureMessage (result: GitSpawnResult) =
+    // Forced progress puts meter lines into either stream, and they say nothing about the cause.
     let stderrText =
         result.StderrText
         |> Option.ofObj
         |> Option.defaultValue String.Empty
+        |> NodeProcess.dropProgressMeterLines
         |> _.Trim()
 
     let stdoutText =
         result.StdoutText
         |> Option.ofObj
         |> Option.defaultValue String.Empty
+        |> NodeProcess.dropProgressMeterLines
         |> _.Trim()
 
     if result.TimedOut then
@@ -1261,18 +1264,36 @@ let checkoutArgsPrefix = [| "lfs"; "checkout"; "--" |]
 let buildCheckoutArgs (relativePath: string) =
     Array.append checkoutArgsPrefix [| lfsPathPattern relativePath |]
 
+/// Output observers that report the meters of both streams as progress under one phase code. The
+/// returned function flushes their line buffers once the process has ended.
+let internal createPhaseMeterOutput
+    (phaseCode: string)
+    (reportProgress: OperationProgress -> unit)
+    : OutputObservers * (unit -> unit) =
+    OutputObservers.meters (fun line ->
+        NodeProcess.tryParseProgressMeter line
+        |> Option.iter (NodeProcess.progressOfMeter phaseCode >> reportProgress))
+
 // Checkout has no timeout or cancellation because git-lfs holds the index lock while it refreshes the index.
 // Stopping it midway leaves a stale lock and a checked-out file.
-let checkoutPatterns (repoPath: string) (patterns: string[]) : JS.Promise<Result<unit, exn>> = promise {
+let checkoutPatterns
+    (repoPath: string)
+    (patterns: string[])
+    (reportProgress: OperationProgress -> unit)
+    : JS.Promise<Result<unit, exn>> = promise {
+    let output, flushOutput = createPhaseMeterOutput "lfs-materialize-checkout" reportProgress
+
     let! result =
-        runGitCaptured {
+        runGitCapturedWithOutput output {
             WorkingDirectory = Some repoPath
             Arguments = Array.append checkoutArgsPrefix patterns
-            Environment = None
+            Environment = Some(withForcedLfsProgress (createNonInteractiveEnv ()))
             StandardInput = None
             CancelCheck = None
             TimeoutMs = None
         }
+
+    flushOutput ()
 
     return
         if result.ExitCode = 0 && not result.TimedOut then
@@ -1523,7 +1544,7 @@ let private createMaintenanceOutputObserver (progressCallback: (GitProgressDto -
                 })
         | None -> ()
 
-    NodeProcess.createMeterObserver reportLine
+    OutputObservers.meters reportLine
 
 /// Runs a maintenance command with authentication and streams its real process progress.
 /// `onStarted` fires only after the child process can observe cancellation.
@@ -1616,21 +1637,28 @@ let downloadObjects
     (commandAuth: GitCommandAuthentication)
     (download: ObjectDownload)
     (cancelCheck: (unit -> bool) option)
+    (reportProgress: OperationProgress -> unit)
     (onStarted: unit -> unit)
     : JS.Promise<Result<unit, exn>> =
     promise {
         let transferEnvironment = withFetchExcludeCleared commandAuth.Environment
 
-        let arguments, standardInput, environment =
+        // Only the fetch reports meters. The smudge moves a single object, and its stdout holds the file content.
+        let arguments, standardInput, environment, (output, flushOutput) =
             match download with
             | SmudgeObject(relativePath, listing) ->
                 buildSmudgePointerArgs relativePath,
                 Some(buildPointerInput listing),
-                withLfsSmudgeEnabled transferEnvironment
-            | FetchPaths relativePaths -> buildDownloadObjectArgs relativePaths, None, transferEnvironment
+                withLfsSmudgeEnabled transferEnvironment,
+                (OutputObservers.none, ignore)
+            | FetchPaths relativePaths ->
+                buildDownloadObjectArgs relativePaths,
+                None,
+                withForcedLfsProgress transferEnvironment,
+                createPhaseMeterOutput "lfs-materialize-transfer" reportProgress
 
         let! result =
-            runGitDiscardingStdoutWithStarted onStarted {
+            runGitDiscardingStdoutWithStartedAndOutput onStarted output {
                 WorkingDirectory = Some repoPath
                 Arguments = GitCredentialStrategy.buildLfsTransferArguments commandAuth.ConfigArgs arguments
                 Environment = Some environment
@@ -1638,6 +1666,8 @@ let downloadObjects
                 CancelCheck = cancelCheck
                 TimeoutMs = None
             }
+
+        flushOutput ()
 
         return
             if result.ExitCode = 0 && not result.TimedOut then
@@ -1967,10 +1997,7 @@ let uploadObjects
             // stdout is a pipe, so request live progress explicitly. Git LFS otherwise
             // suppresses updates and its asynchronous final summary can race process exit.
             // Keep this override local to the upload without changing the caller's auth env.
-            let uploadEnvironment: obj =
-                Fable.Core.JsInterop.emitJsExpr
-                    commandAuth.Environment
-                    "({ ...$0, GIT_LFS_FORCE_PROGRESS: '1' })"
+            let uploadEnvironment = withForcedLfsProgress commandAuth.Environment
 
             let! exactUploadResult =
                 runSpawnedGit {

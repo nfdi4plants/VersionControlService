@@ -1360,6 +1360,48 @@ JavaScript has no native 64-bit integer, so a float is what carries byte totals 
 GiB exactly on both runtimes. Show the message, and branch on the
 phase code.
 
+### Progress of Git transfers
+
+The Git provider turns the progress meters of its long transfers into `OperationProgress` events.
+A meter such as `Receiving objects:  12% (1/8)` becomes an event whose `Completed` is the percent
+and whose `Total` is 100. The `DisplayMessage` holds the meter's label with its object count and
+transferred size, for example `Downloading LFS objects (2/3), 1.2 MB`. A meter for a single object
+has no `Completed` and `Total`, because one object has no useful percent.
+
+These calls report their meters, each under its own phase code:
+
+| Call | Phase code |
+| --- | --- |
+| `git fetch` of Refresh, Update, Synchronize, Publish and Bind | `fetch` |
+| `git clone` | `clone` |
+| `git lfs pull` after a clone | `clone-lfs-pull` |
+| `git lfs pull` that downloads the large objects of an Update or a Synchronize | `lfs-pull` |
+| `git lfs fetch` of `Materialize` | `lfs-materialize-transfer` |
+| `git lfs checkout` of `Materialize` | `lfs-materialize-checkout` |
+
+Git LFS prints its meters to a pipe only when `GIT_LFS_FORCE_PROGRESS=1` is set, and then it
+writes them to stdout. The provider sets the variable for the Git LFS calls in the table and reads
+their stdout for meters. It leaves the dry runs and the listings alone. The failure message of a call
+that printed meters has none of the meter lines.
+
+A step of Synchronize, and of the Refresh and Update inside it, reports an event without numbers
+when it starts. A host can show the step before the first meter arrives. Three of these events carry
+a `DisplayMessage`:
+
+| Phase code | `DisplayMessage` | Reported before |
+| --- | --- | --- |
+| `fetch` | Fetching online changes | the `git fetch` of the refresh |
+| `merge` | Merging online changes | the `git merge` of the update |
+| `lfs-pull` | Downloading large files | the `git lfs pull` that follows an update |
+
+A batch call also reports how many of its files are done. `Materialize` of
+`ObjectBatchMaterialization` uses the phase code `lfs-materialize-files`, and `Dematerialize` uses
+`lfs-dematerialize-files`. `Item` is `None` and `Total` is the number of distinct requested paths.
+`Completed` counts the paths that have an outcome, whatever the outcome is. A downloaded file counts
+as soon as its checkout ends, before the check of its content. `Completed` only rises, and it reaches
+`Total` when the call returns a result. These count events exist only for batch calls with more than
+one path. A call with a single path keeps its earlier progress sequence and reports none.
+
 ## Building against the packages
 
 The packages are on nuget.org:

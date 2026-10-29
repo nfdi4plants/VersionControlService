@@ -163,7 +163,11 @@ let private mergeGitEnvironment (requestEnvironment: (string * string)[]) =
          |> Array.filter (fun (name, _) -> not (Set.contains name requestNames)))
         requestEnvironment
 
-let private runGitEnv
+/// Runs git with a progress phase code for its meter lines. Stderr meters are always read. Stdout is
+/// read only when `observeStdout` is set, because the stdout of most calls is data.
+let private runGitWithProgress
+    (phaseCode: string)
+    (observeStdout: bool)
     (hooks: GitSessionHooks)
     (repoPath: string)
     (arguments: string[])
@@ -177,7 +181,8 @@ let private runGitEnv
                 WorkingDirectory = Some repoPath
                 StdinData = stdinData
                 Environment = mergeGitEnvironment environment
-                ProgressPhase = "git"
+                ProgressPhase = phaseCode
+                ObserveStdoutProgress = observeStdout
         }
 
         let runner = hooks.RunProcess |> Option.defaultValue NodeProcess.run
@@ -189,8 +194,34 @@ let private runGitEnv
         | Failed failure -> return Error failure
     }
 
+let private runGitEnv hooks repoPath arguments stdinData environment context =
+    runGitWithProgress "git" false hooks repoPath arguments stdinData environment context
+
 let private runGit hooks repoPath arguments stdinData context =
     runGitEnv hooks repoPath arguments stdinData [||] context
+
+/// Runs a git call that transfers data. Its meters reach ReportProgress under `phaseCode`. The returned
+/// output has no meter lines left, so a failure text built from it names the cause of the failure.
+let private runGitTransfer
+    (phaseCode: string)
+    (observeStdout: bool)
+    (hooks: GitSessionHooks)
+    (repoPath: string)
+    (arguments: string[])
+    (environment: (string * string)[])
+    (context: OperationContext)
+    : Async<Result<NodeProcess.ProcessOutput, OperationFailure>> =
+    async {
+        let! result = runGitWithProgress phaseCode observeStdout hooks repoPath arguments None environment context
+
+        return
+            result
+            |> Result.map (fun (output: NodeProcess.ProcessOutput) -> {
+                output with
+                    StdOut = NodeProcess.dropProgressMeterLines output.StdOut
+                    StdErr = NodeProcess.dropProgressMeterLines output.StdErr
+            })
+    }
 
 let private reportProgressReset (phaseCode: string) (context: OperationContext) =
     context.ReportProgress {
@@ -199,6 +230,16 @@ let private reportProgressReset (phaseCode: string) (context: OperationContext) 
         Completed = None
         Total = None
         DisplayMessage = None
+    }
+
+/// Announces a step before it runs. Like a reset, the event has no numbers. It also names the step.
+let private reportStepStart (phaseCode: string) (message: string) (context: OperationContext) =
+    context.ReportProgress {
+        PhaseCode = phaseCode
+        Item = None
+        Completed = None
+        Total = None
+        DisplayMessage = Some message
     }
 
 let private runHookedBytesProcess
@@ -228,25 +269,42 @@ let private commandSummary (arguments: string[]) =
     |> Array.truncate 3
     |> String.concat " "
 
+/// Turns a nonzero git exit into a failure.
+let private checkGitExit
+    (arguments: string[])
+    (result: Result<NodeProcess.ProcessOutput, OperationFailure>)
+    : Result<NodeProcess.ProcessOutput, OperationFailure> =
+    match result with
+    | Error failure -> Error failure
+    | Ok output when output.ExitCode <> 0 ->
+        match GitInternals.tryIndexLockFailure output.StdErr with
+        | Some(path, ageSeconds) -> Error(GitInternals.indexLockFailure path ageSeconds)
+        | None ->
+            Error(
+                OperationFailure.createRedacted
+                    ProviderError
+                    "git_failure"
+                    $"git {commandSummary arguments} failed: {output.StdErr}"
+            )
+    | Ok output -> Ok output
+
 /// runGit that fails when git exits nonzero.
 let private runGitChecked hooks repoPath arguments stdinData context =
     async {
         let! result = runGit hooks repoPath arguments stdinData context
+        return checkGitExit arguments result
+    }
 
-        match result with
-        | Error failure -> return Error failure
-        | Ok output when output.ExitCode <> 0 ->
-            match GitInternals.tryIndexLockFailure output.StdErr with
-            | Some(path, ageSeconds) -> return Error(GitInternals.indexLockFailure path ageSeconds)
-            | None ->
-                return
-                    Error(
-                        OperationFailure.createRedacted
-                            ProviderError
-                            "git_failure"
-                            $"git {commandSummary arguments} failed: {output.StdErr}"
-                    )
-        | Ok output -> return Ok output
+/// Git prints no fetch meters to a pipe unless asked, and then writes them to stderr.
+let private fetchArguments (authArguments: string[]) (remote: string) =
+    [| yield! authArguments; "fetch"; "--progress"; remote |]
+
+/// Fetches from the remote with meters under the phase "fetch" and fails when git exits nonzero.
+let private runGitFetchChecked hooks repoPath authArguments remote context =
+    async {
+        let arguments = fetchArguments authArguments remote
+        let! result = runGitTransfer "fetch" false hooks repoPath arguments [||] context
+        return checkGitExit arguments result
     }
 
 let private barrier (hooks: GitSessionHooks) (repoPath: string) (point: string) (context: OperationContext) =
@@ -3376,13 +3434,9 @@ let private refresh (state: SessionState) (context: OperationContext) =
                 | Error failure -> return Failed failure
                 | Ok authArguments ->
 
-                let! fetchResult =
-                    runGitChecked
-                        state.Hooks
-                        state.RepoPath
-                        [| yield! authArguments; "fetch"; remote |]
-                        None
-                        context
+                reportStepStart "fetch" "Fetching online changes" context
+
+                let! fetchResult = runGitFetchChecked state.Hooks state.RepoPath authArguments remote context
 
                 match fetchResult with
                 | Error failure -> return Failed { failure with Retryable = true }
@@ -3551,8 +3605,13 @@ let private downloadLargeObjects
                     match authentication with
                     | Error failure -> return Error failure
                     | Ok authentication ->
+                        reportStepStart "lfs-pull" "Downloading large files" context
+
+                        // Git LFS writes its meters to stdout, and only when asked to.
                         return!
-                            runGitEnv
+                            runGitTransfer
+                                "lfs-pull"
+                                true
                                 state.Hooks
                                 state.RepoPath
                                 (GitCredentialStrategy.buildLfsTransferArguments
@@ -3563,8 +3622,7 @@ let private downloadLargeObjects
                                         remote
                                         yield! hydrationRef |> Option.toArray
                                     |])
-                                None
-                                [| "GIT_TERMINAL_PROMPT", "0" |]
+                                [| GitLfsForceProgress; "GIT_TERMINAL_PROMPT", "0" |]
                                 context
                 }
 
@@ -3646,6 +3704,8 @@ let private updateFromState
                                     false
                                 )
                         else
+                            reportStepStart "merge" "Merging online changes" context
+
                             let! result =
                                 runGitEnv
                                     state.Hooks
@@ -4689,12 +4749,7 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                             }
                     | Ok authArguments ->
                         let! fetchResult =
-                            runGitChecked
-                                state.Hooks
-                                state.RepoPath
-                                [| yield! authArguments; "fetch"; remoteName |]
-                                None
-                                context
+                            runGitFetchChecked state.Hooks state.RepoPath authArguments remoteName context
 
                         match fetchResult with
                         | Error failure ->
@@ -6527,17 +6582,19 @@ let private createFactoryWithSessions
                                 // Git keeps large objects as pointers until hydration so a download
                                 // failure can be reported as partial success.
                                 return!
-                                    runGitEnv
+                                    runGitTransfer
+                                        "clone"
+                                        false
                                         hooks
                                         "."
                                         [|
                                             yield! authentication.ConfigArgs
                                             "clone"
+                                            "--progress"
                                             "--"
                                             location.ProviderLocation
                                             request.TargetPath
                                         |]
-                                        None
                                         [|
                                             "GIT_TERMINAL_PROMPT", "0"
                                             "GIT_LFS_SKIP_SMUDGE", "1"
@@ -6597,14 +6654,16 @@ let private createFactoryWithSessions
                                 )
                             else
                                 reportProgressReset "clone-lfs-pull" context
-                                runGitEnv
+
+                                runGitTransfer
+                                    "clone-lfs-pull"
+                                    true
                                     hooks
                                     request.TargetPath
                                     (GitCredentialStrategy.buildLfsTransferArguments
                                         authentication.ConfigArgs
                                         [| "lfs"; "pull"; "origin" |])
-                                    None
-                                    [| "GIT_TERMINAL_PROMPT", "0" |]
+                                    [| GitLfsForceProgress; "GIT_TERMINAL_PROMPT", "0" |]
                                     context
 
                         match hydration with
@@ -6775,7 +6834,14 @@ let private createFactoryWithSessions
                             location.ConnectionProfileId
 
                     let! _ =
-                        runGit hooks request.WorkspaceRoot [| yield! authArguments; "fetch"; "origin" |] None context
+                        runGitTransfer
+                            "fetch"
+                            false
+                            hooks
+                            request.WorkspaceRoot
+                            (fetchArguments authArguments "origin")
+                            [||]
+                            context
 
                     return OperationResult.succeeded (bindingFor request.WorkspaceRoot location)
         }

@@ -237,6 +237,92 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "reports stdout meters under the request phase code when the request opts in",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let script =
+                    "process.stdout.write('Downloading LFS objects:  50% (1/2), 1 B | 1 B/s\\r" +
+                    "Downloading LFS objects: 100% (2/2), 2 B | 1 B/s, done.\\n');"
+
+                let request = {
+                    NodeProcess.ProcessRequest.create nodeExecutable [| "-e"; script |] with
+                        ProgressPhase = "lfs-pull"
+                        ObserveStdoutProgress = true
+                }
+
+                let reports = ResizeArray<OperationProgress>()
+                let context = OperationContext.create "runtime-stdout-meters" OperationCancellation.none reports.Add
+                let! result = run (NodeProcess.run request context)
+
+                match result with
+                | Succeeded outcome -> Vitest.expect(outcome.Value.ExitCode).toBe 0
+                | PartiallySucceeded _
+                | Failed _ -> failwith "Expected the process to succeed."
+
+                Vitest.expect(reports |> Seq.map (fun report -> report.PhaseCode) |> Seq.toArray).toEqual [|
+                    "lfs-pull"
+                    "lfs-pull"
+                |]
+
+                Vitest.expect(reports |> Seq.map (fun report -> report.Completed) |> Seq.toArray).toEqual [|
+                    Some 50.0
+                    Some 100.0
+                |]
+            }
+        )
+
+        Vitest.test (
+            "does not parse stdout for meters unless the request opts in",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let script =
+                    "process.stdout.write('Downloading LFS objects:  50% (1/2), 1 B | 1 B/s\\n');"
+
+                let request = NodeProcess.ProcessRequest.create nodeExecutable [| "-e"; script |]
+                let reports = ResizeArray<OperationProgress>()
+                let context = OperationContext.create "runtime-stdout-plain" OperationCancellation.none reports.Add
+                let! result = run (NodeProcess.run request context)
+
+                match result with
+                | Succeeded outcome -> Vitest.expect(outcome.Value.StdOut.Contains "Downloading LFS objects").toBe true
+                | PartiallySucceeded _
+                | Failed _ -> failwith "Expected the process to succeed."
+
+                Vitest.expect(reports.Count).toBe 0
+            }
+        )
+
+        Vitest.test (
+            "keeps a stdout meter whole when stderr output arrives in the middle of it",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                // The pauses put each write into its own chunk, so the stderr line lands inside the stdout meter.
+                let script =
+                    "process.stdout.write('Downloading LFS objects:  5');" +
+                    "setTimeout(() => process.stderr.write('warning: slow link\\n'), 150);" +
+                    "setTimeout(() => process.stdout.write('0% (1/3), 1 B | 1 B/s\\n'), 300);"
+
+                let request = {
+                    NodeProcess.ProcessRequest.create nodeExecutable [| "-e"; script |] with
+                        ObserveStdoutProgress = true
+                }
+
+                let reports = ResizeArray<OperationProgress>()
+                let context = OperationContext.create "runtime-split-meter" OperationCancellation.none reports.Add
+                let! result = run (NodeProcess.run request context)
+
+                match result with
+                | Succeeded outcome -> Vitest.expect(outcome.Value.ExitCode).toBe 0
+                | PartiallySucceeded _
+                | Failed _ -> failwith "Expected the process to succeed."
+
+                Vitest.expect(reports |> Seq.map (fun report -> report.DisplayMessage) |> Seq.toArray).toEqual [|
+                    Some "Downloading LFS objects (1/3), 1 B"
+                |]
+            }
+        )
+
+        Vitest.test (
             "cancellation after child exit preserves success",
             TestOptions(timeout = 120000),
             fun () -> promise {

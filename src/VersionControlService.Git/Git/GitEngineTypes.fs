@@ -15,6 +15,15 @@ type GitLfsLsFileInfo = {
 [<Literal>]
 let GitLfsSkipSmudgeEnvKey = "GIT_LFS_SKIP_SMUDGE"
 
+/// Git LFS prints no meters to a pipe unless this variable asks for them. With it, every meter goes to stdout.
+let GitLfsForceProgress = "GIT_LFS_FORCE_PROGRESS", "1"
+
+/// A copy of the environment with live Git LFS progress forced. The environment passed in stays as it is.
+let withForcedLfsProgress (environment: obj) : obj =
+    let key, value = GitLfsForceProgress
+
+    JS.Constructors.Object.assign (JsInterop.createObj [], environment, JsInterop.createObj [ key, box value ])
+
 type GitLfsCommand =
     | Pull
     | Fetch

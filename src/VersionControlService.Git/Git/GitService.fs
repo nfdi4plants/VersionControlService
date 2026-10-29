@@ -1091,7 +1091,7 @@ let private runGitCapturedWithOutput progressCallback request =
                 |> report)
         | None -> ()
 
-    let observeOutput, flushOutput = NodeProcess.createMeterObserver reportLine
+    let observeOutput, flushOutput = GitLfsAdapter.OutputObservers.meters reportLine
 
     promise {
         let! result = GitLfsAdapter.runGitCapturedWithOutput observeOutput request
@@ -2254,6 +2254,31 @@ let private groupLfsCandidatesByPattern (candidates: LfsPathCandidate[]) =
 
     groups
 
+/// Reports how many of the paths of a batch are done, so a caller can show "n of m files". The count is
+/// the settled paths plus `pending`, files that wait only for a later check. A request with a single
+/// distinct path reports nothing, and a count equal to the last report is skipped, so Completed only rises.
+let private createLfsCountReporter
+    (phaseCode: string)
+    (reportProgress: OperationProgress -> unit)
+    (results: LfsPathResults)
+    (order: ResizeArray<string>)
+    : int -> unit =
+    let lastCompleted = ref -1
+
+    fun pending ->
+        let completed = results.Count + pending
+
+        if order.Count > 1 && completed <> lastCompleted.Value then
+            lastCompleted.Value <- completed
+
+            reportProgress {
+                PhaseCode = phaseCode
+                Item = None
+                Completed = Some(float completed)
+                Total = Some(float order.Count)
+                DisplayMessage = None
+            }
+
 /// Downloads the objects of the candidates into the local cache. A download that fails does not
 /// stop the others, because git-lfs still fetches the rest of its objects. `missingOnRemote` collects
 /// the candidates whose object the remote lacks and `downloadErrors` the error of every other failed
@@ -2302,6 +2327,7 @@ let private downloadLfsObjects
                     session.CommandAuth
                     (GitLfsService.SmudgeObject(candidate.Key, candidate.Listing))
                     cancelCheck
+                    reportProgress
                     (reportTransfer (Some candidate.SafePath))
 
             match result with
@@ -2334,6 +2360,7 @@ let private downloadLfsObjects
                         session.CommandAuth
                         (GitLfsService.FetchPaths(chunkCandidates |> Array.map (fun candidate -> candidate.Key)))
                         cancelCheck
+                        reportProgress
                         (reportTransfer item)
 
                 match result with
@@ -2355,6 +2382,8 @@ let private checkoutLfsCandidates
     (arcPath: string)
     (candidates: LfsPathCandidate[])
     (results: LfsPathResults)
+    (reportProgress: OperationProgress -> unit)
+    (reportCount: int -> unit)
     (context: OperationContext)
     : JS.Promise<GitResult<LfsPathCandidate[]>> = promise {
     let groups = groupLfsCandidatesByPattern candidates
@@ -2382,13 +2411,16 @@ let private checkoutLfsCandidates
                 for candidate in chunkCandidates do
                     results[candidate.Requested] <- Error(canceledLfsFailure ())
         else
-            let! checkoutResult = GitLfsService.checkoutPatterns arcPath patterns
+            let! checkoutResult = GitLfsService.checkoutPatterns arcPath patterns reportProgress
 
             match checkoutResult with
             | Error error ->
                 for candidate in chunkCandidates do
                     results[candidate.Requested] <- Error(toFailure error)
             | Ok() -> checkedOut.AddRange chunkCandidates
+
+            // The verification settles the checked-out files later, and they count as done from here.
+            reportCount checkedOut.Count
 
         chunkIndex <- chunkIndex + 1
 
@@ -2476,6 +2508,7 @@ let private downloadLfsCandidates
     (reportProgress: OperationProgress -> unit)
     (context: OperationContext)
     (results: LfsPathResults)
+    (reportCount: int -> unit)
     : JS.Promise<GitResult<unit>> = promise {
     for candidate in candidates do
         reportProgress {
@@ -2565,7 +2598,9 @@ let private downloadLfsCandidates
                     if present.Count = 0 then
                         return Ok()
                     else
-                        match! checkoutLfsCandidates arcPath (present.ToArray()) results context with
+                        match!
+                            checkoutLfsCandidates arcPath (present.ToArray()) results reportProgress reportCount context
+                        with
                         | Error failure -> return Error failure
                         | Ok checkedOut ->
                             do! verifyLfsCandidates arcPath checkedOut results reportProgress context
@@ -2673,6 +2708,8 @@ let private runLfsDownload
     (results: LfsPathResults)
     (order: ResizeArray<string>)
     : JS.Promise<GitResult<unit>> = promise {
+    let reportCount = createLfsCountReporter "lfs-materialize-files" reportProgress results order
+
     match!
         readLfsCandidates
             arcPath
@@ -2693,9 +2730,14 @@ let private runLfsDownload
             order
     with
     | Error failure -> return Error failure
-    | Ok(_, candidates) when candidates.Length = 0 -> return Ok()
+    | Ok(_, candidates) when candidates.Length = 0 ->
+        reportCount 0
+        return Ok()
     | Ok(listing, candidates) ->
-        return!
+        // The listing has settled the paths that need no download and the paths that failed.
+        reportCount 0
+
+        let! downloaded =
             downloadLfsCandidates
                 arcPath
                 listing
@@ -2705,6 +2747,13 @@ let private runLfsDownload
                 reportProgress
                 context
                 results
+                reportCount
+
+        match downloaded with
+        | Ok() -> reportCount 0
+        | Error _ -> ()
+
+        return downloaded
 }
 
 /// Validates and deduplicates the requested paths for a download or a free, and runs `run` on the
@@ -3204,6 +3253,7 @@ let private freeLfsCandidates
     (confirmed: LfsPathCandidate[])
     (results: LfsPathResults)
     (reportProgress: OperationProgress -> unit)
+    (reportCount: int -> unit)
     (context: OperationContext)
     : JS.Promise<GitResult<unit>> = promise {
     let mutable index = 0
@@ -3227,6 +3277,7 @@ let private freeLfsCandidates
             | Ok() -> results[candidate.Requested] <- Ok Changed
             | Error failure -> results[candidate.Requested] <- Error failure
 
+        reportCount 0
         index <- index + 1
 
     if canceledBeforeChange then
@@ -3246,6 +3297,8 @@ let private runLfsFree
     (results: LfsPathResults)
     (order: ResizeArray<string>)
     : JS.Promise<GitResult<unit>> = promise {
+    let reportCount = createLfsCountReporter "lfs-dematerialize-files" reportProgress results order
+
     match!
         readLfsCandidates
             arcPath
@@ -3266,7 +3319,9 @@ let private runLfsFree
             order
     with
     | Error failure -> return Error failure
-    | Ok(_, candidates) when candidates.Length = 0 -> return Ok()
+    | Ok(_, candidates) when candidates.Length = 0 ->
+        reportCount 0
+        return Ok()
     | Ok(_, candidates) ->
         let! trackedResult = readLfsTrackedPaths arcPath (candidates |> Array.map (fun candidate -> candidate.Key))
         let tracked = ResizeArray<LfsPathCandidate>()
@@ -3288,6 +3343,7 @@ let private runLfsFree
                     )
 
         if tracked.Count = 0 then
+            reportCount 0
             return Ok()
         else
             for candidate in tracked do
@@ -3321,10 +3377,14 @@ let private runLfsFree
                     with
                     | Error failure -> return Error failure
                     | Ok confirmed ->
+                        // The confirmation has settled the paths that are already free and the ones that failed.
+                        reportCount 0
+
                         if confirmed.Length = 0 then
                             return Ok()
                         else
-                            return! freeLfsCandidates arcPath session confirmed results reportProgress context
+                            return!
+                                freeLfsCandidates arcPath session confirmed results reportProgress reportCount context
 }
 
 /// Replaces the content of Git LFS files with their pointers, after the remote has confirmed that it
