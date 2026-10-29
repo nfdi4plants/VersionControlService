@@ -2128,14 +2128,13 @@ let private createLfsCheckoutFailure safePath trackedByAttributes =
 
 let private lfsFailure (message: string) : GitFailure = toFailure (exn message)
 
-/// Reads which of `paths` have changes, with one `git status` per chunk of literal pathspecs.
-/// The set holds the path of every status record and the source path of a rename, the names
-/// that isPathCleanInStatus compares. The read has no timeout and ends when the context is canceled.
-let private readDirtyPaths
+/// Reads the status records of the `paths` that have changes, with one `git status` per chunk
+/// of literal pathspecs. The read has no timeout and ends when the context is canceled.
+let private readDirtyFiles
     (arcPath: string)
     (paths: string[])
     (context: OperationContext)
-    : JS.Promise<GitResult<Set<string>>> =
+    : JS.Promise<GitResult<GitFileStatusDto[]>> =
     withCancellableLocalGit
         arcPath
         context.Cancellation
@@ -2146,7 +2145,7 @@ let private readDirtyPaths
             let chunks =
                 GitPathTransport.chunkArguments fixedArguments (literalPathspecsFromStrings paths |> Array.distinct)
 
-            let dirtyPaths = ResizeArray<string>()
+            let dirtyFiles = ResizeArray<GitFileStatusDto>()
 
             for chunk in chunks do
                 let! output = git.raw (Array.append fixedArguments chunk)
@@ -2154,15 +2153,30 @@ let private readDirtyPaths
                 if context.Cancellation.IsCancellationRequested() then
                     abortGitPromise "Git LFS operation canceled."
 
-                for file in (parsePorcelainV2StatusDto arcPath output).Files do
-                    dirtyPaths.Add file.Path
+                dirtyFiles.AddRange (parsePorcelainV2StatusDto arcPath output).Files
 
-                    match file.OriginalPath with
-                    | Some original -> dirtyPaths.Add original
-                    | None -> ()
-
-            return Set.ofSeq dirtyPaths
+            return dirtyFiles.ToArray()
         })
+
+/// The path of every status record and the source path of a rename, the names that
+/// isPathCleanInStatus compares.
+let private dirtyPathsOf (files: GitFileStatusDto[]) : Set<string> =
+    files
+    |> Seq.collect (fun file ->
+        match file.OriginalPath with
+        | Some original -> [ file.Path; original ]
+        | None -> [ file.Path ])
+    |> Set.ofSeq
+
+/// Reads which of `paths` have changes, with one `git status` per chunk of literal pathspecs.
+let private readDirtyPaths
+    (arcPath: string)
+    (paths: string[])
+    (context: OperationContext)
+    : JS.Promise<GitResult<Set<string>>> = promise {
+    let! filesResult = readDirtyFiles arcPath paths context
+    return filesResult |> Result.map dirtyPathsOf
+}
 
 /// Reads which of `paths` the current .gitattributes registers with the lfs filter.
 /// The error is the text of the failed check.
@@ -2625,16 +2639,93 @@ let private downloadLfsCandidates
                             return Ok()
 }
 
+/// Tells whether the working tree holds the content of the listed object at the path. Only a regular
+/// file counts, and the hash is read only when the size equals the size of the object.
+let private holdsLfsObjectContent (absolutePath: string) (listing: GitLfsLsFileInfo) : JS.Promise<bool> = promise {
+    try
+        match tryLstatSync absolutePath with
+        | Some stats when stats.isFile () && stats.size = listing.size ->
+            let! hashed = hashFileSha256Async absolutePath |> Async.StartAsPromise
+            return String.Equals(hashed.Sha256, listing.oid, StringComparison.OrdinalIgnoreCase)
+        | _ -> return false
+    with _ ->
+        return false
+}
+
+/// Refreshes the index entries of the paths with `git add`. The clean filter of a Git LFS path turns
+/// the file into the committed pointer, so the call stages nothing and only records the stat data of
+/// the file. One call serves each chunk of paths.
+let private refreshLfsIndexEntries (arcPath: string) (keys: string[]) : JS.Promise<GitResult<unit>> =
+    withUntimedLocalGit arcPath None (fun git -> promise {
+        let fixedArguments = [| "add"; "--" |]
+
+        for chunk in GitPathTransport.chunkArguments fixedArguments (literalPathspecsFromStrings keys) do
+            let! _ = git.raw (Array.append fixedArguments chunk)
+            ()
+    })
+
+/// Repairs the dirty paths whose only change is an index entry with the stat data of the pointer, which
+/// a `git lfs checkout` leaves when it cannot take the index lock. Such a path has a modified working
+/// tree and no staged change, its file holds the content of its object, and the current attributes still
+/// register it with the lfs filter. Without the filter, `git add` would stage the file as a plain blob.
+/// The result names the repaired paths, and they are clean afterwards. A path that fails any of the
+/// checks stays dirty.
+let private repairStaleLfsIndexEntries
+    (arcPath: string)
+    (dirtyFiles: GitFileStatusDto[])
+    (listings: GitLfsLsFileInfo[])
+    (context: OperationContext)
+    : JS.Promise<GitResult<Set<string>>> = promise {
+    let staleKeys =
+        dirtyFiles
+        |> Array.filter (fun file -> file.Index = " " && file.WorkingDir = "M" && file.OriginalPath.IsNone)
+        |> Array.map (fun file -> file.Path)
+        |> Set.ofArray
+
+    let holdingContent = ResizeArray<string>()
+
+    for listing in listings do
+        if staleKeys.Contains listing.name && not (context.Cancellation.IsCancellationRequested()) then
+            let! holdsContent = holdsLfsObjectContent (resolve [| arcPath; listing.name |]) listing
+
+            if holdsContent then
+                holdingContent.Add listing.name
+
+    // One attribute check serves all paths. A failed check repairs nothing, and the paths keep their local-changes failure.
+    let! trackedPaths =
+        promise {
+            if holdingContent.Count = 0 then
+                return Set.empty
+            else
+                match! readLfsTrackedPaths arcPath (holdingContent.ToArray()) with
+                | Ok tracked -> return tracked
+                | Error _ -> return Set.empty
+        }
+
+    let repairable = holdingContent.ToArray() |> Array.filter trackedPaths.Contains
+
+    if context.Cancellation.IsCancellationRequested() then
+        return canceledLfsResult ()
+    elif repairable.Length = 0 then
+        return Ok Set.empty
+    else
+        match! refreshLfsIndexEntries arcPath repairable with
+        | Error failure -> return Error failure
+        | Ok() -> return Ok(Set.ofArray repairable)
+}
+
 /// Reads the Git LFS listing once. It settles the paths that need no action and fails the paths with
 /// changes or without a listing entry. The rest are the candidates. A request that names an
 /// already listed path again, for example in another case, is dropped from `order`, because a
-/// duplicate counts once.
+/// duplicate counts once. With `repairStaleIndex`, a path whose only change is a stale index entry
+/// is repaired and counts as already in state.
 let private readLfsCandidates
     (arcPath: string)
     (resolvedPaths: (string * string)[])
     (dirtyMessage: string -> string)
     (isAlreadyInState: GitLfsLsFileInfo -> bool)
     (reportAlreadyInState: string -> GitLfsLsFileInfo -> unit)
+    (repairStaleIndex: bool)
     (context: OperationContext)
     (results: LfsPathResults)
     (order: ResizeArray<string>)
@@ -2678,41 +2769,56 @@ let private readLfsCandidates
                 | None -> safePath)
             |> Array.distinct
 
-        match! readDirtyPaths arcPath statusPaths context with
+        match! readDirtyFiles arcPath statusPaths context with
         | Error _ when isCanceled () -> return canceledLfsResult ()
         | Error failure -> return Error failure
         | Ok _ when isCanceled () -> return canceledLfsResult ()
-        | Ok dirtyPaths ->
-            let candidates = ResizeArray<LfsPathCandidate>()
+        | Ok dirtyFiles ->
+            let dirtyPaths = dirtyPathsOf dirtyFiles
 
-            for requested, safePath, info in entries do
-                let statusPath =
-                    match info with
-                    | Some listed -> listed.name
-                    | None -> safePath
-
-                if dirtyPaths.Contains statusPath then
-                    results[requested] <- Error(lfsFailure (dirtyMessage safePath))
+            let! repairResult =
+                if repairStaleIndex && dirtyFiles.Length > 0 then
+                    repairStaleLfsIndexEntries
+                        arcPath
+                        dirtyFiles
+                        (entries |> Array.choose (fun (_, _, info) -> info))
+                        context
                 else
-                    match info with
-                    | None ->
-                        results[requested] <-
-                            Error(
-                                lfsFailure $"'{safePath}' The file is not listed by Git LFS in the current checkout."
-                            )
-                    | Some listed when isAlreadyInState listed ->
-                        results[requested] <- Ok AlreadyInState
-                        reportAlreadyInState safePath listed
-                    | Some listed ->
-                        candidates.Add {
-                            Requested = requested
-                            SafePath = safePath
-                            Key = listed.name
-                            AbsolutePath = resolve [| arcPath; listed.name |]
-                            Listing = listed
-                        }
+                    promise { return Ok Set.empty }
 
-            return Ok(listing, candidates.ToArray())
+            match repairResult with
+            | Error failure -> return Error failure
+            | Ok repairedPaths ->
+                let candidates = ResizeArray<LfsPathCandidate>()
+
+                for requested, safePath, info in entries do
+                    let statusPath =
+                        match info with
+                        | Some listed -> listed.name
+                        | None -> safePath
+
+                    if dirtyPaths.Contains statusPath && not (repairedPaths.Contains statusPath) then
+                        results[requested] <- Error(lfsFailure (dirtyMessage safePath))
+                    else
+                        match info with
+                        | None ->
+                            results[requested] <-
+                                Error(
+                                    lfsFailure $"'{safePath}' The file is not listed by Git LFS in the current checkout."
+                                )
+                        | Some listed when repairedPaths.Contains listed.name || isAlreadyInState listed ->
+                            results[requested] <- Ok AlreadyInState
+                            reportAlreadyInState safePath listed
+                        | Some listed ->
+                            candidates.Add {
+                                Requested = requested
+                                SafePath = safePath
+                                Key = listed.name
+                                AbsolutePath = resolve [| arcPath; listed.name |]
+                                Listing = listed
+                            }
+
+                return Ok(listing, candidates.ToArray())
 }
 
 /// Reads the Git LFS listing once, then downloads the paths that need it.
@@ -2743,6 +2849,7 @@ let private runLfsDownload
                     Total = Some listed.size
                     DisplayMessage = Some "Git LFS file is already materialized"
                 })
+            true
             context
             results
             order
@@ -3342,6 +3449,7 @@ let private runLfsFree
                     Total = Some listed.size
                     DisplayMessage = Some "Git LFS file is already dematerialized"
                 })
+            false
             context
             results
             order
