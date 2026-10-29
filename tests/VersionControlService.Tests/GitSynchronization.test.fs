@@ -486,6 +486,69 @@ let private createLfsConflictFixtureWithOptions
 let private createLfsConflictFixture () =
     createLfsConflictFixtureWithOptions GitWorkspaceSession.GitSessionHooks.none "tracked.xlsx" None [||]
 
+/// Picks the workspace candidate of an LFS conflict while every `git lfs checkout` ends with the text that
+/// git-lfs 3.7.0 prints when the index lock is held, and exits with 0. With `createLock`, the checkout also
+/// creates the lock file, which the text does not name. Returns the result of the pick and whether the lock exists.
+let private pickLfsConflictWithIndexError (createLock: bool) (operationName: string) = promise {
+    let hooks: GitWorkspaceSession.GitSessionHooks = {
+        GitWorkspaceSession.GitSessionHooks.none with
+            RunProcess =
+                Some(fun request processContext ->
+                    async {
+                        if request.Arguments.Length >= 2 && request.Arguments[0] = "lfs" && request.Arguments[1] = "checkout" then
+                            if createLock then
+                                let workingDirectory = request.WorkingDirectory |> Option.defaultValue "."
+
+                                do!
+                                    writeUtf8FileAsync
+                                        (join [| workingDirectory; ".git"; "index.lock" |])
+                                        "held by another process\n"
+                                    |> Async.AwaitPromise
+
+                            return
+                                OperationResult.succeeded {
+                                    NodeProcess.ExitCode = 0
+                                    StdOut = ""
+                                    StdErr = "Error updating the Git index:\n\n\nErrors logged to 'x.log'."
+                                }
+                        else
+                            return! NodeProcess.run request processContext
+                    })
+    }
+
+    let! root, workPath, path, _, _, _, session = createLfsConflictFixtureWithOptions hooks "tracked.xlsx" None [||]
+
+    try
+        let conflicts = conflictService session
+        let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession(ctx $"{operationName}-session"))
+
+        let summary =
+            match expectValue "LFS conflict session" summaryResult with
+            | Some value -> value
+            | None -> failwith "Expected an active LFS conflict session."
+
+        let! status = sessionStatus session
+
+        let! resolveResult =
+            Async.StartAsPromise(
+                conflicts.Resolve
+                    {
+                        Handle = summary.Handle
+                        ExpectedWorkspaceVersion = status.WorkspaceVersion
+                        Path = mkPath path
+                        Resolution = PickCandidate "workspace"
+                    }
+                    (ctx $"{operationName}-pick")
+            )
+
+        let! lockExists = pathExistsAsync (join [| workPath; ".git"; "index.lock" |])
+        do! removeDirectoryAsync root
+        return resolveResult, lockExists
+    with error ->
+        do! removeDirectoryAsync root
+        return raise error
+}
+
 let private createModifyDeleteConflictFixture
     (hooks: GitWorkspaceSession.GitSessionHooks)
     (path: string)
@@ -2679,6 +2742,53 @@ Vitest.describe (
                     with error ->
                         do! removeDirectoryAsync root
                         return raise error
+            }
+        )
+
+        Vitest.test (
+            "LFS pick reports the lock recovery when the checkout ends with success but could not update the index and a lock exists",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGitResultIn "." [| "lfs"; "version" |]
+
+                if lfsProbe.ExitCode <> 0 then
+                    Vitest.expect(true).toBe true
+                else
+                    let! resolveResult, lockExists = pickLfsConflictWithIndexError true "lfs-pick-index-error-lock"
+
+                    match resolveResult with
+                    | PartiallySucceeded(_, failure) ->
+                        Vitest.expect(failure.Code).toBe "object_materialization_failed"
+                        Vitest.expect(failure.StateChanged).toBe true
+                        Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "remove_index_lock")
+                    | Failed failure -> failwith $"Expected a partial result, received {failure.Category}/{failure.Code}."
+                    | Succeeded _ -> failwith "Expected the checkout that could not update the index to be reported."
+
+                    Vitest.expect(lockExists).toBe true
+            }
+        )
+
+        Vitest.test (
+            "LFS pick keeps the plain failure when the checkout ends with success but could not update the index and no lock exists",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGitResultIn "." [| "lfs"; "version" |]
+
+                if lfsProbe.ExitCode <> 0 then
+                    Vitest.expect(true).toBe true
+                else
+                    let! resolveResult, lockExists = pickLfsConflictWithIndexError false "lfs-pick-index-error-no-lock"
+
+                    match resolveResult with
+                    | PartiallySucceeded(_, failure) ->
+                        Vitest.expect(failure.Code).toBe "object_materialization_failed"
+                        Vitest.expect(failure.StateChanged).toBe true
+                        Vitest.expect(failure.Message.Contains "Error updating the Git index").toBe true
+                        Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "retry_materialization")
+                    | Failed failure -> failwith $"Expected a partial result, received {failure.Category}/{failure.Code}."
+                    | Succeeded _ -> failwith "Expected the checkout that could not update the index to be reported."
+
+                    Vitest.expect(lockExists).toBe false
             }
         )
 
@@ -7004,6 +7114,7 @@ Vitest.describe (
                     Vitest.expect(fetchRequest.Arguments |> Array.contains "--progress").toBe true
 
                     let factory = GitWorkspaceSession.createFactory hooks
+                    let reports = ResizeArray<OperationProgress>()
 
                     let! cloneResult =
                         factory.Clone
@@ -7016,9 +7127,9 @@ Vitest.describe (
                                 }
                                 TargetPath = join [| root; "progress-clone" |]
                                 TargetRef = None
-                                MaterializeAllObjects = false
+                                MaterializeAllObjects = true
                             }
-                            (ctx "progress-clone")
+                            (OperationContext.create "progress-clone" OperationCancellation.none reports.Add)
                         |> Async.StartAsPromise
 
                     expectValue "clone" cloneResult |> ignore
@@ -7027,6 +7138,18 @@ Vitest.describe (
                         observed |> Seq.find (fun request -> gitSubcommand request.Arguments = Some "clone")
 
                     Vitest.expect(cloneRequest.Arguments |> Array.contains "--progress").toBe true
+
+                    // The clone announces each step before it runs, with a message and without numbers.
+                    let firstReportOf (phaseCode: string) =
+                        reports |> Seq.findIndex (fun report -> report.PhaseCode = phaseCode)
+
+                    for phaseCode in [| "clone"; "clone-lfs-pull" |] do
+                        let first = reports[firstReportOf phaseCode]
+                        Vitest.expect(first.Completed).toEqual None
+                        Vitest.expect(first.Total).toEqual None
+                        Vitest.expect(first.DisplayMessage.IsSome).toBe true
+
+                    Vitest.expect(firstReportOf "clone" < firstReportOf "clone-lfs-pull").toBe true
                     do! removeDirectoryAsync root
                 with error ->
                     do! removeDirectoryAsync root

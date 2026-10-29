@@ -32,17 +32,24 @@ let private categoryOfKind (kind: GitFailureKind) =
     | GitFailureKind.Unknown -> ProviderError
 
 let private toOperationFailure (failure: GitService.GitFailure) : OperationFailure =
-    match GitInternals.tryIndexLockFailure failure.Message with
-    | Some(path, ageSeconds) -> GitInternals.indexLockFailure path ageSeconds
-    | None when failure.Kind = GitFailureKind.InvalidLfsThreshold ->
-        OperationFailure.create Validation "invalid_lfs_threshold" failure.Message
-    | None when failure.Kind = GitFailureKind.LfsBackupRetained ->
-        {
-            OperationFailure.createRedacted ProviderError "lfs_backup_retained" failure.Message with
-                StateChanged = true
-        }
-    | None ->
-        OperationFailure.createRedacted (categoryOfKind failure.Kind) "lfs_operation_failed" failure.Message
+    let mapped =
+        match GitInternals.tryIndexLockFailure failure.Message with
+        | Some(path, ageSeconds) -> GitInternals.indexLockFailure path ageSeconds
+        | None when failure.Kind = GitFailureKind.InvalidLfsThreshold ->
+            OperationFailure.create Validation "invalid_lfs_threshold" failure.Message
+        | None when failure.Kind = GitFailureKind.LfsBackupRetained ->
+            {
+                OperationFailure.createRedacted ProviderError "lfs_backup_retained" failure.Message with
+                    StateChanged = true
+            }
+        | None ->
+            OperationFailure.createRedacted (categoryOfKind failure.Kind) "lfs_operation_failed" failure.Message
+
+    // A checkout that reports an index error has written its files already.
+    if GitLfsService.mentionsIndexUpdateFailure failure.Message then
+        { mapped with StateChanged = true }
+    else
+        mapped
 
 let private toOperationResult (failure: GitService.GitFailure) : OperationResult<unit> =
     if failure.Kind = GitFailureKind.Canceled then
@@ -79,6 +86,13 @@ let private affectedPath (relativePath: string) (failure: OperationFailure) = {
         AffectedPaths = [| relativePath |]
 }
 
+/// affectedPath for a failure that follows a checkout which wrote the file.
+let private changedAffectedPath (relativePath: string) (failure: OperationFailure) =
+    {
+        affectedPath relativePath failure with
+            StateChanged = true
+    }
+
 let private bumpRegularFileMtime (repoPath: string) (relativePath: string) : Result<unit, string> =
     try
         let absolutePath = NodePath.resolve [| repoPath; relativePath |]
@@ -112,8 +126,8 @@ let private completeStoragePolicyChange (repoPath: string) (relativePath: string
         }
 
 /// The index lock failure when the repository has a lock file, found through the caller's git runner.
-/// The lookup runs without the cancellation of the context, because it follows a checkout that a cancel
-/// could not stop. A lookup that fails finds nothing.
+/// The lookup runs without the cancellation of the context, because it follows a checkout that ran to
+/// its end. A lookup that fails finds nothing.
 let private tryHeldIndexLockFailure
     (repoPath: string)
     (runGit: string[] -> OperationContext -> Async<Result<NodeProcess.ProcessOutput, OperationFailure>>)
@@ -125,14 +139,11 @@ let private tryHeldIndexLockFailure
                 Cancellation = OperationCancellation.none
         }
 
-        let! result = runGit [| "rev-parse"; "--git-path"; "index.lock" |] lookupContext
+        let! lockPath = GitLfsService.tryFindHeldIndexLockWith (fun arguments -> runGit arguments lookupContext) repoPath
 
-        match result with
-        | Ok output when output.ExitCode = 0 ->
-            return
-                GitLfsService.heldIndexLockPath repoPath output.StdOut
-                |> Option.map (fun lockPath -> GitInternals.indexLockFailure lockPath (GitInternals.tryFileAgeSeconds lockPath))
-        | _ -> return None
+        return
+            lockPath
+            |> Option.map (fun path -> GitInternals.indexLockFailure path (GitInternals.tryFileAgeSeconds path))
     }
 
 let private prepareUnmarkAfterPreflight
@@ -164,10 +175,12 @@ let private prepareUnmarkAfterPreflight
                         |> affectedPath relativePath
                     )
             | Ok _ ->
+                // The checkout is local and holds the index lock, so a cancel must not kill it.
                 let! checkoutResult =
                     runGit
                         [| "lfs"; "checkout"; "--"; GitLfsObjects.lfsCheckoutPattern relativePath |]
-                        context
+                        { context with
+                            Cancellation = OperationCancellation.none }
 
                 match checkoutResult with
                 | Error failure ->
@@ -189,7 +202,7 @@ let private prepareUnmarkAfterPreflight
                                 lockFailure
                                 |> Option.defaultWith (fun () ->
                                     OperationFailure.createRedacted ProviderError "object_materialization_failed" text)
-                                |> affectedPath relativePath
+                                |> changedAffectedPath relativePath
                             )
                     | None ->
                         let! restoredPointerResult = GitLfsObjects.readWorktreePointer repoPath relativePath

@@ -3332,6 +3332,7 @@ Vitest.describe (
                         | Failed failure ->
                             Vitest.expect(failure.Code).toBe "batch_materialization_incomplete"
                             Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "remove_index_lock")
+                            Vitest.expect(failure.StateChanged).toBe true
                             Vitest.expect(failure.AffectedPaths.Length).toBe lfsDownloadFiles.Length
                         | Succeeded _
                         | PartiallySucceeded _ -> failwith "Expected a failure for a checkout that could not update the index."
@@ -3377,6 +3378,7 @@ Vitest.describe (
                         | Failed failure ->
                             Vitest.expect(failure.Code).toBe "batch_materialization_incomplete"
                             Vitest.expect(failure.RecoveryAction).toEqual None
+                            Vitest.expect(failure.StateChanged).toBe true
                             Vitest.expect(failure.AffectedPaths.Length).toBe lfsDownloadFiles.Length
                             Vitest.expect(failure.Message.Contains "Error updating the Git index").toBe true
                         | Succeeded _

@@ -3801,7 +3801,7 @@ let private lfsMediaDirectoryFromEnvironment (lfsEnvironment: string) =
 let private lfsObjectPath (mediaDirectory: string) (oid: string) =
     join [| mediaDirectory; oid.Substring(0, 2); oid.Substring(2, 2); oid |]
 
-let private createDownloadedLfsRestoreFixture () = promise {
+let private createDownloadedLfsRestoreFixtureWithHooks (hooks: GitWorkspaceSession.GitSessionHooks) = promise {
     let! root = createTempDirectoryAsync ()
     let barePath = join [| root; "origin.git" |]
     let sourcePath = join [| root; "source" |]
@@ -3836,13 +3836,74 @@ let private createDownloadedLfsRestoreFixture () = promise {
         ConnectionProfileId = None
     }
 
-    return root, repoPath, GitWorkspaceSession.createSession GitWorkspaceSession.GitSessionHooks.none binding
+    return root, repoPath, GitWorkspaceSession.createSession hooks binding
 }
+
+let private createDownloadedLfsRestoreFixture () =
+    createDownloadedLfsRestoreFixtureWithHooks GitWorkspaceSession.GitSessionHooks.none
 
 let private repositoryPath (value: string) =
     match RepositoryPath.tryCreate value with
     | Ok path -> path
     | Error message -> failwith message
+
+/// Restores a locally edited LFS file while every `git lfs checkout` ends with the text that git-lfs 3.7.0
+/// prints when the index lock is held, and exits with 0. With `createLock`, the checkout also creates the
+/// lock file, which the text does not name. Returns the result of the restore and whether the lock exists.
+let private restoreLfsFileWithIndexError (createLock: bool) (operationName: string) = promise {
+    let hooks: GitWorkspaceSession.GitSessionHooks = {
+        GitWorkspaceSession.GitSessionHooks.none with
+            RunProcess =
+                Some(fun request processContext ->
+                    async {
+                        if request.Arguments.Length >= 2 && request.Arguments[0] = "lfs" && request.Arguments[1] = "checkout" then
+                            if createLock then
+                                let workingDirectory = request.WorkingDirectory |> Option.defaultValue "."
+
+                                do!
+                                    writeUtf8FileAsync
+                                        (join [| workingDirectory; ".git"; "index.lock" |])
+                                        "held by another process\n"
+                                    |> Async.AwaitPromise
+
+                            return
+                                OperationResult.succeeded {
+                                    NodeProcess.ExitCode = 0
+                                    StdOut = ""
+                                    StdErr = "Error updating the Git index:\n\n\nErrors logged to 'x.log'."
+                                }
+                        else
+                            return! NodeProcess.run request processContext
+                    })
+    }
+
+    let! root, repoPath, session = createDownloadedLfsRestoreFixtureWithHooks hooks
+
+    try
+        do! writeUtf8FileAsync (join [| repoPath; "large.bin" |]) "local edit\n"
+
+        let! statusResult =
+            session.Core.GetStatus(OperationContext.detached $"{operationName}-status")
+            |> Async.StartAsPromise
+
+        let status = expectProviderValue "status before restoring the LFS file" statusResult
+
+        let! restoreResult =
+            session.Core.RestorePaths
+                {
+                    Paths = [| repositoryPath "large.bin" |]
+                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                }
+                (OperationContext.detached operationName)
+            |> Async.StartAsPromise
+
+        let lockExists = NodeFileSystem.existsSync (join [| repoPath; ".git"; "index.lock" |])
+        do! removeDirectoryAsync root
+        return restoreResult, lockExists
+    with error ->
+        do! removeDirectoryAsync root
+        return raise error
+}
 
 Vitest.describe (
     "Git clone target refs",
@@ -4355,6 +4416,55 @@ Vitest.describe (
                     with error ->
                         do! removeDirectoryAsync root
                         return raise error
+            }
+        )
+
+        Vitest.test (
+            "RestorePaths reports the lock recovery when the checkout ends with success but could not update the index and a lock exists",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGitResultIn "." [| "lfs"; "version" |]
+
+                if lfsProbe.ExitCode <> 0 then
+                    Vitest.expect(true).toBe true
+                else
+                    let! result, lockExists = restoreLfsFileWithIndexError true "restore-lfs-index-error-lock"
+
+                    match result with
+                    | PartiallySucceeded(_, failure) ->
+                        Vitest.expect(failure.Code).toBe "object_materialization_failed"
+                        Vitest.expect(failure.StateChanged).toBe true
+                        Vitest.expect(failure.AffectedPaths).toEqual [| "large.bin" |]
+                        Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "remove_index_lock")
+                    | Failed failure -> failwith $"Expected a partial result, received {failure.Category}/{failure.Code}."
+                    | Succeeded _ -> failwith "Expected the checkout that could not update the index to be reported."
+
+                    Vitest.expect(lockExists).toBe true
+            }
+        )
+
+        Vitest.test (
+            "RestorePaths keeps the plain failure when the checkout ends with success but could not update the index and no lock exists",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGitResultIn "." [| "lfs"; "version" |]
+
+                if lfsProbe.ExitCode <> 0 then
+                    Vitest.expect(true).toBe true
+                else
+                    let! result, lockExists = restoreLfsFileWithIndexError false "restore-lfs-index-error-no-lock"
+
+                    match result with
+                    | PartiallySucceeded(_, failure) ->
+                        Vitest.expect(failure.Code).toBe "object_materialization_failed"
+                        Vitest.expect(failure.StateChanged).toBe true
+                        Vitest.expect(failure.AffectedPaths).toEqual [| "large.bin" |]
+                        Vitest.expect(failure.Message.Contains "Error updating the Git index").toBe true
+                        Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "retry_materialization")
+                    | Failed failure -> failwith $"Expected a partial result, received {failure.Category}/{failure.Code}."
+                    | Succeeded _ -> failwith "Expected the checkout that could not update the index to be reported."
+
+                    Vitest.expect(lockExists).toBe false
             }
         )
 

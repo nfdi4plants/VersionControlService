@@ -1650,13 +1650,28 @@ let private resolveGitStatePathAt
 let private resolveGitStatePath (state: SessionState) (name: string) (context: OperationContext) =
     resolveGitStatePathAt state.Hooks state.RepoPath name context
 
+/// The path of the index lock when its file exists. The lookup runs on a copy of the context without its
+/// cancellation, because it follows a checkout that ran to its end and the process runner starts nothing
+/// on a canceled context. A lookup that fails finds nothing.
+let private tryFindHeldIndexLock
+    (hooks: GitSessionHooks)
+    (repoPath: string)
+    (context: OperationContext)
+    : Async<string option> =
+    let lookupContext = {
+        context with
+            Cancellation = OperationCancellation.none
+    }
+
+    GitLfsService.tryFindHeldIndexLockWith
+        (fun arguments -> runGit hooks repoPath arguments None lookupContext)
+        repoPath
+
 /// Recovery for a large-object download that failed or was canceled after the Git transfer itself
 /// worked. It names the index.lock when Git reported one in the failure text, and when the checkout
 /// step failed while a lock file exists. A lock next to a failed fetch proves nothing, because the
 /// fetch takes no lock, so that failure gets the plain retry. The library never deletes a lock, because
-/// nothing here shows who owns it. The lookup runs on a copy of the context without its cancellation,
-/// because the process runner starts nothing on a canceled context. A lookup that fails falls back to
-/// the plain retry.
+/// nothing here shows who owns it. A lookup that fails falls back to the plain retry.
 let private hydrationRecovery
     (hooks: GitSessionHooks)
     (repoPath: string)
@@ -1681,16 +1696,11 @@ let private hydrationRecovery
         elif not checkoutFailed then
             return materializationRecovery failure
         else
-            let lookupContext = {
-                context with
-                    Cancellation = OperationCancellation.none
-            }
+            let! heldLock = tryFindHeldIndexLock hooks repoPath context
 
-            let! lockPathResult = resolveGitStatePathAt hooks repoPath "index.lock" lookupContext
-
-            match lockPathResult with
-            | Ok(Some lockPath) when NodeFileSystem.existsSync lockPath -> return removeLock
-            | _ -> return materializationRecovery failure
+            match heldLock with
+            | Some _ -> return removeLock
+            | None -> return materializationRecovery failure
     }
 
 let private preflightIndexLock (state: SessionState) (context: OperationContext) : Async<Result<unit, OperationFailure>> =
@@ -2339,6 +2349,29 @@ let private isMaterializedLfsObject (state: SessionState) (pathValue: string) (s
     with _ ->
         false
 
+/// The failure of a `git lfs checkout` that wrote its files but could not update the Git index. A held
+/// index lock gives the lock failure with its recovery, and any other cause gives the checkout failure.
+/// The files changed in both cases.
+let private lfsCheckoutIndexFailure
+    (state: SessionState)
+    (text: string)
+    (context: OperationContext)
+    : Async<OperationFailure> =
+    async {
+        let! heldLock = tryFindHeldIndexLock state.Hooks state.RepoPath context
+
+        let failure =
+            match heldLock with
+            | Some lockPath -> GitInternals.indexLockFailure lockPath (GitInternals.tryFileAgeSeconds lockPath)
+            | None ->
+                OperationFailure.createRedacted
+                    ProviderError
+                    "lfs_checkout_failed"
+                    $"Git LFS checkout failed: {text}"
+
+        return { failure with StateChanged = true }
+    }
+
 let private materializeLocalLfsObject
     (state: SessionState)
     (pathValue: string)
@@ -2357,6 +2390,7 @@ let private materializeLocalLfsObject
         | Ok mediaDirectory when not (GitLfsObjects.isObjectLocallyAvailable mediaDirectory objectId sizeBytes) ->
             return LocalLfsObjectUnavailable
         | Ok _ ->
+            // The checkout is local and holds the index lock, so a cancel must not kill it.
             let! checkoutResult =
                 runGit
                     state.Hooks
@@ -2368,7 +2402,8 @@ let private materializeLocalLfsObject
                         GitLfsObjects.lfsCheckoutPattern pathValue
                     |]
                     None
-                    context
+                    { context with
+                        Cancellation = OperationCancellation.none }
 
             match checkoutResult with
             | Error failure -> return LocalLfsCheckoutFailed failure
@@ -2376,30 +2411,9 @@ let private materializeLocalLfsObject
                 match GitLfsService.lfsCheckoutIndexUpdateFailed output.StdOut output.StdErr with
                 | None -> return LocalLfsCheckoutCompleted(isMaterializedLfsObject state pathValue sizeBytes)
                 | Some text ->
-                    // The checkout wrote the file, so the size check would pass. The lookup has no
-                    // cancellation, because the checkout ran to its end.
-                    let! lockPathResult =
-                        resolveGitStatePathAt
-                            state.Hooks
-                            state.RepoPath
-                            "index.lock"
-                            { context with
-                                Cancellation = OperationCancellation.none }
-
-                    match lockPathResult with
-                    | Ok(Some lockPath) when NodeFileSystem.existsSync lockPath ->
-                        return
-                            LocalLfsCheckoutFailed(
-                                GitInternals.indexLockFailure lockPath (GitInternals.tryFileAgeSeconds lockPath)
-                            )
-                    | _ ->
-                        return
-                            LocalLfsCheckoutFailed(
-                                OperationFailure.createRedacted
-                                    ProviderError
-                                    "lfs_checkout_failed"
-                                    $"Git LFS checkout failed: {text}"
-                            )
+                    // The checkout wrote the file, so the size check would pass.
+                    let! failure = lfsCheckoutIndexFailure state text context
+                    return LocalLfsCheckoutFailed failure
             | Ok output ->
                 let detail =
                     if String.IsNullOrWhiteSpace output.StdErr then
@@ -2416,14 +2430,17 @@ let private materializeLocalLfsObject
                     )
     }
 
+/// Checks out the local objects of the restored paths. It returns the failures as path, text and whether a
+/// cancel caused them. It also returns the recovery of a checkout that hit a held index lock.
 let private materializeRestoredLocalLfsObjects
     (state: SessionState)
     (restoredPaths: string[])
     (context: OperationContext)
-    : Async<(string * string * bool)[]> =
+    : Async<(string * string * bool)[] * RecoveryAction option> =
     async {
         let candidates = ResizeArray<string * GitLfsObjects.LfsPointerInfo>()
         let failures = ResizeArray<string * string * bool>()
+        let lockRecoveries = ResizeArray<RecoveryAction>()
 
         for pathValue in restoredPaths do
             let! pointerResult = GitLfsObjects.readWorktreePointer state.RepoPath pathValue
@@ -2461,19 +2478,32 @@ let private materializeRestoredLocalLfsObjects
                     |> Seq.toArray
 
                 for chunk in Array.chunkBySize 50 availableCandidates do
+                    // The checkout is local and holds the index lock, so a cancel must not kill it. A
+                    // cancel that arrived earlier stops the chunks that have not started.
                     let! checkoutResult =
-                        runGit
-                            state.Hooks
-                            state.RepoPath
-                            [|
-                                "lfs"
-                                "checkout"
-                                "--"
-                                for pathValue, _ in chunk do
-                                    GitLfsObjects.lfsCheckoutPattern pathValue
-                            |]
-                            None
-                            context
+                        if context.Cancellation.IsCancellationRequested() then
+                            async.Return(
+                                Error(
+                                    OperationFailure.create
+                                        Canceled
+                                        "operation_canceled"
+                                        "The operation was canceled before the process started."
+                                )
+                            )
+                        else
+                            runGit
+                                state.Hooks
+                                state.RepoPath
+                                [|
+                                    "lfs"
+                                    "checkout"
+                                    "--"
+                                    for pathValue, _ in chunk do
+                                        GitLfsObjects.lfsCheckoutPattern pathValue
+                                |]
+                                None
+                                { context with
+                                    Cancellation = OperationCancellation.none }
 
                     match checkoutResult with
                     | Error failure ->
@@ -2482,13 +2512,23 @@ let private materializeRestoredLocalLfsObjects
                         for pathValue, _ in chunk do
                             failures.Add(pathValue, failure.Message, canceled)
                     | Ok output when output.ExitCode = 0 ->
-                        for pathValue, pointer in chunk do
-                            if not (isMaterializedLfsObject state pathValue pointer.SizeInBytes) then
-                                failures.Add(
-                                    pathValue,
-                                    "Git LFS checkout did not write the expected object content.",
-                                    false
-                                )
+                        match GitLfsService.lfsCheckoutIndexUpdateFailed output.StdOut output.StdErr with
+                        | Some text ->
+                            // The checkout wrote the files, so the content check below would pass.
+                            let! indexFailure = lfsCheckoutIndexFailure state text context
+
+                            indexFailure.RecoveryAction |> Option.iter lockRecoveries.Add
+
+                            for pathValue, _ in chunk do
+                                failures.Add(pathValue, indexFailure.Message, false)
+                        | None ->
+                            for pathValue, pointer in chunk do
+                                if not (isMaterializedLfsObject state pathValue pointer.SizeInBytes) then
+                                    failures.Add(
+                                        pathValue,
+                                        "Git LFS checkout did not write the expected object content.",
+                                        false
+                                    )
                     | Ok output ->
                         let detail =
                             if String.IsNullOrWhiteSpace output.StdErr then
@@ -2501,7 +2541,7 @@ let private materializeRestoredLocalLfsObjects
                         for pathValue, _ in chunk do
                             failures.Add(pathValue, detail, canceled)
 
-        return failures.ToArray()
+        return failures.ToArray(), Seq.tryHead lockRecoveries
     }
 
 let private restorePaths (state: SessionState) (request: RestoreRequest) (context: OperationContext) =
@@ -2562,7 +2602,7 @@ let private restorePaths (state: SessionState) (request: RestoreRequest) (contex
                     match result with
                     | Error failure -> return Failed failure
                     | Ok restoredPaths ->
-                        let! materializationFailures =
+                        let! materializationFailures, lockRecovery =
                             materializeRestoredLocalLfsObjects
                                 state
                                 restoredPaths
@@ -2593,7 +2633,7 @@ let private restorePaths (state: SessionState) (request: RestoreRequest) (contex
                                 OperationResult.partiallySucceeded
                                     (OperationOutcome.performed ())
                                     failure
-                                    (localMaterializationRecovery ())
+                                    (lockRecovery |> Option.defaultWith localMaterializationRecovery)
     }
 
 let private listRefs (state: SessionState) (context: OperationContext) =
@@ -6781,6 +6821,7 @@ let private createFactoryWithSessions
                             | Error failure -> return Error failure
                             | Ok () ->
                                 cloneStarted <- true
+                                reportStepStart "clone" "Cloning the repository" context
 
                                 // Git keeps large objects as pointers until hydration so a download
                                 // failure can be reported as partial success.
@@ -6859,7 +6900,7 @@ let private createFactoryWithSessions
                                     Details = [||]
                                 }
                             else
-                                reportProgressReset "clone-lfs-pull" context
+                                reportStepStart "clone-lfs-pull" "Downloading large files" context
 
                                 runLfsHydration
                                     "clone-lfs-pull"

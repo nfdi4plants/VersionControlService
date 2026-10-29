@@ -1264,6 +1264,13 @@ let private extractSpawnFailureMessage (result: GitSpawnResult) =
     else
         "Git command failed."
 
+let private indexUpdateFailureMarker = "Error updating the Git index"
+
+/// True when the text carries the index error of a `git lfs checkout`. The failure mapping of the batch
+/// callers reads it to tell that git-lfs wrote its files before it failed.
+let internal mentionsIndexUpdateFailure (text: string) : bool =
+    not (isNull text) && text.IndexOf(indexUpdateFailureMarker, StringComparison.Ordinal) >= 0
+
 /// The error text of a `git lfs checkout` that wrote its files but could not update the Git index.
 /// With a held index.lock, git-lfs 3.7.0 prints "Error updating the Git index:" to stderr and still exits
 /// with 0. The files then read as modified and the lock stays, so the exit code alone reports success for
@@ -1278,13 +1285,14 @@ let lfsCheckoutIndexUpdateFailed (stdout: string) (stderr: string) : string opti
             |> NodeProcess.dropProgressMeterLines
             |> _.Trim()
 
-        if text.IndexOf("Error updating the Git index", StringComparison.Ordinal) >= 0 then
-            Some text
-        else
-            None)
+        if mentionsIndexUpdateFailure text then Some text else None)
+
+/// The arguments that ask Git for the path of the index lock. Every lookup of a held lock uses them,
+/// whichever runner executes them.
+let internal heldIndexLockArguments = [| "rev-parse"; "--git-path"; "index.lock" |]
 
 /// The path of the index lock when its file exists. `gitPathOutput` is the stdout of
-/// `git rev-parse --git-path index.lock` run in `repoPath`, and a relative answer is relative to it.
+/// `heldIndexLockArguments` run in `repoPath`, and a relative answer is relative to it.
 let internal heldIndexLockPath (repoPath: string) (gitPathOutput: string) : string option =
     let rawPath = gitPathOutput |> Option.ofObj |> Option.defaultValue String.Empty |> _.Trim()
 
@@ -1302,7 +1310,7 @@ let internal tryFindHeldIndexLock (repoPath: string) : JS.Promise<string option>
     let! result =
         runGitCaptured {
             WorkingDirectory = Some repoPath
-            Arguments = [| "rev-parse"; "--git-path"; "index.lock" |]
+            Arguments = heldIndexLockArguments
             Environment = None
             StandardInput = None
             CancelCheck = None
@@ -1316,6 +1324,20 @@ let internal tryFindHeldIndexLock (repoPath: string) : JS.Promise<string option>
         else
             None
 }
+
+/// The same lookup through the git runner of the caller, which also applies the context of the caller.
+/// A lookup that fails finds nothing.
+let internal tryFindHeldIndexLockWith
+    (runGit: string[] -> Async<Result<NodeProcess.ProcessOutput, OperationFailure>>)
+    (repoPath: string)
+    : Async<string option> =
+    async {
+        let! result = runGit heldIndexLockArguments
+
+        match result with
+        | Ok output when output.ExitCode = 0 -> return heldIndexLockPath repoPath output.StdOut
+        | _ -> return None
+    }
 
 /// Git-lfs ends its index error without the lock message of Git, so the text alone does not name the
 /// lock. With a held lock, the text gets that message in Git's words, which the failure mapping of the
