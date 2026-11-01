@@ -9,6 +9,7 @@ open VersionControlService.Runtime.Node.Interop
 open VersionControlService.Git.GitAuthAdapter
 
 module GitExecution = VersionControlService.Git.GitExecution
+module NodeOutput = VersionControlService.Runtime.Node.OutputReporter
 
 [<Literal>]
 let private repoValidationTimeoutMs = 5000
@@ -69,6 +70,8 @@ type GitSpawnRequest = {
     StandardInput: string option
     CancelCheck: (unit -> bool) option
     TimeoutMs: int option
+    /// Where the process reports its output lines. None when the operation's host did not ask for them.
+    Output: NodeOutput.OutputTarget option
 }
 
 /// Captured process result for spawned git commands, including raw stdout for binary-safe batch parsing.
@@ -80,6 +83,32 @@ type GitSpawnResult = {
     TimedOut: bool
 }
 
+/// Receives the decoded text of each stdout and stderr chunk of a spawned git process. An observer
+/// that keeps a line buffer needs one buffer per stream, because a chunk of one stream can arrive
+/// inside a split line of the other.
+type OutputObservers = {
+    OnStdout: string -> unit
+    OnStderr: string -> unit
+}
+
+module OutputObservers =
+
+    let none: OutputObservers = { OnStdout = ignore; OnStderr = ignore }
+
+    /// One callback for both streams, for observers that keep no line buffer.
+    let both (observe: string -> unit) : OutputObservers = { OnStdout = observe; OnStderr = observe }
+
+    /// Reports the progress meter lines of both streams to `reportLine`, each stream with its own
+    /// line buffer. The returned function flushes the buffers after the process has ended.
+    let meters (reportLine: string -> unit) : OutputObservers * (unit -> unit) =
+        let observeStdout, flushStdout = VersionControlService.Runtime.Node.Process.createMeterObserver reportLine
+        let observeStderr, flushStderr = VersionControlService.Runtime.Node.Process.createMeterObserver reportLine
+
+        { OnStdout = observeStdout; OnStderr = observeStderr },
+        fun () ->
+            flushStdout ()
+            flushStderr ()
+
 let private resolveGitEnvironment (environment: obj option) =
     environment
     |> Option.defaultWith createNonInteractiveEnv
@@ -89,17 +118,31 @@ let private resolveGitEnvironment (environment: obj option) =
 let private runGitProcess
     (captureStdout: bool)
     (onStarted: unit -> unit)
-    (onOutput: string -> unit)
+    (output: OutputObservers)
     (request: GitSpawnRequest)
     : Promise<GitSpawnResult> =
     promise {
     let! result =
         Fable.Core.JS.Constructors.Promise.Create(fun resolve _ ->
+            let environment = resolveGitEnvironment request.Environment
+
+            // The header is queued before the spawn. Nothing is computed when the host asked for no output.
+            let commandOutput =
+                request.Output
+                |> Option.map (fun target ->
+                    NodeOutput.beginCommand
+                        target.Channel
+                        "git"
+                        request.Arguments
+                        request.Arguments
+                        (NodeOutput.environmentEntries environment)
+                        target.ReportStdout)
+
             let spawnOptions =
                 createObj [
                     "shell" ==> false
                     "windowsHide" ==> true
-                    "env" ==> resolveGitEnvironment request.Environment
+                    "env" ==> environment
                     "detached" ==> not (isWindows ())
 
                     match request.WorkingDirectory with
@@ -138,6 +181,8 @@ let private runGitProcess
                 if not finished then
                     finished <- true
                     clearTimers ()
+                    // The host has the output before the operation sees the result.
+                    commandOutput |> Option.iter (fun output -> output.Finish())
                     let effectiveExitCode = if cancelRequested && exitCode = 0 then -1 else exitCode
 
                     let stdoutBuffer =
@@ -205,12 +250,24 @@ let private runGitProcess
                         )
                 | _ -> ()
 
+            // One decoder per stream keeps a multi-byte character that spans two chunks whole.
+            let stdoutDecoder = createUtf8StringDecoder ()
+            let stderrDecoder = createUtf8StringDecoder ()
+
+            let observeStdout (text: string) =
+                output.OnStdout text
+                commandOutput |> Option.iter (fun command -> command.ObserveStdout text)
+
+            let observeStderr (text: string) =
+                stderrChunks.Add text
+                output.OnStderr text
+                commandOutput |> Option.iter (fun command -> command.ObserveStderr text)
+
             proc?stdout?on (
                 "data",
                 fun d ->
                     resetIdleTimer ()
-                    let text = d?toString ("utf8") |> unbox<string>
-                    onOutput text
+                    observeStdout (decodeUtf8Chunk stdoutDecoder d)
 
                     if captureStdout then
                         stdoutChunks.Add d
@@ -221,9 +278,7 @@ let private runGitProcess
                 "data",
                 fun d ->
                     resetIdleTimer ()
-                    let text = d?toString ("utf8") |> unbox<string>
-                    stderrChunks.Add text
-                    onOutput text
+                    observeStderr (decodeUtf8Chunk stderrDecoder d)
             )
             |> ignore
 
@@ -262,6 +317,13 @@ let private runGitProcess
             proc?on (
                 "close",
                 fun code ->
+                    if not finished then
+                        for decoder, observe in [ stdoutDecoder, observeStdout; stderrDecoder, observeStderr ] do
+                            let tail = finishUtf8Decoding decoder
+
+                            if not (String.IsNullOrEmpty tail) then
+                                observe tail
+
                     finish (if isNull code then -1 else int (unbox<float> code))
             )
             |> ignore
@@ -299,41 +361,50 @@ let private runGitProcess
 }
 
 /// Runs `git` without a shell and captures stdout/stderr for callers that need exact output or stdin support.
-let runGitCaptured (request: GitSpawnRequest) : Promise<GitSpawnResult> = runGitProcess true ignore ignore request
+let runGitCaptured (request: GitSpawnRequest) : Promise<GitSpawnResult> = runGitProcess true ignore OutputObservers.none request
 
 /// Runs `git` with a notification after the child process and its cancellation handlers are active.
 let runGitCapturedWithStarted
     (onStarted: unit -> unit)
     (request: GitSpawnRequest)
     : Promise<GitSpawnResult> =
-    runGitProcess true onStarted ignore request
+    runGitProcess true onStarted OutputObservers.none request
 
 /// Assembly-internal streaming variant used by explicit LFS transfers so
 /// provider progress originates from the real child process.
 let internal runGitCapturedWithOutput
-    (onOutput: string -> unit)
+    (output: OutputObservers)
     (request: GitSpawnRequest)
     : Promise<GitSpawnResult> =
-    runGitProcess true ignore onOutput request
+    runGitProcess true ignore output request
 
 /// Assembly-internal streaming variant used by maintenance operations so
 /// provider progress originates from the real child process.
 let internal runGitCapturedWithStartedAndOutput
     (onStarted: unit -> unit)
-    (onOutput: string -> unit)
+    (output: OutputObservers)
     (request: GitSpawnRequest)
     : Promise<GitSpawnResult> =
-    runGitProcess true onStarted onOutput request
+    runGitProcess true onStarted output request
 
 /// Runs `git` while draining and discarding stdout.
 /// This is used for commands such as `git lfs smudge`, whose stdout may contain a large file.
-let runGitDiscardingStdout (request: GitSpawnRequest) : Promise<GitSpawnResult> = runGitProcess false ignore ignore request
+let runGitDiscardingStdout (request: GitSpawnRequest) : Promise<GitSpawnResult> = runGitProcess false ignore OutputObservers.none request
 
 let runGitDiscardingStdoutWithStarted
     (onStarted: unit -> unit)
     (request: GitSpawnRequest)
     : Promise<GitSpawnResult> =
-    runGitProcess false onStarted ignore request
+    runGitProcess false onStarted OutputObservers.none request
+
+/// Drains and discards stdout like runGitDiscardingStdoutWithStarted, and still hands every chunk of both
+/// streams to the observers, so the meters of a transfer reach the caller although its stdout is not kept.
+let internal runGitDiscardingStdoutWithStartedAndOutput
+    (onStarted: unit -> unit)
+    (output: OutputObservers)
+    (request: GitSpawnRequest)
+    : Promise<GitSpawnResult> =
+    runGitProcess false onStarted output request
 
 /// Runs a small git command and returns stdout text, or None on command failure.
 /// Used for feature probes where failure should not surface as a user-facing Git error.
@@ -346,6 +417,7 @@ let tryExecGitText (workingDirectory: string option) (timeoutMs: int) (args: str
             StandardInput = None
             CancelCheck = None
             TimeoutMs = Some timeoutMs
+            Output = None
         }
 
     if result.ExitCode = 0 && not result.TimedOut then
@@ -390,6 +462,7 @@ let checkFilterAttributes
                     StandardInput = Some(String.concat "\000" (relativePaths |> Seq.distinct |> Seq.toArray))
                     CancelCheck = None
                     TimeoutMs = Some repoValidationTimeoutMs
+                    Output = None
                 }
 
             if result.ExitCode <> 0 || result.TimedOut then
@@ -468,7 +541,7 @@ type NodeGitLfsAdapter() =
                         runGitProcess
                             true
                             ignore
-                            onProgress
+                            (OutputObservers.both onProgress)
                             {
                                 WorkingDirectory = workingDirectory
                                 Arguments = args |> List.toArray
@@ -476,6 +549,7 @@ type NodeGitLfsAdapter() =
                                 StandardInput = None
                                 CancelCheck = Some cancelCheck
                                 TimeoutMs = timeoutMs
+                                Output = None
                             }
 
                     return {

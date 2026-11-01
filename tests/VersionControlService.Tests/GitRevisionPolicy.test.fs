@@ -230,6 +230,70 @@ let private lfsMediaDirectoryFromEnvironment (lfsEnvironment: string) =
             None)
     |> Option.defaultWith (fun () -> failwith "Expected Git LFS to report its local media directory.")
 
+/// Unmarks `manual/<name>.bin` while `git lfs checkout` writes the file, prints the text that git-lfs 3.7.0
+/// prints for a held index lock and exits with 0. With `createLock`, the checkout also creates the lock file,
+/// which the text does not name. Returns the result of the unmark and whether the lock file exists.
+let private unmarkWithIndexError (createLock: bool) (name: string) : JS.Promise<OperationResult<unit> * bool> =
+    withGitFixture RevisionPolicyStrategy.automatic (Some "\n") (fun fixture -> promise {
+        let path = $"manual/{name}.bin"
+        let absolutePath = join [| fixture.WorkPath; path |]
+        let lockPath = join [| fixture.WorkPath; ".git"; "index.lock" |]
+        do! writeUtf8FileAsync absolutePath "local object content\n"
+
+        let! initial = createRevision fixture "test: commit path before the index error" [| path |]
+        expectSucceeded "initial plain revision" initial |> ignore
+
+        let storagePolicy =
+            fixture.Session.StoragePolicy
+            |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
+
+        let! markResult =
+            storagePolicy.SetPathPolicy (repositoryPath path) true (context $"mark-{name}")
+            |> Async.StartAsPromise
+
+        expectSucceeded "mark before the index error" markResult |> ignore
+
+        let! lfsRevision =
+            createRevision fixture "test: commit path with LFS before the index error" [| path; ".gitattributes" |]
+
+        expectSucceeded "LFS revision before the index error" lfsRevision |> ignore
+        let! pointer = runGitOk fixture.WorkPath [| "cat-file"; "-p"; $"HEAD:{path}" |]
+        do! writeUtf8FileAsync absolutePath pointer
+
+        // The fake checkout restores the content, as git-lfs does before it reports the index error.
+        let hooks = {
+            GitWorkspaceSession.GitSessionHooks.none with
+                RunProcess =
+                    Some(fun request processContext ->
+                        async {
+                            match request.Arguments with
+                            | [| "lfs"; "checkout"; "--"; _ |] ->
+                                do! writeUtf8FileAsync absolutePath "local object content\n" |> Async.AwaitPromise
+
+                                if createLock then
+                                    do! writeUtf8FileAsync lockPath "held by another process\n" |> Async.AwaitPromise
+
+                                return
+                                    OperationResult.succeeded {
+                                        ExitCode = 0
+                                        StdOut = ""
+                                        StdErr = "Error updating the Git index:\n\n\nErrors logged to 'x.log'."
+                                    }
+                            | _ -> return! NodeProcess.run request processContext
+                        })
+        }
+
+        let hookedStoragePolicy =
+            (GitWorkspaceSession.createSession hooks fixture.Binding).StoragePolicy
+            |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
+
+        let! unmarkResult =
+            hookedStoragePolicy.SetPathPolicy (repositoryPath path) false (context name)
+            |> Async.StartAsPromise
+
+        return unmarkResult, NodeFileSystem.existsSync lockPath
+    })
+
 Vitest.describe (
     "Git revision policy",
     fun () ->
@@ -905,6 +969,47 @@ Vitest.describe (
                     Vitest.expect(attributesAfter).toBe attributesBefore
                     Vitest.expect(worktreeAfter).toBe pointer
                 })
+        )
+
+        Vitest.test (
+            "unmarking reports the index lock when Git LFS ends the checkout with success but could not update the index",
+            TestOptions(timeout = 180000),
+            fun () -> promise {
+                let! result, lockExists = unmarkWithIndexError true "unmark-index-error"
+                let path = "manual/unmark-index-error.bin"
+
+                match result with
+                | Failed failure ->
+                    Vitest.expect(failure.Code).toBe "index_locked"
+                    Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "remove_index_lock")
+                    Vitest.expect(failure.StateChanged).toBe true
+                    Vitest.expect(failure.AffectedPaths).toEqual [| path |]
+                | Succeeded _
+                | PartiallySucceeded _ -> failwith "Expected unmarking to fail while the index lock is held."
+
+                Vitest.expect(lockExists).toBe true
+            }
+        )
+
+        Vitest.test (
+            "unmarking keeps the plain failure when Git LFS ends the checkout with success but could not update the index and no lock exists",
+            TestOptions(timeout = 180000),
+            fun () -> promise {
+                let! result, lockExists = unmarkWithIndexError false "unmark-index-error-no-lock"
+                let path = "manual/unmark-index-error-no-lock.bin"
+
+                match result with
+                | Failed failure ->
+                    Vitest.expect(failure.Code).toBe "object_materialization_failed"
+                    Vitest.expect(failure.Message.Contains "Error updating the Git index").toBe true
+                    Vitest.expect(failure.RecoveryAction).toEqual None
+                    Vitest.expect(failure.StateChanged).toBe true
+                    Vitest.expect(failure.AffectedPaths).toEqual [| path |]
+                | Succeeded _
+                | PartiallySucceeded _ -> failwith "Expected unmarking to fail after the index error."
+
+                Vitest.expect(lockExists).toBe false
+            }
         )
 
         Vitest.test (

@@ -6,6 +6,7 @@ open VersionControlService.Abstractions
 open Vitest
 
 module NodeProcess = VersionControlService.Runtime.Node.Process
+module NodeOutput = VersionControlService.Runtime.Node.OutputReporter
 module NodeInterop = VersionControlService.Runtime.Node.Interop
 module NodeBinaryIO = VersionControlService.Runtime.Node.BinaryIO
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
@@ -233,6 +234,92 @@ Vitest.describe (
                 Vitest.expect(reports[1].DisplayMessage).toEqual (Some "Uploading LFS objects (20/20), 2.4 MB")
                 Vitest.expect(reports[1].Completed).toEqual (Some 100.0)
                 Vitest.expect(reports[1].Total).toEqual (Some 100.0)
+            }
+        )
+
+        Vitest.test (
+            "reports stdout meters under the request phase code when the request opts in",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let script =
+                    "process.stdout.write('Downloading LFS objects:  50% (1/2), 1 B | 1 B/s\\r" +
+                    "Downloading LFS objects: 100% (2/2), 2 B | 1 B/s, done.\\n');"
+
+                let request = {
+                    NodeProcess.ProcessRequest.create nodeExecutable [| "-e"; script |] with
+                        ProgressPhase = "lfs-pull"
+                        ObserveStdoutProgress = true
+                }
+
+                let reports = ResizeArray<OperationProgress>()
+                let context = OperationContext.create "runtime-stdout-meters" OperationCancellation.none reports.Add
+                let! result = run (NodeProcess.run request context)
+
+                match result with
+                | Succeeded outcome -> Vitest.expect(outcome.Value.ExitCode).toBe 0
+                | PartiallySucceeded _
+                | Failed _ -> failwith "Expected the process to succeed."
+
+                Vitest.expect(reports |> Seq.map (fun report -> report.PhaseCode) |> Seq.toArray).toEqual [|
+                    "lfs-pull"
+                    "lfs-pull"
+                |]
+
+                Vitest.expect(reports |> Seq.map (fun report -> report.Completed) |> Seq.toArray).toEqual [|
+                    Some 50.0
+                    Some 100.0
+                |]
+            }
+        )
+
+        Vitest.test (
+            "does not parse stdout for meters unless the request opts in",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let script =
+                    "process.stdout.write('Downloading LFS objects:  50% (1/2), 1 B | 1 B/s\\n');"
+
+                let request = NodeProcess.ProcessRequest.create nodeExecutable [| "-e"; script |]
+                let reports = ResizeArray<OperationProgress>()
+                let context = OperationContext.create "runtime-stdout-plain" OperationCancellation.none reports.Add
+                let! result = run (NodeProcess.run request context)
+
+                match result with
+                | Succeeded outcome -> Vitest.expect(outcome.Value.StdOut.Contains "Downloading LFS objects").toBe true
+                | PartiallySucceeded _
+                | Failed _ -> failwith "Expected the process to succeed."
+
+                Vitest.expect(reports.Count).toBe 0
+            }
+        )
+
+        Vitest.test (
+            "keeps a stdout meter whole when stderr output arrives in the middle of it",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                // The pauses put each write into its own chunk, so the stderr line lands inside the stdout meter.
+                let script =
+                    "process.stdout.write('Downloading LFS objects:  5');" +
+                    "setTimeout(() => process.stderr.write('warning: slow link\\n'), 150);" +
+                    "setTimeout(() => process.stdout.write('0% (1/3), 1 B | 1 B/s\\n'), 300);"
+
+                let request = {
+                    NodeProcess.ProcessRequest.create nodeExecutable [| "-e"; script |] with
+                        ObserveStdoutProgress = true
+                }
+
+                let reports = ResizeArray<OperationProgress>()
+                let context = OperationContext.create "runtime-split-meter" OperationCancellation.none reports.Add
+                let! result = run (NodeProcess.run request context)
+
+                match result with
+                | Succeeded outcome -> Vitest.expect(outcome.Value.ExitCode).toBe 0
+                | PartiallySucceeded _
+                | Failed _ -> failwith "Expected the process to succeed."
+
+                Vitest.expect(reports |> Seq.map (fun report -> report.DisplayMessage) |> Seq.toArray).toEqual [|
+                    Some "Downloading LFS objects (1/3), 1 B"
+                |]
             }
         )
 
@@ -680,6 +767,329 @@ Vitest.describe (
                 with error ->
                     do! removeDirectoryAsync root
                     return raise error
+            }
+        )
+)
+
+/// A clock the test moves by hand. Timers run when the clock passes their time.
+type private FakeTimer = {
+    At: float
+    Callback: unit -> unit
+    mutable Done: bool
+}
+
+type private FakeClock() =
+    let mutable now = 0.0
+    let timers = ResizeArray<FakeTimer>()
+
+    member _.Clock: NodeOutput.OutputClock = {
+        Now = fun () -> now
+        Schedule =
+            fun delay callback ->
+                let timer = {
+                    At = now + delay
+                    Callback = callback
+                    Done = false
+                }
+
+                timers.Add timer
+                fun () -> timer.Done <- true
+    }
+
+    member _.Advance(milliseconds: float) =
+        let target = now + milliseconds
+        let mutable running = true
+
+        while running do
+            let due =
+                timers
+                |> Seq.filter (fun timer -> not timer.Done && timer.At <= target)
+                |> Seq.sortBy (fun timer -> timer.At)
+                |> Seq.tryHead
+
+            match due with
+            | None -> running <- false
+            | Some timer ->
+                timer.Done <- true
+                now <- max now timer.At
+                timer.Callback()
+
+        now <- target
+
+let private newOutputChannel (clock: FakeClock) =
+    let batches = ResizeArray<OperationOutput[]>()
+    NodeOutput.createChannel clock.Clock batches.Add, batches
+
+let private beginOutputCommand (channel: NodeOutput.OutputChannel) =
+    NodeOutput.beginCommand channel "git" [| "fetch" |] [| "fetch" |] [||] true
+
+let private allEntries (batches: ResizeArray<OperationOutput[]>) = batches |> Seq.collect id |> Seq.toArray
+
+let private stderrEntries (batches: ResizeArray<OperationOutput[]>) =
+    allEntries batches
+    |> Array.filter (fun entry -> entry.Kind = OperationOutputKind.StdErr)
+
+Vitest.describe (
+    "Node runtime output channel",
+    fun () ->
+        Vitest.test (
+            "a context has a channel only when its host set an output callback, and all copies share it",
+            fun () ->
+                Vitest.expect((NodeOutput.tryOf (OperationContext.detached "output-none")).IsNone).toBe true
+
+                let context =
+                    OperationContext.createWithOutput "output-shared" OperationCancellation.none ignore ignore
+
+                let copy = { context with Cancellation = OperationCancellation.none }
+                let first = NodeOutput.tryOf context
+                let second = NodeOutput.tryOf copy
+
+                Vitest.expect(first.IsSome && second.IsSome).toBe true
+                Vitest.expect(obj.ReferenceEquals(first.Value, second.Value)).toBe true
+        )
+
+        Vitest.test (
+            "reads a CRLF split across two chunks as one newline",
+            fun () ->
+                let channel, batches = newOutputChannel (FakeClock())
+                let command = beginOutputCommand channel
+
+                command.ObserveStderr "abc\r"
+                command.ObserveStderr "\ndef\n"
+                channel.Flush()
+
+                // A lone CR followed by text would have rewritten "abc". The CRLF completes it.
+                let lines = stderrEntries batches
+                Vitest.expect(lines |> Array.map (fun entry -> entry.Text)).toEqual [| "abc"; "def" |]
+                Vitest.expect(lines |> Array.exists (fun entry -> entry.IsPartial)).toBe false
+        )
+
+        Vitest.test (
+            "collapses carriage return updates within 250 ms into one snapshot and the final state",
+            fun () ->
+                let clock = FakeClock()
+                let channel, batches = newOutputChannel clock
+                let command = beginOutputCommand channel
+
+                command.ObserveStderr "Receiving objects:  10% (1/10)\r"
+                clock.Advance 100.0
+                command.ObserveStderr "Receiving objects:  50% (5/10)\r"
+                clock.Advance 100.0
+                command.ObserveStderr "Receiving objects: 100% (10/10), done.\n"
+                channel.Flush()
+
+                let lines = stderrEntries batches
+
+                Vitest.expect(lines |> Array.map (fun entry -> entry.Text)).toEqual [|
+                    "Receiving objects:  10% (1/10)"
+                    "Receiving objects: 100% (10/10), done."
+                |]
+
+                Vitest.expect(lines |> Array.map (fun entry -> entry.IsPartial)).toEqual [| true; false |]
+        )
+
+        Vitest.test (
+            "strips terminal escape sequences and control characters but keeps tabs",
+            fun () ->
+                let channel, batches = newOutputChannel (FakeClock())
+                let command = beginOutputCommand channel
+
+                command.ObserveStderr "\u001b[1;32mok\u001b[0m\tdone\u0001\u001b]0;title\u0007!\n"
+                channel.Flush()
+
+                Vitest.expect(stderrEntries batches |> Array.map (fun entry -> entry.Text)).toEqual [| "ok\tdone!" |]
+        )
+
+        Vitest.test (
+            "replaces a line over the length limit with a notice and keeps one at the limit",
+            fun () ->
+                let channel, batches = newOutputChannel (FakeClock())
+                let command = beginOutputCommand channel
+                let atLimit = String.replicate NodeOutput.MaxLineLength "x"
+
+                command.ObserveStderr(atLimit + "\n" + atLimit + "y\nafter\n")
+                channel.Flush()
+
+                let entries = allEntries batches |> Array.filter (fun entry -> entry.Kind <> OperationOutputKind.Command)
+
+                Vitest.expect(entries |> Array.map (fun entry -> entry.Kind = OperationOutputKind.Notice)).toEqual [|
+                    false
+                    true
+                    false
+                |]
+
+                Vitest.expect(entries[0].Text).toBe atLimit
+                Vitest.expect(entries[1].Text.Contains "longer than").toBe true
+                Vitest.expect(entries[2].Text).toBe "after"
+        )
+
+        Vitest.test (
+            "drops the oldest entries when the queue is full and says how many",
+            fun () ->
+                let channel, batches = newOutputChannel (FakeClock())
+                let command = beginOutputCommand channel
+                let lines = [ for number in 1..200 -> $"line {number}\n" ] |> String.concat ""
+
+                // The clock stands still, so the header went out and nothing else did.
+                command.ObserveStderr lines
+                command.Finish()
+
+                let entries = allEntries batches |> Array.filter (fun entry -> entry.Kind <> OperationOutputKind.Command)
+                let notice = entries[0]
+                let texts = entries |> Array.skip 1 |> Array.map (fun entry -> entry.Text)
+
+                Vitest.expect(notice.Kind = OperationOutputKind.Notice).toBe true
+                Vitest.expect(notice.Text.Contains "72").toBe true
+                Vitest.expect(texts.Length).toBe NodeOutput.MaxQueuedEntries
+                Vitest.expect(texts[0]).toBe "line 73"
+                Vitest.expect(texts[texts.Length - 1]).toBe "line 200"
+        )
+
+        Vitest.test (
+            "a full queue keeps its command headers, drops lines first and counts the lines",
+            fun () ->
+                let channel, batches = newOutputChannel (FakeClock())
+                // The first header goes out at once and starts the rate limit, so the second one waits in the queue.
+                beginOutputCommand channel |> ignore
+                let command = beginOutputCommand channel
+                let lines = [ for number in 1..200 -> $"line {number}\n" ] |> String.concat ""
+
+                command.ObserveStderr lines
+                command.Finish()
+
+                let entries = allEntries batches
+                let notice = entries |> Array.find (fun entry -> entry.Kind = OperationOutputKind.Notice)
+                let texts = stderrEntries batches |> Array.map (fun entry -> entry.Text)
+
+                let headers = entries |> Array.filter (fun entry -> entry.Kind = OperationOutputKind.Command)
+
+                Vitest.expect(headers.Length).toBe 2
+                Vitest.expect(notice.CommandId).toBe ""
+                Vitest.expect(notice.Text.Contains "73").toBe true
+                Vitest.expect(texts[0]).toBe "line 74"
+                Vitest.expect(texts[texts.Length - 1]).toBe "line 200"
+        )
+
+        Vitest.test (
+            "publishes a snapshot that the 250 ms rule held back once the interval ends",
+            fun () ->
+                let clock = FakeClock()
+                let channel, batches = newOutputChannel clock
+                let command = beginOutputCommand channel
+
+                command.ObserveStderr "Receiving objects:  10% (1/10)\r"
+                clock.Advance 100.0
+                command.ObserveStderr "Receiving objects:  50% (5/10)\r"
+                clock.Advance 100.0
+
+                // No chunk arrives after the second one, and 200 ms since the first snapshot is too early.
+                Vitest.expect(stderrEntries batches |> Array.map (fun entry -> entry.Text)).toEqual [|
+                    "Receiving objects:  10% (1/10)"
+                |]
+
+                clock.Advance 50.0
+                let lines = stderrEntries batches
+
+                Vitest.expect(lines |> Array.map (fun entry -> entry.Text)).toEqual [|
+                    "Receiving objects:  10% (1/10)"
+                    "Receiving objects:  50% (5/10)"
+                |]
+
+                Vitest.expect(lines |> Array.forall (fun entry -> entry.IsPartial)).toBe true
+        )
+
+        Vitest.test (
+            "an overlong segment that ends with a carriage return leaves no earlier segment to complete",
+            fun () ->
+                let channel, batches = newOutputChannel (FakeClock())
+                let command = beginOutputCommand channel
+                let tooLong = String.replicate (NodeOutput.MaxLineLength + 1) "x"
+
+                command.ObserveStderr("Receiving objects:  10% (1/10)\r" + tooLong + "\r\n")
+                channel.Flush()
+
+                let entries = allEntries batches |> Array.filter (fun entry -> entry.Kind <> OperationOutputKind.Command)
+
+                Vitest.expect(entries |> Array.map (fun entry -> entry.Kind)).toEqual [| OperationOutputKind.Notice |]
+        )
+
+        Vitest.test (
+            "an overlong line closes the partial entry that is still open",
+            fun () ->
+                let clock = FakeClock()
+                let channel, batches = newOutputChannel clock
+                let command = beginOutputCommand channel
+                let tooLong = String.replicate (NodeOutput.MaxLineLength + 1) "x"
+
+                command.ObserveStderr "Receiving objects:  10% (1/10)\r"
+                clock.Advance 100.0
+                command.ObserveStderr(tooLong + "\n")
+                channel.Flush()
+
+                let lines = stderrEntries batches
+
+                // The host replaces a partial entry only with an entry of the same command and kind.
+                Vitest.expect(lines |> Array.map (fun entry -> entry.Text, entry.IsPartial)).toEqual [|
+                    "Receiving objects:  10% (1/10)", true
+                    "Receiving objects:  10% (1/10)", false
+                |]
+
+                Vitest.expect(allEntries batches |> Array.exists (fun entry -> entry.Kind = OperationOutputKind.Notice)).toBe true
+        )
+
+        Vitest.test (
+            "delivers at most twenty entries per batch and ten batches per second",
+            fun () ->
+                let clock = FakeClock()
+                let channel, batches = newOutputChannel clock
+                let command = beginOutputCommand channel
+                let lines = [ for number in 1..60 -> $"line {number}\n" ] |> String.concat ""
+
+                command.ObserveStderr lines
+                Vitest.expect(batches.Count).toBe 1
+                clock.Advance 99.0
+                Vitest.expect(batches.Count).toBe 1
+                clock.Advance 1.0
+                Vitest.expect(batches.Count).toBe 2
+                clock.Advance 100.0
+                Vitest.expect(batches.Count).toBe 3
+                Vitest.expect(batches |> Seq.map (fun batch -> $"{batch.Length}") |> String.concat ",").toBe "1,20,20"
+        )
+
+        Vitest.test (
+            "delivers the final output of a canceled process before the run completes",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                // The text after the newline has no terminator, so only the final flush can deliver it.
+                let script = "process.stderr.write('line one\\ntail'); setInterval(() => {}, 1000);"
+                let request = NodeProcess.ProcessRequest.create nodeExecutable [| "-e"; script |]
+                let batches = ResizeArray<OperationOutput[]>()
+                let source = OperationCancellation.Source()
+
+                let context =
+                    OperationContext.createWithOutput "runtime-output-cancel" source.Cancellation ignore batches.Add
+
+                let running = run (NodeProcess.run request context)
+                let attempts = ref 0
+
+                while not (allEntries batches |> Array.exists (fun entry -> entry.Text = "line one"))
+                      && attempts.Value < 200 do
+                    do! run (Async.Sleep 50)
+                    attempts.Value <- attempts.Value + 1
+
+                source.Cancel()
+                let! result = running
+
+                match result with
+                | Failed failure -> Vitest.expect(failure.Category).toEqual Canceled
+                | Succeeded _
+                | PartiallySucceeded _ -> failwith "Expected the canceled process to fail."
+
+                let tail =
+                    stderrEntries batches
+                    |> Array.tryFind (fun entry -> entry.Text = "tail")
+
+                Vitest.expect(tail.IsSome && not tail.Value.IsPartial).toBe true
             }
         )
 )

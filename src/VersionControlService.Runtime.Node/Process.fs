@@ -19,6 +19,13 @@ type ProcessRequest = {
     Environment: (string * string)[]
     /// Stable progress phase code attached to parsed meter events.
     ProgressPhase: string
+    /// Also reads meter lines from stdout. Stderr is always read. Stdout is off by default because
+    /// plumbing output such as `status -z` is data. Only a few tools print meters there, such as
+    /// git-lfs with GIT_LFS_FORCE_PROGRESS.
+    ObserveStdoutProgress: bool
+    /// Also reports stdout to the context's output channel. Stderr always goes there when the context
+    /// has an output callback. Set it only for a call whose stdout is diagnostic text.
+    ReportStdoutOutput: bool
 }
 
 module ProcessRequest =
@@ -30,6 +37,8 @@ module ProcessRequest =
         StdinData = None
         Environment = [||]
         ProgressPhase = "process"
+        ObserveStdoutProgress = false
+        ReportStdoutOutput = false
     }
 
 type ProcessOutput = {
@@ -110,16 +119,38 @@ let progressMeterCompletedTotal (meter: ProgressMeter) =
     | Some(_, 1) -> None
     | _ -> Some(meter.Percent, 100.0)
 
-let private reportProgressMeter (phaseCode: string) (context: OperationContext) (meter: ProgressMeter) =
+/// The progress event of a parsed meter under the given phase code. The display text is redacted.
+let progressOfMeter (phaseCode: string) (meter: ProgressMeter) : OperationProgress =
     let completedTotal = progressMeterCompletedTotal meter
 
-    context.ReportProgress {
+    {
         PhaseCode = phaseCode
         Item = None
         Completed = completedTotal |> Option.map fst
         Total = completedTotal |> Option.map snd
         DisplayMessage = Some(Redaction.redact (formatProgressMeter meter))
     }
+
+let private reportProgressMeter (phaseCode: string) (context: OperationContext) (meter: ProgressMeter) =
+    context.ReportProgress(progressOfMeter phaseCode meter)
+
+let private lineWithTerminatorPattern = Regex(@"[^\r\n]*(?:\r\n|\r|\n|$)")
+
+/// Removes every line that tryParseProgressMeter accepts, with its terminator, so each CR-separated
+/// redraw of a meter goes. The other lines keep their text and terminators. A failure message built
+/// from a transfer that printed meters uses this, because a meter line says nothing about the cause.
+let dropProgressMeterLines (text: string) : string =
+    if String.IsNullOrEmpty text then
+        text
+    else
+        lineWithTerminatorPattern.Replace(
+            text,
+            MatchEvaluator(fun matched ->
+                if (tryParseProgressMeter matched.Value).IsSome then
+                    String.Empty
+                else
+                    matched.Value)
+        )
 
 let createMeterObserver (reportLine: string -> unit) =
     let pending = System.Text.StringBuilder()
@@ -166,7 +197,9 @@ let killProcessTree (pid: int) : unit =
 
 /// Runs a child process under the operation context. On cancellation, it terminates
 /// the process tree and returns a canceled failure with StateChanged = false.
-/// Parsed progress meter lines are redacted before progress reporting.
+/// Parsed progress meter lines are redacted before progress reporting. When the context has an output
+/// callback, the call also reports its header and output lines there, and the host has them before the
+/// result is returned.
 let run (request: ProcessRequest) (context: OperationContext) : Async<OperationResult<ProcessOutput>> =
     Async.FromContinuations(fun (resolve, _, _) ->
         if context.Cancellation.IsCancellationRequested() then
@@ -189,11 +222,28 @@ let run (request: ProcessRequest) (context: OperationContext) : Async<OperationR
             let mutable exited = false
             let mutable exitCode = -1
 
+            // The channel exists only when the host asked for output, so a plain call computes nothing here.
+            let commandOutput =
+                OutputReporter.tryOf context
+                |> Option.map (fun channel ->
+                    OutputReporter.beginCommand
+                        channel
+                        request.Command
+                        request.Arguments
+                        request.Arguments
+                        request.Environment
+                        request.ReportStdoutOutput)
+
+            // Every path that ends the call finishes the output first, so the host has it before the result.
+            let finishOutput () =
+                commandOutput |> Option.iter (fun output -> output.Finish())
+
             let child: obj =
                 try
                     childProcessModule?spawn (request.Command, request.Arguments, options)
                 with error ->
                     finished <- true
+                    finishOutput ()
 
                     resolve (
                         OperationResult.failed (
@@ -217,23 +267,35 @@ let run (request: ProcessRequest) (context: OperationContext) : Async<OperationR
                     tryParseProgressMeter line
                     |> Option.iter (reportProgressMeter request.ProgressPhase context)
 
-                let observeStderr, flushStderr = createMeterObserver reportLine
+                // One observer per stream, so a chunk of one stream never lands inside a split line of the other.
+                let observeStdoutMeters, flushStdout = createMeterObserver reportLine
+                let observeStderrMeters, flushStderr = createMeterObserver reportLine
+
+                let observeStdout (text: string) =
+                    if request.ObserveStdoutProgress then
+                        observeStdoutMeters text
+
+                    commandOutput |> Option.iter (fun output -> output.ObserveStdout text)
+
+                let observeStderr (text: string) =
+                    observeStderrMeters text
+                    commandOutput |> Option.iter (fun output -> output.ObserveStderr text)
 
                 let observeStream
                     (stream: obj)
                     (decoder: obj)
                     (buffer: System.Text.StringBuilder)
-                    (observeProgress: (string -> unit) option)
+                    (observe: string -> unit)
                     =
                     if not (isNull stream) then
                         stream?on ("data", fun (data: obj) ->
                             let text = Interop.decodeUtf8Chunk decoder data
                             buffer.Append text |> ignore
-                            observeProgress |> Option.iter (fun observe -> observe text))
+                            observe text)
                         |> ignore
 
-                observeStream child?stdout stdoutDecoder stdout None
-                observeStream child?stderr stderrDecoder stderr (Some observeStderr)
+                observeStream child?stdout stdoutDecoder stdout observeStdout
+                observeStream child?stderr stderrDecoder stderr observeStderr
 
                 child?on ("exit", fun (code: obj) ->
                     exited <- true
@@ -243,6 +305,7 @@ let run (request: ProcessRequest) (context: OperationContext) : Async<OperationR
                 child?on ("error", fun (error: obj) ->
                     if not finished then
                         finished <- true
+                        finishOutput ()
 
                         resolve (
                             OperationResult.failed (
@@ -259,6 +322,8 @@ let run (request: ProcessRequest) (context: OperationContext) : Async<OperationR
                         finished <- true
 
                         if canceled then
+                            finishOutput ()
+
                             resolve (
                                 OperationResult.canceled "The operation was canceled and its process tree terminated."
                             )
@@ -273,13 +338,18 @@ let run (request: ProcessRequest) (context: OperationContext) : Async<OperationR
                                     buffer.Append tail |> ignore
                                 tail
 
-                            finishStream stdoutDecoder stdout |> ignore
+                            let stdoutTail = finishStream stdoutDecoder stdout
                             let stderrTail = finishStream stderrDecoder stderr
+
+                            if not (String.IsNullOrEmpty stdoutTail) then
+                                observeStdout stdoutTail
 
                             if not (String.IsNullOrEmpty stderrTail) then
                                 observeStderr stderrTail
 
+                            flushStdout ()
                             flushStderr ()
+                            finishOutput ()
 
                             resolve (
                                 OperationResult.succeeded {

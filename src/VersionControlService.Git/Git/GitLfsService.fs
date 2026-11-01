@@ -17,6 +17,7 @@ module GitCredentialStrategy = VersionControlService.Git.GitCredentialStrategy
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodePath = VersionControlService.Runtime.Node.Path
 module NodeProcess = VersionControlService.Runtime.Node.Process
+module NodeOutput = VersionControlService.Runtime.Node.OutputReporter
 
 /// Default timeout for interactive Git LFS commands launched by the service process.
 [<Literal>]
@@ -91,6 +92,27 @@ let tryFindLsFileInfoByRelativePath (filesByRelativePath: Dictionary<string, Git
                 None
         )
 
+/// Builds the lookup of tryFindLsFileInfoByRelativePath once, for many paths. An exact key wins, and
+/// otherwise the first listed path that equals the request ignoring case does, as pathsEqual decides.
+let createListingLookup (filesByRelativePath: Dictionary<string, GitLfsLsFileInfo>) : string -> GitLfsLsFileInfo option =
+    let byComparisonKey = Dictionary<string, GitLfsLsFileInfo>()
+
+    for entry in filesByRelativePath do
+        let comparisonKey = PathHelpers.normalizeForComparison entry.Key
+
+        if not (byComparisonKey.ContainsKey comparisonKey) then
+            byComparisonKey[comparisonKey] <- entry.Value
+
+    fun relativePath ->
+        let normalizedPath = PathHelpers.normalizeSeparators relativePath
+
+        match filesByRelativePath.TryGetValue normalizedPath with
+        | true, info -> Some info
+        | false, _ ->
+            match byComparisonKey.TryGetValue(PathHelpers.normalizeForComparison normalizedPath) with
+            | true, info -> Some info
+            | false, _ -> None
+
 let buildLsFilesJsonArgs () = [| "lfs"; "ls-files"; "-j" |]
 
 /// Chooses the most useful text from a Git LFS adapter result for user-facing errors.
@@ -113,6 +135,24 @@ let isMissingOnRemote (output: string) =
     && (output.IndexOf("does not exist on the server", StringComparison.OrdinalIgnoreCase) >= 0
         || output.IndexOf("remote missing object", StringComparison.OrdinalIgnoreCase) >= 0
         || Regex.IsMatch(output, @"\[[0-9a-f]{64}\][^\r\n]*\[404\]"))
+
+/// Object ids that fetch output reports as missing on the remote. A line counts when
+/// isMissingOnRemote accepts it, and every 64-digit hex token on it is an id.
+let missingOnRemoteObjectIds (output: string) : Set<string> =
+    let isHexDigit (character: char) =
+        (character >= '0' && character <= '9') || (character >= 'a' && character <= 'f')
+
+    if String.IsNullOrWhiteSpace output then
+        Set.empty
+    else
+        output.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
+        |> Array.filter isMissingOnRemote
+        |> Array.collect (fun line ->
+            line
+            |> String.map (fun character -> if isHexDigit character then character else ' ')
+            |> fun hexOnly -> hexOnly.Split([| ' ' |], StringSplitOptions.RemoveEmptyEntries)
+            |> Array.filter (fun token -> token.Length = 64))
+        |> Set.ofArray
 
 let private redactDiagnosticText (text: string) =
     if String.IsNullOrWhiteSpace text then
@@ -171,6 +211,7 @@ let private requireGitLfsForLiteralPolicy (repoPath: string) : JS.Promise<Result
             StandardInput = None
             CancelCheck = None
             TimeoutMs = Some DefaultTimeoutMs
+            Output = None
         }
 
     return
@@ -211,6 +252,7 @@ let tryGetLfsEndpoint (repoPath: string) : JS.Promise<string option> = promise {
             StandardInput = None
             CancelCheck = None
             TimeoutMs = Some DefaultTimeoutMs
+            Output = None
         }
 
     if result.ExitCode <> 0 || result.TimedOut then
@@ -229,6 +271,7 @@ let tryHasStandaloneTransferAgent (repoPath: string) : JS.Promise<bool> = promis
                 StandardInput = None
                 CancelCheck = None
                 TimeoutMs = Some 5000
+                Output = None
             }
 
         return result.ExitCode = 0 && not result.TimedOut && not (String.IsNullOrWhiteSpace result.StdoutText)
@@ -933,14 +976,14 @@ let readLsFilesByRelativePath
         try
             let! commandResult =
                 runGitCapturedWithOutput
-                    (fun _ ->
+                    (OutputObservers.both (fun _ ->
                         context.ReportProgress {
                             PhaseCode = "lfs-list-transfer"
                             Item = None
                             Completed = Some 0.0
                             Total = None
                             DisplayMessage = None
-                        })
+                        }))
                     {
                     WorkingDirectory = Some normalizedRepoRoot
                     Arguments = buildLsFilesJsonArgs ()
@@ -948,6 +991,8 @@ let readLsFilesByRelativePath
                     StandardInput = None
                     CancelCheck = Some context.Cancellation.IsCancellationRequested
                     TimeoutMs = None
+                    // The listing is JSON data, so only stderr reaches the output channel.
+                    Output = NodeOutput.OutputTarget.ofContext context
                 }
 
             if commandResult.ExitCode <> 0 || commandResult.TimedOut then
@@ -1025,7 +1070,7 @@ let storageDedupArgs = [| "lfs"; "dedup" |]
 
 /// git-lfs has no working escape for these characters.
 /// The root-anchored pattern can also match a few files whose names differ only at special characters.
-/// A download checks for such files with pathPatternMatchesOtherListedPath.
+/// A download checks for such files with pathPatternMatchesIndexedPath.
 let lfsPathPattern (path: string) : string =
     let pattern =
         path
@@ -1036,18 +1081,13 @@ let lfsPathPattern (path: string) : string =
 
     "/" + pattern
 
-/// Tells whether a pattern from lfsPathPattern matches a repository path. A `?` matches one
-/// character other than `/`, and every other character matches itself. The leading `/` anchors
-/// the pattern at the root. The comparison ignores case, and a pattern that matches a directory
-/// also matches the files below it. Both err toward reporting a match, which only costs the
-/// caller the slower exact-object download.
-let lfsPathPatternMatches (pattern: string) (path: string) : bool =
-    let body =
-        (if pattern.StartsWith("/", StringComparison.Ordinal) then pattern.Substring 1 else pattern)
-            .ToLowerInvariant()
+/// The pattern without its leading `/`, in lower case.
+let private lfsPatternBody (pattern: string) : string =
+    (if pattern.StartsWith("/", StringComparison.Ordinal) then pattern.Substring 1 else pattern)
+        .ToLowerInvariant()
 
-    let candidate = (PathHelpers.normalizeSeparators path).ToLowerInvariant()
-
+/// The matching of lfsPathPatternMatches on a pattern body and a path that are both in lower case.
+let private lfsPathPatternMatchesLowered (body: string) (candidate: string) : bool =
     let rec matchesFrom index =
         if index = body.Length then
             true
@@ -1063,27 +1103,71 @@ let lfsPathPatternMatches (pattern: string) (path: string) : bool =
     && matchesFrom 0
     && (candidate.Length = body.Length || candidate.[body.Length] = '/')
 
-/// Tells whether the path pattern of `relativePath` also matches another path in the LFS listing.
-let pathPatternMatchesOtherListedPath
-    (filesByRelativePath: Dictionary<string, GitLfsLsFileInfo>)
-    (relativePath: string)
-    : bool =
-    let pattern = lfsPathPattern relativePath
-    let normalizedPath = PathHelpers.normalizeSeparators relativePath
+/// Tells whether a pattern from lfsPathPattern matches a repository path. A `?` matches one
+/// character other than `/`, and every other character matches itself. The leading `/` anchors
+/// the pattern at the root. The comparison ignores case, and a pattern that matches a directory
+/// also matches the files below it. Both err toward reporting a match, which only costs the
+/// caller the slower exact-object download.
+let lfsPathPatternMatches (pattern: string) (path: string) : bool =
+    lfsPathPatternMatchesLowered (lfsPatternBody pattern) ((PathHelpers.normalizeSeparators path).ToLowerInvariant())
 
-    filesByRelativePath.Keys
-    |> Seq.exists (fun listedPath ->
-        not (String.Equals(listedPath, normalizedPath, StringComparison.Ordinal))
-        && lfsPathPatternMatches pattern listedPath)
+/// Lower-case views of listed paths. They are built once, so that many paths can ask whether their
+/// pattern matches a listed path without scanning the listing each time.
+type ListedPathIndex = {
+    /// Every listed path, in listing order.
+    LowerPaths: string[]
+    LowerPathSet: HashSet<string>
+    /// Every directory above a listed path.
+    LowerDirectories: HashSet<string>
+}
 
-let buildFetchRefetchArgs (dryRun: bool) (relativePath: string) =
+/// Indexes the listed paths that a pattern may match. A caller leaves out the paths it asks about, so that
+/// a path never matches itself.
+let createListedPathIndex (listedPaths: string seq) : ListedPathIndex =
+    let lowerPaths =
+        listedPaths
+        |> Seq.map (fun listedPath -> (PathHelpers.normalizeSeparators listedPath).ToLowerInvariant())
+        |> Seq.toArray
+
+    let directories = HashSet<string>()
+
+    for lowerPath in lowerPaths do
+        let mutable separator = lowerPath.IndexOf '/'
+
+        while separator >= 0 do
+            directories.Add(lowerPath.Substring(0, separator)) |> ignore
+            separator <- lowerPath.IndexOf('/', separator + 1)
+
+    {
+        LowerPaths = lowerPaths
+        LowerPathSet = HashSet<string>(lowerPaths)
+        LowerDirectories = directories
+    }
+
+/// Tells whether the path pattern of `relativePath` also matches a path of the index. Only a path with a
+/// character that lfsPathPattern turns into a wildcard needs the scan. Any other pattern matches a
+/// listed path that equals it, or lies below it as a directory, ignoring case.
+let pathPatternMatchesIndexedPath (index: ListedPathIndex) (relativePath: string) : bool =
+    let body = lfsPatternBody (lfsPathPattern relativePath)
+
+    if relativePath.IndexOfAny([| '*'; '?'; '['; ']'; '{'; '}'; ',' |]) >= 0 then
+        index.LowerPaths |> Array.exists (fun lowerPath -> lfsPathPatternMatchesLowered body lowerPath)
+    else
+        index.LowerPathSet.Contains body || index.LowerDirectories.Contains body
+
+/// The fixed arguments of a refetch. The comma-joined include patterns of lfsPathPattern follow them.
+let buildFetchRefetchArgsForPaths (dryRun: bool) (relativePaths: string[]) =
     let dryRunArguments = if dryRun then [| "--dry-run" |] else [||]
+    let includePatterns = relativePaths |> Array.map lfsPathPattern |> String.concat ","
 
     Array.concat [|
         [| "lfs"; "fetch"; "--refetch" |]
         dryRunArguments
-        [| $"--include={lfsPathPattern relativePath}"; "origin"; "HEAD" |]
+        [| $"--include={includePatterns}"; "origin"; "HEAD" |]
     |]
+
+let buildFetchRefetchArgs (dryRun: bool) (relativePath: string) =
+    buildFetchRefetchArgsForPaths dryRun [| relativePath |]
 
 /// A configured lfs.fetchexclude wins over --include, so the fetch clears it. The override goes
 /// through git's GIT_CONFIG_COUNT variables (git 2.31 or newer), which git-lfs reads as config.
@@ -1111,6 +1195,16 @@ let dryRunCoversObject (output: string) (oid: string) : bool =
     output.Split '\n'
     |> Array.exists (fun line -> line.Trim().StartsWith(prefix, StringComparison.Ordinal))
 
+/// The text of a failed dry run without its listing lines. A listing line holds an object id and a
+/// path, and either can contain a word that the failure classification reads as the cause. A text with
+/// nothing but listing lines stays as it is, so the failure keeps a message.
+let dropDryRunListingLines (text: string) : string =
+    let remaining =
+        text.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
+        |> Array.filter (fun line -> not (Regex.IsMatch(line, @"^\s*fetch [0-9a-f]{64} => ")))
+
+    if remaining.Length = 0 then text else String.concat "\n" remaining
+
 let private buildSmudgePointerArgs (relativePath: string) = [|
     "-c"
     "lfs.fetchinclude="
@@ -1127,27 +1221,35 @@ let private buildPointerInput (listing: GitLfsLsFileInfo) =
 
     $"version {listing.version}\noid {listing.``oid_type``}:{listing.oid}\nsize {sizeText}\n"
 
-let private buildDownloadObjectArgs (relativePath: string) = [|
-    "-c"
-    "lfs.fetchrecentalways=false"
-    "lfs"
-    "fetch"
-    $"--include={lfsPathPattern relativePath}"
-    "origin"
-    "HEAD"
-|]
+/// git-lfs reads one comma-separated list from --include and keeps only the last of repeated
+/// flags. lfsPathPattern never leaves a comma in a pattern, so joining the patterns is safe.
+let buildDownloadObjectArgs (relativePaths: string[]) =
+    let includePatterns = relativePaths |> Array.map lfsPathPattern |> String.concat ","
+
+    [|
+        "-c"
+        "lfs.fetchrecentalways=false"
+        "lfs"
+        "fetch"
+        $"--include={includePatterns}"
+        "origin"
+        "HEAD"
+    |]
 
 let private extractSpawnFailureMessage (result: GitSpawnResult) =
+    // Forced progress puts meter lines into either stream, and they say nothing about the cause.
     let stderrText =
         result.StderrText
         |> Option.ofObj
         |> Option.defaultValue String.Empty
+        |> NodeProcess.dropProgressMeterLines
         |> _.Trim()
 
     let stdoutText =
         result.StdoutText
         |> Option.ofObj
         |> Option.defaultValue String.Empty
+        |> NodeProcess.dropProgressMeterLines
         |> _.Trim()
 
     if result.TimedOut then
@@ -1162,26 +1264,138 @@ let private extractSpawnFailureMessage (result: GitSpawnResult) =
     else
         "Git command failed."
 
-let buildCheckoutArgs (relativePath: string) = [| "lfs"; "checkout"; "--"; lfsPathPattern relativePath |]
+let private indexUpdateFailureMarker = "Error updating the Git index"
 
-// Checkout has no timeout or cancellation because git-lfs holds the index lock while it refreshes the index.
-// Stopping it midway leaves a stale lock and a checked-out file.
-let checkoutPath (repoPath: string) (relativePath: string) : JS.Promise<Result<unit, exn>> = promise {
+/// True when the text carries the index error of a `git lfs checkout`. The failure mapping of the batch
+/// callers reads it to tell that git-lfs wrote its files before it failed.
+let internal mentionsIndexUpdateFailure (text: string) : bool =
+    not (isNull text) && text.IndexOf(indexUpdateFailureMarker, StringComparison.Ordinal) >= 0
+
+/// The error text of a `git lfs checkout` that wrote its files but could not update the Git index.
+/// With a held index.lock, git-lfs 3.7.0 prints "Error updating the Git index:" to stderr and still exits
+/// with 0. The files then read as modified and the lock stays, so the exit code alone reports success for
+/// a failed run. The error stream is read before the output stream, and meter lines are dropped from both.
+let lfsCheckoutIndexUpdateFailed (stdout: string) (stderr: string) : string option =
+    [| stderr; stdout |]
+    |> Array.tryPick (fun stream ->
+        let text =
+            stream
+            |> Option.ofObj
+            |> Option.defaultValue String.Empty
+            |> NodeProcess.dropProgressMeterLines
+            |> _.Trim()
+
+        if mentionsIndexUpdateFailure text then Some text else None)
+
+/// The arguments that ask Git for the path of the index lock. Every lookup of a held lock uses them,
+/// whichever runner executes them.
+let internal heldIndexLockArguments = [| "rev-parse"; "--git-path"; "index.lock" |]
+
+/// The path of the index lock when its file exists. `gitPathOutput` is the stdout of
+/// `heldIndexLockArguments` run in `repoPath`, and a relative answer is relative to it.
+let internal heldIndexLockPath (repoPath: string) (gitPathOutput: string) : string option =
+    let rawPath = gitPathOutput |> Option.ofObj |> Option.defaultValue String.Empty |> _.Trim()
+
+    if String.IsNullOrWhiteSpace rawPath then
+        None
+    else
+        let lockPath = NodePath.resolve [| repoPath; rawPath |]
+
+        if NodeFileSystem.existsSync lockPath then Some lockPath else None
+
+/// Looks for a held index lock through Git, so a linked worktree reports its own lock path. The lookup
+/// has no cancellation, because it runs after a checkout that a cancel could not stop. A lookup that
+/// fails finds nothing.
+let internal tryFindHeldIndexLock (repoPath: string) : JS.Promise<string option> = promise {
     let! result =
         runGitCaptured {
             WorkingDirectory = Some repoPath
-            Arguments = buildCheckoutArgs relativePath
+            Arguments = heldIndexLockArguments
             Environment = None
             StandardInput = None
             CancelCheck = None
-            TimeoutMs = None
+            TimeoutMs = Some DefaultTimeoutMs
+            Output = None
         }
 
     return
         if result.ExitCode = 0 && not result.TimedOut then
-            Ok()
+            heldIndexLockPath repoPath result.StdoutText
         else
-            Error(exn (extractSpawnFailureMessage result))
+            None
+}
+
+/// The same lookup through the git runner of the caller, which also applies the context of the caller.
+/// A lookup that fails finds nothing.
+let internal tryFindHeldIndexLockWith
+    (runGit: string[] -> Async<Result<NodeProcess.ProcessOutput, OperationFailure>>)
+    (repoPath: string)
+    : Async<string option> =
+    async {
+        let! result = runGit heldIndexLockArguments
+
+        match result with
+        | Ok output when output.ExitCode = 0 -> return heldIndexLockPath repoPath output.StdOut
+        | _ -> return None
+    }
+
+/// Git-lfs ends its index error without the lock message of Git, so the text alone does not name the
+/// lock. With a held lock, the text gets that message in Git's words, which the failure mapping of the
+/// callers reads to report the lock.
+let internal withHeldIndexLockMessage (text: string) (lockPath: string option) : string =
+    match lockPath with
+    | Some path -> $"{text}\nfatal: Unable to create '{path}': File exists."
+    | None -> text
+
+/// The fixed arguments of `git lfs checkout`. The patterns of lfsPathPattern follow them.
+let checkoutArgsPrefix = [| "lfs"; "checkout"; "--" |]
+
+let buildCheckoutArgs (relativePath: string) =
+    Array.append checkoutArgsPrefix [| lfsPathPattern relativePath |]
+
+/// Output observers that report the meters of both streams as progress under one phase code. The
+/// returned function flushes their line buffers once the process has ended.
+let internal createPhaseMeterOutput
+    (phaseCode: string)
+    (reportProgress: OperationProgress -> unit)
+    : OutputObservers * (unit -> unit) =
+    OutputObservers.meters (fun line ->
+        NodeProcess.tryParseProgressMeter line
+        |> Option.iter (NodeProcess.progressOfMeter phaseCode >> reportProgress))
+
+// Checkout has no timeout or cancellation because git-lfs holds the index lock while it refreshes the index.
+// Stopping it midway leaves a stale lock and a checked-out file.
+let checkoutPatterns
+    (repoPath: string)
+    (patterns: string[])
+    (reportProgress: OperationProgress -> unit)
+    (outputTarget: NodeOutput.OutputTarget option)
+    : JS.Promise<Result<unit, exn>> = promise {
+    let output, flushOutput = createPhaseMeterOutput "lfs-materialize-checkout" reportProgress
+
+    let! result =
+        runGitCapturedWithOutput output {
+            WorkingDirectory = Some repoPath
+            Arguments = Array.append checkoutArgsPrefix patterns
+            Environment = Some(withForcedLfsProgress (createNonInteractiveEnv ()))
+            StandardInput = None
+            CancelCheck = None
+            TimeoutMs = None
+            // The stdout of `lfs checkout` is its transfer summary, so it is diagnostic text.
+            Output = NodeOutput.OutputTarget.withStdout outputTarget
+        }
+
+    flushOutput ()
+
+    if result.ExitCode = 0 && not result.TimedOut then
+        match lfsCheckoutIndexUpdateFailed result.StdoutText result.StderrText with
+        | None -> return Ok()
+        | Some text when text.IndexOf("index.lock", StringComparison.Ordinal) >= 0 -> return Error(exn text)
+        | Some text ->
+            let! heldLock = tryFindHeldIndexLock repoPath
+            return Error(exn (withHeldIndexLockMessage text heldLock))
+    else
+        return Error(exn (extractSpawnFailureMessage result))
 }
 
 let private resolvePushRefSpec
@@ -1426,7 +1640,7 @@ let private createMaintenanceOutputObserver (progressCallback: (GitProgressDto -
                 })
         | None -> ()
 
-    NodeProcess.createMeterObserver reportLine
+    OutputObservers.meters reportLine
 
 /// Runs a maintenance command with authentication and streams its real process progress.
 /// `onStarted` fires only after the child process can observe cancellation.
@@ -1451,6 +1665,7 @@ let internal runAuthenticatedMaintenance
                     StandardInput = None
                     CancelCheck = Some cancelCheck
                     TimeoutMs = None
+                    Output = None
                 }
 
         flushOutput ()
@@ -1462,13 +1677,14 @@ let internal runAuthenticatedMaintenance
                 Error(exn (extractSpawnFailureMessage result))
     }
 
-let fetchRefetchForPath
+let fetchRefetchForPaths
     (repoPath: string)
     (commandAuth: GitCommandAuthentication)
-    (relativePath: string)
+    (relativePaths: string[])
     (dryRun: bool)
     (cancelCheck: (unit -> bool) option)
     (onStarted: unit -> unit)
+    (outputTarget: NodeOutput.OutputTarget option)
     : JS.Promise<Result<string, exn>> =
     promise {
         let! result =
@@ -1479,11 +1695,13 @@ let fetchRefetchForPath
                     Arguments =
                         GitCredentialStrategy.buildLfsTransferArguments
                             commandAuth.ConfigArgs
-                            (buildFetchRefetchArgs dryRun relativePath)
+                            (buildFetchRefetchArgsForPaths dryRun relativePaths)
                     Environment = Some(withFetchExcludeCleared commandAuth.Environment)
                     StandardInput = None
                     CancelCheck = cancelCheck
                     TimeoutMs = None
+                    // The stdout of the dry run is a listing of objects, so only stderr is reported.
+                    Output = outputTarget
                 }
 
         return
@@ -1501,42 +1719,59 @@ let fetchRefetchForPath
                     else
                         outputMessage
 
-                Error(exn failureMessage)
+                Error(exn (if dryRun then dropDryRunListingLines failureMessage else failureMessage))
     }
 
-/// Downloads the object of `listing` into the local cache.
-/// By default one fetch of the path pattern downloads it. The pattern can also match files whose
-/// names differ from the requested one only at special characters. For those, `exactObjectOnly`
-/// switches to `git lfs smudge`, which downloads only the object named in the pointer on stdin.
-let downloadObjectFromListing
+/// Chooses how downloadObjects fetches objects into the local cache.
+type ObjectDownload =
+    /// One fetch for the path patterns of these paths.
+    | FetchPaths of relativePaths: string[]
+    /// One `git lfs smudge` for the object named by the listing. A fetch of the path pattern also
+    /// downloads files whose names differ from the requested one only at special characters,
+    /// and the smudge takes just this object.
+    | SmudgeObject of relativePath: string * listing: GitLfsLsFileInfo
+
+/// Downloads objects into the local cache.
+let downloadObjects
     (repoPath: string)
     (commandAuth: GitCommandAuthentication)
-    (relativePath: string)
-    (listing: GitLfsLsFileInfo)
-    (exactObjectOnly: bool)
+    (download: ObjectDownload)
     (cancelCheck: (unit -> bool) option)
+    (reportProgress: OperationProgress -> unit)
     (onStarted: unit -> unit)
+    (outputTarget: NodeOutput.OutputTarget option)
     : JS.Promise<Result<unit, exn>> =
     promise {
         let transferEnvironment = withFetchExcludeCleared commandAuth.Environment
 
-        let arguments, standardInput, environment =
-            if exactObjectOnly then
+        // Only the fetch reports meters. The smudge moves a single object, and its stdout holds the file content.
+        let arguments, standardInput, environment, (output, flushOutput), spawnOutput =
+            match download with
+            | SmudgeObject(relativePath, listing) ->
                 buildSmudgePointerArgs relativePath,
                 Some(buildPointerInput listing),
-                withLfsSmudgeEnabled transferEnvironment
-            else
-                buildDownloadObjectArgs relativePath, None, transferEnvironment
+                withLfsSmudgeEnabled transferEnvironment,
+                (OutputObservers.none, ignore),
+                outputTarget
+            | FetchPaths relativePaths ->
+                buildDownloadObjectArgs relativePaths,
+                None,
+                withForcedLfsProgress transferEnvironment,
+                createPhaseMeterOutput "lfs-materialize-transfer" reportProgress,
+                NodeOutput.OutputTarget.withStdout outputTarget
 
         let! result =
-            runGitDiscardingStdoutWithStarted onStarted {
+            runGitDiscardingStdoutWithStartedAndOutput onStarted output {
                 WorkingDirectory = Some repoPath
                 Arguments = GitCredentialStrategy.buildLfsTransferArguments commandAuth.ConfigArgs arguments
                 Environment = Some environment
                 StandardInput = standardInput
                 CancelCheck = cancelCheck
                 TimeoutMs = None
+                Output = spawnOutput
             }
+
+        flushOutput ()
 
         return
             if result.ExitCode = 0 && not result.TimedOut then
@@ -1574,6 +1809,7 @@ let private filterResolvableRemoteTipIds
                     StandardInput = Some(String.concat "\n" [| yield! distinctRemoteTipIds; yield "" |])
                     CancelCheck = None
                     TimeoutMs = Some DefaultTimeoutMs
+                    Output = None
                 }
 
             if batchCheckResult.ExitCode <> 0 then
@@ -1673,6 +1909,7 @@ let private tryGetOptimizedLfsObjectIds
                 StandardInput = Some(buildRevListStandardInput refSpec remoteTipIds)
                 CancelCheck = None
                 TimeoutMs = Some DefaultTimeoutMs
+                Output = None
             }
 
         if revListResult.ExitCode <> 0 then
@@ -1696,6 +1933,7 @@ let private tryGetOptimizedLfsObjectIds
                         StandardInput = Some(String.concat "\n" [| yield! candidateBlobIds; yield "" |])
                         CancelCheck = None
                         TimeoutMs = Some DefaultTimeoutMs
+                        Output = None
                     }
 
                 if catFileResult.ExitCode <> 0 then
@@ -1733,6 +1971,7 @@ let private getOutboundObjectIdsFromRemoteTips
                 StandardInput = Some(buildRevListStandardInput refSpec remoteTipIds)
                 CancelCheck = None
                 TimeoutMs = Some DefaultTimeoutMs
+                Output = None
             }
 
         if revListResult.ExitCode = 0 then
@@ -1856,6 +2095,7 @@ let uploadObjects
     (remoteName: string)
     (refSpec: string)
     (lfsObjectIds: string[])
+    (outputTarget: NodeOutput.OutputTarget option)
     : JS.Promise<Result<unit, exn>> =
     promise {
         if lfsObjectIds.Length = 0 then
@@ -1866,10 +2106,7 @@ let uploadObjects
             // stdout is a pipe, so request live progress explicitly. Git LFS otherwise
             // suppresses updates and its asynchronous final summary can race process exit.
             // Keep this override local to the upload without changing the caller's auth env.
-            let uploadEnvironment: obj =
-                Fable.Core.JsInterop.emitJsExpr
-                    commandAuth.Environment
-                    "({ ...$0, GIT_LFS_FORCE_PROGRESS: '1' })"
+            let uploadEnvironment = withForcedLfsProgress commandAuth.Environment
 
             let! exactUploadResult =
                 runSpawnedGit {
@@ -1882,6 +2119,8 @@ let uploadObjects
                     StandardInput = Some(String.concat "\n" [| yield! lfsObjectIds; yield "" |])
                     CancelCheck = Some cancelCheck
                     TimeoutMs = None
+                    // The stdout of `lfs push` is its transfer summary, so it is diagnostic text.
+                    Output = NodeOutput.OutputTarget.withStdout outputTarget
                 }
 
             if exactUploadResult.ExitCode = 0 then
@@ -1901,6 +2140,7 @@ let uploadObjects
                             StandardInput = None
                             CancelCheck = Some cancelCheck
                             TimeoutMs = None
+                            Output = NodeOutput.OutputTarget.withStdout outputTarget
                         }
 
                     return

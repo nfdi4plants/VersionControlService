@@ -85,6 +85,9 @@ let private buffersEqual (_left: obj) (_right: obj) : bool = jsNative
 """)>]
 let private observeGitSpawnArguments (_observed: ResizeArray<string[]>) : unit -> unit = jsNative
 
+[<Emit("process.execPath")>]
+let private nodeExecutablePath: string = jsNative
+
 /// The git subcommand of a spawn, skipping global options such as `-c key=value`.
 let private gitSubcommand (arguments: string[]) =
     let rec find index =
@@ -482,6 +485,69 @@ let private createLfsConflictFixtureWithOptions
 
 let private createLfsConflictFixture () =
     createLfsConflictFixtureWithOptions GitWorkspaceSession.GitSessionHooks.none "tracked.xlsx" None [||]
+
+/// Picks the workspace candidate of an LFS conflict while every `git lfs checkout` ends with the text that
+/// git-lfs 3.7.0 prints when the index lock is held, and exits with 0. With `createLock`, the checkout also
+/// creates the lock file, which the text does not name. Returns the result of the pick and whether the lock exists.
+let private pickLfsConflictWithIndexError (createLock: bool) (operationName: string) = promise {
+    let hooks: GitWorkspaceSession.GitSessionHooks = {
+        GitWorkspaceSession.GitSessionHooks.none with
+            RunProcess =
+                Some(fun request processContext ->
+                    async {
+                        if request.Arguments.Length >= 2 && request.Arguments[0] = "lfs" && request.Arguments[1] = "checkout" then
+                            if createLock then
+                                let workingDirectory = request.WorkingDirectory |> Option.defaultValue "."
+
+                                do!
+                                    writeUtf8FileAsync
+                                        (join [| workingDirectory; ".git"; "index.lock" |])
+                                        "held by another process\n"
+                                    |> Async.AwaitPromise
+
+                            return
+                                OperationResult.succeeded {
+                                    NodeProcess.ExitCode = 0
+                                    StdOut = ""
+                                    StdErr = "Error updating the Git index:\n\n\nErrors logged to 'x.log'."
+                                }
+                        else
+                            return! NodeProcess.run request processContext
+                    })
+    }
+
+    let! root, workPath, path, _, _, _, session = createLfsConflictFixtureWithOptions hooks "tracked.xlsx" None [||]
+
+    try
+        let conflicts = conflictService session
+        let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession(ctx $"{operationName}-session"))
+
+        let summary =
+            match expectValue "LFS conflict session" summaryResult with
+            | Some value -> value
+            | None -> failwith "Expected an active LFS conflict session."
+
+        let! status = sessionStatus session
+
+        let! resolveResult =
+            Async.StartAsPromise(
+                conflicts.Resolve
+                    {
+                        Handle = summary.Handle
+                        ExpectedWorkspaceVersion = status.WorkspaceVersion
+                        Path = mkPath path
+                        Resolution = PickCandidate "workspace"
+                    }
+                    (ctx $"{operationName}-pick")
+            )
+
+        let! lockExists = pathExistsAsync (join [| workPath; ".git"; "index.lock" |])
+        do! removeDirectoryAsync root
+        return resolveResult, lockExists
+    with error ->
+        do! removeDirectoryAsync root
+        return raise error
+}
 
 let private createModifyDeleteConflictFixture
     (hooks: GitWorkspaceSession.GitSessionHooks)
@@ -2676,6 +2742,53 @@ Vitest.describe (
                     with error ->
                         do! removeDirectoryAsync root
                         return raise error
+            }
+        )
+
+        Vitest.test (
+            "LFS pick reports the lock recovery when the checkout ends with success but could not update the index and a lock exists",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGitResultIn "." [| "lfs"; "version" |]
+
+                if lfsProbe.ExitCode <> 0 then
+                    Vitest.expect(true).toBe true
+                else
+                    let! resolveResult, lockExists = pickLfsConflictWithIndexError true "lfs-pick-index-error-lock"
+
+                    match resolveResult with
+                    | PartiallySucceeded(_, failure) ->
+                        Vitest.expect(failure.Code).toBe "object_materialization_failed"
+                        Vitest.expect(failure.StateChanged).toBe true
+                        Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "remove_index_lock")
+                    | Failed failure -> failwith $"Expected a partial result, received {failure.Category}/{failure.Code}."
+                    | Succeeded _ -> failwith "Expected the checkout that could not update the index to be reported."
+
+                    Vitest.expect(lockExists).toBe true
+            }
+        )
+
+        Vitest.test (
+            "LFS pick keeps the plain failure when the checkout ends with success but could not update the index and no lock exists",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGitResultIn "." [| "lfs"; "version" |]
+
+                if lfsProbe.ExitCode <> 0 then
+                    Vitest.expect(true).toBe true
+                else
+                    let! resolveResult, lockExists = pickLfsConflictWithIndexError false "lfs-pick-index-error-no-lock"
+
+                    match resolveResult with
+                    | PartiallySucceeded(_, failure) ->
+                        Vitest.expect(failure.Code).toBe "object_materialization_failed"
+                        Vitest.expect(failure.StateChanged).toBe true
+                        Vitest.expect(failure.Message.Contains "Error updating the Git index").toBe true
+                        Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "retry_materialization")
+                    | Failed failure -> failwith $"Expected a partial result, received {failure.Category}/{failure.Code}."
+                    | Succeeded _ -> failwith "Expected the checkout that could not update the index to be reported."
+
+                    Vitest.expect(lockExists).toBe false
             }
         )
 
@@ -5694,16 +5807,21 @@ Vitest.describe (
 
 let private unhydratedLfsContent = "large binary payload\n"
 
-let private isLfsPullRequest (request: NodeProcess.ProcessRequest) =
-    request.Arguments |> Array.contains "lfs" && request.Arguments |> Array.contains "pull"
+let private isLfsCommandRequest (command: string) (request: NodeProcess.ProcessRequest) =
+    request.Arguments
+    |> Array.windowed 2
+    |> Array.exists (fun pair -> pair[0] = "lfs" && pair[1] = command)
 
-/// An origin with one LFS file and a work clone that holds only its pointer, as after a
-/// clone with the large-object setting off. The work clone is level with its upstream.
-let private createUnhydratedLfsClone (hooks: GitWorkspaceSession.GitSessionHooks) = promise {
+let private isLfsPullRequest = isLfsCommandRequest "pull"
+let private isLfsFetchRequest = isLfsCommandRequest "fetch"
+let private isLfsCheckoutRequest = isLfsCommandRequest "checkout"
+
+/// A temporary directory with a bare origin at origin.git that holds the LFS files. The objects of
+/// the files in `lostFiles` are deleted from the origin afterwards, like objects that the server lost.
+let private createLfsOrigin (files: (string * string) list) (lostFiles: string list) = promise {
     let! root = createTempDirectoryAsync ()
     let barePath = join [| root; "origin.git" |]
     let sourcePath = join [| root; "source" |]
-    let workPath = join [| root; "work" |]
     let! _ = runGitIn root [| "init"; "--bare"; "-b"; "main"; barePath |]
     let! _ = runGitIn root [| "init"; "-b"; "main"; sourcePath |]
     let! _ = runGitIn sourcePath [| "config"; "user.name"; "VCS Sync Tests" |]
@@ -5711,11 +5829,38 @@ let private createUnhydratedLfsClone (hooks: GitWorkspaceSession.GitSessionHooks
     let! _ = runGitIn sourcePath [| "config"; "core.autocrlf"; "false" |]
     let! _ = runGitIn sourcePath [| "lfs"; "install"; "--local" |]
     let! _ = runGitIn sourcePath [| "lfs"; "track"; "*.bin" |]
-    do! writeUtf8FileAsync (join [| sourcePath; "large.bin" |]) unhydratedLfsContent
+
+    for name, content in files do
+        do! writeUtf8FileAsync (join [| sourcePath; name |]) content
+
     let! _ = runGitIn sourcePath [| "add"; "-A" |]
     let! _ = runGitIn sourcePath [| "commit"; "-m"; "init: lfs base" |]
     let! _ = runGitIn sourcePath [| "remote"; "add"; "origin"; barePath |]
     let! _ = runGitIn sourcePath [| "push"; "-u"; "origin"; "main" |]
+
+    for name in lostFiles do
+        let! pointer = runGitIn sourcePath [| "show"; $"HEAD:{name}" |]
+
+        let oid =
+            pointer.Replace("\r\n", "\n").Split('\n')
+            |> Array.find (fun line -> line.StartsWith "oid sha256:")
+            |> fun line -> line.Substring("oid sha256:".Length).Trim()
+
+        do! removePathAsync (join [| barePath; "lfs"; "objects"; oid.Substring(0, 2); oid.Substring(2, 2); oid |])
+
+    return root
+}
+
+/// An origin with LFS files and a work clone that holds only their pointers, as after a clone with the
+/// large-object setting off. The work clone is level with its upstream.
+let private createUnhydratedLfsCloneOf
+    (files: (string * string) list)
+    (lostFiles: string list)
+    (hooks: GitWorkspaceSession.GitSessionHooks)
+    = promise {
+    let! root = createLfsOrigin files lostFiles
+    let barePath = join [| root; "origin.git" |]
+    let workPath = join [| root; "work" |]
 
     let cloneRequest = {
         NodeProcess.ProcessRequest.create "git" [| "clone"; "-c"; "core.autocrlf=false"; barePath; workPath |] with
@@ -5733,6 +5878,10 @@ let private createUnhydratedLfsClone (hooks: GitWorkspaceSession.GitSessionHooks
     return root, workPath, GitWorkspaceSession.createSession hooks (syncBinding workPath barePath)
 }
 
+/// An origin with one LFS file and a work clone that holds only its pointer.
+let private createUnhydratedLfsClone (hooks: GitWorkspaceSession.GitSessionHooks) =
+    createUnhydratedLfsCloneOf [ "large.bin", unhydratedLfsContent ] [] hooks
+
 let private setMaterializeLargeObjects (workPath: string) (enabled: bool) =
     runGitIn
         workPath
@@ -5743,7 +5892,7 @@ let private setMaterializeLargeObjects (workPath: string) (enabled: bool) =
             (if enabled then "true" else "false")
         |]
 
-let private synchronizeWithoutPublish (session: WorkspaceSession) (name: string) = promise {
+let private synchronizeWithoutPublishIn (session: WorkspaceSession) (context: OperationContext) = promise {
     let! status = sessionStatus session
 
     return!
@@ -5754,9 +5903,12 @@ let private synchronizeWithoutPublish (session: WorkspaceSession) (name: string)
                 AcceptUpdateRisks = false
                 PublishLocalRevisions = false
             }
-            (ctx name)
+            context
         |> Async.StartAsPromise
 }
+
+let private synchronizeWithoutPublish (session: WorkspaceSession) (name: string) =
+    synchronizeWithoutPublishIn session (ctx name)
 
 Vitest.describe (
     "Git LFS transfer ordering",
@@ -5777,6 +5929,432 @@ Vitest.describe (
 
                     let! content = tryReadUtf8FileAsync (join [| workPath; "large.bin" |])
                     Vitest.expect(content).toEqual (Some unhydratedLfsContent)
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "hydration runs lfs fetch with the remote and ref and then lfs checkout, and never lfs pull",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let observed = ResizeArray<NodeProcess.ProcessRequest>()
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request processContext ->
+                            observed.Add request
+                            NodeProcess.run request processContext)
+                    Barrier = None
+                }
+
+                let! root, workPath, session = createUnhydratedLfsClone hooks
+
+                try
+                    let! _ = setMaterializeLargeObjects workPath true
+                    let! result = synchronizeWithoutPublish session "lfs-fetch-then-checkout"
+                    expectSucceeded "synchronize with a two-step hydration" result |> ignore
+
+                    let fetchIndex = observed |> Seq.findIndex isLfsFetchRequest
+                    let checkoutIndex = observed |> Seq.findIndex isLfsCheckoutRequest
+                    Vitest.expect(checkoutIndex > fetchIndex).toBe true
+                    Vitest.expect(observed |> Seq.exists isLfsPullRequest).toBe false
+
+                    let fetchRequest = observed[fetchIndex]
+                    let checkoutRequest = observed[checkoutIndex]
+
+                    Vitest
+                        .expect(fetchRequest.Arguments |> Array.windowed 4 |> Array.contains [| "lfs"; "fetch"; "origin"; "main" |])
+                        .toBe true
+
+                    Vitest.expect(Array.last checkoutRequest.Arguments).toBe "checkout"
+
+                    // Both calls carry the same authentication arguments, which come before the lfs command.
+                    let authenticationOf (request: NodeProcess.ProcessRequest) =
+                        request.Arguments |> Array.takeWhile (fun argument -> argument <> "lfs")
+
+                    Vitest.expect(authenticationOf checkoutRequest).toEqual (authenticationOf fetchRequest)
+
+                    for request in [| fetchRequest; checkoutRequest |] do
+                        Vitest.expect(request.Environment |> Array.contains ("GIT_TERMINAL_PROMPT", "0")).toBe true
+
+                    let! content = tryReadUtf8FileAsync (join [| workPath; "large.bin" |])
+                    Vitest.expect(content).toEqual (Some unhydratedLfsContent)
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "canceling the download during the fetch reports a retryable cancel, leaves no index.lock and no checkout",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let observed = ResizeArray<NodeProcess.ProcessRequest>()
+                let source = OperationCancellation.Source()
+
+                // The fetch is replaced by a program that prints one meter and then waits to be killed.
+                let blockedFetchScript =
+                    "process.stdout.write('Downloading LFS objects:  50% (1/2), 1 B | 1 B/s\\r');setInterval(()=>{},1000);"
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request processContext ->
+                            observed.Add request
+
+                            if isLfsFetchRequest request then
+                                NodeProcess.run
+                                    { request with
+                                        Command = nodeExecutablePath
+                                        Arguments = [| "-e"; blockedFetchScript |] }
+                                    processContext
+                            else
+                                NodeProcess.run request processContext)
+                    Barrier = None
+                }
+
+                let! root, workPath, session = createUnhydratedLfsClone hooks
+
+                try
+                    let! _ = setMaterializeLargeObjects workPath true
+                    let! status = sessionStatus session
+
+                    let context =
+                        OperationContext.create "lfs-cancel-during-fetch" source.Cancellation (fun progress ->
+                            if progress.PhaseCode = "lfs-pull" && progress.Completed.IsSome then
+                                source.Cancel())
+
+                    let! updateResult =
+                        (syncService session).Update { ExpectedWorkspaceVersion = status.WorkspaceVersion } context
+                        |> Async.StartAsPromise
+
+                    match updateResult with
+                    | PartiallySucceeded(_, failure) ->
+                        Vitest.expect(failure.Category).toEqual Canceled
+                        Vitest.expect(failure.Code).toBe "hydration_failed"
+                        Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "retry_materialization")
+                    | Failed failure -> failwith $"Expected a partial result, received {failure.Code}."
+                    | Succeeded _ -> failwith "Expected the canceled download to be reported."
+
+                    Vitest.expect(observed |> Seq.exists isLfsCheckoutRequest).toBe false
+                    let! lockExists = pathExistsAsync (join [| workPath; ".git"; "index.lock" |])
+                    Vitest.expect(lockExists).toBe false
+
+                    let materialization =
+                        session.ObjectMaterialization
+                        |> Option.defaultWith (fun () -> failwith "Expected Git object materialization.")
+
+                    let! materializeResult =
+                        materialization.Materialize (mkPath "large.bin") (ctx "lfs-materialize-after-cancel")
+                        |> Async.StartAsPromise
+
+                    expectSucceeded "materialize after the canceled download" materializeResult |> ignore
+                    let! content = tryReadUtf8FileAsync (join [| workPath; "large.bin" |])
+                    Vitest.expect(content).toEqual (Some unhydratedLfsContent)
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "canceling the download during the checkout lets the checkout finish and reports the completed work",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let source = OperationCancellation.Source()
+                let mutable checkoutSawCancellation = true
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request processContext ->
+                            async {
+                                if isLfsCheckoutRequest request then
+                                    // The cancel arrives as the checkout starts. The checkout must still run to its end.
+                                    source.Cancel()
+                                    checkoutSawCancellation <- processContext.Cancellation.IsCancellationRequested()
+
+                                return! NodeProcess.run request processContext
+                            })
+                    Barrier = None
+                }
+
+                let! root, workPath, session = createUnhydratedLfsClone hooks
+
+                try
+                    let! _ = setMaterializeLargeObjects workPath true
+                    let! status = sessionStatus session
+
+                    let context =
+                        OperationContext.create "lfs-cancel-during-checkout" source.Cancellation ignore
+
+                    let! updateResult =
+                        (syncService session).Update { ExpectedWorkspaceVersion = status.WorkspaceVersion } context
+                        |> Async.StartAsPromise
+
+                    expectSucceeded "update that is canceled during the checkout" updateResult |> ignore
+                    Vitest.expect(source.IsCancellationRequested).toBe true
+                    Vitest.expect(checkoutSawCancellation).toBe false
+                    let! lockExists = pathExistsAsync (join [| workPath; ".git"; "index.lock" |])
+                    Vitest.expect(lockExists).toBe false
+                    let! content = tryReadUtf8FileAsync (join [| workPath; "large.bin" |])
+                    Vitest.expect(content).toEqual (Some unhydratedLfsContent)
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "a failed fetch with an index.lock in the repository keeps the plain retry and leaves the lock in place",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable lockPath = ""
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request processContext ->
+                            async {
+                                if isLfsFetchRequest request then
+                                    do! writeUtf8FileAsync lockPath "held by another process\n" |> Async.AwaitPromise
+
+                                    return
+                                        OperationResult.succeeded {
+                                            NodeProcess.ExitCode = 1
+                                            StdOut = ""
+                                            StdErr = "HTTP 401 Unauthorized during LFS hydration"
+                                        }
+                                else
+                                    return! NodeProcess.run request processContext
+                            })
+                    Barrier = None
+                }
+
+                let! root, workPath, barePath, session = createSyncFixture hooks
+
+                try
+                    lockPath <- join [| workPath; ".git"; "index.lock" |]
+                    let! _ = setMaterializeLargeObjects workPath true
+                    do! advanceTarget root barePath [ "target-lfs.bin", "target content\n" ]
+                    let! status = sessionStatus session
+
+                    let! updateResult =
+                        (syncService session).Update
+                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                            (ctx "lfs-update-with-lock")
+                        |> Async.StartAsPromise
+
+                    match updateResult with
+                    | PartiallySucceeded(_, failure) ->
+                        Vitest.expect(failure.Category).toEqual Authentication
+                        Vitest.expect(failure.Code).toBe "hydration_failed"
+                        Vitest.expect(failure.AffectedPaths).toContain "target-lfs.bin"
+                        // The fetch takes no lock, so a lock next to its failure proves nothing.
+                        Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "retry_materialization")
+                    | Failed failure -> failwith $"Expected a partial result, received {failure.Code}."
+                    | Succeeded _ -> failwith "Expected the failed download to be reported."
+
+                    let! lockExists = pathExistsAsync lockPath
+                    Vitest.expect(lockExists).toBe true
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "a checkout that fails while an index.lock exists recommends removing the lock and leaves it in place",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable lockPath = ""
+                let mutable checkoutRuns = 0
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request processContext ->
+                            async {
+                                if isLfsCheckoutRequest request then
+                                    checkoutRuns <- checkoutRuns + 1
+                                    do! writeUtf8FileAsync lockPath "held by another process\n" |> Async.AwaitPromise
+
+                                    // The first checkout names the lock in Git's words. The second one fails
+                                    // without naming it, so only the lock file shows the cause.
+                                    return
+                                        OperationResult.succeeded {
+                                            NodeProcess.ExitCode = 128
+                                            StdOut = ""
+                                            StdErr =
+                                                if checkoutRuns = 1 then
+                                                    $"fatal: Unable to create '{lockPath}': File exists."
+                                                else
+                                                    "fatal: the checkout stopped"
+                                        }
+                                else
+                                    return! NodeProcess.run request processContext
+                            })
+                    Barrier = None
+                }
+
+                let! root, workPath, session = createUnhydratedLfsClone hooks
+
+                try
+                    lockPath <- join [| workPath; ".git"; "index.lock" |]
+                    let! _ = setMaterializeLargeObjects workPath true
+
+                    for attempt in 1..2 do
+                        // The stand-in checkout leaves the lock behind, and the next update starts without it.
+                        do! removePathAsync lockPath
+                        let! status = sessionStatus session
+
+                        let! updateResult =
+                            (syncService session).Update
+                                { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                                (ctx $"lfs-checkout-with-lock-{attempt}")
+                            |> Async.StartAsPromise
+
+                        match updateResult with
+                        | PartiallySucceeded(_, failure) ->
+                            Vitest.expect(failure.Code).toBe "hydration_failed"
+                            Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "remove_index_lock")
+                        | Failed failure -> failwith $"Expected a partial result, received {failure.Code}."
+                        | Succeeded _ -> failwith "Expected the failed checkout to be reported."
+
+                        let! lockExists = pathExistsAsync lockPath
+                        Vitest.expect(lockExists).toBe true
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "a checkout that ends with success but could not update the index is a failed hydration with the lock recovery",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let mutable lockPath = ""
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request processContext ->
+                            async {
+                                if isLfsCheckoutRequest request then
+                                    do! writeUtf8FileAsync lockPath "held by another process\n" |> Async.AwaitPromise
+
+                                    // git-lfs 3.7.0 prints this to stderr when the lock is held, and exits with 0.
+                                    // The text does not name the lock, so only the lock file shows the cause.
+                                    return
+                                        OperationResult.succeeded {
+                                            NodeProcess.ExitCode = 0
+                                            StdOut = ""
+                                            StdErr = "Error updating the Git index:\n\n\nErrors logged to 'x.log'."
+                                        }
+                                else
+                                    return! NodeProcess.run request processContext
+                            })
+                    Barrier = None
+                }
+
+                let! root, workPath, session = createUnhydratedLfsClone hooks
+
+                try
+                    lockPath <- join [| workPath; ".git"; "index.lock" |]
+                    let! _ = setMaterializeLargeObjects workPath true
+                    let! status = sessionStatus session
+
+                    let! updateResult =
+                        (syncService session).Update
+                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                            (ctx "lfs-checkout-index-error-exit-0")
+                        |> Async.StartAsPromise
+
+                    match updateResult with
+                    | PartiallySucceeded(_, failure) ->
+                        Vitest.expect(failure.Code).toBe "hydration_failed"
+                        Vitest.expect(failure.Message.Contains "Error updating the Git index").toBe true
+                        Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "remove_index_lock")
+                    | Failed failure -> failwith $"Expected a partial result, received {failure.Code}."
+                    | Succeeded _ -> failwith "Expected the checkout that could not update the index to be reported."
+
+                    let! lockExists = pathExistsAsync lockPath
+                    Vitest.expect(lockExists).toBe true
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "a checkout that fails after a failed fetch keeps the fetch failure and adds its own text to the details",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let observed = ResizeArray<NodeProcess.ProcessRequest>()
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request processContext ->
+                            async {
+                                observed.Add request
+
+                                if isLfsFetchRequest request then
+                                    return
+                                        OperationResult.succeeded {
+                                            NodeProcess.ExitCode = 1
+                                            StdOut = ""
+                                            StdErr = "HTTP 401 Unauthorized during LFS hydration"
+                                        }
+                                elif isLfsCheckoutRequest request then
+                                    return
+                                        OperationResult.succeeded {
+                                            NodeProcess.ExitCode = 2
+                                            StdOut = ""
+                                            StdErr = "the working tree refused the checkout"
+                                        }
+                                else
+                                    return! NodeProcess.run request processContext
+                            })
+                    Barrier = None
+                }
+
+                let! root, workPath, session = createUnhydratedLfsClone hooks
+
+                try
+                    let! _ = setMaterializeLargeObjects workPath true
+                    let! status = sessionStatus session
+
+                    let! updateResult =
+                        (syncService session).Update
+                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                            (ctx "lfs-failed-fetch-failed-checkout")
+                        |> Async.StartAsPromise
+
+                    match updateResult with
+                    | PartiallySucceeded(_, failure) ->
+                        Vitest.expect(failure.Category).toEqual Authentication
+                        Vitest.expect(failure.Message.Contains "the working tree refused the checkout").toBe false
+
+                        Vitest.expect(
+                            failure.Details |> Array.exists (fun line -> line.Contains "the working tree refused the checkout")
+                        )
+                            .toBe true
+                    | Failed failure -> failwith $"Expected a partial result, received {failure.Code}."
+                    | Succeeded _ -> failwith "Expected the failed download to be reported."
+
+                    Vitest.expect(observed |> Seq.exists isLfsCheckoutRequest).toBe true
                     do! removeDirectoryAsync root
                 with error ->
                     do! removeDirectoryAsync root
@@ -5806,7 +6384,9 @@ Vitest.describe (
                     let! result = synchronizeWithoutPublish session "lfs-up-to-date-setting-off"
                     expectSucceeded "synchronize with the setting off" result |> ignore
 
-                    Vitest.expect(observed |> Seq.exists isLfsPullRequest).toBe false
+                    Vitest
+                        .expect(observed |> Seq.exists (fun request -> isLfsFetchRequest request || isLfsCheckoutRequest request))
+                        .toBe false
                     let! content = tryReadUtf8FileAsync (join [| workPath; "large.bin" |])
                     Vitest.expect((content = Some unhydratedLfsContent)).toBe false
                     do! removeDirectoryAsync root
@@ -5825,7 +6405,7 @@ Vitest.describe (
                     RunProcess =
                         Some(fun request processContext ->
                             async {
-                                if isLfsPullRequest request then
+                                if isLfsFetchRequest request then
                                     return
                                         OperationResult.succeeded {
                                             NodeProcess.ExitCode = 1
@@ -5878,10 +6458,7 @@ Vitest.describe (
                             async {
                                 observed.Add request
 
-                                if
-                                    request.Arguments |> Array.contains "lfs"
-                                    && request.Arguments |> Array.contains "pull"
-                                then
+                                if isLfsFetchRequest request then
                                     return
                                         OperationResult.succeeded {
                                             NodeProcess.ExitCode = 1
@@ -5936,11 +6513,7 @@ Vitest.describe (
                         .expect(mergeRequest.Environment |> Array.contains ("GIT_LFS_SKIP_SMUDGE", "1"))
                         .toBe true
 
-                    let hydrationIndex =
-                        observed
-                        |> Seq.findIndex (fun request ->
-                            request.Arguments |> Array.contains "lfs"
-                            && request.Arguments |> Array.contains "pull")
+                    let hydrationIndex = observed |> Seq.findIndex isLfsFetchRequest
 
                     let mergeIndex =
                         observed
@@ -5977,10 +6550,7 @@ Vitest.describe (
                                             if argument = cloneUrl then cloneSource else argument)
 
                                     return! NodeProcess.run { request with Arguments = cloneArguments } processContext
-                                elif
-                                    request.Arguments |> Array.contains "lfs"
-                                    && request.Arguments |> Array.contains "pull"
-                                then
+                                elif isLfsFetchRequest request then
                                     return
                                         OperationResult.succeeded {
                                             NodeProcess.ExitCode = 1
@@ -6045,11 +6615,7 @@ Vitest.describe (
                         .expect(cloneRequest.Environment |> Array.contains ("GIT_LFS_SKIP_SMUDGE", "1"))
                         .toBe true
 
-                    let hydrationRequest =
-                        observed
-                        |> Seq.find (fun request ->
-                            request.Arguments |> Array.contains "lfs"
-                            && request.Arguments |> Array.contains "pull")
+                    let hydrationRequest = observed |> Seq.find isLfsFetchRequest
 
                     let expectedLfsUrl =
                         $"lfs.url=https://{credential.Username}:{credential.Secret}@git.local.test/origin.git/info/lfs"
@@ -6065,6 +6631,203 @@ Vitest.describe (
                         )
                         .toBe false
 
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "synchronize hydration checks out the files whose objects arrived when the server lost another one",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, session =
+                    createUnhydratedLfsCloneOf
+                        [ "a.bin", "payload one\n"; "b.bin", "payload two\n" ]
+                        [ "b.bin" ]
+                        GitWorkspaceSession.GitSessionHooks.none
+
+                try
+                    let! _ = setMaterializeLargeObjects workPath true
+                    let! result = synchronizeWithoutPublish session "lfs-hydration-lost-object"
+
+                    match result with
+                    | PartiallySucceeded(_, failure) ->
+                        Vitest.expect(failure.Code).toBe "hydration_failed"
+                        Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "retry_materialization")
+                    | Failed failure -> failwith $"Expected a partial result, received {failure.Code}."
+                    | Succeeded _ -> failwith "Expected the lost object to be reported."
+
+                    let! available = tryReadUtf8FileAsync (join [| workPath; "a.bin" |])
+                    let! lost = tryReadUtf8FileAsync (join [| workPath; "b.bin" |])
+                    Vitest.expect(available).toEqual (Some "payload one\n")
+                    Vitest.expect(lost.IsSome && lost.Value.StartsWith "version https://git-lfs.github.com/spec/v1").toBe true
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "clone hydration checks out the files whose objects arrived when the server lost another one",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root = createLfsOrigin [ "a.bin", "payload one\n"; "b.bin", "payload two\n" ] [ "b.bin" ]
+                let clonePath = join [| root; "hydrated-clone" |]
+                let factory = GitWorkspaceSession.createFactory GitWorkspaceSession.GitSessionHooks.none
+
+                try
+                    let! cloneResult =
+                        factory.Clone
+                            {
+                                Location = {
+                                    ProviderId = gitProviderId
+                                    DisplayName = None
+                                    ProviderLocation = join [| root; "origin.git" |]
+                                    ConnectionProfileId = None
+                                }
+                                TargetPath = clonePath
+                                TargetRef = None
+                                MaterializeAllObjects = true
+                            }
+                            (ctx "lfs-clone-lost-object")
+                        |> Async.StartAsPromise
+
+                    match cloneResult with
+                    | PartiallySucceeded(_, failure) ->
+                        Vitest.expect(failure.Code).toBe "hydration_failed"
+                        Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "retry_materialization")
+                    | Failed failure -> failwith $"Expected a partial result, received {failure.Code}."
+                    | Succeeded _ -> failwith "Expected the lost object to be reported."
+
+                    let! available = tryReadUtf8FileAsync (join [| clonePath; "a.bin" |])
+                    let! lost = tryReadUtf8FileAsync (join [| clonePath; "b.bin" |])
+                    Vitest.expect(available).toEqual (Some "payload one\n")
+                    Vitest.expect(lost.IsSome && lost.Value.StartsWith "version https://git-lfs.github.com/spec/v1").toBe true
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "a cancel right after the fetch of a synchronize skips the checkout and keeps the retry",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let observed = ResizeArray<NodeProcess.ProcessRequest>()
+                let source = OperationCancellation.Source()
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request processContext ->
+                            async {
+                                observed.Add request
+
+                                if isLfsFetchRequest request then
+                                    // The fetch ends well, and the cancel arrives before the checkout can start.
+                                    source.Cancel()
+
+                                    return
+                                        OperationResult.succeeded {
+                                            NodeProcess.ExitCode = 0
+                                            StdOut = ""
+                                            StdErr = ""
+                                        }
+                                else
+                                    return! NodeProcess.run request processContext
+                            })
+                    Barrier = None
+                }
+
+                let! root, workPath, session = createUnhydratedLfsClone hooks
+
+                try
+                    let! _ = setMaterializeLargeObjects workPath true
+
+                    let! result =
+                        synchronizeWithoutPublishIn
+                            session
+                            (OperationContext.create "lfs-cancel-after-fetch" source.Cancellation ignore)
+
+                    match result with
+                    | PartiallySucceeded(_, failure) ->
+                        Vitest.expect(failure.Category).toEqual Canceled
+                        Vitest.expect(failure.Code).toBe "hydration_failed"
+                        Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "retry_materialization")
+                    | Failed failure -> failwith $"Expected a partial result, received {failure.Code}."
+                    | Succeeded _ -> failwith "Expected the canceled download to be reported."
+
+                    Vitest.expect(observed |> Seq.exists isLfsCheckoutRequest).toBe false
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "a cancel right after the fetch of a clone skips the checkout and removes the clone",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let observed = ResizeArray<NodeProcess.ProcessRequest>()
+                let source = OperationCancellation.Source()
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request processContext ->
+                            async {
+                                observed.Add request
+
+                                if isLfsFetchRequest request then
+                                    source.Cancel()
+
+                                    return
+                                        OperationResult.succeeded {
+                                            NodeProcess.ExitCode = 0
+                                            StdOut = ""
+                                            StdErr = ""
+                                        }
+                                else
+                                    return! NodeProcess.run request processContext
+                            })
+                    Barrier = None
+                }
+
+                let! root = createLfsOrigin [ "a.bin", "payload one\n" ] []
+                let clonePath = join [| root; "canceled-clone" |]
+
+                try
+                    let factory = GitWorkspaceSession.createFactory hooks
+
+                    let! cloneResult =
+                        factory.Clone
+                            {
+                                Location = {
+                                    ProviderId = gitProviderId
+                                    DisplayName = None
+                                    ProviderLocation = join [| root; "origin.git" |]
+                                    ConnectionProfileId = None
+                                }
+                                TargetPath = clonePath
+                                TargetRef = None
+                                MaterializeAllObjects = true
+                            }
+                            (OperationContext.create "lfs-clone-cancel-after-fetch" source.Cancellation ignore)
+                        |> Async.StartAsPromise
+
+                    match cloneResult with
+                    | Failed failure -> Vitest.expect(failure.Category).toEqual Canceled
+                    | PartiallySucceeded(_, failure) -> failwith $"Expected a failure, received a partial {failure.Code}."
+                    | Succeeded _ -> failwith "Expected the canceled clone to fail."
+
+                    Vitest.expect(observed |> Seq.exists isLfsCheckoutRequest).toBe false
+                    let! cloneExists = pathExistsAsync clonePath
+                    Vitest.expect(cloneExists).toBe false
                     do! removeDirectoryAsync root
                 with error ->
                     do! removeDirectoryAsync root
@@ -6247,6 +7010,231 @@ Vitest.describe (
                     let! unrelatedObjectPresent = pathExistsAsync (lfsObjectPath unrelatedOid)
                     Vitest.expect(publishedObjectPresent).toBe true
                     Vitest.expect(unrelatedObjectPresent).toBe false
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+)
+
+Vitest.describe (
+    "Git transfer progress",
+    fun () ->
+        Vitest.test (
+            "hydration fetch and checkout read stdout meters under their own phase codes with Git LFS progress forced",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let observed = ResizeArray<NodeProcess.ProcessRequest>()
+
+                let meterScript (label: string) =
+                    "process.stdout.write('" + label + ":  50% (1/2), 1 B | 1 B/s\\r" +
+                    label + ": 100% (2/2), 2 B | 1 B/s, done.\\n');"
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request processContext ->
+                            observed.Add request
+
+                            // The request keeps its phase code and its stdout opt-in. Only the program changes.
+                            if isLfsFetchRequest request then
+                                NodeProcess.run
+                                    { request with
+                                        Command = nodeExecutablePath
+                                        Arguments = [| "-e"; meterScript "Downloading LFS objects" |] }
+                                    processContext
+                            elif isLfsCheckoutRequest request then
+                                NodeProcess.run
+                                    { request with
+                                        Command = nodeExecutablePath
+                                        Arguments = [| "-e"; meterScript "Checking out LFS objects" |] }
+                                    processContext
+                            else
+                                NodeProcess.run request processContext)
+                    Barrier = None
+                }
+
+                let! root, workPath, session = createUnhydratedLfsClone hooks
+
+                try
+                    let! _ = setMaterializeLargeObjects workPath true
+                    let reports = ResizeArray<OperationProgress>()
+
+                    let! result =
+                        synchronizeWithoutPublishIn
+                            session
+                            (OperationContext.create "lfs-hydration-meters" OperationCancellation.none reports.Add)
+
+                    expectSucceeded "synchronize with a metered hydration" result |> ignore
+
+                    for request in [| observed |> Seq.find isLfsFetchRequest; observed |> Seq.find isLfsCheckoutRequest |] do
+                        Vitest.expect(request.Environment |> Array.contains ("GIT_LFS_FORCE_PROGRESS", "1")).toBe true
+                        Vitest.expect(request.ObserveStdoutProgress).toBe true
+
+                    let metersOf (phaseCode: string) =
+                        reports
+                        |> Seq.filter (fun report -> report.PhaseCode = phaseCode && report.Completed.IsSome)
+                        |> Seq.map (fun report -> report.Completed)
+                        |> Seq.toArray
+
+                    Vitest.expect(metersOf "lfs-pull").toEqual [| Some 50.0; Some 100.0 |]
+                    Vitest.expect(metersOf "lfs-pull-checkout").toEqual [| Some 50.0; Some 100.0 |]
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "fetch and clone ask git for progress",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let observed = ResizeArray<NodeProcess.ProcessRequest>()
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request processContext ->
+                            observed.Add request
+                            NodeProcess.run request processContext)
+                    Barrier = None
+                }
+
+                let! root, _, barePath, session = createSyncFixture hooks
+
+                try
+                    let! refreshResult = (syncService session).Refresh(ctx "progress-refresh") |> Async.StartAsPromise
+                    expectValue "refresh" refreshResult |> ignore
+
+                    let fetchRequest =
+                        observed |> Seq.find (fun request -> gitSubcommand request.Arguments = Some "fetch")
+
+                    Vitest.expect(fetchRequest.Arguments |> Array.contains "--progress").toBe true
+
+                    let factory = GitWorkspaceSession.createFactory hooks
+                    let reports = ResizeArray<OperationProgress>()
+
+                    let! cloneResult =
+                        factory.Clone
+                            {
+                                Location = {
+                                    ProviderId = gitProviderId
+                                    DisplayName = None
+                                    ProviderLocation = barePath
+                                    ConnectionProfileId = None
+                                }
+                                TargetPath = join [| root; "progress-clone" |]
+                                TargetRef = None
+                                MaterializeAllObjects = true
+                            }
+                            (OperationContext.create "progress-clone" OperationCancellation.none reports.Add)
+                        |> Async.StartAsPromise
+
+                    expectValue "clone" cloneResult |> ignore
+
+                    let cloneRequest =
+                        observed |> Seq.find (fun request -> gitSubcommand request.Arguments = Some "clone")
+
+                    Vitest.expect(cloneRequest.Arguments |> Array.contains "--progress").toBe true
+
+                    // The clone announces each step before it runs, with a message and without numbers.
+                    let firstReportOf (phaseCode: string) =
+                        reports |> Seq.findIndex (fun report -> report.PhaseCode = phaseCode)
+
+                    for phaseCode in [| "clone"; "clone-lfs-pull" |] do
+                        let first = reports[firstReportOf phaseCode]
+                        Vitest.expect(first.Completed).toEqual None
+                        Vitest.expect(first.Total).toEqual None
+                        Vitest.expect(first.DisplayMessage.IsSome).toBe true
+
+                    Vitest.expect(firstReportOf "clone" < firstReportOf "clone-lfs-pull").toBe true
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "a failing fetch whose stderr holds meter lines reports a failure message without them",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request processContext ->
+                            if gitSubcommand request.Arguments = Some "fetch" then
+                                async {
+                                    return
+                                        OperationResult.succeeded {
+                                            NodeProcess.ExitCode = 128
+                                            StdOut = ""
+                                            StdErr =
+                                                "Receiving objects:  10% (1/10)\rReceiving objects: 100% (10/10), done.\n"
+                                                + "fatal: injected fetch failure\n"
+                                        }
+                                }
+                            else
+                                NodeProcess.run request processContext)
+                    Barrier = None
+                }
+
+                let! root, _, _, session = createSyncFixture hooks
+
+                try
+                    let! refreshResult = (syncService session).Refresh(ctx "progress-failed-fetch") |> Async.StartAsPromise
+                    let failure = expectProviderFailure "refresh" refreshResult
+
+                    Vitest.expect(failure.Message.Contains "fatal: injected fetch failure").toBe true
+                    Vitest.expect(failure.Message.Contains "Receiving objects").toBe false
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "synchronize reports its step events in order for an update that downloads large objects",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, barePath, session = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+
+                try
+                    let! _ = setMaterializeLargeObjects workPath true
+                    do! advanceTarget root barePath [ "target.txt", "target content\n" ]
+                    let reports = ResizeArray<OperationProgress>()
+
+                    let! result =
+                        synchronizeWithoutPublishIn
+                            session
+                            (OperationContext.create "step-events" OperationCancellation.none reports.Add)
+
+                    match result with
+                    | Failed failure -> failwith $"Synchronize failed ({failure.Code}): {failure.Message}"
+                    | Succeeded _
+                    | PartiallySucceeded _ -> ()
+
+                    let steps =
+                        [| "fetch"; "refresh-state"; "merge"; "update-inspection"; "lfs-pull"; "lfs-pull-checkout" |]
+
+                    let reportedSteps =
+                        reports
+                        |> Seq.map (fun report -> report.PhaseCode)
+                        |> Seq.filter (fun code -> Array.contains code steps)
+                        |> Seq.distinct
+                        |> Seq.toArray
+
+                    Vitest.expect(reportedSteps).toEqual steps
+
+                    for code in [| "fetch"; "merge"; "lfs-pull"; "lfs-pull-checkout" |] do
+                        let first = reports |> Seq.find (fun report -> report.PhaseCode = code)
+                        Vitest.expect(first.Completed).toEqual None
+                        Vitest.expect(first.Total).toEqual None
+                        Vitest.expect(first.DisplayMessage.IsSome).toBe true
+
                     do! removeDirectoryAsync root
                 with error ->
                     do! removeDirectoryAsync root
@@ -7642,6 +8630,207 @@ Vitest.describe (
                     return raise error
 
                 do! removeDirectoryAsync root
+            }
+        )
+)
+
+let private outputContext (name: string) (batches: ResizeArray<OperationOutput[]>) =
+    OperationContext.createWithOutput name OperationCancellation.none ignore batches.Add
+
+let private outputEntries (batches: ResizeArray<OperationOutput[]>) =
+    batches |> Seq.collect id |> Seq.toArray
+
+Vitest.describe (
+    "Git output channel",
+    fun () ->
+        Vitest.test (
+            "synchronize reports the header and the stderr lines of its fetch",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, _, barePath, session = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+
+                try
+                    do! advanceTarget root barePath [ "target.txt", "target content\n" ]
+                    let batches = ResizeArray<OperationOutput[]>()
+
+                    let! result = synchronizeWithoutPublishIn session (outputContext "output-fetch" batches)
+                    expectSucceeded "synchronize with output" result |> ignore
+
+                    let entries = outputEntries batches
+
+                    let fetchHeader =
+                        entries
+                        |> Array.tryFind (fun entry ->
+                            entry.Kind = OperationOutputKind.Command && entry.Text = "git fetch --progress origin")
+
+                    Vitest.expect(fetchHeader.IsSome).toBe true
+
+                    // The ref update line is what git prints to stderr when the fetch brings something new.
+                    let fetchLines =
+                        entries
+                        |> Array.filter (fun entry ->
+                            entry.CommandId = fetchHeader.Value.CommandId
+                            && entry.Kind = OperationOutputKind.StdErr)
+
+                    Vitest.expect(fetchLines |> Array.exists (fun entry -> entry.Text.Contains "origin/main")).toBe true
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "hydration reports the stdout of lfs fetch and lfs checkout",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let meterScript (label: string) =
+                    "process.stdout.write('" + label + ":  50% (1/2), 1 B | 1 B/s\\r" +
+                    label + ": 100% (2/2), 2 B | 1 B/s, done.\\n');"
+
+                let hooks: GitWorkspaceSession.GitSessionHooks = {
+                    RunBytesProcess = None
+                    RunProcess =
+                        Some(fun request processContext ->
+                            if isLfsFetchRequest request then
+                                NodeProcess.run
+                                    { request with
+                                        Command = nodeExecutablePath
+                                        Arguments = [| "-e"; meterScript "Downloading LFS objects" |] }
+                                    processContext
+                            elif isLfsCheckoutRequest request then
+                                NodeProcess.run
+                                    { request with
+                                        Command = nodeExecutablePath
+                                        Arguments = [| "-e"; meterScript "Checking out LFS objects" |] }
+                                    processContext
+                            else
+                                NodeProcess.run request processContext)
+                    Barrier = None
+                }
+
+                let! root, workPath, session = createUnhydratedLfsClone hooks
+
+                try
+                    let! _ = setMaterializeLargeObjects workPath true
+                    let batches = ResizeArray<OperationOutput[]>()
+
+                    let! result = synchronizeWithoutPublishIn session (outputContext "output-hydration" batches)
+                    expectSucceeded "synchronize with a metered hydration" result |> ignore
+
+                    let stdoutTexts =
+                        outputEntries batches
+                        |> Array.filter (fun entry -> entry.Kind = OperationOutputKind.StdOut && not entry.IsPartial)
+                        |> Array.map (fun entry -> entry.Text)
+
+                    Vitest.expect(stdoutTexts).toEqual [|
+                        "Downloading LFS objects: 100% (2/2), 2 B | 1 B/s, done."
+                        "Checking out LFS objects: 100% (2/2), 2 B | 1 B/s, done."
+                    |]
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "the LFS listing reports its header and never its JSON stdout",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, _, session = createUnhydratedLfsClone GitWorkspaceSession.GitSessionHooks.none
+
+                try
+                    let batches = ResizeArray<OperationOutput[]>()
+
+                    let materialization =
+                        session.ObjectMaterialization
+                        |> Option.defaultWith (fun () -> failwith "Expected Git object materialization.")
+
+                    let! listResult =
+                        materialization.ListObjects(outputContext "output-listing" batches)
+                        |> Async.StartAsPromise
+
+                    expectValue "listing" listResult |> ignore
+                    let entries = outputEntries batches
+
+                    Vitest.expect(
+                        entries
+                        |> Array.exists (fun entry ->
+                            entry.Kind = OperationOutputKind.Command && entry.Text = "git lfs ls-files -j")
+                    )
+                        .toBe true
+
+                    Vitest.expect(entries |> Array.exists (fun entry -> entry.Kind = OperationOutputKind.StdOut)).toBe false
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+
+        Vitest.test (
+            "publish reports the header and the stdout of the explicit LFS upload",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! root, workPath, _, session = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
+
+                try
+                    do!
+                        writeUtf8FileAsync
+                            (join [| workPath; "publish-large.bin" |])
+                            (String.replicate (1024 * 1024) "p")
+
+                    let! saveStatus = sessionStatus session
+
+                    let! revisionResult =
+                        session.Core.CreateRevision
+                            {
+                                Message = "test: publish explicit LFS object"
+                                Paths = [| mkPath "publish-large.bin" |]
+                                ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+                            }
+                            (ctx "output-publish-revision")
+                        |> Async.StartAsPromise
+
+                    expectValue "LFS revision" revisionResult |> ignore
+                    let batches = ResizeArray<OperationOutput[]>()
+                    let! publishStatus = sessionStatus session
+
+                    let! publishResult =
+                        (syncService session).Publish
+                            {
+                                ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                            }
+                            (outputContext "output-publish" batches)
+                        |> Async.StartAsPromise
+
+                    expectValue "publish" publishResult |> ignore
+                    let entries = outputEntries batches
+
+                    let upload =
+                        entries
+                        |> Array.tryFind (fun entry ->
+                            entry.Kind = OperationOutputKind.Command
+                            && entry.Text = "git lfs push --object-id origin --stdin")
+
+                    Vitest.expect(upload.IsSome).toBe true
+
+                    Vitest.expect(
+                        entries
+                        |> Array.exists (fun entry ->
+                            entry.CommandId = upload.Value.CommandId
+                            && entry.Kind = OperationOutputKind.StdOut
+                            && entry.Text.Contains "Uploading LFS objects")
+                    )
+                        .toBe true
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
             }
         )
 )

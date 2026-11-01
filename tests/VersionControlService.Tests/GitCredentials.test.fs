@@ -10,6 +10,7 @@ open Vitest
 module GitWorkspaceSession = VersionControlService.Git.GitWorkspaceSession
 module GitCredentialStrategy = VersionControlService.Git.GitCredentialStrategy
 module NodeProcess = VersionControlService.Runtime.Node.Process
+module NodeOutput = VersionControlService.Runtime.Node.OutputReporter
 
 let private fsPromisesDynamic: obj = importAll "fs/promises"
 let private osDynamic: obj = importAll "os"
@@ -439,6 +440,125 @@ Vitest.describe (
                         Vitest
                             .expect(transfer |> Array.exists (fun argument -> argument.Contains "alice" || argument.Contains "old-secret"))
                             .toBe false
+
+                        do! removeDirectoryAsync root
+                    with error ->
+                        stopObserving.Value ()
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
+            "a single Materialize lists the Git LFS files once and reads the status of its own path",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGitIn "." [| "lfs"; "version" |]
+
+                if String.IsNullOrWhiteSpace lfsProbe then
+                    failwith "Expected Git LFS to be available."
+                else
+                    let! root = createTempDirectoryAsync ()
+                    let workPath = join [| root; "work" |]
+                    let remoteUrl = "https://127.0.0.1:1/origin.git"
+                    let relativePath = "materialized.bin"
+                    let observedCommands = ResizeArray<string[]>()
+                    let stopObserving = ref ignore
+
+                    try
+                        let! _ = runGitIn root [| "init"; "-b"; "main"; workPath |]
+                        let! _ = runGitIn workPath [| "config"; "user.name"; "VCS Cred Tests" |]
+                        let! _ = runGitIn workPath [| "config"; "user.email"; "cred@example.org" |]
+                        let! _ = runGitIn workPath [| "config"; "core.autocrlf"; "false" |]
+                        let! _ = runGitIn workPath [| "lfs"; "install"; "--local" |]
+                        let! _ = runGitIn workPath [| "lfs"; "track"; relativePath |]
+                        do! writeUtf8FileAsync (join [| workPath; relativePath |]) "cached LFS content\n"
+                        let! _ = runGitIn workPath [| "add"; "-A" |]
+                        let! _ = runGitIn workPath [| "commit"; "-m"; "test: cached materialization" |]
+                        let! _ = runGitIn workPath [| "remote"; "add"; "origin"; remoteUrl |]
+                        let! pointer = runGitIn workPath [| "show"; $"HEAD:{relativePath}" |]
+                        do! writeUtf8FileAsync (join [| workPath; relativePath |]) pointer
+
+                        let! _ =
+                            runGitIn workPath [|
+                                "-c"
+                                "filter.lfs.smudge="
+                                "-c"
+                                "filter.lfs.process="
+                                "-c"
+                                "filter.lfs.required=false"
+                                "checkout"
+                                "HEAD"
+                                "--"
+                                relativePath
+                            |]
+
+                        let strategy: GitCredentialStrategy.GitCredentialStrategy = {
+                            ResolveCredential =
+                                fun _host _profileId ->
+                                    async {
+                                        return
+                                            Some {
+                                                Username = "oauth2"
+                                                Secret = testSecret
+                                            }
+                                    }
+                        }
+
+                        let binding: WorkspaceBinding = {
+                            SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
+                            ProviderId = gitProviderId
+                            WorkspaceRoot = workPath
+                            ProviderStateRef = None
+                            Location = {
+                                ProviderId = gitProviderId
+                                DisplayName = None
+                                ProviderLocation = remoteUrl
+                                ConnectionProfileId = Some "token-profile"
+                            }
+                            ConnectionProfileId = Some "token-profile"
+                        }
+
+                        let session =
+                            GitWorkspaceSession.createSessionWithCredentials
+                                GitWorkspaceSession.GitSessionHooks.none
+                                strategy
+                                binding
+
+                        let materialization =
+                            session.ObjectMaterialization
+                            |> Option.defaultWith (fun () -> failwith "Expected Git object materialization.")
+
+                        stopObserving.Value <- observeGitSpawnArguments observedCommands
+
+                        let! materializeResult =
+                            materialization.Materialize
+                                (RepositoryPath.tryCreate relativePath |> Result.defaultWith failwith)
+                                (ctx "listing-once-materialize")
+                            |> Async.StartAsPromise
+
+                        stopObserving.Value ()
+                        stopObserving.Value <- ignore
+                        expectValue "materialization with one listing" materializeResult |> ignore
+
+                        let listingCommands =
+                            observedCommands
+                            |> Seq.filter (fun arguments ->
+                                arguments |> Array.contains "lfs" && arguments |> Array.contains "ls-files")
+                            |> Seq.toArray
+
+                        Vitest.expect(listingCommands.Length).toBe 1
+
+                        let statusCommands =
+                            observedCommands
+                            |> Seq.filter (fun arguments -> arguments |> Array.contains "status")
+                            |> Seq.toArray
+
+                        Vitest.expect(statusCommands.Length > 0).toBe true
+
+                        for arguments in statusCommands do
+                            let separator = arguments |> Array.findIndex (fun argument -> argument = "--")
+                            Vitest.expect(arguments |> Array.skip (separator + 1)).toEqual [| $":(literal){relativePath}" |]
 
                         do! removeDirectoryAsync root
                     with error ->
@@ -1075,4 +1195,343 @@ Vitest.describe (
                 TestOptions(timeout = 30000),
                 fun () -> promise { Vitest.expect(GitCredentialStrategy.tryIdentityHost input).toEqual expected }
             )
+)
+
+
+[<Emit("process.execPath")>]
+let private nodeExecutablePath: string = jsNative
+
+[<Emit("Buffer.from($0, 'utf8').toString('base64')")>]
+let private toBase64 (_value: string) : string = jsNative
+
+let private runWithOutput (request: NodeProcess.ProcessRequest) = promise {
+    let batches = ResizeArray<OperationOutput[]>()
+
+    let context =
+        OperationContext.createWithOutput "git-credential-output" OperationCancellation.none ignore batches.Add
+
+    let! _ = Async.StartAsPromise(NodeProcess.run request context)
+    return batches |> Seq.collect id |> Seq.toArray
+}
+
+// A stand-in for `git clone <url>` that prints the URL to stderr, like git does in a failure message.
+let private runCloneStandIn (url: string) =
+    runWithOutput (
+        NodeProcess.ProcessRequest.create nodeExecutablePath [|
+            "-e"
+            "console.error(process.argv[process.argv.length - 1])"
+            "--"
+            "clone"
+            url
+        |]
+    )
+
+Vitest.describe (
+    "Git output channel redaction",
+    fun () ->
+        Vitest.test (
+            "output text never holds a secret from config arguments, URL userinfo, Bearer or Basic headers",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let secret = "p@ss word-secret-123"
+                let encodedSecret = "p%40ss%20word-secret-123"
+                let basicPayload = toBase64 $"oauth2:{secret}"
+                let bearerToken = "bearer-token-value-77"
+                let plainPassword = "plain-password-value-55"
+
+                let credentialArguments = [|
+                    "-c"
+                    $"http.https://{testHost}/.extraHeader=Authorization: Basic {basicPayload}"
+                    "-c"
+                    $"remote.origin.lfsurl=https://oauth2:{encodedSecret}@{testHost}/origin.git/info/lfs"
+                    "-c"
+                    $"fixture.bearer=Authorization: Bearer {bearerToken}"
+                    "-c"
+                    $"fixture.password={plainPassword}"
+                |]
+
+                // Git prints a value it cannot read as a boolean, which puts each secret form into stderr
+                // in a sentence that the structural redaction does not recognize.
+                let secretForms = [|
+                    basicPayload
+                    $"oauth2:{secret}"
+                    secret
+                    encodedSecret
+                    bearerToken
+                    plainPassword
+                |]
+
+                let reported = ResizeArray<OperationOutput>()
+
+                for form in secretForms do
+                    let request =
+                        NodeProcess.ProcessRequest.create "git" [|
+                            yield! credentialArguments
+                            "-c"
+                            $"fixture.echo={form}"
+                            "config"
+                            "--bool"
+                            "fixture.echo"
+                        |]
+
+                    let! entries = runWithOutput request
+                    reported.AddRange entries
+
+                let messages =
+                    reported
+                    |> Seq.filter (fun entry -> entry.Kind = OperationOutputKind.StdErr)
+                    |> Seq.toArray
+
+                Vitest.expect(messages.Length).toBe secretForms.Length
+                Vitest.expect(messages |> Array.forall (fun entry -> entry.Text.Contains "[REDACTED]")).toBe true
+
+                for entry in reported do
+                    for form in secretForms do
+                        Vitest.expect(entry.Text.Contains form).toBe false
+            }
+        )
+
+        Vitest.test (
+            "the command header leaves out the leading config pairs and cuts a long argument list",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let request =
+                    NodeProcess.ProcessRequest.create "git" [|
+                        "-c"
+                        $"http.https://{testHost}/.extraHeader=Authorization: Basic {toBase64 testSecret}"
+                        "-c"
+                        "fixture.setting=1"
+                        "config"
+                        "--bool"
+                        "fixture.missing"
+                    |]
+
+                let! entries = runWithOutput request
+
+                Vitest.expect(
+                    entries
+                    |> Array.filter (fun entry -> entry.Kind = OperationOutputKind.Command)
+                    |> Array.map (fun entry -> entry.Text)
+                ).toEqual [| "git config --bool fixture.missing" |]
+
+                let manyArguments = [| for number in 1..14 -> $"argument{number}" |]
+                let header = NodeOutput.commandHeader [||] "git" manyArguments
+
+                Vitest.expect(header).toBe (
+                    "git "
+                    + (manyArguments |> Array.truncate NodeOutput.MaxHeaderArguments |> String.concat " ")
+                    + " ..."
+                )
+            }
+        )
+
+        Vitest.test (
+            "the command header redacts a long token in a clone URL before it cuts the argument",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                // The URL is well over 200 characters, the length at which the header cuts an argument.
+                let token = String.replicate 25 "aB3dEf9hIj"
+                let! entries = runCloneStandIn $"https://oauth2:{token}@{testHost}/origin.git"
+
+                Vitest.expect(entries |> Array.exists (fun entry -> entry.Kind = OperationOutputKind.Command)).toBe true
+
+                for entry in entries do
+                    for start in 0 .. token.Length - 20 do
+                        Vitest.expect(entry.Text.Contains(token.Substring(start, 20))).toBe false
+            }
+        )
+
+        Vitest.test (
+            "a user name with an at sign does not leak the rest of the URL userinfo into the output",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! entries = runCloneStandIn $"https://me@mail.com:s3cr3tTokenValue@{testHost}/origin.git"
+
+                Vitest.expect(
+                    entries
+                    |> Array.exists (fun entry ->
+                        entry.Kind = OperationOutputKind.Command && entry.Text.Contains $"[REDACTED]@{testHost}")
+                )
+                    .toBe true
+
+                for entry in entries do
+                    Vitest.expect(entry.Text.Contains "s3cr3tTokenValue").toBe false
+                    Vitest.expect(entry.Text.Contains "mail.com").toBe false
+            }
+        )
+
+        Vitest.test (
+            "a fetch with credentials reports no part of the credential in its output",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let secret = "p@ss word-secret-123"
+                let basicPayload = toBase64 $"oauth2:{secret}"
+                let! root = createTempDirectoryAsync ()
+                let workPath = join [| root; "work" |]
+
+                try
+                    let! _ = runGitIn root [| "init"; "-b"; "main"; workPath |]
+                    let! _ = runGitIn workPath [| "config"; "user.name"; "VCS Cred Tests" |]
+                    let! _ = runGitIn workPath [| "config"; "user.email"; "cred@example.org" |]
+                    do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) "base\n"
+                    let! _ = runGitIn workPath [| "add"; "-A" |]
+                    let! _ = runGitIn workPath [| "commit"; "-m"; "init: base" |]
+                    let! _ = runGitIn workPath [| "remote"; "add"; "origin"; testHttpsUrl |]
+                    let! _ = runGitIn workPath [| "config"; "branch.main.remote"; "origin" |]
+                    let! _ = runGitIn workPath [| "config"; "branch.main.merge"; "refs/heads/main" |]
+                    let! _ = runGitIn workPath [| "update-ref"; "refs/remotes/origin/main"; "HEAD" |]
+
+                    // The stand-in for git echoes its arguments and the secret forms that the arguments hold,
+                    // like a git that traces its configuration. The header value is not on a line of its own.
+                    let echoScript =
+                        "const args = process.argv.slice(1);"
+                        + "for (const a of args) console.error(a);"
+                        + "const header = args.find(a => a.includes('Basic '));"
+                        + "const payload = header.split('Basic ')[1];"
+                        + "console.error('payload=' + payload);"
+                        + "console.error('decoded=' + Buffer.from(payload, 'base64').toString());"
+
+                    let hooks: GitWorkspaceSession.GitSessionHooks = {
+                        RunBytesProcess = None
+                        RunProcess =
+                            Some(fun request processContext ->
+                                if request.Arguments |> Array.contains "fetch" then
+                                    NodeProcess.run
+                                        { request with
+                                            Command = nodeExecutablePath
+                                            Arguments = [| "-e"; echoScript; "--"; yield! request.Arguments |] }
+                                        processContext
+                                else
+                                    NodeProcess.run request processContext)
+                        Barrier = None
+                    }
+
+                    let strategy: GitCredentialStrategy.GitCredentialStrategy = {
+                        ResolveCredential =
+                            fun _host _profileId ->
+                                async {
+                                    return
+                                        Some {
+                                            Username = "oauth2"
+                                            Secret = secret
+                                        }
+                                }
+                    }
+
+                    let binding: WorkspaceBinding = {
+                        SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
+                        ProviderId = gitProviderId
+                        WorkspaceRoot = workPath
+                        ProviderStateRef = None
+                        Location = {
+                            ProviderId = gitProviderId
+                            DisplayName = None
+                            ProviderLocation = testHttpsUrl
+                            ConnectionProfileId = Some "token-profile"
+                        }
+                        ConnectionProfileId = Some "token-profile"
+                    }
+
+                    let session = GitWorkspaceSession.createSessionWithCredentials hooks strategy binding
+                    let batches = ResizeArray<OperationOutput[]>()
+
+                    let context =
+                        OperationContext.createWithOutput
+                            "credential-fetch-output"
+                            OperationCancellation.none
+                            ignore
+                            batches.Add
+
+                    let synchronization =
+                        session.Synchronization
+                        |> Option.defaultWith (fun () -> failwith "Expected the Git synchronization service.")
+
+                    let! _ = synchronization.Refresh context |> Async.StartAsPromise
+                    let entries = batches |> Seq.collect id |> Seq.toArray
+
+                    Vitest.expect(
+                        entries
+                        |> Array.exists (fun entry ->
+                            entry.Kind = OperationOutputKind.StdErr && entry.Text = "payload=[REDACTED]")
+                    )
+                        .toBe true
+
+                    for entry in entries do
+                        for form in [| basicPayload; $"oauth2:{secret}"; secret |] do
+                            Vitest.expect(entry.Text.Contains form).toBe false
+
+                    do! removeDirectoryAsync root
+                with error ->
+                    do! removeDirectoryAsync root
+                    return raise error
+            }
+        )
+)
+
+let private lfsEndpointArguments (remoteUrl: string) : string[] =
+    let credential: GitCredentialStrategy.GitCredential option =
+        Some {
+            Username = "oauth2"
+            Secret = testSecret
+        }
+
+    let authentication = GitCredentialStrategy.buildScopedCommandAuthentication "origin" remoteUrl credential
+
+    authentication.ConfigArgs
+    |> Array.filter (fun argument ->
+        argument.StartsWith("lfs.url=", StringComparison.Ordinal)
+        || argument.StartsWith("remote.origin.lfsurl=", StringComparison.Ordinal))
+
+let private expectLfsEndpoint (remoteUrl: string) (endpoint: string) =
+    Vitest.expect(lfsEndpointArguments remoteUrl).toEqual [|
+        $"remote.origin.lfsurl={endpoint}"
+        $"lfs.url={endpoint}"
+    |]
+
+Vitest.describe (
+    "Git LFS endpoint of a credentialed remote",
+    fun () ->
+        Vitest.test (
+            "adds .git to a remote URL without the suffix, as git-lfs server discovery does",
+            fun () ->
+                expectLfsEndpoint
+                    $"https://{testHost}/group/proj"
+                    $"https://oauth2:{testSecret}@{testHost}/group/proj.git/info/lfs"
+        )
+
+        Vitest.test (
+            "keeps a remote URL that already ends in .git from getting the suffix twice",
+            fun () ->
+                expectLfsEndpoint
+                    $"https://{testHost}/group/proj.git"
+                    $"https://oauth2:{testSecret}@{testHost}/group/proj.git/info/lfs"
+        )
+
+        Vitest.test (
+            "compares the .git suffix case-sensitively, as git-lfs does",
+            fun () ->
+                expectLfsEndpoint
+                    $"https://{testHost}/group/proj.GIT"
+                    $"https://oauth2:{testSecret}@{testHost}/group/proj.GIT.git/info/lfs"
+        )
+
+        Vitest.test (
+            "trims a trailing slash before it appends the endpoint path",
+            fun () ->
+                expectLfsEndpoint
+                    $"https://{testHost}/group/proj/"
+                    $"https://oauth2:{testSecret}@{testHost}/group/proj.git/info/lfs"
+
+                expectLfsEndpoint
+                    $"https://{testHost}/group/proj.git/"
+                    $"https://oauth2:{testSecret}@{testHost}/group/proj.git/info/lfs"
+        )
+
+        Vitest.test (
+            "replaces the userinfo of the remote URL with the resolved credential in the endpoint",
+            fun () ->
+                expectLfsEndpoint
+                    $"https://someone:old-secret@{testHost}/group/proj"
+                    $"https://oauth2:{testSecret}@{testHost}/group/proj.git/info/lfs"
+        )
 )

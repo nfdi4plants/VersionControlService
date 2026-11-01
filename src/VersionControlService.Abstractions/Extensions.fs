@@ -302,6 +302,24 @@ type ObjectMaterializationService = {
     Dematerialize: RepositoryPath -> OperationContext -> Async<OperationResult<unit>>
 }
 
+/// Optional batch variant of the object-materialization extension. A provider supplies it when it can
+/// download or free many large objects in one operation, which is faster than one Materialize or
+/// Dematerialize call per path.
+///
+/// Paths are exact keys, as for the single calls, and a duplicate counts once. An empty array or paths that
+/// are already in the target state give Succeeded with a NoOp effect. When some paths fail and others
+/// changed, the result is PartiallySucceeded. When none changed, it is Failed. A failure lists the failed
+/// paths in AffectedPaths and one "<path>: <message>" line per failed path in Details. The outcome's
+/// AffectedPaths lists the changed paths. A canceled run reports the paths that finished as changed and
+/// fails the others with a Canceled failure (PartiallySucceeded when some changed, Failed when none).
+type ObjectBatchMaterializationService = {
+    /// Replaces the pointers of the given paths with their content.
+    Materialize: RepositoryPath[] -> OperationContext -> Async<OperationResult<unit>>
+    /// Replaces the content of the given paths with their pointers. Each path follows the rules of the
+    /// single Dematerialize call.
+    Dematerialize: RepositoryPath[] -> OperationContext -> Async<OperationResult<unit>>
+}
+
 type StoragePolicySettings = {
     /// Threshold in megabytes above which new objects use large-object storage, when supported.
     AutoPolicyThresholdMb: int option

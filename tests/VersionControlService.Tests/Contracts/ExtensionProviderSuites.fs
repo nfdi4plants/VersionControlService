@@ -40,6 +40,25 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     expectValue "list objects" listResult |> ignore
                 }
 
+            if harness.ExpectedServices |> List.contains "batch-materialization" then
+                profileTest "batch materialization of no paths changes nothing"
+                <| fun () -> promise {
+                    let! workspace = harness.CreateWorkspace()
+
+                    let batchMaterialization =
+                        match workspace.Session.ObjectBatchMaterialization with
+                        | Some service -> service
+                        | None -> failwith "The harness advertises batch-materialization but the session lacks it."
+
+                    let! materializeResult = run (batchMaterialization.Materialize [||] (ctx "batch-materialize-none"))
+                    expectNoOp "batch materialize of no paths" materializeResult |> ignore
+
+                    let! dematerializeResult =
+                        run (batchMaterialization.Dematerialize [||] (ctx "batch-dematerialize-none"))
+
+                    expectNoOp "batch dematerialize of no paths" dematerializeResult |> ignore
+                }
+
             if harness.ExpectedServices |> List.contains "storage-policy" then
                 profileTest "storage policy settings round-trip"
                 <| fun () -> promise {

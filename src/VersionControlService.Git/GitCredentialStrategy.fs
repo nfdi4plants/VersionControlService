@@ -132,6 +132,21 @@ let internal buildScopedAuthArguments (remoteUrl: string) (credential: GitCreden
             |]
         | _ -> [||]
 
+/// Builds the Git LFS endpoint of a remote URL with the rule git-lfs applies in its
+/// server discovery (docs/api/server-discovery.md). A remote that ends in ".git" gets
+/// "/info/lfs" and any other remote gets ".git/info/lfs". git-lfs compares the suffix
+/// case-sensitively (path.Ext(url) == ".git" in NewEndpointFromCloneURL), so "proj.GIT" becomes
+/// "proj.GIT.git/info/lfs" here as well. git-lfs uses an explicit lfs.url literally, so the
+/// suffix has to be added here. GitLab answers a batch request to an endpoint without ".git"
+/// with "422 Unprocessable entity".
+let private buildLfsEndpoint (remoteUrl: string) : string =
+    let trimmed = remoteUrl.TrimEnd('/')
+
+    if trimmed.EndsWith(".git", StringComparison.Ordinal) then
+        trimmed + "/info/lfs"
+    else
+        trimmed + ".git/info/lfs"
+
 /// Builds one command-scoped authentication value that can be reused for core
 /// Git and explicit Git LFS processes. The credential-bearing LFS endpoint is
 /// supplied only through `-c` arguments and is never persisted in repository
@@ -160,7 +175,7 @@ let internal buildScopedCommandAuthentication
             let username = encodeUriComponent resolved.Username
             let secret = encodeUriComponent resolved.Secret
             let authenticatedRemote = $"https://{username}:{secret}@{remoteWithoutScheme}"
-            let authenticatedLfsUrl = authenticatedRemote.TrimEnd('/') + "/info/lfs"
+            let authenticatedLfsUrl = buildLfsEndpoint authenticatedRemote
 
             [|
                 "-c"

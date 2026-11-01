@@ -17,6 +17,7 @@ module GitLfsExtensions = VersionControlService.Git.GitLfsExtensions
 module GitProvisioningService = VersionControlService.Git.GitProvisioningService
 module GitTextDiffService = VersionControlService.Git.TextDiff.GitTextDiffService
 module NodeProcess = VersionControlService.Runtime.Node.Process
+module NodeOutput = VersionControlService.Runtime.Node.OutputReporter
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodePath = VersionControlService.Runtime.Node.Path
 module NodeInterop = VersionControlService.Runtime.Node.Interop
@@ -98,6 +99,7 @@ let private categoryOfKind (kind: GitFailureKind) =
     | GitFailureKind.LfsBackupRetained -> ProviderError
     | GitFailureKind.InvalidLfsThreshold -> Validation
     | GitFailureKind.RemoteProjectAlreadyExists -> ProviderError
+    | GitFailureKind.LocalChanges -> ProviderError
     | GitFailureKind.Unknown -> ProviderError
 
 let private codeOfKind (kind: GitFailureKind) =
@@ -111,6 +113,7 @@ let private codeOfKind (kind: GitFailureKind) =
     | GitFailureKind.LfsBackupRetained -> "lfs_backup_retained"
     | GitFailureKind.InvalidLfsThreshold -> "invalid_lfs_threshold"
     | GitFailureKind.RemoteProjectAlreadyExists -> "remote_project_exists"
+    | GitFailureKind.LocalChanges -> "local_changes"
     | GitFailureKind.Unknown -> "git_failure"
 
 let private toOperationFailure (failure: GitService.GitFailure) : OperationFailure =
@@ -163,7 +166,11 @@ let private mergeGitEnvironment (requestEnvironment: (string * string)[]) =
          |> Array.filter (fun (name, _) -> not (Set.contains name requestNames)))
         requestEnvironment
 
-let private runGitEnv
+/// Runs git with a progress phase code for its meter lines. Stderr meters are always read. Stdout is
+/// read and reported to the output channel only when `observeStdout` is set, because the stdout of most calls is data.
+let private runGitWithProgress
+    (phaseCode: string)
+    (observeStdout: bool)
     (hooks: GitSessionHooks)
     (repoPath: string)
     (arguments: string[])
@@ -177,7 +184,9 @@ let private runGitEnv
                 WorkingDirectory = Some repoPath
                 StdinData = stdinData
                 Environment = mergeGitEnvironment environment
-                ProgressPhase = "git"
+                ProgressPhase = phaseCode
+                ObserveStdoutProgress = observeStdout
+                ReportStdoutOutput = observeStdout
         }
 
         let runner = hooks.RunProcess |> Option.defaultValue NodeProcess.run
@@ -189,8 +198,34 @@ let private runGitEnv
         | Failed failure -> return Error failure
     }
 
+let private runGitEnv hooks repoPath arguments stdinData environment context =
+    runGitWithProgress "git" false hooks repoPath arguments stdinData environment context
+
 let private runGit hooks repoPath arguments stdinData context =
     runGitEnv hooks repoPath arguments stdinData [||] context
+
+/// Runs a git call that transfers data. Its meters reach ReportProgress under `phaseCode`. The returned
+/// output has no meter lines left, so a failure text built from it names the cause of the failure.
+let private runGitTransfer
+    (phaseCode: string)
+    (observeStdout: bool)
+    (hooks: GitSessionHooks)
+    (repoPath: string)
+    (arguments: string[])
+    (environment: (string * string)[])
+    (context: OperationContext)
+    : Async<Result<NodeProcess.ProcessOutput, OperationFailure>> =
+    async {
+        let! result = runGitWithProgress phaseCode observeStdout hooks repoPath arguments None environment context
+
+        return
+            result
+            |> Result.map (fun (output: NodeProcess.ProcessOutput) -> {
+                output with
+                    StdOut = NodeProcess.dropProgressMeterLines output.StdOut
+                    StdErr = NodeProcess.dropProgressMeterLines output.StdErr
+            })
+    }
 
 let private reportProgressReset (phaseCode: string) (context: OperationContext) =
     context.ReportProgress {
@@ -200,6 +235,136 @@ let private reportProgressReset (phaseCode: string) (context: OperationContext) 
         Total = None
         DisplayMessage = None
     }
+
+/// Announces a step before it runs. Like a reset, the event has no numbers. It also names the step.
+let private reportStepStart (phaseCode: string) (message: string) (context: OperationContext) =
+    context.ReportProgress {
+        PhaseCode = phaseCode
+        Item = None
+        Completed = None
+        Total = None
+        DisplayMessage = Some message
+    }
+
+let private outputFailureText (output: NodeProcess.ProcessOutput) =
+    if String.IsNullOrWhiteSpace output.StdErr then output.StdOut else output.StdErr
+
+/// How runLfsHydration ended. `Output` is the output of the step that ended the sequence, and for a fetch
+/// that failed it is the fetch. `CheckoutFailed` is set when the checkout ran and failed. `Details` holds
+/// the failure text of a checkout that failed after a failed fetch, for the Details of the failure.
+type private LfsHydrationRun = {
+    Output: Result<NodeProcess.ProcessOutput, OperationFailure>
+    CheckoutFailed: bool
+    Details: string[]
+}
+
+/// Downloads the large objects of a checkout with `git lfs fetch` and then `git lfs checkout`, which is
+/// what `git lfs pull` does in one process. A canceled pull kills git-lfs while it holds the index lock
+/// and leaves `.git/index.lock` behind. The fetch takes no lock, so a cancel stops it cleanly. The
+/// checkout is local and runs to its end, because stopping it midway is what leaves the lock. A cancel
+/// that arrives during the checkout takes effect afterwards, and the work it finished counts. The
+/// checkout runs after every fetch that ended without a cancel, whatever its exit code, because git-lfs
+/// fetches the objects it can reach before it reports one that is missing, and those objects belong in the
+/// working tree. The failure of such a fetch stays the result. The fetch reports under `phaseCode` and the
+/// checkout under `phaseCode` plus "-checkout".
+let private runLfsHydration
+    (phaseCode: string)
+    (hooks: GitSessionHooks)
+    (repoPath: string)
+    (authenticationArguments: string[])
+    (fetchTarget: string[])
+    (context: OperationContext)
+    : Async<LfsHydrationRun> =
+    async {
+        // Git LFS writes its meters to stdout, and only when asked to.
+        let run code arguments runContext =
+            runGitTransfer
+                code
+                true
+                hooks
+                repoPath
+                (GitCredentialStrategy.buildLfsTransferArguments authenticationArguments arguments)
+                [| GitLfsForceProgress; "GIT_TERMINAL_PROMPT", "0" |]
+                runContext
+
+        let! fetched = run phaseCode [| "lfs"; "fetch"; yield! fetchTarget |] context
+
+        let endedWith output = {
+            Output = output
+            CheckoutFailed = false
+            Details = [||]
+        }
+
+        match fetched with
+        | Ok fetchOutput when not (context.Cancellation.IsCancellationRequested()) ->
+            let checkoutPhaseCode = phaseCode + "-checkout"
+            reportStepStart checkoutPhaseCode "Checking out large files" context
+
+            let! finishedCheckout =
+                run
+                    checkoutPhaseCode
+                    [| "lfs"; "checkout" |]
+                    { context with
+                        Cancellation = OperationCancellation.none }
+
+            // A held index.lock makes git-lfs write the files, report the index error and exit with 0.
+            // That run counts as a failed checkout, so its output carries the error text and a nonzero exit.
+            let checkout =
+                match finishedCheckout with
+                | Ok output when output.ExitCode = 0 ->
+                    match GitLfsService.lfsCheckoutIndexUpdateFailed output.StdOut output.StdErr with
+                    | Some text ->
+                        Ok {
+                            output with
+                                ExitCode = 1
+                                StdOut = String.Empty
+                                StdErr = text
+                        }
+                    | None -> finishedCheckout
+                | _ -> finishedCheckout
+
+            let checkoutFailure =
+                match checkout with
+                | Ok output when output.ExitCode = 0 -> None
+                | Ok output -> Some((outputFailureText output).Trim())
+                | Error failure -> Some failure.Message
+
+            if fetchOutput.ExitCode = 0 then
+                return {
+                    endedWith checkout with
+                        CheckoutFailed = checkoutFailure.IsSome
+                }
+            else
+                return {
+                    endedWith fetched with
+                        CheckoutFailed = checkoutFailure.IsSome
+                        Details =
+                            checkoutFailure
+                            |> Option.map (fun text -> $"The checkout after the failed fetch also failed: {text}")
+                            |> Option.toArray
+                }
+        | Ok output when output.ExitCode = 0 ->
+            return
+                endedWith (
+                    Error(
+                        OperationFailure.create
+                            Canceled
+                            "operation_canceled"
+                            "The large-object download was canceled before the checkout started."
+                    )
+                )
+        | _ -> return endedWith fetched
+    }
+
+/// The failure of a hydration that ended with a nonzero exit, named after the operation whose Git
+/// transfer had worked. Failure text of a checkout that followed a failed fetch goes to the Details.
+let private hydrationOutputFailure (operation: string) (output: NodeProcess.ProcessOutput) (details: string[]) =
+    let failure = hydrationFailure operation (outputFailureText output)
+
+    if details.Length = 0 then
+        failure
+    else
+        OperationFailure.withDetails details failure
 
 let private runHookedBytesProcess
     (hooks: GitSessionHooks)
@@ -218,35 +383,47 @@ let private runHookedBytesProcess
 
 /// The summary leaves out the leading `-c` pairs because they can hold credentials, and redacting a header would take Git's reason with it.
 let private commandSummary (arguments: string[]) =
-    let mutable firstRemainingArgument = 0
-
-    while firstRemainingArgument + 1 < arguments.Length && arguments[firstRemainingArgument] = "-c" do
-        firstRemainingArgument <- firstRemainingArgument + 2
-
     arguments
-    |> Array.skip firstRemainingArgument
+    |> NodeOutput.withoutLeadingConfig
     |> Array.truncate 3
     |> String.concat " "
+
+/// Turns a nonzero git exit into a failure.
+let private checkGitExit
+    (arguments: string[])
+    (result: Result<NodeProcess.ProcessOutput, OperationFailure>)
+    : Result<NodeProcess.ProcessOutput, OperationFailure> =
+    match result with
+    | Error failure -> Error failure
+    | Ok output when output.ExitCode <> 0 ->
+        match GitInternals.tryIndexLockFailure output.StdErr with
+        | Some(path, ageSeconds) -> Error(GitInternals.indexLockFailure path ageSeconds)
+        | None ->
+            Error(
+                OperationFailure.createRedacted
+                    ProviderError
+                    "git_failure"
+                    $"git {commandSummary arguments} failed: {output.StdErr}"
+            )
+    | Ok output -> Ok output
 
 /// runGit that fails when git exits nonzero.
 let private runGitChecked hooks repoPath arguments stdinData context =
     async {
         let! result = runGit hooks repoPath arguments stdinData context
+        return checkGitExit arguments result
+    }
 
-        match result with
-        | Error failure -> return Error failure
-        | Ok output when output.ExitCode <> 0 ->
-            match GitInternals.tryIndexLockFailure output.StdErr with
-            | Some(path, ageSeconds) -> return Error(GitInternals.indexLockFailure path ageSeconds)
-            | None ->
-                return
-                    Error(
-                        OperationFailure.createRedacted
-                            ProviderError
-                            "git_failure"
-                            $"git {commandSummary arguments} failed: {output.StdErr}"
-                    )
-        | Ok output -> return Ok output
+/// Git prints no fetch meters to a pipe unless asked, and then writes them to stderr.
+let private fetchArguments (authArguments: string[]) (remote: string) =
+    [| yield! authArguments; "fetch"; "--progress"; remote |]
+
+/// Fetches from the remote with meters under the phase "fetch" and fails when git exits nonzero.
+let private runGitFetchChecked hooks repoPath authArguments remote context =
+    async {
+        let arguments = fetchArguments authArguments remote
+        let! result = runGitTransfer "fetch" false hooks repoPath arguments [||] context
+        return checkGitExit arguments result
     }
 
 let private barrier (hooks: GitSessionHooks) (repoPath: string) (point: string) (context: OperationContext) =
@@ -1431,9 +1608,14 @@ let private toWorkspaceStatus
 
 /// Resolves a repository state path (MERGE_HEAD, ...) through Git itself so
 /// linked worktrees report the right location instead of `<root>/.git/<name>`.
-let private resolveGitStatePath (state: SessionState) (name: string) (context: OperationContext) =
+let private resolveGitStatePathAt
+    (hooks: GitSessionHooks)
+    (repoPath: string)
+    (name: string)
+    (context: OperationContext)
+    =
     async {
-        let! output = runGit state.Hooks state.RepoPath [| "rev-parse"; "--git-path"; name |] None context
+        let! output = runGit hooks repoPath [| "rev-parse"; "--git-path"; name |] None context
 
         match output with
         | Error failure -> return Error failure
@@ -1447,7 +1629,7 @@ let private resolveGitStatePath (state: SessionState) (name: string) (context: O
                     if rawPath.StartsWith "/" || (rawPath.Length >= 2 && rawPath[1] = ':') then
                         rawPath
                     else
-                        NodePath.join [| state.RepoPath; rawPath |]
+                        NodePath.join [| repoPath; rawPath |]
 
                 return Ok(Some absolutePath)
         | Ok result ->
@@ -1465,6 +1647,62 @@ let private resolveGitStatePath (state: SessionState) (name: string) (context: O
                             "git_failure"
                             $"git rev-parse --git-path {name} failed: {detail}"
                     )
+    }
+
+let private resolveGitStatePath (state: SessionState) (name: string) (context: OperationContext) =
+    resolveGitStatePathAt state.Hooks state.RepoPath name context
+
+/// The path of the index lock when its file exists. The lookup runs on a copy of the context without its
+/// cancellation, because it follows a checkout that ran to its end and the process runner starts nothing
+/// on a canceled context. A lookup that fails finds nothing.
+let private tryFindHeldIndexLock
+    (hooks: GitSessionHooks)
+    (repoPath: string)
+    (context: OperationContext)
+    : Async<string option> =
+    let lookupContext = {
+        context with
+            Cancellation = OperationCancellation.none
+    }
+
+    GitLfsService.tryFindHeldIndexLockWith
+        (fun arguments -> runGit hooks repoPath arguments None lookupContext)
+        repoPath
+
+/// Recovery for a large-object download that failed or was canceled after the Git transfer itself
+/// worked. It names the index.lock when Git reported one in the failure text, and when the checkout
+/// step failed while a lock file exists. A lock next to a failed fetch proves nothing, because the
+/// fetch takes no lock, so that failure gets the plain retry. The library never deletes a lock, because
+/// nothing here shows who owns it. A lookup that fails falls back to the plain retry.
+let private hydrationRecovery
+    (hooks: GitSessionHooks)
+    (repoPath: string)
+    (failure: OperationFailure)
+    (checkoutFailed: bool)
+    (context: OperationContext)
+    : Async<RecoveryAction> =
+    async {
+        let removeLock = {
+            Code = "remove_index_lock"
+            Instructions =
+                Some
+                    "An index.lock in the repository blocks the checkout of large files. Make sure no git process is running on the repository and remove the lock file if it is still there. Then retry the download."
+        }
+
+        let namedByGit =
+            Array.append [| failure.Message |] failure.Details
+            |> Array.exists (fun text -> (GitInternals.tryIndexLockFailure text).IsSome)
+
+        if namedByGit then
+            return removeLock
+        elif not checkoutFailed then
+            return materializationRecovery failure
+        else
+            let! heldLock = tryFindHeldIndexLock hooks repoPath context
+
+            match heldLock with
+            | Some _ -> return removeLock
+            | None -> return materializationRecovery failure
     }
 
 let private preflightIndexLock (state: SessionState) (context: OperationContext) : Async<Result<unit, OperationFailure>> =
@@ -2113,6 +2351,29 @@ let private isMaterializedLfsObject (state: SessionState) (pathValue: string) (s
     with _ ->
         false
 
+/// The failure of a `git lfs checkout` that wrote its files but could not update the Git index. A held
+/// index lock gives the lock failure with its recovery, and any other cause gives the checkout failure.
+/// The files changed in both cases.
+let private lfsCheckoutIndexFailure
+    (state: SessionState)
+    (text: string)
+    (context: OperationContext)
+    : Async<OperationFailure> =
+    async {
+        let! heldLock = tryFindHeldIndexLock state.Hooks state.RepoPath context
+
+        let failure =
+            match heldLock with
+            | Some lockPath -> GitInternals.indexLockFailure lockPath (GitInternals.tryFileAgeSeconds lockPath)
+            | None ->
+                OperationFailure.createRedacted
+                    ProviderError
+                    "lfs_checkout_failed"
+                    $"Git LFS checkout failed: {text}"
+
+        return { failure with StateChanged = true }
+    }
+
 let private materializeLocalLfsObject
     (state: SessionState)
     (pathValue: string)
@@ -2131,6 +2392,7 @@ let private materializeLocalLfsObject
         | Ok mediaDirectory when not (GitLfsObjects.isObjectLocallyAvailable mediaDirectory objectId sizeBytes) ->
             return LocalLfsObjectUnavailable
         | Ok _ ->
+            // The checkout is local and holds the index lock, so a cancel must not kill it.
             let! checkoutResult =
                 runGit
                     state.Hooks
@@ -2142,12 +2404,18 @@ let private materializeLocalLfsObject
                         GitLfsObjects.lfsCheckoutPattern pathValue
                     |]
                     None
-                    context
+                    { context with
+                        Cancellation = OperationCancellation.none }
 
             match checkoutResult with
             | Error failure -> return LocalLfsCheckoutFailed failure
             | Ok output when output.ExitCode = 0 ->
-                return LocalLfsCheckoutCompleted(isMaterializedLfsObject state pathValue sizeBytes)
+                match GitLfsService.lfsCheckoutIndexUpdateFailed output.StdOut output.StdErr with
+                | None -> return LocalLfsCheckoutCompleted(isMaterializedLfsObject state pathValue sizeBytes)
+                | Some text ->
+                    // The checkout wrote the file, so the size check would pass.
+                    let! failure = lfsCheckoutIndexFailure state text context
+                    return LocalLfsCheckoutFailed failure
             | Ok output ->
                 let detail =
                     if String.IsNullOrWhiteSpace output.StdErr then
@@ -2164,14 +2432,17 @@ let private materializeLocalLfsObject
                     )
     }
 
+/// Checks out the local objects of the restored paths. It returns the failures as path, text and whether a
+/// cancel caused them. It also returns the recovery of a checkout that hit a held index lock.
 let private materializeRestoredLocalLfsObjects
     (state: SessionState)
     (restoredPaths: string[])
     (context: OperationContext)
-    : Async<(string * string * bool)[]> =
+    : Async<(string * string * bool)[] * RecoveryAction option> =
     async {
         let candidates = ResizeArray<string * GitLfsObjects.LfsPointerInfo>()
         let failures = ResizeArray<string * string * bool>()
+        let lockRecoveries = ResizeArray<RecoveryAction>()
 
         for pathValue in restoredPaths do
             let! pointerResult = GitLfsObjects.readWorktreePointer state.RepoPath pathValue
@@ -2209,19 +2480,32 @@ let private materializeRestoredLocalLfsObjects
                     |> Seq.toArray
 
                 for chunk in Array.chunkBySize 50 availableCandidates do
+                    // The checkout is local and holds the index lock, so a cancel must not kill it. A
+                    // cancel that arrived earlier stops the chunks that have not started.
                     let! checkoutResult =
-                        runGit
-                            state.Hooks
-                            state.RepoPath
-                            [|
-                                "lfs"
-                                "checkout"
-                                "--"
-                                for pathValue, _ in chunk do
-                                    GitLfsObjects.lfsCheckoutPattern pathValue
-                            |]
-                            None
-                            context
+                        if context.Cancellation.IsCancellationRequested() then
+                            async.Return(
+                                Error(
+                                    OperationFailure.create
+                                        Canceled
+                                        "operation_canceled"
+                                        "The operation was canceled before the process started."
+                                )
+                            )
+                        else
+                            runGit
+                                state.Hooks
+                                state.RepoPath
+                                [|
+                                    "lfs"
+                                    "checkout"
+                                    "--"
+                                    for pathValue, _ in chunk do
+                                        GitLfsObjects.lfsCheckoutPattern pathValue
+                                |]
+                                None
+                                { context with
+                                    Cancellation = OperationCancellation.none }
 
                     match checkoutResult with
                     | Error failure ->
@@ -2230,13 +2514,23 @@ let private materializeRestoredLocalLfsObjects
                         for pathValue, _ in chunk do
                             failures.Add(pathValue, failure.Message, canceled)
                     | Ok output when output.ExitCode = 0 ->
-                        for pathValue, pointer in chunk do
-                            if not (isMaterializedLfsObject state pathValue pointer.SizeInBytes) then
-                                failures.Add(
-                                    pathValue,
-                                    "Git LFS checkout did not write the expected object content.",
-                                    false
-                                )
+                        match GitLfsService.lfsCheckoutIndexUpdateFailed output.StdOut output.StdErr with
+                        | Some text ->
+                            // The checkout wrote the files, so the content check below would pass.
+                            let! indexFailure = lfsCheckoutIndexFailure state text context
+
+                            indexFailure.RecoveryAction |> Option.iter lockRecoveries.Add
+
+                            for pathValue, _ in chunk do
+                                failures.Add(pathValue, indexFailure.Message, false)
+                        | None ->
+                            for pathValue, pointer in chunk do
+                                if not (isMaterializedLfsObject state pathValue pointer.SizeInBytes) then
+                                    failures.Add(
+                                        pathValue,
+                                        "Git LFS checkout did not write the expected object content.",
+                                        false
+                                    )
                     | Ok output ->
                         let detail =
                             if String.IsNullOrWhiteSpace output.StdErr then
@@ -2249,7 +2543,7 @@ let private materializeRestoredLocalLfsObjects
                         for pathValue, _ in chunk do
                             failures.Add(pathValue, detail, canceled)
 
-        return failures.ToArray()
+        return failures.ToArray(), Seq.tryHead lockRecoveries
     }
 
 let private restorePaths (state: SessionState) (request: RestoreRequest) (context: OperationContext) =
@@ -2310,7 +2604,7 @@ let private restorePaths (state: SessionState) (request: RestoreRequest) (contex
                     match result with
                     | Error failure -> return Failed failure
                     | Ok restoredPaths ->
-                        let! materializationFailures =
+                        let! materializationFailures, lockRecovery =
                             materializeRestoredLocalLfsObjects
                                 state
                                 restoredPaths
@@ -2341,7 +2635,7 @@ let private restorePaths (state: SessionState) (request: RestoreRequest) (contex
                                 OperationResult.partiallySucceeded
                                     (OperationOutcome.performed ())
                                     failure
-                                    (localMaterializationRecovery ())
+                                    (lockRecovery |> Option.defaultWith localMaterializationRecovery)
     }
 
 let private listRefs (state: SessionState) (context: OperationContext) =
@@ -3376,13 +3670,9 @@ let private refresh (state: SessionState) (context: OperationContext) =
                 | Error failure -> return Failed failure
                 | Ok authArguments ->
 
-                let! fetchResult =
-                    runGitChecked
-                        state.Hooks
-                        state.RepoPath
-                        [| yield! authArguments; "fetch"; remote |]
-                        None
-                        context
+                reportStepStart "fetch" "Fetching online changes" context
+
+                let! fetchResult = runGitFetchChecked state.Hooks state.RepoPath authArguments remote context
 
                 match fetchResult with
                 | Error failure -> return Failed { failure with Retryable = true }
@@ -3517,13 +3807,14 @@ let private readMaterializeLargeObjects (state: SessionState) (context: Operatio
             | Error failure -> Error failure
     }
 
-/// Downloads the large objects of the checkout from the upstream remote of `targetRef`.
+/// Downloads the large objects of the checkout from the upstream remote of `targetRef`. A failure comes
+/// with the recovery that fits it.
 let private downloadLargeObjects
     (state: SessionState)
     (targetRef: LogicalRef option)
     (operation: string)
     (context: OperationContext)
-    : Async<Result<unit, OperationFailure>> =
+    : Async<Result<unit, OperationFailure * RecoveryAction>> =
     async {
         let! remoteResult =
             match targetRef with
@@ -3551,29 +3842,33 @@ let private downloadLargeObjects
                     match authentication with
                     | Error failure -> return Error failure
                     | Ok authentication ->
-                        return!
-                            runGitEnv
+                        reportStepStart "lfs-pull" "Downloading large files" context
+
+                        let! run =
+                            runLfsHydration
+                                "lfs-pull"
                                 state.Hooks
                                 state.RepoPath
-                                (GitCredentialStrategy.buildLfsTransferArguments
-                                    authentication.ConfigArgs
-                                    [|
-                                        "lfs"
-                                        "pull"
-                                        remote
-                                        yield! hydrationRef |> Option.toArray
-                                    |])
-                                None
-                                [| "GIT_TERMINAL_PROMPT", "0" |]
+                                authentication.ConfigArgs
+                                [| remote; yield! hydrationRef |> Option.toArray |]
                                 context
+
+                        return Ok run
                 }
 
+        let failedWith (failure: OperationFailure) (checkoutFailed: bool) = async {
+            let! recovery = hydrationRecovery state.Hooks state.RepoPath failure checkoutFailed context
+            return Error(failure, recovery)
+        }
+
         match hydration with
-        | Ok output when output.ExitCode = 0 -> return Ok()
-        | Ok output ->
-            let detail = if String.IsNullOrWhiteSpace output.StdErr then output.StdOut else output.StdErr
-            return Error(hydrationFailure operation detail)
-        | Error failure -> return Error { failure with Code = "hydration_failed" }
+        | Error failure -> return! failedWith { failure with Code = "hydration_failed" } false
+        | Ok run ->
+            match run.Output with
+            | Ok output when output.ExitCode = 0 -> return Ok()
+            | Ok output ->
+                return! failedWith (hydrationOutputFailure operation output run.Details) run.CheckoutFailed
+            | Error failure -> return! failedWith { failure with Code = "hydration_failed" } run.CheckoutFailed
     }
 
 /// Without anything to merge, an update still downloads the large objects of the checkout
@@ -3598,7 +3893,7 @@ let private downloadLargeObjectsWithoutUpdate
 
                 match downloaded with
                 | Ok() -> return Succeeded outcome
-                | Error failure -> return OperationResult.partiallySucceeded outcome failure (materializationRecovery failure)
+                | Error(failure, recovery) -> return OperationResult.partiallySucceeded outcome failure recovery
         | _ -> return Succeeded outcome
     }
 
@@ -3646,6 +3941,8 @@ let private updateFromState
                                     false
                                 )
                         else
+                            reportStepStart "merge" "Merging online changes" context
+
                             let! result =
                                 runGitEnv
                                     state.Hooks
@@ -3763,18 +4060,17 @@ let private updateFromState
                                 ResultingRevision = newState.WorkspaceRevision
                         }
 
-                        let partial failure =
-                            OperationResult.partiallySucceeded
-                                outcome
-                                {
-                                    failure with
-                                        AffectedPaths = affectedPaths
-                                }
-                                (materializationRecovery failure)
-
                         match hydration with
                         | Ok _ -> return Succeeded outcome
-                        | Error failure -> return partial failure
+                        | Error(failure, recovery) ->
+                            return
+                                OperationResult.partiallySucceeded
+                                    outcome
+                                    {
+                                        failure with
+                                            AffectedPaths = affectedPaths
+                                    }
+                                    recovery
             | Ok output, Ok start ->
                 reportProgressReset "update-inspection" context
                 let inspectionContext = startInspection ()
@@ -4203,6 +4499,7 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                             fetchAuthentication
                                             authentication
                                             (Some reportLfsProgress)
+                                            (NodeOutput.OutputTarget.ofContext context)
                                             context.Cancellation.IsCancellationRequested
                                         |> Async.AwaitPromise
 
@@ -4689,12 +4986,7 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                             }
                     | Ok authArguments ->
                         let! fetchResult =
-                            runGitChecked
-                                state.Hooks
-                                state.RepoPath
-                                [| yield! authArguments; "fetch"; remoteName |]
-                                None
-                                context
+                            runGitFetchChecked state.Hooks state.RepoPath authArguments remoteName context
 
                         match fetchResult with
                         | Error failure ->
@@ -5418,7 +5710,14 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                                         when context.Cancellation.IsCancellationRequested() ->
                                                                         return Ok([||], Some(canceledMaterializationFailure failure.Message))
                                                                     | LocalLfsCheckoutFailed failure ->
-                                                                        return Ok([||], Some(materializationFailure failure.Message))
+                                                                        return
+                                                                            Ok(
+                                                                                [||],
+                                                                                Some {
+                                                                                    materializationFailure failure.Message with
+                                                                                        RecoveryAction = failure.RecoveryAction
+                                                                                }
+                                                                            )
                                                                 | _ -> return Ok(objectNotMaterialized (), None)
                                                 }
 
@@ -5457,7 +5756,8 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                             OperationResult.partiallySucceeded
                                                                 outcome
                                                                 failure
-                                                                (localMaterializationRecovery ())
+                                                                (failure.RecoveryAction
+                                                                 |> Option.defaultWith localMaterializationRecovery)
                 })
         Finalize =
             fun request context ->
@@ -5817,6 +6117,18 @@ let private createSessionWithTextDiff
         LfsMediaDirectory = None
     }
 
+    // A Save in the middle of a Free or Download could commit the file while it is missing
+    // or half written, so these bodies take the mutation lock like every other workspace change.
+    // The lock is not re-entrant, and nothing inside these bodies takes it again.
+    let serializeLargeObjectWork (body: unit -> Async<OperationResult<unit>>) = async {
+        do! state.Lock.Acquire()
+
+        try
+            return! body ()
+        finally
+            state.Lock.Release()
+    }
+
     let core: CoreVersionControl = {
         GetStatus = fun context -> getWorkspaceStatus state context
         ListRefs = fun context -> listRefs state context
@@ -5947,17 +6259,17 @@ let private createSessionWithTextDiff
                         state.Credentials
                         state.ConnectionProfileId
                         (preflightIndexLock state)
-                        // A Save in the middle of a Free or Download could commit the file while it is missing
-                        // or half written, so these bodies take the mutation lock like every other workspace change.
-                        // The lock is not re-entrant, and nothing inside these bodies takes it again.
-                        (fun body -> async {
-                            do! state.Lock.Acquire()
-
-                            try
-                                return! body ()
-                            finally
-                                state.Lock.Release()
-                        })
+                        serializeLargeObjectWork
+                )
+            ObjectBatchMaterialization =
+                Some(
+                    GitLfsExtensions.createObjectBatchMaterialization
+                        state.RepoPath
+                        (fun arguments context -> runGit state.Hooks state.RepoPath arguments None context)
+                        state.Credentials
+                        state.ConnectionProfileId
+                        (preflightIndexLock state)
+                        serializeLargeObjectWork
                 )
             StoragePolicy =
                 Some(
@@ -6511,21 +6823,24 @@ let private createFactoryWithSessions
                             | Error failure -> return Error failure
                             | Ok () ->
                                 cloneStarted <- true
+                                reportStepStart "clone" "Cloning the repository" context
 
                                 // Git keeps large objects as pointers until hydration so a download
                                 // failure can be reported as partial success.
                                 return!
-                                    runGitEnv
+                                    runGitTransfer
+                                        "clone"
+                                        false
                                         hooks
                                         "."
                                         [|
                                             yield! authentication.ConfigArgs
                                             "clone"
+                                            "--progress"
                                             "--"
                                             location.ProviderLocation
                                             request.TargetPath
                                         |]
-                                        None
                                         [|
                                             "GIT_TERMINAL_PROMPT", "0"
                                             "GIT_LFS_SKIP_SMUDGE", "1"
@@ -6575,43 +6890,42 @@ let private createFactoryWithSessions
                         // that hides the changed workspace.
                         let! hydration =
                             if context.Cancellation.IsCancellationRequested() then
-                                async.Return(
-                                    Error(
-                                        OperationFailure.create
-                                            Canceled
-                                            "operation_canceled"
-                                            "The clone was canceled before large-object download started."
-                                    )
-                                )
+                                async.Return {
+                                    Output =
+                                        Error(
+                                            OperationFailure.create
+                                                Canceled
+                                                "operation_canceled"
+                                                "The clone was canceled before large-object download started."
+                                        )
+                                    CheckoutFailed = false
+                                    Details = [||]
+                                }
                             else
-                                reportProgressReset "clone-lfs-pull" context
-                                runGitEnv
+                                reportStepStart "clone-lfs-pull" "Downloading large files" context
+
+                                runLfsHydration
+                                    "clone-lfs-pull"
                                     hooks
                                     request.TargetPath
-                                    (GitCredentialStrategy.buildLfsTransferArguments
-                                        authentication.ConfigArgs
-                                        [| "lfs"; "pull"; "origin" |])
-                                    None
-                                    [| "GIT_TERMINAL_PROMPT", "0" |]
+                                    authentication.ConfigArgs
+                                    [| "origin" |]
                                     context
 
-                        match hydration with
+                        match hydration.Output with
                         | Ok hydrationOutput when hydrationOutput.ExitCode = 0 ->
                             return OperationResult.succeeded binding
                         | Ok hydrationOutput ->
-                            let detail =
-                                if String.IsNullOrWhiteSpace hydrationOutput.StdErr then
-                                    hydrationOutput.StdOut
-                                else
-                                    hydrationOutput.StdErr
+                            let failure = hydrationOutputFailure "clone" hydrationOutput hydration.Details
 
-                            let failure = hydrationFailure "clone" detail
+                            let! recovery =
+                                hydrationRecovery hooks request.TargetPath failure hydration.CheckoutFailed context
 
                             return
                                 OperationResult.partiallySucceeded
                                     (OperationOutcome.performed binding)
                                     failure
-                                    (materializationRecovery failure)
+                                    recovery
                         | Error hydrationFailure ->
                             if hydrationFailure.Category = Canceled then
                                 let! cleanupError = removeCloneResidue ()
@@ -6620,11 +6934,19 @@ let private createFactoryWithSessions
 
                                 return Failed(withResidue canceledFailure cleanupError)
                             else
+                                let! recovery =
+                                    hydrationRecovery
+                                        hooks
+                                        request.TargetPath
+                                        hydrationFailure
+                                        hydration.CheckoutFailed
+                                        context
+
                                 return
                                     OperationResult.partiallySucceeded
                                         (OperationOutcome.performed binding)
                                         hydrationFailure
-                                        (materializationRecovery hydrationFailure)
+                                        recovery
         }
     Adopt =
         fun request context ->
@@ -6763,7 +7085,14 @@ let private createFactoryWithSessions
                             location.ConnectionProfileId
 
                     let! _ =
-                        runGit hooks request.WorkspaceRoot [| yield! authArguments; "fetch"; "origin" |] None context
+                        runGitTransfer
+                            "fetch"
+                            false
+                            hooks
+                            request.WorkspaceRoot
+                            (fetchArguments authArguments "origin")
+                            [||]
+                            context
 
                     return OperationResult.succeeded (bindingFor request.WorkspaceRoot location)
         }

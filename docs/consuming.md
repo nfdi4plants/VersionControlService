@@ -179,7 +179,7 @@ let cloneWorkspace (factory: ProviderFactory) location targetPath (context: Oper
 }
 ```
 
-A clone canceled before it completes rolls back and fails as `Canceled`. A pre-existing empty target is cleaned by removing its entries, so entries another program adds to that folder during the clone are removed too. A clone that finished before cancellation took effect succeeds. A download failure that is not a cancellation returns `PartiallySucceeded` with `retry_materialization`, so the workspace exists and its large objects are not materialized.
+A clone canceled before it completes rolls back and fails as `Canceled`. A pre-existing empty target is cleaned by removing its entries, so entries another program adds to that folder during the clone are removed too. A clone that finished before cancellation took effect succeeds. A download failure that is not a cancellation returns `PartiallySucceeded` with `retry_materialization`, so the workspace exists and its large objects are not materialized. The download is `git lfs fetch` followed by `git lfs checkout`. A cancel stops the fetch and rolls the clone back. A cancel that arrives during the checkout waits for the checkout to end, and the clone succeeds. A fetch that fails without a cancel still runs the checkout, so the files whose objects arrived are checked out, and the result is the failure of the fetch. When the checkout fails and a `.git/index.lock` is present, or when Git names the lock in its failure text, the recovery is `remove_index_lock` instead of `retry_materialization`. Remove the lock once no git process runs, then materialize again.
 
 A clone whose rollback cannot remove the target returns `Failed` with `StateChanged = true` and the recovery code `remove_clone_target`, with category `Canceled` when the user canceled. Ask the user to clear the target folder before retrying.
 
@@ -406,7 +406,7 @@ ordering.
 
 ## Optional services
 
-Every session has `Descriptor`, `Core` and `Close`. The seven services are `option`, and a
+Every session has `Descriptor`, `Core` and `Close`. The eight services are `option`, and a
 provider leaves one absent when it has nothing to offer there. Feature discovery is an
 `Option.isSome` check, and there are two reasonable ways to write a host against that.
 
@@ -445,7 +445,7 @@ let describe (session: WorkspaceSession) (context: OperationContext) = async {
 ```
 
 `WorkspaceSession.availability` returns a `ServiceAvailability` record with one boolean
-per service, which is easier to hand to a view model than seven options.
+per service, which is easier to hand to a view model than eight options.
 
 ### Filled: every service present, no-ops where the provider has nothing
 
@@ -476,7 +476,8 @@ The text diff fallback returns `NotDiffable ProviderUnsupported` from `Open`. It
 lakeFS has no text diff service, so it gets this fallback.
 
 A fallback write also succeeds and changes nothing. `Materialize`, `Dematerialize`,
-`SetPathPolicy` and `SetSettings` return `Succeeded` with the same warning. Read the
+`SetPathPolicy` and `SetSettings` return `Succeeded` with the same warning. The
+`Materialize` and `Dematerialize` of the batch service do the same. Read the
 warning before you treat one of these as done. The storage settings reseed in
 [provider authoring](provider-authoring.md) shows why this matters. It tells a host to
 write its saved threshold through `SetSettings` and mark the migration complete only
@@ -548,6 +549,12 @@ Fill the gaps when the host is generic over providers and a missing feature shou
 degrade quietly. Keep them absent when the interface changes shape per provider, or when
 a host must never offer an action the provider cannot carry out. Two hosts can make
 opposite choices against the same provider, which is the intent.
+
+Use `ObjectBatchMaterialization` when an action covers many paths, for example a folder,
+because one call is faster than one `ObjectMaterialization` call per path. When the
+provider does not supply it, call `ObjectMaterialization.Materialize` or `Dematerialize`
+for each path instead. A filled session always has the service, but its fallback changes
+nothing, so read the `service_unavailable` warning before you treat the result as done.
 
 ## Paged text diffs
 
@@ -1296,7 +1303,7 @@ last changed the file.
 Picking a candidate with no preview and no stored object resolves the item by deleting the file.
 A pick of a stored object whose bytes are not local succeeds with the warning
 `object_not_materialized`. A pick whose local materialization fails returns `PartiallySucceeded`
-with `object_materialization_failed` and `retry_materialization`. Git's Materialize refuses a path
+with `object_materialization_failed` and `retry_materialization`, or `remove_index_lock` when an index lock caused it. Git's Materialize refuses a path
 that has an uncommitted change, which every picked path has until Finalize, so the host materializes
 such paths after `Finalize`.
 
@@ -1321,7 +1328,8 @@ let createContext (operationId: string) (onProgress: OperationProgress -> unit) 
 
 `OperationContext.create` catches and drops exceptions from the progress callback, so a
 callback that reports to a closed window cannot fail the operation it watches. The guard
-belongs to `create`. A context built as a record literal calls the callback unguarded.
+belongs to `create` and `createWithOutput`. A context built as a record literal calls the
+callbacks unguarded and has to set `ReportOutput`, which is `None` when the host asks for no output.
 
 The host calls `source.Cancel()` from wherever the user asks, such as a stop button. A
 canceled operation comes back as a `Canceled` failure that describes what the
@@ -1343,13 +1351,143 @@ process leaves its `index.lock` behind, so `remove_index_lock` is the usual reco
 and a host needs a path for it. The recovery codes a Git update can report are listed in
 [provider authoring](provider-authoring.md).
 
+The large-object download of an Update or a Synchronize (with `versioncontrolservice.lfs.materializelargeobjects` on) is `git lfs fetch` followed by `git lfs checkout`. A cancel kills only the fetch, and no checkout starts. The checkout is local and holds the index lock while it runs, so the provider never kills it. A cancel that arrives during the checkout takes effect when the checkout ends, and the call reports the work that finished, which is `Succeeded` when every file is checked out. A canceled fetch returns `PartiallySucceeded` with category `Canceled`, code `hydration_failed` and the recovery `retry_materialization`. A fetch that fails without a cancel, for example because the server lost one object, still runs the checkout, so the files whose objects arrived are checked out, and the result is the failure of the fetch. The provider never deletes a lock file. When the checkout fails and an `index.lock` exists, or when Git names the lock in its failure text, the partial result reports `remove_index_lock` instead. A failed fetch keeps `retry_materialization`, because the fetch takes no lock. With a held lock, git-lfs writes the files, prints `Error updating the Git index:` without Git's lock message and still exits with 0. The provider reads that text from the checkout and treats the run as a failed checkout. Every `git lfs checkout` of the provider runs to its end, because it holds the index lock. Besides the checkout of the download, these are the checkouts of a batch `Materialize`, of the unmark in `StoragePolicy.SetPathPolicy`, of the local materialization of a picked conflict object and of `RestorePaths`. A cancel never kills a running checkout. A batch `Materialize`, the unmark, the pick and `RestorePaths` look for the lock file through `git rev-parse --git-path index.lock` after the index error. When it exists, the unmark fails with `index_locked`, a batch `Materialize` gets the recovery `remove_index_lock` on its failure, and the pick and `RestorePaths` return `PartiallySucceeded` with that recovery. Without a lock file the failure is plain. The unmark fails with `object_materialization_failed` and the text of git-lfs. A batch `Materialize` that changed at least one path returns `PartiallySucceeded` with `retry_materialization`, and one that changed no path returns `Failed` with no recovery action. The pick and `RestorePaths` keep `retry_materialization`. Git-lfs wrote the files in each case, so these failures have `StateChanged` set to `true`. Remove the lock once no git process runs, then retry the download. The retry finds the files with their content but with index entries that still hold the stat data of the pointers, so `git status` lists them as modified. A single or batch `Materialize` repairs such an entry with `git add` when the file is a regular file with the size and the SHA-256 of its object and the entry has no staged change. The attributes must also still register the path with the lfs filter. The `git add` stages nothing, because the clean filter reproduces the committed pointer for that content (the file's content hashes to the pointer's object and the attributes route the path through the lfs filter). The repair changes the index, so the path counts as changed. A single `Materialize` returns a performed outcome, a batch `Materialize` lists the path in `AffectedPaths`, and the progress report of the path says the file is materialized. A held lock fails the repair with the lock failure, and any other modified file keeps the local-changes failure.
+
+The local-changes failure of `Materialize` and `Dematerialize` has the code `local_changes` and the category `ProviderError`. It covers a path with local changes, for example an edited file. The single-path `ObjectMaterialization` and `ObjectBatchMaterialization` both use it. A batch call returns `local_changes` when every failed path was refused for local changes. The result is `Failed` when no path changed and `PartiallySucceeded` otherwise, with the failed paths in `AffectedPaths` and one `<path>: <message>` line per failed path in `Details`. A batch with any other failed path keeps `batch_materialization_incomplete` for `Materialize` and `batch_dematerialization_incomplete` for `Dematerialize`. A partial success keeps the recovery `retry_materialization` or `retry_dematerialization`. Decide by the code. The message names the path and can change.
+
 The Git provider runs `git lfs ls-files -j` with no time limit, because that command prints nothing until it has listed every file. This applies to `ObjectMaterialization.ListObjects`, `Materialize` (including its download step) and `Dematerialize`. Each of them takes an `OperationContext`. Cancel the context to stop one that runs too long. The cancellation ends the git-lfs process and the operation returns a `Canceled` failure.
+
+The `Materialize` and `Dematerialize` of `ObjectBatchMaterialization` behave the same way, and a canceled batch reports the paths that finished as changed.
 
 `OperationProgress` carries a stable `PhaseCode` such as `transfer`, an optional item,
 completed and total counts, and a sanitized `DisplayMessage`. Counts are `float` because
 JavaScript has no native 64-bit integer, so a float is what carries byte totals above two
 GiB exactly on both runtimes. Show the message, and branch on the
 phase code.
+
+### Progress of Git transfers
+
+The Git provider turns the progress meters of its long transfers into `OperationProgress` events.
+A meter such as `Receiving objects:  12% (1/8)` becomes an event whose `Completed` is the percent
+and whose `Total` is 100. The `DisplayMessage` holds the meter's label with its object count and
+transferred size, for example `Downloading LFS objects (2/3), 1.2 MB`. A meter for a single object
+has no `Completed` and `Total`, because one object has no useful percent.
+
+These calls report their meters, each under its own phase code:
+
+| Call | Phase code |
+| --- | --- |
+| `git fetch` of Refresh, Update, Synchronize, Publish and Bind | `fetch` |
+| `git clone` | `clone` |
+| `git lfs fetch` after a clone | `clone-lfs-pull` |
+| `git lfs checkout` after that fetch | `clone-lfs-pull-checkout` |
+| `git lfs fetch` that downloads the large objects of an Update or a Synchronize | `lfs-pull` |
+| `git lfs checkout` after that fetch | `lfs-pull-checkout` |
+| `git lfs fetch` of `Materialize` | `lfs-materialize-transfer` |
+| `git lfs checkout` of `Materialize` | `lfs-materialize-checkout` |
+
+Git LFS prints its meters to a pipe only when `GIT_LFS_FORCE_PROGRESS=1` is set, and then it
+writes them to stdout. The provider sets the variable for the Git LFS calls in the table and reads
+their stdout for meters. It leaves the dry runs and the listings alone. The failure message of a call
+that printed meters has none of the meter lines.
+
+A step of Synchronize, and of the Refresh and Update inside it, reports an event without numbers
+when it starts, and so does a step of Clone. A host can show the step before the first meter
+arrives. These events carry a `DisplayMessage`:
+
+| Phase code | `DisplayMessage` | Reported before |
+| --- | --- | --- |
+| `fetch` | Fetching online changes | the `git fetch` of the refresh |
+| `merge` | Merging online changes | the `git merge` of the update |
+| `lfs-pull` | Downloading large files | the `git lfs fetch` that follows an update |
+| `lfs-pull-checkout` | Checking out large files | the `git lfs checkout` that follows that fetch |
+| `clone` | Cloning the repository | the `git clone` |
+| `clone-lfs-pull` | Downloading large files | the `git lfs fetch` that follows a clone with `MaterializeAllObjects` |
+
+The checkout after the fetch of a clone reports the same event under `clone-lfs-pull-checkout`.
+
+A batch call also reports how many of its files are done. `Materialize` of
+`ObjectBatchMaterialization` uses the phase code `lfs-materialize-files`, and `Dematerialize` uses
+`lfs-dematerialize-files`. `Item` is `None` and `Total` is the number of distinct requested paths.
+`Completed` counts the paths that have an outcome, whatever the outcome is. A downloaded file counts
+as soon as its checkout ends, before the check of its content. `Completed` only rises, and it reaches
+`Total` when the call returns a result. These count events exist only for batch calls with more than
+one path. A call with a single path keeps its earlier progress sequence and reports none.
+
+### Raw output of subprocesses
+
+A host that wants to show what git and git-lfs print, for example in a folded "Show logs" section,
+builds its context with `OperationContext.createWithOutput`. The last argument receives batches of
+`OperationOutput`:
+
+```fsharp
+let createContextWithLogs
+    (operationId: string)
+    (onProgress: OperationProgress -> unit)
+    (onOutput: OperationOutput[] -> unit)
+    =
+    let source = OperationCancellation.Source()
+
+    let context =
+        OperationContext.createWithOutput operationId source.Cancellation onProgress onOutput
+
+    context, source
+```
+
+The channel is opt-in. `create` and `detached` leave `ReportOutput` at `None`, and the provider then
+does no work for output. Progress stays what it was, and no raw line ever becomes a progress event.
+The callback runs on the thread that runs the operation, so it should only queue the entries and
+render them later. An exception from it is dropped.
+
+Each entry has a `Kind` and a `Text` without a line terminator. `CommandId` groups the entries of one
+subprocess and is unique within the operation. A notice that concerns the whole operation has an empty
+`CommandId`.
+
+| Kind | Content |
+| --- | --- |
+| `Command` | The header of a subprocess, such as `git lfs fetch origin HEAD`. The provider sends one before the subprocess starts. It leaves out the leading `-c key=value` pairs, which can hold credentials, and it shows at most twelve arguments and then `...`. |
+| `StdErr` | A line from stderr. Every subprocess of the operation reports it, including probes whose failure the operation expects. Such a line does not mean that the operation failed. |
+| `StdOut` | A line from stdout. Only calls whose stdout is diagnostic text report it. |
+| `Notice` | A message from the library, for example that a long line was omitted or that lines were dropped. |
+
+Stdout is diagnostic text for the large-object download that Clone and the synchronizing operations
+run (`git lfs fetch` and `git lfs checkout`), for the download of `Materialize` (the same two
+commands) and for the `git lfs push` of a publish. The stdout of every other call is data, such as
+`git lfs ls-files -j`, `git status -z`, object content or the output of `git cat-file`, and it never
+reaches the channel.
+
+Git rewrites a progress meter in place with carriage returns, and the provider collapses these
+rewrites. A line that is still being rewritten arrives as a snapshot with `IsPartial` set, at most
+every 250 ms. A snapshot that this rate holds back arrives when the 250 ms end, even if no more text
+comes. The next entry with the same `CommandId` and `Kind` replaces a partial entry in the
+host's view, whether that next entry is partial or complete. When the line ends, or the subprocess
+ends for any reason, the final text arrives with `IsPartial` unset.
+
+The text is a redacted diagnostic and the channel keeps no transcript. The provider strips terminal
+escape sequences and control characters and skips blank lines. It replaces the credentials of the call
+with `[REDACTED]`. These are the values of credential-bearing configuration arguments, the token
+and the decoded `user:secret` parts of an Authorization header, the userinfo of URLs and the values
+of credential-looking environment variables. The provider cannot recognize a secret it has no way to
+know, for example one that a git hook prints. The order of stdout and stderr lines relative to each
+other is not promised, and the provider keeps no history. The host decides how many lines to keep.
+
+The channel has these limits:
+
+| Limit | Behavior |
+| --- | --- |
+| 4096 UTF-16 units per line | A longer line is dropped and a notice says so. A partial entry that is open at that moment ends with its last text. |
+| 20 entries per batch, 10 batches per second | Entries wait in a queue between batches. The rate holds within a subprocess. |
+| 128 waiting entries | The oldest lines are dropped, the command headers stay, and a notice reports how many lines were left out. |
+| End of a subprocess | Everything that waits is delivered at once, without waiting for the batch rate, before the operation completes. |
+
+The Git provider reports the subprocesses of Refresh, Update, Synchronize, Publish, Clone and Bind, the
+large-object listing, download and free of `ObjectMaterialization` and `ObjectBatchMaterialization`, and
+the LFS upload of a publish. It does not report the text diff workers, the byte-exact object reads, the
+cleanup of the LFS cache (prune and dedup) or the few configuration probes that run without an operation
+context. The lakeFS provider runs no subprocesses and reports no output.
+
+Show the output only in a folded or secondary view. Never use a raw line as the headline of an
+operation. The headline comes from progress and from the result.
 
 ## Building against the packages
 

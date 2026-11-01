@@ -29,20 +29,30 @@ let private categoryOfKind (kind: GitFailureKind) =
     | GitFailureKind.LfsBackupRetained -> ProviderError
     | GitFailureKind.InvalidLfsThreshold -> Validation
     | GitFailureKind.RemoteProjectAlreadyExists -> ProviderError
+    | GitFailureKind.LocalChanges -> ProviderError
     | GitFailureKind.Unknown -> ProviderError
 
 let private toOperationFailure (failure: GitService.GitFailure) : OperationFailure =
-    match GitInternals.tryIndexLockFailure failure.Message with
-    | Some(path, ageSeconds) -> GitInternals.indexLockFailure path ageSeconds
-    | None when failure.Kind = GitFailureKind.InvalidLfsThreshold ->
-        OperationFailure.create Validation "invalid_lfs_threshold" failure.Message
-    | None when failure.Kind = GitFailureKind.LfsBackupRetained ->
-        {
-            OperationFailure.createRedacted ProviderError "lfs_backup_retained" failure.Message with
-                StateChanged = true
-        }
-    | None ->
-        OperationFailure.createRedacted (categoryOfKind failure.Kind) "lfs_operation_failed" failure.Message
+    let mapped =
+        match GitInternals.tryIndexLockFailure failure.Message with
+        | Some(path, ageSeconds) -> GitInternals.indexLockFailure path ageSeconds
+        | None when failure.Kind = GitFailureKind.InvalidLfsThreshold ->
+            OperationFailure.create Validation "invalid_lfs_threshold" failure.Message
+        | None when failure.Kind = GitFailureKind.LfsBackupRetained ->
+            {
+                OperationFailure.createRedacted ProviderError "lfs_backup_retained" failure.Message with
+                    StateChanged = true
+            }
+        | None when failure.Kind = GitFailureKind.LocalChanges ->
+            OperationFailure.createRedacted (categoryOfKind failure.Kind) "local_changes" failure.Message
+        | None ->
+            OperationFailure.createRedacted (categoryOfKind failure.Kind) "lfs_operation_failed" failure.Message
+
+    // A checkout that reports an index error has written its files already.
+    if GitLfsService.mentionsIndexUpdateFailure failure.Message then
+        { mapped with StateChanged = true }
+    else
+        mapped
 
 let private toOperationResult (failure: GitService.GitFailure) : OperationResult<unit> =
     if failure.Kind = GitFailureKind.Canceled then
@@ -79,6 +89,13 @@ let private affectedPath (relativePath: string) (failure: OperationFailure) = {
         AffectedPaths = [| relativePath |]
 }
 
+/// affectedPath for a failure that follows a checkout which wrote the file.
+let private changedAffectedPath (relativePath: string) (failure: OperationFailure) =
+    {
+        affectedPath relativePath failure with
+            StateChanged = true
+    }
+
 let private bumpRegularFileMtime (repoPath: string) (relativePath: string) : Result<unit, string> =
     try
         let absolutePath = NodePath.resolve [| repoPath; relativePath |]
@@ -111,6 +128,27 @@ let private completeStoragePolicyChange (repoPath: string) (relativePath: string
                 AffectedPaths = affectedPaths
         }
 
+/// The index lock failure when the repository has a lock file, found through the caller's git runner.
+/// The lookup runs without the cancellation of the context, because it follows a checkout that ran to
+/// its end. A lookup that fails finds nothing.
+let private tryHeldIndexLockFailure
+    (repoPath: string)
+    (runGit: string[] -> OperationContext -> Async<Result<NodeProcess.ProcessOutput, OperationFailure>>)
+    (context: OperationContext)
+    : Async<OperationFailure option> =
+    async {
+        let lookupContext = {
+            context with
+                Cancellation = OperationCancellation.none
+        }
+
+        let! lockPath = GitLfsService.tryFindHeldIndexLockWith (fun arguments -> runGit arguments lookupContext) repoPath
+
+        return
+            lockPath
+            |> Option.map (fun path -> GitInternals.indexLockFailure path (GitInternals.tryFileAgeSeconds path))
+    }
+
 let private prepareUnmarkAfterPreflight
     (repoPath: string)
     (runGit: string[] -> OperationContext -> Async<Result<NodeProcess.ProcessOutput, OperationFailure>>)
@@ -140,10 +178,12 @@ let private prepareUnmarkAfterPreflight
                         |> affectedPath relativePath
                     )
             | Ok _ ->
+                // The checkout is local and holds the index lock, so a cancel must not kill it.
                 let! checkoutResult =
                     runGit
                         [| "lfs"; "checkout"; "--"; GitLfsObjects.lfsCheckoutPattern relativePath |]
-                        context
+                        { context with
+                            Cancellation = OperationCancellation.none }
 
                 match checkoutResult with
                 | Error failure ->
@@ -156,20 +196,32 @@ let private prepareUnmarkAfterPreflight
                             |> affectedPath relativePath
                         )
                 | Ok output when output.ExitCode = 0 ->
-                    let! restoredPointerResult = GitLfsObjects.readWorktreePointer repoPath relativePath
+                    match GitLfsService.lfsCheckoutIndexUpdateFailed output.StdOut output.StdErr with
+                    | Some text ->
+                        let! lockFailure = tryHeldIndexLockFailure repoPath runGit context
 
-                    match restoredPointerResult with
-                    | Error failure -> return Error(affectedPath relativePath failure)
-                    | Ok(Some _) ->
                         return
                             Error(
-                                OperationFailure.create
-                                    ProviderError
-                                    "object_materialization_failed"
-                                    "Git LFS did not restore the file's content, so it stays in Git LFS."
-                                |> affectedPath relativePath
+                                lockFailure
+                                |> Option.defaultWith (fun () ->
+                                    OperationFailure.createRedacted ProviderError "object_materialization_failed" text)
+                                |> changedAffectedPath relativePath
                             )
-                    | Ok None -> return Ok true
+                    | None ->
+                        let! restoredPointerResult = GitLfsObjects.readWorktreePointer repoPath relativePath
+
+                        match restoredPointerResult with
+                        | Error failure -> return Error(affectedPath relativePath failure)
+                        | Ok(Some _) ->
+                            return
+                                Error(
+                                    OperationFailure.create
+                                        ProviderError
+                                        "object_materialization_failed"
+                                        "Git LFS did not restore the file's content, so it stays in Git LFS."
+                                    |> affectedPath relativePath
+                                )
+                        | Ok None -> return Ok true
                 | Ok output ->
                     let detail =
                         if String.IsNullOrWhiteSpace output.StdErr then
@@ -215,6 +267,91 @@ let private wrapUnitWithPreflight
             | Error failure when failure.Category = Canceled -> return OperationResult.canceled failure.Message
             | Error failure -> return Failed failure
             | Ok() -> return! wrapUnit context beginOperation operation
+    }
+
+/// Removes the cached objects of files that were just freed. An object stays when an unpushed commit
+/// adds it, because git-lfs needs the local object to push that commit. The same holds for a custom
+/// lfs.storage, which other clones can share and which prune refuses too. Every error is ignored,
+/// because a cached object that stays only costs disk space.
+let deleteCachedObjectsOfFreedPaths
+    (repoPath: string)
+    (runGit: string[] -> OperationContext -> Async<Result<NodeProcess.ProcessOutput, OperationFailure>>)
+    (context: OperationContext)
+    (relativePaths: string[])
+    : Async<unit> =
+    async {
+        let detachedContext = { context with Cancellation = OperationCancellation.none }
+
+        let hasNoOutput (result: Result<NodeProcess.ProcessOutput, OperationFailure>) =
+            match result with
+            | Ok output -> output.ExitCode = 0 && String.IsNullOrWhiteSpace output.StdOut
+            | Error _ -> false
+
+        try
+            let pointers = ResizeArray<GitLfsObjects.LfsPointerInfo>()
+
+            for relativePath in relativePaths do
+                let! pointerResult = GitLfsObjects.readWorktreePointer repoPath relativePath
+
+                match pointerResult with
+                | Ok(Some pointer) -> pointers.Add pointer
+                | Error _
+                | Ok None -> ()
+
+            if pointers.Count > 0 then
+                let! mediaDirectoryResult =
+                    GitLfsObjects.resolveLocalMediaDirectory (fun arguments -> runGit arguments detachedContext) repoPath
+
+                match mediaDirectoryResult with
+                | Error _ -> ()
+                | Ok mediaDirectory ->
+                    let! storageResult = runGit [| "config"; "--get"; "lfs.storage" |] detachedContext
+
+                    match storageResult with
+                    | Ok output when not (String.IsNullOrWhiteSpace(output.StdOut.Trim())) -> ()
+                    | _ ->
+                        // One question answers it for every object when no commit is unpushed.
+                        // The search covers HEAD too, so a commit on a detached HEAD keeps its objects.
+                        let! unpushedCommitsResult =
+                            runGit [| "rev-list"; "-1"; "HEAD"; "--branches"; "--not"; "--remotes=origin" |] detachedContext
+
+                        for pointer in pointers do
+                            let! isUnreferenced =
+                                async {
+                                    if hasNoOutput unpushedCommitsResult then
+                                        return true
+                                    else
+                                        let! unpushedResult =
+                                            runGit
+                                                [|
+                                                    "-c"
+                                                    "log.diffMerges=separate"
+                                                    "log"
+                                                    "-m"
+                                                    "HEAD"
+                                                    "--branches"
+                                                    "--not"
+                                                    "--remotes=origin"
+                                                    "--format=%H"
+                                                    "-1"
+                                                    ("-Soid sha256:" + pointer.Oid)
+                                                |]
+                                                detachedContext
+
+                                        return hasNoOutput unpushedResult
+                                }
+
+                            if isUnreferenced then
+                                // One object that cannot be removed does not keep the others.
+                                try
+                                    let objectPath = GitLfsObjects.objectPath mediaDirectory pointer.Oid
+
+                                    if NodeFileSystem.existsSync objectPath then
+                                        NodeFileSystem.unlinkSync objectPath
+                                with _ ->
+                                    ()
+        with _ ->
+            ()
     }
 
 let createObjectMaterialization
@@ -334,67 +471,223 @@ let createObjectMaterialization
 
                             match result with
                             | Ok true ->
-                                let detachedContext = { context with Cancellation = OperationCancellation.none }
-
-                                try
-                                    let! pointerResult =
-                                        GitLfsObjects.readWorktreePointer repoPath (RepositoryPath.value path)
-                                        |> Async.StartAsPromise
-
-                                    match pointerResult with
-                                    | Ok(Some pointer) ->
-                                        let! mediaDirectoryResult =
-                                            GitLfsObjects.resolveLocalMediaDirectory
-                                                (fun arguments -> runGit arguments detachedContext)
-                                                repoPath
-                                            |> Async.StartAsPromise
-
-                                        match mediaDirectoryResult with
-                                        | Ok mediaDirectory ->
-                                            let! storageResult =
-                                                runGit [| "config"; "--get"; "lfs.storage" |] detachedContext
-                                                |> Async.StartAsPromise
-
-                                            match storageResult with
-                                            // Other clones can share a custom lfs.storage, so its objects stay. Prune refuses such storage too.
-                                            | Ok output when not (String.IsNullOrWhiteSpace(output.StdOut.Trim())) -> ()
-                                            | _ ->
-                                                // git-lfs needs the local object to push an unpushed commit that adds it.
-                                                // The search covers HEAD too, so a commit on a detached HEAD keeps the object.
-                                                let! unpushedResult =
-                                                    runGit
-                                                        [|
-                                                            "-c"
-                                                            "log.diffMerges=separate"
-                                                            "log"
-                                                            "-m"
-                                                            "HEAD"
-                                                            "--branches"
-                                                            "--not"
-                                                            "--remotes=origin"
-                                                            "--format=%H"
-                                                            "-1"
-                                                            ("-Soid sha256:" + pointer.Oid)
-                                                        |]
-                                                        detachedContext
-                                                    |> Async.StartAsPromise
-
-                                                match unpushedResult with
-                                                | Ok output when output.ExitCode = 0 && String.IsNullOrWhiteSpace output.StdOut ->
-                                                    let objectPath = GitLfsObjects.objectPath mediaDirectory pointer.Oid
-
-                                                    if NodeFileSystem.existsSync objectPath then
-                                                        NodeFileSystem.unlinkSync objectPath
-                                                | _ -> ()
-                                        | Error _ -> ()
-                                    | Error _
-                                    | Ok None -> ()
-                                with _ -> ()
+                                do!
+                                    deleteCachedObjectsOfFreedPaths repoPath runGit context [| RepositoryPath.value path |]
+                                    |> Async.StartAsPromise
 
                                 return Ok()
                             | Ok false -> return Ok()
                             | Error failure -> return Error failure
                         }))
+}
+
+/// How a batch operation reports an incomplete run.
+type internal BatchAction = {
+    /// Code of a failure when some paths fail.
+    IncompleteCode: string
+    /// Recovery of a partial success.
+    Recovery: RecoveryAction
+}
+
+let internal batchMaterializeAction = {
+    IncompleteCode = "batch_materialization_incomplete"
+    Recovery = {
+        Code = "retry_materialization"
+        Instructions = Some "Materialize the path again to replace the pointer with the object's content."
+    }
+}
+
+let private batchDematerializeAction = {
+    IncompleteCode = "batch_dematerialization_incomplete"
+    Recovery = {
+        Code = "retry_dematerialization"
+        Instructions = Some "Free the path again after the reported problem is fixed."
+    }
+}
+
+let private batchNoOpReason = "Every path is already in the requested state."
+
+/// Collapses the outcomes of the paths into one result. The failure of a run with failed paths names
+/// them in AffectedPaths and Details. It takes its category and retry flag from the first failure that
+/// is not a cancellation, and has the category Canceled only when every failure is a cancellation. The
+/// code is operation_canceled when every failure is a cancellation and local_changes when every failure is
+/// the refusal of a path with local changes. Any other mix has the code of the action.
+let internal toBatchResult (action: BatchAction) (outcomes: GitService.LfsPathOutcome[]) : OperationResult<unit> =
+    let changed =
+        outcomes
+        |> Array.choose (fun outcome ->
+            match outcome.Result with
+            | Ok GitService.Changed -> Some outcome.Path
+            | _ -> None)
+
+    let failed =
+        outcomes
+        |> Array.choose (fun outcome ->
+            match outcome.Result with
+            | Error failure -> Some(outcome.Path, failure)
+            | Ok _ -> None)
+
+    if failed.Length = 0 then
+        if changed.Length = 0 then
+            OperationResult.noOp (Some batchNoOpReason) ()
+        else
+            Succeeded {
+                OperationOutcome.performed () with
+                    AffectedPaths = changed
+            }
+    else
+        let failures = failed |> Array.map (fun (path, failure) -> path, toOperationFailure failure)
+        let allCanceled = failed |> Array.forall (fun (_, failure) -> failure.Kind = GitFailureKind.Canceled)
+
+        let allLocalChanges =
+            failed |> Array.forall (fun (_, failure) -> failure.Kind = GitFailureKind.LocalChanges)
+
+        // A cancellation says little about why other paths failed. The first failure that is not a
+        // cancellation therefore supplies the message and the category with its retry flag.
+        let basis =
+            match failed |> Array.tryFindIndex (fun (_, failure) -> failure.Kind <> GitFailureKind.Canceled) with
+            | Some index -> snd failures[index]
+            | None -> snd failures[0]
+
+        let failure = {
+            basis with
+                Code =
+                    if allCanceled then "operation_canceled"
+                    elif allLocalChanges then "local_changes"
+                    else action.IncompleteCode
+                Message = $"{failed.Length} of {outcomes.Length} paths failed: {basis.Message}"
+                StateChanged = changed.Length > 0 || (failures |> Array.exists (fun (_, item) -> item.StateChanged))
+                AffectedPaths = failures |> Array.map fst
+                Details = failures |> Array.map (fun (path, item) -> $"{path}: {item.Message}")
+        }
+
+        // A lock blocks every later path, so a lock recovery of any failed path replaces the retry
+        // and is also the recovery of a run in which every path failed.
+        let lockRecovery =
+            failures
+            |> Array.tryPick (fun (_, item) ->
+                item.RecoveryAction |> Option.filter (fun recovery -> recovery.Code = "remove_index_lock"))
+
+        if changed.Length > 0 then
+            OperationResult.partiallySucceeded
+                {
+                    OperationOutcome.performed () with
+                        AffectedPaths = changed
+                }
+                failure
+                (lockRecovery |> Option.defaultValue action.Recovery)
+        else
+            Failed(
+                match lockRecovery with
+                | Some recovery ->
+                    { failure with
+                        RecoveryAction = Some recovery }
+                | None -> failure
+            )
+
+/// Runs a batch operation under the session lock, after the preflight. An empty request needs neither.
+let private runBatch
+    (preflight: OperationContext -> Async<Result<unit, OperationFailure>>)
+    (serialize: (unit -> Async<OperationResult<unit>>) -> Async<OperationResult<unit>>)
+    (phaseCode: string)
+    (action: BatchAction)
+    (operation: string[] -> OperationContext -> JS.Promise<GitService.GitResult<GitService.LfsPathOutcome[]>>)
+    (paths: RepositoryPath[])
+    (context: OperationContext)
+    : Async<OperationResult<unit>> =
+    if paths.Length = 0 then
+        async { return OperationResult.noOp (Some batchNoOpReason) () }
+    else
+        serialize (fun () ->
+            async {
+                if context.Cancellation.IsCancellationRequested() then
+                    return OperationResult.canceled "Git LFS operation canceled."
+                else
+                    let! preflightResult = preflight context
+
+                    match preflightResult with
+                    | Error failure when failure.Category = Canceled -> return OperationResult.canceled failure.Message
+                    | Error failure -> return Failed failure
+                    | Ok() ->
+                        context.ReportProgress {
+                            PhaseCode = phaseCode
+                            Item = None
+                            Completed = None
+                            Total = None
+                            DisplayMessage = None
+                        }
+
+                        if context.Cancellation.IsCancellationRequested() then
+                            return OperationResult.canceled "Git LFS operation canceled."
+                        else
+                            let! result =
+                                Async.AwaitPromise(operation (paths |> Array.map RepositoryPath.value) context)
+
+                            match result with
+                            | Error failure -> return toOperationResult failure
+                            | Ok outcomes -> return toBatchResult action outcomes
+            })
+
+/// The batch variant of createObjectMaterialization. Both operations read the Git LFS listing once, and the
+/// download fetches the objects of many paths together. A path that fails does not stop the others.
+let createObjectBatchMaterialization
+    (repoPath: string)
+    (runGit: string[] -> OperationContext -> Async<Result<NodeProcess.ProcessOutput, OperationFailure>>)
+    (credentials: GitCredentialStrategy.GitCredentialStrategy)
+    (connectionProfileId: string option)
+    (preflight: OperationContext -> Async<Result<unit, OperationFailure>>)
+    (serialize: (unit -> Async<OperationResult<unit>>) -> Async<OperationResult<unit>>)
+    : ObjectBatchMaterializationService = {
+    Materialize =
+        runBatch
+            preflight
+            serialize
+            "lfs-materialize"
+            batchMaterializeAction
+            (fun requestedPaths context ->
+                GitService.downloadLfsFiles
+                    repoPath
+                    requestedPaths
+                    credentials
+                    connectionProfileId
+                    context.ReportProgress
+                    context)
+    Dematerialize =
+        runBatch
+            preflight
+            serialize
+            "lfs-dematerialize"
+            batchDematerializeAction
+            (fun requestedPaths context ->
+                promise {
+                    let! result =
+                        GitService.freeLfsFiles
+                            repoPath
+                            requestedPaths
+                            credentials
+                            connectionProfileId
+                            context.ReportProgress
+                            context
+
+                    match result with
+                    | Error failure -> return Error failure
+                    | Ok outcomes ->
+                        // The cleanup also covers a run that stopped on cancellation, because the files
+                        // that were already freed stay freed.
+                        let freedPaths =
+                            outcomes
+                            |> Array.choose (fun outcome ->
+                                match outcome.Result with
+                                | Ok GitService.Changed -> Some outcome.Path
+                                | _ -> None)
+
+                        if freedPaths.Length > 0 then
+                            do!
+                                deleteCachedObjectsOfFreedPaths repoPath runGit context freedPaths
+                                |> Async.StartAsPromise
+
+                        return Ok outcomes
+                })
 }
 
 let createStoragePolicy

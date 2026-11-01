@@ -11,6 +11,8 @@ open VersionControlService.Git.GitAuthAdapter
 
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodeProcess = VersionControlService.Runtime.Node.Process
+module NodeOutput = VersionControlService.Runtime.Node.OutputReporter
+module NodeInterop = VersionControlService.Runtime.Node.Interop
 
 type GitProgressCallback = GitProgressDto -> unit
 
@@ -113,22 +115,84 @@ let private hasStreamListener (_stream: obj) : bool = jsNative
 let private attachOutputHandler (_git: ISimpleGit) (_handler: string -> obj -> obj -> string[] -> unit) : ISimpleGit =
     jsNative
 
-let internal withGitOutputProgress (progressCallback: GitProgressCallback option) (git: ISimpleGit) =
-    match progressCallback with
-    | None -> git
-    | Some _ ->
+/// Attaches an output handler that reads the meter lines of both streams for the progress callback. When the
+/// operation has an output channel, each command also reports a header and its stderr lines there. The
+/// stdout of a simple-git command is data, so it never reaches the channel. `secretArguments` are
+/// authentication arguments that the instance applies itself, in case the handler does not see them.
+let internal withGitOutput
+    (progressCallback: GitProgressCallback option)
+    (outputTarget: NodeOutput.OutputTarget option)
+    (secretArguments: string[])
+    (git: ISimpleGit)
+    =
+    match progressCallback, outputTarget with
+    | None, None -> git
+    | _ ->
         attachOutputHandler
             git
-            (fun (_command: string) (stdout: obj) (stderr: obj) (_args: string[]) ->
-                let observeStream (stream: obj) =
-                    if hasStreamListener stream then
-                        let observe, flush = createOutputObserver progressCallback
-                        stream?on ("data", fun (chunk: obj) -> observe (string chunk)) |> ignore
-                        stream?on ("end", fun (_: obj) -> flush ()) |> ignore
+            (fun (_command: string) (stdout: obj) (stderr: obj) (args: string[]) ->
+                let commandArguments = if isNull (box args) then [||] else args
 
-                observeStream stdout
-                observeStream stderr
+                let commandOutput =
+                    outputTarget
+                    |> Option.map (fun target ->
+                        NodeOutput.beginCommand
+                            target.Channel
+                            "git"
+                            commandArguments
+                            (Array.append secretArguments commandArguments)
+                            [||]
+                            false)
+
+                // The command ends when both streams have ended.
+                let openStreams = ref 0
+
+                let observeStream (stream: obj) (observeLog: NodeOutput.CommandOutput -> string -> unit) =
+                    if hasStreamListener stream then
+                        openStreams.Value <- openStreams.Value + 1
+                        let observeMeters, flushMeters =
+                            if progressCallback.IsSome then
+                                createOutputObserver progressCallback
+                            else
+                                ignore, ignore
+
+                        let decoder = NodeInterop.createUtf8StringDecoder ()
+                        let ended = ref false
+
+                        let observe (text: string) =
+                            observeMeters text
+                            commandOutput |> Option.iter (fun output -> observeLog output text)
+
+                        let finish () =
+                            if not ended.Value then
+                                ended.Value <- true
+                                let tail = NodeInterop.finishUtf8Decoding decoder
+
+                                if not (String.IsNullOrEmpty tail) then
+                                    observe tail
+
+                                flushMeters ()
+                                openStreams.Value <- openStreams.Value - 1
+
+                                if openStreams.Value = 0 then
+                                    commandOutput |> Option.iter (fun output -> output.Finish())
+
+                        stream?on ("data", fun (chunk: obj) -> observe (NodeInterop.decodeUtf8Chunk decoder chunk))
+                        |> ignore
+
+                        stream?on ("end", fun (_: obj) -> finish ()) |> ignore
+                        stream?on ("close", fun (_: obj) -> finish ()) |> ignore
+
+                observeStream stdout (fun output text -> output.ObserveStdout text)
+                observeStream stderr (fun output text -> output.ObserveStderr text)
+
+                // A command whose streams cannot be observed would otherwise leave its header waiting.
+                if openStreams.Value = 0 then
+                    commandOutput |> Option.iter (fun output -> output.Finish())
             )
+
+let internal withGitOutputProgress (progressCallback: GitProgressCallback option) (git: ISimpleGit) =
+    withGitOutput progressCallback None [||] git
 
 // `internal` stays inside the library assembly boundary.
 let internal unsafeOptions =

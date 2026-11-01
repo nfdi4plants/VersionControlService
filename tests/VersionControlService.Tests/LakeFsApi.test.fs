@@ -698,3 +698,35 @@ Vitest.describe (
             }
         )
 )
+
+Vitest.describe (
+    "lakeFS output channel",
+    fun () ->
+        Vitest.test (
+            "an operation whose context has an output callback reports no output",
+            TestOptions(timeout = 30000),
+            fun () -> promise {
+                let! server =
+                    startFakeServer [
+                        "GET", "/api/v1/repositories/repo/branches/main", 200, """{"id":"main","commit_id":"c1"}"""
+                    ]
+
+                try
+                    let batches = ResizeArray<OperationOutput[]>()
+
+                    let context =
+                        OperationContext.createWithOutput "lakefs-output" OperationCancellation.none ignore batches.Add
+
+                    let! result =
+                        Async.StartAsPromise(LakeFsApi.getBranch (connectionFor server) "repo" "main" context)
+
+                    match result with
+                    | Ok branch -> Vitest.expect(branch.CommitId).toBe "c1"
+                    | Error failure -> failwith $"Expected the branch lookup to succeed: {failure.Message}"
+
+                    Vitest.expect(batches.Count).toBe 0
+                finally
+                    server.Close()
+            }
+        )
+)

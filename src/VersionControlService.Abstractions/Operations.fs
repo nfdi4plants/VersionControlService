@@ -55,34 +55,76 @@ type OperationProgress = {
     DisplayMessage: string option
 }
 
+/// The kind of an output entry.
+[<RequireQualifiedAccess>]
+type OperationOutputKind =
+    /// The header of a subprocess, such as "git lfs pull origin main". It has no `-c` configuration pairs.
+    | Command
+    | StdOut
+    | StdErr
+    /// A message from the library, for example that a line was too long to keep.
+    | Notice
+
+/// One entry of the raw output channel: a redacted line from a subprocess that an operation ran.
+/// The channel carries diagnostics and keeps no transcript. Progress stays in `OperationProgress`.
+///
+/// A line that git rewrites in place with a carriage return, such as a progress meter, arrives as
+/// snapshots with `IsPartial` set. The next entry with the same `CommandId` and `Kind` replaces a
+/// partial entry in the host's view, whether that next entry is partial or complete. A complete
+/// entry (`IsPartial` false) is never replaced.
+type OperationOutput = {
+    /// Groups the entries of one subprocess. It is empty for a notice that concerns the whole operation.
+    CommandId: string
+    Kind: OperationOutputKind
+    /// Redacted text without a line terminator.
+    Text: string
+    IsPartial: bool
+}
+
 /// Context passed to every asynchronous provider operation.
 type OperationContext = {
     OperationId: string
     Cancellation: OperationCancellation
     ReportProgress: OperationProgress -> unit
+    /// Receives batches of redacted subprocess output. None means the host did not ask for output,
+    /// and a provider then does no work for it. Create a context with output through
+    /// `OperationContext.createWithOutput`.
+    ReportOutput: (OperationOutput[] -> unit) option
 }
 
 module OperationContext =
 
+    let private guard (callback: 'T -> unit) : 'T -> unit =
+        fun value ->
+            try
+                callback value
+            with _ ->
+                ()
+
     /// The context catches and drops any exception the progress callback throws, so a host
     /// that reports to something already gone (a closed window, say) cannot fail the operation.
+    /// The context has no output callback.
     let create (operationId: string) (cancellation: OperationCancellation) (reportProgress: OperationProgress -> unit) = {
         OperationId = operationId
         Cancellation = cancellation
-        ReportProgress =
-            fun progress ->
-                try
-                    reportProgress progress
-                with _ ->
-                    ()
+        ReportProgress = guard reportProgress
+        ReportOutput = None
     }
 
-    /// Context without cancellation or progress observation.
-    let detached (operationId: string) = {
-        OperationId = operationId
-        Cancellation = OperationCancellation.none
-        ReportProgress = ignore
-    }
+    /// Like `create`, and the context also delivers raw subprocess output in batches to
+    /// `reportOutput`. An exception from that callback is dropped like one from the progress callback.
+    let createWithOutput
+        (operationId: string)
+        (cancellation: OperationCancellation)
+        (reportProgress: OperationProgress -> unit)
+        (reportOutput: OperationOutput[] -> unit)
+        =
+        { create operationId cancellation reportProgress with
+            ReportOutput = Some(guard reportOutput) }
+
+    /// Context without cancellation, progress or output observation.
+    let detached (operationId: string) =
+        create operationId OperationCancellation.none ignore
 
 /// Stable failure category. Provider-specific detail lives in the extensible Code string.
 type FailureCategory =
@@ -174,8 +216,9 @@ module Redaction =
     open System.Text.RegularExpressions
 
     let private replacements = [
-        // URL credentials: https://user:secret@host or https://token@host
-        Regex(@"://[^/@\s]+@", RegexOptions.None), "://[REDACTED]@"
+        // URL credentials: https://user:secret@host or https://token@host. A user name can hold an "@",
+        // so the userinfo runs to the last "@" before the first "/".
+        Regex(@"://[^/\s]+@", RegexOptions.None), "://[REDACTED]@"
         // Authorization / token headers keep the field name, lose the value.
         Regex(@"(authorization\s*:)[^\r\n]+", RegexOptions.IgnoreCase), "$1 [REDACTED]"
         Regex(@"(private-token\s*:)[^\r\n]+", RegexOptions.IgnoreCase), "$1 [REDACTED]"
