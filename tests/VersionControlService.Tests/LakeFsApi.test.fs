@@ -28,6 +28,53 @@ let private buffersEqual (_left: obj) (_right: obj) : bool = jsNative
 
 let private ctx (name: string) = OperationContext.detached name
 
+[<Emit("globalThis.fetch = $0")>]
+let private setFetch (_fetch: obj) : unit = jsNative
+
+/// A fetch that rejects the way undici does: a TypeError whose cause carries the error code.
+[<Emit("(async () => { throw Object.assign(new TypeError($0), { cause: Object.assign(new Error($1), { code: $2 }) }); })")>]
+let private fetchRejectingWith (_outerMessage: string) (_causeMessage: string) (_causeCode: string) : obj = jsNative
+
+/// The same, with the AggregateError that Node raises for a connect to several addresses.
+[<Emit("(async () => { throw Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new AggregateError([], $0), { code: $1 }) }); })")>]
+let private fetchRejectingWithAggregate (_causeMessage: string) (_causeCode: string) : obj = jsNative
+
+/// A fetch that answers with a status line and then fails the body the way undici does.
+/// Both reading the text and streaming the body reject with the timeout.
+[<Emit("(() => { const timeout = () => Object.assign(new TypeError('terminated'), { cause: Object.assign(new Error($0), { code: 'UND_ERR_BODY_TIMEOUT' }) }); return async () => ({ status: 200, headers: { get: () => null }, text: async () => { throw timeout(); }, body: new ReadableStream({ start(controller) { controller.error(timeout()); } }) }); })()")>]
+let private fetchWithTimedOutBody (_causeMessage: string) : obj = jsNative
+
+/// A fetch that is canceled by the caller and then fails with a timeout error.
+[<Emit("(async () => { $0(); throw Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('Headers Timeout Error'), { code: 'UND_ERR_HEADERS_TIMEOUT' }) }); })")>]
+let private fetchCancelingThenTimingOut (_cancel: unit -> unit) : obj = jsNative
+
+let private withFetch (replacement: obj) (run: unit -> JS.Promise<unit>) : JS.Promise<unit> = promise {
+    let originalFetch: obj = emitJsExpr () "globalThis.fetch"
+    setFetch replacement
+
+    try
+        do! run ()
+    finally
+        setFetch originalFetch
+}
+
+let private withTempDirectory (run: string -> JS.Promise<unit>) : JS.Promise<unit> = promise {
+    let! root =
+        fsPromisesDynamic?mkdtemp (
+            join [|
+                osDynamic?tmpdir () |> unbox<string>
+                "vcs-lakefs-timeout-"
+            |]
+        )
+        |> unbox<JS.Promise<string>>
+
+    try
+        do! run root
+    finally
+        fsPromisesDynamic?rm (root, createObj [ "recursive" ==> true; "force" ==> true ])
+        |> ignore
+}
+
 /// A recorded request the fake server observed.
 type private RecordedRequest = {
     Method: string
@@ -696,6 +743,235 @@ Vitest.describe (
                 finally
                     emitJsStatement originalFetch "globalThis.fetch = $0"
             }
+        )
+)
+
+Vitest.describe (
+    "lakeFS timeout classification",
+    fun () ->
+        let connection: LakeFsConnection = {
+            Endpoint = "http://127.0.0.1:1"
+            AccessKeyId = "AKIA-test"
+            SecretAccessKey = "irrelevant"
+        }
+
+        let expectTimeout (detail: string) (failure: OperationFailure) =
+            Vitest.expect(failure.Category).toEqual (Timeout)
+            Vitest.expect(failure.Code).toBe ("timeout")
+            Vitest.expect(failure.Retryable).toBe (true)
+            Vitest.expect(failure.Message.Contains detail).toBe (true)
+
+        let timeoutCases = [
+            "UND_ERR_CONNECT_TIMEOUT", "Connect Timeout Error (attempted address: 10.0.0.1:80, timeout: 10000ms)"
+            "UND_ERR_HEADERS_TIMEOUT", "Headers Timeout Error"
+            "UND_ERR_BODY_TIMEOUT", "Body Timeout Error"
+            "ETIMEDOUT", "read ETIMEDOUT"
+        ]
+
+        for code, detail in timeoutCases do
+            Vitest.test (
+                $"an API request that fails with {code} is a retryable timeout",
+                TestOptions(timeout = 30000),
+                fun () ->
+                    withFetch
+                        (fetchRejectingWith "fetch failed" detail code)
+                        (fun () -> promise {
+                            let! result =
+                                Async.StartAsPromise(LakeFsApi.getBranch connection "repo" "main" (ctx "timeout"))
+
+                            match result with
+                            | Error failure -> expectTimeout detail failure
+                            | Ok _ -> failwith "Expected the timed out transport to report an error."
+                        })
+            )
+
+        for code in [ "UND_ERR_SOCKET"; "ECONNREFUSED"; "ECONNRESET" ] do
+            Vitest.test (
+                $"an API request that fails with {code} stays a network failure",
+                TestOptions(timeout = 30000),
+                fun () ->
+                    withFetch
+                        (fetchRejectingWith "fetch failed" "transport error" code)
+                        (fun () -> promise {
+                            let! result =
+                                Async.StartAsPromise(LakeFsApi.getBranch connection "repo" "main" (ctx "network"))
+
+                            match result with
+                            | Error failure ->
+                                Vitest.expect(failure.Category).toEqual (Network)
+                                Vitest.expect(failure.Code).toBe ("network_failure")
+                                Vitest.expect(failure.Retryable).toBe (true)
+                            | Ok _ -> failwith "Expected the failing transport to report an error."
+                        })
+            )
+
+        Vitest.test (
+            "a timeout code on the AggregateError of a multi-address connect is a timeout",
+            TestOptions(timeout = 30000),
+            fun () ->
+                withFetch
+                    (fetchRejectingWithAggregate "connect ETIMEDOUT" "ETIMEDOUT")
+                    (fun () -> promise {
+                        let! result =
+                            Async.StartAsPromise(LakeFsApi.getBranch connection "repo" "main" (ctx "aggregate"))
+
+                        match result with
+                        | Error failure -> expectTimeout "connect ETIMEDOUT" failure
+                        | Ok _ -> failwith "Expected the timed out transport to report an error."
+                    })
+        )
+
+        Vitest.test (
+            "an API response whose body times out while it is read is a timeout",
+            TestOptions(timeout = 30000),
+            fun () ->
+                withFetch
+                    (fetchWithTimedOutBody "Body Timeout Error")
+                    (fun () -> promise {
+                        let! result = Async.StartAsPromise(LakeFsApi.getBranch connection "repo" "main" (ctx "body"))
+
+                        match result with
+                        | Error failure -> expectTimeout "Body Timeout Error" failure
+                        | Ok _ -> failwith "Expected the timed out body to report an error."
+                    })
+        )
+
+        Vitest.test (
+            "a timeout error after the caller canceled stays canceled",
+            TestOptions(timeout = 30000),
+            fun () ->
+                let source = OperationCancellation.Source()
+                let context = OperationContext.create "canceled-timeout" source.Cancellation ignore
+
+                withFetch
+                    (fetchCancelingThenTimingOut (fun () -> source.Cancel()))
+                    (fun () -> promise {
+                        let! result = Async.StartAsPromise(LakeFsApi.getBranch connection "repo" "main" context)
+
+                        match result with
+                        | Error failure ->
+                            Vitest.expect(failure.Category).toEqual (Canceled)
+                            Vitest.expect(failure.Code).toBe ("operation_canceled")
+                        | Ok _ -> failwith "Expected the canceled request to report an error."
+                    })
+        )
+
+        Vitest.test (
+            "a download whose request times out is a retryable timeout",
+            TestOptions(timeout = 30000),
+            fun () ->
+                withTempDirectory (fun root ->
+                    withFetch
+                        (fetchRejectingWith "fetch failed" "Headers Timeout Error" "UND_ERR_HEADERS_TIMEOUT")
+                        (fun () -> promise {
+                            let! result =
+                                LakeFsApi.downloadObjectToFile
+                                    connection
+                                    "repo"
+                                    "main"
+                                    "slow.dat"
+                                    (join [| root; "slow.dat" |])
+                                    (ctx "download-timeout")
+                                |> Async.StartAsPromise
+
+                            match result with
+                            | Error failure -> expectTimeout "Headers Timeout Error" failure
+                            | Ok _ -> failwith "Expected the timed out download to report an error."
+                        })
+                )
+        )
+
+        Vitest.test (
+            "a download whose body times out while it streams is a timeout and leaves no file",
+            TestOptions(timeout = 30000),
+            fun () ->
+                withTempDirectory (fun root ->
+                    withFetch
+                        (fetchWithTimedOutBody "Body Timeout Error")
+                        (fun () -> promise {
+                            let target = join [| root; "partial.dat" |]
+
+                            let! result =
+                                LakeFsApi.downloadObjectToFile
+                                    connection
+                                    "repo"
+                                    "main"
+                                    "slow.dat"
+                                    target
+                                    (ctx "download-body")
+                                |> Async.StartAsPromise
+
+                            match result with
+                            | Error failure -> expectTimeout "Body Timeout Error" failure
+                            | Ok _ -> failwith "Expected the timed out download to report an error."
+
+                            let! exists =
+                                fsPromisesDynamic?access target
+                                |> unbox<JS.Promise<obj>>
+                                |> Promise.map (fun _ -> true)
+                                |> Promise.catch (fun _ -> false)
+
+                            Vitest.expect(exists).toBe false
+                        })
+                )
+        )
+
+        Vitest.test (
+            "an upload whose request times out is a retryable timeout",
+            TestOptions(timeout = 30000),
+            fun () ->
+                withTempDirectory (fun root ->
+                    withFetch
+                        (fetchRejectingWith "fetch failed" "Headers Timeout Error" "UND_ERR_HEADERS_TIMEOUT")
+                        (fun () -> promise {
+                            let source = join [| root; "upload.dat" |]
+                            do! fsPromisesDynamic?writeFile (source, "payload") |> unbox<JS.Promise<unit>>
+
+                            let! result =
+                                LakeFsApi.uploadObjectFromFile
+                                    connection
+                                    "repo"
+                                    "main"
+                                    "upload.dat"
+                                    source
+                                    (ctx "upload-timeout")
+                                |> Async.StartAsPromise
+
+                            match result with
+                            | Error failure -> expectTimeout "Headers Timeout Error" failure
+                            | Ok _ -> failwith "Expected the timed out upload to report an error."
+                        })
+                )
+        )
+
+        Vitest.test (
+            "an upload that fails with a socket error stays a network failure",
+            TestOptions(timeout = 30000),
+            fun () ->
+                withTempDirectory (fun root ->
+                    withFetch
+                        (fetchRejectingWith "fetch failed" "other side closed" "UND_ERR_SOCKET")
+                        (fun () -> promise {
+                            let source = join [| root; "upload.dat" |]
+                            do! fsPromisesDynamic?writeFile (source, "payload") |> unbox<JS.Promise<unit>>
+
+                            let! result =
+                                LakeFsApi.uploadObjectFromFile
+                                    connection
+                                    "repo"
+                                    "main"
+                                    "upload.dat"
+                                    source
+                                    (ctx "upload-socket")
+                                |> Async.StartAsPromise
+
+                            match result with
+                            | Error failure ->
+                                Vitest.expect(failure.Category).toEqual (Network)
+                                Vitest.expect(failure.Code).toBe ("network_failure")
+                            | Ok _ -> failwith "Expected the failing upload to report an error."
+                        })
+                )
         )
 )
 

@@ -11,6 +11,7 @@ open VersionControlService.LakeFs.LakeFsTypes
 
 module NodeCancellation = VersionControlService.Runtime.Node.Cancellation
 module LakeFsBinaryTransfer = VersionControlService.LakeFs.LakeFsBinaryTransfer
+module LakeFsTransportError = VersionControlService.LakeFs.LakeFsTransportError
 
 [<Emit("Buffer.from($0, 'utf8').toString('base64')")>]
 let private toBase64 (_value: string) : string = jsNative
@@ -103,13 +104,12 @@ let request
                         )
                 else
                     return
-                        Error {
-                            OperationFailure.createRedacted
-                                Network
-                                "network_failure"
-                                $"The lakeFS endpoint is unreachable: {error.Message}" with
-                                Retryable = true
-                        }
+                        Error(
+                            LakeFsTransportError.toFailure
+                                "The lakeFS endpoint is unreachable"
+                                "The lakeFS request timed out"
+                                (box error)
+                        )
     }
 
 /// Request that fails on non-2xx statuses with classification.

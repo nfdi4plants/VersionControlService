@@ -9,6 +9,7 @@ module NodeCancellation = VersionControlService.Runtime.Node.Cancellation
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodeInterop = VersionControlService.Runtime.Node.Interop
 module NodeBinaryIO = VersionControlService.Runtime.Node.BinaryIO
+module LakeFsTransportError = VersionControlService.LakeFs.LakeFsTransportError
 
 type StreamCopyResult = NodeBinaryIO.StreamCopyResult
 
@@ -64,6 +65,12 @@ let private networkFailure message =
             $"The lakeFS object transfer failed: {message}" with
                 Retryable = true
     }
+
+let private transportFailure (error: exn) =
+    LakeFsTransportError.toFailure
+        "The lakeFS object transfer failed"
+        "The lakeFS object transfer timed out"
+        (box error)
 
 let private reportBytes phase item total (context: OperationContext) completed =
     context.ReportProgress {
@@ -176,7 +183,7 @@ let downloadObjectToFile
                     if context.Cancellation.IsCancellationRequested() then
                         return Error(canceledFailure ())
                     else
-                        return Error(networkFailure (NodeInterop.errorMessage error))
+                        return Error(transportFailure error)
         finally
             source |> Option.iter (fun value -> value?destroy () |> ignore)
             target |> Option.iter (fun value -> value?destroy () |> ignore)
@@ -301,7 +308,7 @@ let private uploadObjectFromFileCore
                         if context.Cancellation.IsCancellationRequested() then
                             return Error(canceledFailure ())
                         else
-                            return Error(networkFailure (NodeInterop.errorMessage error))
+                            return Error(transportFailure error)
         finally
             source |> Option.iter (fun value -> value?destroy () |> ignore)
             body |> Option.iter (fun value -> value?destroy () |> ignore)

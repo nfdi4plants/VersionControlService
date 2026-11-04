@@ -427,6 +427,9 @@ succeed without further changes, which is what decides whether the host offers a
 `AffectedPaths` and `RevisionEvidence` name what the failure was about. Messages and details
 arrive redacted, so a host can show them to a user.
 
+A request that timed out fails with the category `Timeout` and the code `timeout` in both
+providers.
+
 `OperationOutcome.Publication` is the field to read before telling anyone their work is safe.
 `Published` means the result is visible on the logical target. `LocalOnly` means the revisions
 exist locally and a publish can still be retried. `PublicationNotApplicable` means the

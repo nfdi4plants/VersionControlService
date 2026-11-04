@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 -   `DependencyStatus` has a new `ProbeExecutablePath` field, so record literals have to set it.
 -   With an explicit selection, the Git provider's `CheckDependencies` checks that git and does not fall back to the one on the PATH. An unusable selection marks every component as not installed, and the `Remediation` names the path.
+-   lakeFS requests that time out fail with the category `Timeout` and the code `timeout`, as in the Git provider. They used to fail as `Network` with `network_failure`.
 
 ### Removed
 
