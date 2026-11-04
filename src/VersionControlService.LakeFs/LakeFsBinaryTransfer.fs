@@ -10,6 +10,7 @@ module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodeInterop = VersionControlService.Runtime.Node.Interop
 module NodeBinaryIO = VersionControlService.Runtime.Node.BinaryIO
 module LakeFsTransportError = VersionControlService.LakeFs.LakeFsTransportError
+module LakeFsRequestOutput = VersionControlService.LakeFs.LakeFsRequestOutput
 
 type StreamCopyResult = NodeBinaryIO.StreamCopyResult
 
@@ -38,7 +39,7 @@ let private encodeUriComponent (_value: string) : string = jsNative
 [<Emit("new $0.Transform({ transform(chunk, encoding, callback) { try { $1(chunk); } catch (error) { callback(error); return; } callback(null, chunk); } })")>]
 let private createByteTap (_stream: obj) (_onChunk: obj -> unit) : obj = jsNative
 
-let private classifyStatus status body =
+let private classifyStatus (connection: LakeFsConnection) status body =
     let category, code =
         match status with
         | 401 -> Authentication, "unauthorized"
@@ -49,8 +50,12 @@ let private classifyStatus status body =
         | value when value >= 500 -> ProviderError, "server_error"
         | _ -> ProviderError, "request_failed"
 
+    // A server can echo the credentials it received, so the body is cleaned of this connection's secrets too.
     {
-        OperationFailure.createRedacted category code $"lakeFS request failed ({status}): {body}" with
+        OperationFailure.createRedacted
+            category
+            code
+            (LakeFsRequestOutput.redactText connection $"lakeFS request failed ({status}): {body}") with
             Retryable = status >= 500
     }
 
@@ -72,6 +77,11 @@ let private transportFailure (error: exn) =
         "The lakeFS object transfer timed out"
         (box error)
 
+// Reports a failure on the request's output and hands it back as the result.
+let private failWith (output: LakeFsRequestOutput.RequestOutput option) (failure: OperationFailure) =
+    LakeFsRequestOutput.reportFailed output failure
+    Error failure
+
 let private reportBytes phase item total (context: OperationContext) completed =
     context.ReportProgress {
         PhaseCode = phase
@@ -81,23 +91,32 @@ let private reportBytes phase item total (context: OperationContext) completed =
         DisplayMessage = Some "lakeFS object bytes transferred"
     }
 
-let private objectUrl connection repository reference key =
-    connection.Endpoint.TrimEnd '/'
-    + "/api/v1/repositories/"
+// The request targets are relative to /api/v1. The output header shows the same text that the URL ends with.
+let private objectTarget repository reference key =
+    "/repositories/"
     + encodeUriComponent repository
     + "/refs/"
     + encodeUriComponent reference
     + "/objects?path="
     + encodeUriComponent key
 
-let private uploadUrl connection repository branch key =
-    connection.Endpoint.TrimEnd '/'
-    + "/api/v1/repositories/"
+let private uploadTarget repository branch key =
+    "/repositories/"
     + encodeUriComponent repository
     + "/branches/"
     + encodeUriComponent branch
     + "/objects?path="
     + encodeUriComponent key
+
+let private objectUrl connection repository reference key =
+    connection.Endpoint.TrimEnd '/'
+    + "/api/v1"
+    + objectTarget repository reference key
+
+let private uploadUrl connection repository branch key =
+    connection.Endpoint.TrimEnd '/'
+    + "/api/v1"
+    + uploadTarget repository branch key
 
 let private headers connection =
     let credentials = toBase64 $"{connection.AccessKeyId}:{connection.SecretAccessKey}"
@@ -116,6 +135,7 @@ let downloadObjectToFile
         let mutable owned = false
         let mutable source: obj option = None
         let mutable target: obj option = None
+        let mutable output: LakeFsRequestOutput.RequestOutput option = None
 
         try
             if context.Cancellation.IsCancellationRequested() then
@@ -129,15 +149,20 @@ let downloadObjectToFile
                     target |> Option.iter (fun value -> value?destroy (NodeInterop.createError "canceled") |> ignore))
 
                 try
+                    output <-
+                        LakeFsRequestOutput.tryBegin connection "GET" (objectTarget repository reference key) context
+
                     let! response =
                         fetchJs (objectUrl connection repository reference key) options
                         |> Async.AwaitPromise
 
                     let status = unbox<int> response?status
+                    LakeFsRequestOutput.reportStatus output status
 
                     if status < 200 || status >= 300 then
                         let! body = response?text () |> unbox<JS.Promise<string>> |> Async.AwaitPromise
-                        return Error(classifyStatus status body)
+                        LakeFsRequestOutput.reportErrorBody output body
+                        return Error(classifyStatus connection status body)
                     else
                         let readable: obj = streamDynamic?Readable?fromWeb (response?body)
                         let writable: obj =
@@ -171,9 +196,11 @@ let downloadObjectToFile
                         do! pipeline |> Async.AwaitPromise |> Async.Ignore
 
                         if context.Cancellation.IsCancellationRequested() then
-                            return Error(canceledFailure ())
+                            return failWith output (canceledFailure ())
                         else
                             completed <- true
+                            LakeFsRequestOutput.reportTransferred output copied
+
                             return
                                 Ok {
                                     BytesCopied = copied
@@ -181,9 +208,9 @@ let downloadObjectToFile
                                 }
                 with error ->
                     if context.Cancellation.IsCancellationRequested() then
-                        return Error(canceledFailure ())
+                        return failWith output (canceledFailure ())
                     else
-                        return Error(transportFailure error)
+                        return failWith output (transportFailure error)
         finally
             source |> Option.iter (fun value -> value?destroy () |> ignore)
             target |> Option.iter (fun value -> value?destroy () |> ignore)
@@ -195,6 +222,9 @@ let downloadObjectToFile
                     NodeFileSystem.unlinkSync temporaryPath
                 with _ ->
                     ()
+
+            // The command ends when the transfer has settled, not when fetch has answered.
+            LakeFsRequestOutput.finish output
     }
 
 let private uploadObjectFromFileCore
@@ -210,6 +240,7 @@ let private uploadObjectFromFileCore
         let mutable source: obj option = None
         let mutable body: obj option = None
         let mutable descriptorToClose: int option = None
+        let mutable output: LakeFsRequestOutput.RequestOutput option = None
 
         try
             if context.Cancellation.IsCancellationRequested() then
@@ -274,28 +305,34 @@ let private uploadObjectFromFileCore
                         ]
 
                     try
+                        // The request starts here, after the local file passed its checks.
+                        output <-
+                            LakeFsRequestOutput.tryBegin connection "POST" (uploadTarget repository branch key) context
+
                         let! response =
                             fetchJs (uploadUrl connection repository branch key) options
                             |> Async.AwaitPromise
 
                         let status = unbox<int> response?status
+                        LakeFsRequestOutput.reportStatus output status
 
                         if status >= 200 && status < 300 then
                             if context.Cancellation.IsCancellationRequested() then
-                                return Error(canceledFailure ())
+                                return failWith output (canceledFailure ())
                             else
                                 match readFailure with
-                                | Some error -> return Error(networkFailure (NodeInterop.errorMessage error))
+                                | Some error -> return failWith output (networkFailure (NodeInterop.errorMessage error))
                                 | None ->
                                     // The counter and the hash run ahead of the socket, so a
                                     // success answer only counts once the body really ended.
                                     if not (unbox<bool> tap?readableEnded) then
                                         return
-                                            Error(
-                                                networkFailure
-                                                    "lakeFS answered before the upload body was fully sent."
-                                            )
+                                            failWith
+                                                output
+                                                (networkFailure "lakeFS answered before the upload body was fully sent.")
                                     else
+                                        LakeFsRequestOutput.reportTransferred output copied
+
                                         return
                                             Ok {
                                                 BytesCopied = copied
@@ -303,16 +340,20 @@ let private uploadObjectFromFileCore
                                             }
                         else
                             let! body = response?text () |> unbox<JS.Promise<string>> |> Async.AwaitPromise
-                            return Error(classifyStatus status body)
+                            LakeFsRequestOutput.reportErrorBody output body
+                            return Error(classifyStatus connection status body)
                     with error ->
                         if context.Cancellation.IsCancellationRequested() then
-                            return Error(canceledFailure ())
+                            return failWith output (canceledFailure ())
                         else
-                            return Error(transportFailure error)
+                            return failWith output (transportFailure error)
         finally
             source |> Option.iter (fun value -> value?destroy () |> ignore)
             body |> Option.iter (fun value -> value?destroy () |> ignore)
             descriptorToClose |> Option.iter NodeFileSystem.closeFileDescriptorSync
+
+            // The command ends when the upload body is verified or the request failed, not when fetch has answered.
+            LakeFsRequestOutput.finish output
     }
 
 let uploadObjectFromFile

@@ -20,12 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 -   `GitExecution.setGitExecutableProvider` lets a host choose the git executable for every Git operation in the process. The selection has to be an absolute path, and `None` uses the git on the PATH. `GitExecution.resetGitExecutableProvider` goes back to automatic discovery.
 -   `DependencyStatus.ProbeExecutablePath` names the git executable that `CheckDependencies` ran.
+-   The lakeFS provider reports its HTTP requests on `OperationContext.ReportOutput`, with the credentials of the connection removed.
+-   `CommandOutput.ObserveNotice` adds a `Notice` line to a command. `OutputReporter.knownSecrets` and `beginCommandWithSecrets` start a command that hides credentials the caller knows as values.
 
 ### Changed
 
 -   `DependencyStatus` has a new `ProbeExecutablePath` field, so record literals have to set it.
 -   With an explicit selection, the Git provider's `CheckDependencies` checks that git and does not fall back to the one on the PATH. An unusable selection marks every component as not installed, and the `Remediation` names the path.
 -   lakeFS requests that time out fail with the category `Timeout` and the code `timeout`, as in the Git provider. They used to fail as `Network` with `network_failure`.
+-   The lakeFS provider removes the credentials of the connection from failure messages built from an error response.
 
 ### Removed
 

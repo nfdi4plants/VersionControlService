@@ -19,6 +19,7 @@ module LakeFsObjectTransfer = VersionControlService.LakeFs.LakeFsObjectTransfer
 module LakeFsSelectedRevision = VersionControlService.LakeFs.LakeFsSelectedRevision
 module LakeFsSynchronization = VersionControlService.LakeFs.LakeFsSynchronization
 module LakeFsConflictSession = VersionControlService.LakeFs.LakeFsConflictSession
+module LakeFsRequestOutput = VersionControlService.LakeFs.LakeFsRequestOutput
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodeInterop = VersionControlService.Runtime.Node.Interop
 module NodePath = VersionControlService.Runtime.Node.Path
@@ -613,17 +614,17 @@ let private interruptedSelectedRevisionFailure
             |]
     }
 
-/// Cancellation recovery uses a detached context because the caller's signal is
+/// Cancellation recovery uses a context without cancellation because the caller's signal is
 /// already set. It only resets the provider-owned branch when both the local
 /// ownership proof and the live expected head still match.
 let private recoverInterruptedSelectedRevision
     (state: SessionState)
     (resolved: LakeFsConnection)
     (expectedHead: string option)
-    (operationId: string)
+    (context: OperationContext)
     =
     async {
-        let recoveryContext = OperationContext.detached $"{operationId}-recovery"
+        let recoveryContext = LakeFsRequestOutput.withoutCancellation context "recovery"
         let ownsBranch =
             state.Index.OwnershipToken <> ""
             && workspaceBranchName state.Binding.WorkspaceRoot state.Index.OwnershipToken
@@ -907,7 +908,7 @@ let private createRevision (state: SessionState) (request: CreateRevisionRequest
                                         state
                                         resolved
                                         expectedParent
-                                        context.OperationId
+                                        context
 
                                 return Failed interrupted
                             | LakeFsObjectTransfer.TransferFailed(failure, completed) ->
@@ -949,7 +950,7 @@ let private createRevision (state: SessionState) (request: CreateRevisionRequest
                                             state
                                             resolved
                                             expectedParent
-                                            context.OperationId
+                                            context
 
                                     return Failed interrupted
                                 else
@@ -969,7 +970,7 @@ let private createRevision (state: SessionState) (request: CreateRevisionRequest
                                                 state
                                                 resolved
                                                 expectedParent
-                                                context.OperationId
+                                                context
 
                                         return Failed interrupted
                                     | Error failure ->
@@ -994,7 +995,7 @@ let private createRevision (state: SessionState) (request: CreateRevisionRequest
                                                     state
                                                     resolved
                                                     expectedParent
-                                                    context.OperationId
+                                                    context
 
                                             return Failed interrupted
                                         else
@@ -3242,7 +3243,7 @@ let private openSessionFromStateDirectory
                                         resolved
                                         state.Index.Repository
                                         workspaceBranch
-                                        (OperationContext.detached $"{context.OperationId}-cleanup")
+                                        (LakeFsRequestOutput.withoutCancellation context "cleanup")
 
                                 match deleted with
                                 | Ok() -> return Failed failure

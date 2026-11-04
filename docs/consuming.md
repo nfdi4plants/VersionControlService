@@ -1523,7 +1523,31 @@ The Git provider reports the subprocesses of Refresh, Update, Synchronize, Publi
 large-object listing, download and free of `ObjectMaterialization` and `ObjectBatchMaterialization`, and
 the LFS upload of a publish. It does not report the text diff workers, the byte-exact object reads, the
 cleanup of the LFS cache (prune and dedup) or the few configuration probes that run without an operation
-context. The lakeFS provider runs no subprocesses and reports no output.
+context.
+
+The lakeFS provider runs no subprocesses and reports its HTTP requests instead. Every request of an
+operation is one command. The `Command` header reads `lakefs <method> <target>`, with the target relative
+to `/api/v1`, for example `lakefs GET /repositories/arc1/branches/main` or
+`lakefs GET /repositories/arc1/refs/main/objects?path=data%2Fa.bin`. A `Notice` gives the status code and
+the time until the response arrived, for example `status 200 after 12 ms`. A response with a status
+outside 200 to 299 adds its body as `StdErr` lines. A transport failure or a timeout adds a `Notice` with
+the elapsed time and a `StdErr` line with the reason, and a cancellation adds a `Notice`. A transfer that
+completes adds a `Notice` with its byte count and total time. Object bodies and the bodies of successful
+responses never reach the channel. A request that the caller canceled before it started reports nothing.
+
+The command of a request ends when the request has settled. An object download ends after its file is
+written, and an upload ends after the provider has verified that the whole body was sent. A body that
+breaks while it is read therefore keeps the status that the response already had.
+
+The provider replaces the access key id and the secret of the connection with `[REDACTED]` in every line,
+including the Basic credential built from them and the percent-encoded forms. It also replaces the value
+of a query parameter whose name looks like a credential, such as a signature or a token. A credential shorter than four characters is not replaced,
+because the channel leaves out values that short, so use longer credentials if the log is shown to others.
+The failure messages of the provider get the same replacement.
+
+The end of a request delivers its pending entries at once, as the end of a subprocess does. An operation
+with many short requests, such as a paginated listing, can therefore deliver more than ten batches per
+second. The entries of one request stay together in order, and the host decides how many of them to keep.
 
 Show the output only in a folded or secondary view. Never use a raw line as the headline of an
 operation. The headline comes from progress and from the result.
