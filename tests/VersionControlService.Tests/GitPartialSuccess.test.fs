@@ -298,9 +298,11 @@ let private planOutboundLfsPush
     (runSpawnedGit: GitLfsAdapter.GitSpawnRequest -> JS.Promise<GitLfsAdapter.GitSpawnResult>)
     (workPath: string)
     =
+    let invocation = GitExecution.resolveInvocation ()
+
     let git =
-        GitInternals.createOptions workPath GitInternals.standardTimeout None
-        |> GitInternals.createGit
+        GitInternals.createOptions invocation workPath GitInternals.standardTimeout None
+        |> GitInternals.createGit invocation
 
     GitLfsService.planOutboundPush
         (fun operation currentGit -> GitInternals.runSimpleGit id operation currentGit)

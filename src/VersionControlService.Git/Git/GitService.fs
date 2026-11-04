@@ -21,6 +21,7 @@ module NodeProcess = VersionControlService.Runtime.Node.Process
 module NodeOutput = VersionControlService.Runtime.Node.OutputReporter
 module NodeCancellation = VersionControlService.Runtime.Node.Cancellation
 module GitCredentialStrategy = VersionControlService.Git.GitCredentialStrategy
+module GitExecution = VersionControlService.Git.GitExecution
 
 type GitFailure = {
     Kind: GitFailureKind
@@ -164,12 +165,17 @@ let classifyFailureKind (message: string) =
     else
         GitFailureKind.Unknown
 
-/// Parses the numeric portion of Git's human-readable version output. Keeping
-/// this tolerant makes dependency probing work for the platform-specific text
-/// emitted by Git distributions without treating an unparseable version as
-/// compatible.
+/// Parses the numeric portion of the `git version <major>.<minor>` line that
+/// `git --version` prints. The line has to start with those words, so the version
+/// banner of another program (Node.js, git-lfs) is not taken for Git's. The text
+/// after the minor number is free, which covers distribution suffixes such as
+/// `.windows.1` or `(Apple Git-145)`.
 let tryParseVersion (versionText: string) : (int * int * int) option =
-    let matchResult = Regex.Match(versionText |> Option.ofObj |> Option.defaultValue String.Empty, @"(\d+)\.(\d+)(?:\.(\d+))?")
+    let matchResult =
+        Regex.Match(
+            versionText |> Option.ofObj |> Option.defaultValue String.Empty,
+            @"(?:^|\n)git version (\d+)\.(\d+)(?:\.(\d+))?"
+        )
 
     if matchResult.Success then
         let patch =
@@ -1447,13 +1453,14 @@ type private AuthenticatedGitSession = {
 }
 
 let private createLocalGitSession arcPath progressCallback =
-    let options = createOptions arcPath syncTimeout progressCallback
+    let invocation = GitExecution.resolveInvocation ()
+    let options = createOptions invocation arcPath syncTimeout progressCallback
 
     {
-        Git = createGit options |> withGitOutputProgress progressCallback
+        Git = createGit invocation options |> withGitOutputProgress progressCallback
         CommandAuth = {
             ConfigArgs = [||]
-            Environment = createNonInteractiveEnv ()
+            Environment = createNonInteractiveBaseEnv ()
         }
     }
 
@@ -1465,8 +1472,9 @@ let private createAuthenticatedGitSession
     (progressCallback: GitProgressCallback option)
     : JS.Promise<GitResult<AuthenticatedGitSession>> =
     promise {
-        let probeOptions = createOptions arcPath standardTimeout None
-        let probeGit = createGit probeOptions
+        let probeInvocation = GitExecution.resolveInvocation ()
+        let probeOptions = createOptions probeInvocation arcPath standardTimeout None
+        let probeGit = createGit probeInvocation probeOptions
 
         let! remoteResult =
             runSimpleGit
@@ -1492,7 +1500,9 @@ let private createAuthenticatedGitSession
                     match credential with
                     | Some resolved when not (String.IsNullOrWhiteSpace resolved.Secret) ->
                         try
-                            let operationOptions = createOptions arcPath syncTimeout progressCallback
+                            let invocation = GitExecution.resolveInvocation ()
+                            let operationOptions = createOptions invocation arcPath syncTimeout progressCallback
+
                             let commandAuth =
                                 GitCredentialStrategy.buildScopedCommandAuthentication
                                     remoteName
@@ -1501,7 +1511,10 @@ let private createAuthenticatedGitSession
 
                             let git =
                                 applyCommandAuthentication
-                                    (fun options -> createGit options |> withGitOutputProgress progressCallback)
+                                    invocation
+                                    (fun options ->
+                                        createGit invocation options |> withGitOutputProgress progressCallback
+                                    )
                                     operationOptions
                                     commandAuth
 
@@ -1524,8 +1537,9 @@ let private createOriginLfsRemoteSession
     : JS.Promise<GitResult<AuthenticatedGitSession>> =
     promise {
         let remoteName = "origin"
-        let probeOptions = createOptions arcPath standardTimeout None
-        let probeGit = createGit probeOptions
+        let probeInvocation = GitExecution.resolveInvocation ()
+        let probeOptions = createOptions probeInvocation arcPath standardTimeout None
+        let probeGit = createGit probeInvocation probeOptions
 
         let! remoteResult =
             runSimpleGit
@@ -1575,8 +1589,9 @@ let private withLocalGitAndProgress
     (operation: ISimpleGit -> JS.Promise<'T>)
     : JS.Promise<GitResult<'T>> =
     promise {
-        let options = createOptions arcPath standardTimeout None
-        let git = createGit options |> withGitOutputProgress progressCallback
+        let invocation = GitExecution.resolveInvocation ()
+        let options = createOptions invocation arcPath standardTimeout None
+        let git = createGit invocation options |> withGitOutputProgress progressCallback
 
         let! repoCheckResult = ensureRepo git
 
@@ -1594,8 +1609,9 @@ let private withUntimedLocalGit
     (operation: ISimpleGit -> JS.Promise<'T>)
     : JS.Promise<GitResult<'T>> =
     promise {
-        let options = createUntimedOptions arcPath progressCallback None
-        let git = createGit options |> withGitOutputProgress progressCallback
+        let invocation = GitExecution.resolveInvocation ()
+        let options = createUntimedOptions invocation arcPath progressCallback None
+        let git = createGit invocation options |> withGitOutputProgress progressCallback
 
         let! repoCheckResult = ensureRepo git
 
@@ -1611,8 +1627,9 @@ let private withCancellableLocalGit
     : JS.Promise<GitResult<'T>> =
     promise {
         let abortSignal = NodeCancellation.toAbortSignal cancellation
-        let options = createUntimedOptions arcPath None (Some abortSignal)
-        let git = createGit options
+        let invocation = GitExecution.resolveInvocation ()
+        let options = createUntimedOptions invocation arcPath None (Some abortSignal)
+        let git = createGit invocation options
         let canceledResult: GitResult<'T> = Error(createFailure GitFailureKind.Canceled "The Git command was canceled.")
         let mapCancellation result =
             match result with
@@ -1834,20 +1851,23 @@ let prepareExplicitLfsPush
         if cancelCheck () then
             return Error(createFailure GitFailureKind.Canceled "Git LFS upload canceled.")
         else
-            let options = createOptions arcPath syncTimeout progressCallback
+            let invocation = GitExecution.resolveInvocation ()
+            let options = createOptions invocation arcPath syncTimeout progressCallback
 
             let git =
                 applyCommandAuthentication
+                    invocation
                     (fun currentOptions ->
-                        createGit currentOptions
+                        createGit invocation currentOptions
                         |> withGitOutput progressCallback outputTarget commandAuth.ConfigArgs)
                     options
                     commandAuth
 
             let fetchGit =
                 applyCommandAuthentication
+                    invocation
                     (fun currentOptions ->
-                        createGit currentOptions
+                        createGit invocation currentOptions
                         |> withGitOutput progressCallback outputTarget fetchAuth.ConfigArgs)
                     options
                     fetchAuth

@@ -190,7 +190,7 @@ let internal buildScopedCommandAuthentication
             yield! buildScopedAuthArguments remoteUrl credential
             yield! lfsArguments
         |]
-        Environment = GitAuthAdapter.createNonInteractiveEnv ()
+        Environment = GitAuthAdapter.createNonInteractiveBaseEnv ()
     }
 
 /// LFS batch actions supply their own authorization, so transfer commands omit Git's scoped header.
@@ -222,7 +222,7 @@ let internal buildScopedHeaderAuthentication
     : GitAuthAdapter.GitCommandAuthentication =
     {
         ConfigArgs = buildScopedAuthArguments remoteUrl credential
-        Environment = GitAuthAdapter.createNonInteractiveEnv ()
+        Environment = GitAuthAdapter.createNonInteractiveBaseEnv ()
     }
 
 /// Resolves the scoped auth arguments for a repository location.

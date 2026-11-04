@@ -1377,7 +1377,7 @@ let checkoutPatterns
         runGitCapturedWithOutput output {
             WorkingDirectory = Some repoPath
             Arguments = Array.append checkoutArgsPrefix patterns
-            Environment = Some(withForcedLfsProgress (createNonInteractiveEnv ()))
+            Environment = Some(withForcedLfsProgress (createNonInteractiveBaseEnv ()))
             StandardInput = None
             CancelCheck = None
             TimeoutMs = None

@@ -1414,6 +1414,7 @@ module FakeHarness =
                                 Version = Some "1.0"
                                 Compatible = true
                                 Remediation = None
+                                ProbeExecutablePath = None
                             }
                         |]
                 }

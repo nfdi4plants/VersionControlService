@@ -100,6 +100,40 @@ let lakeFsFactory =
 `LakeFsCredentials.unconfigured` refuses every profile and is the right default until
 the user has configured one.
 
+### Choosing the git executable
+
+The Git provider runs the `git` found on the PATH unless the host selects another one. A
+host that ships its own git, or lets the user pick one, installs a provider once at
+startup:
+
+```fsharp
+module GitExecution = VersionControlService.Git.GitExecution
+
+// settings.GitExecutablePath is a string option the host reads from its own settings.
+GitExecution.setGitExecutableProvider (fun () -> settings.GitExecutablePath)
+```
+
+One selection serves every factory in the process, and no factory needs rebuilding when it
+changes. simple-git captures its binary and environment when an operation creates its
+instance, so for simple-git a changed setting applies from the next operation. Process
+requests and the Git LFS adapter ask the provider at each start. The text diff supervisor
+asks it each time it launches git. For all of them a changed setting applies from the next
+start. The provider must not throw. `None` or a blank string means the
+git found on the PATH. An explicit selection has to be the absolute path of a file, because
+only the dependency check validates it. Its directory goes first in the PATH of the git
+child processes, so a git-lfs installed beside it is found. A test that installs a
+provider restores automatic discovery with `GitExecution.resetGitExecutableProvider ()`.
+
+`CheckDependencies` uses the same selection, resolved once for the whole check. A
+selection that names no usable file makes every component report `Installed = false`,
+with a `Remediation` that names the path and the reason, and the check does not fall back
+to the git on the PATH. `DependencyStatus.ProbeExecutablePath` is the git executable the
+check ran, so the host can show which one is in use. It is the same for all three
+components. With automatic discovery it is `None` when the PATH holds no git. When the
+`git-lfs-configuration` component is not set up, an explicit selection puts the quoted
+selected path in place of `git` in the command of its `Remediation`, so the user runs the
+git that the provider uses. Automatic discovery keeps the plain `git` command.
+
 ## Naming a repository
 
 A `RepositoryLocation` is nonsecret provider-owned location data plus the profile that
@@ -241,6 +275,8 @@ Each `DependencyStatus` names the component, whether it is installed, the versio
 whether that version is compatible, and a `Remediation` string to show the user. Git reports
 three components: `git`, `git-lfs`, and `git-lfs-configuration` for whether the LFS filter
 is set up. Show the remediation text for a degraded component and let the user carry on.
+`ProbeExecutablePath` names the git executable the check ran, as described under
+[Choosing the git executable](#choosing-the-git-executable).
 
 `InstallDependency` takes a component name and attempts the remediation the provider
 supports. Git supports only `git-lfs-configuration` and answers anything else

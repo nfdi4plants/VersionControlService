@@ -11,7 +11,10 @@ module GitExecution = VersionControlService.Git.GitExecution
 type GitFactory = SimpleGitOptions -> ISimpleGit
 
 /// Auth material that can be applied either through simple-git config entries or spawned git commands.
-/// ConfigArgs contains `-c key=value` pairs; Environment includes non-interactive prompt suppression.
+/// ConfigArgs contains `-c key=value` pairs. Environment is the base environment with non-interactive
+/// prompt suppression, as `createNonInteractiveBaseEnv` builds it. It names no executable and carries
+/// no completed PATH or LC_ALL. Every start of git completes it once for its own executable, so a
+/// selection that changed after this value was built still applies.
 type GitCommandAuthentication = {
     ConfigArgs: string[]
     Environment: obj
@@ -40,12 +43,11 @@ let toConfigEntries (args: string[]) =
     )
     |> Array.choose id
 
-/// Builds a git process environment that disables terminal prompts.
-/// The environment starts from a fresh copy of process.env. PATH resolution covers
-/// macOS and Linux desktop launches that miss the shell PATH. process.env itself is
-/// never modified. Git output receives LC_ALL=C.
-/// All Git entry points should use this so Git never blocks waiting for credentials.
-let createNonInteractiveEnv () : obj =
+/// Builds the base git process environment that disables terminal prompts. It starts from a fresh
+/// copy of process.env and names no executable, so it neither changes PATH nor sets LC_ALL. process.env
+/// itself is never modified. A start of git completes the base with `GitExecution.completeEnvironment`.
+/// `createNonInteractiveEnv` does both for a start that has no base to carry.
+let createNonInteractiveBaseEnv () : obj =
     // Keep existing env variables but drop unsafe git/editor overrides that simple-git rejects by default.
     let safeEnv: obj =
         emitJsExpr
@@ -86,10 +88,16 @@ let createNonInteractiveEnv () : obj =
             })()
             """
 
-    GitCommandResolver.ensureGitToolPath safeEnv
-    |> GitExecution.forceEnglishDiagnostics
+    safeEnv
 
-let applyNonInteractiveEnv (git: ISimpleGit) = git.env (createNonInteractiveEnv ())
+/// The child environment of one start that disables terminal prompts. The base environment is completed
+/// for the executable of `invocation`, which sets PATH and LC_ALL=C. All Git entry points should use
+/// this or complete a base themselves, so Git never blocks waiting for credentials.
+let createNonInteractiveEnv (invocation: GitExecution.GitInvocation) : obj =
+    GitExecution.completeEnvironment invocation (createNonInteractiveBaseEnv ())
+
+let applyNonInteractiveEnv (invocation: GitExecution.GitInvocation) (git: ISimpleGit) =
+    git.env (createNonInteractiveEnv invocation)
 
 let private tryExtractHostFromAbsoluteUri (remoteUrl: string) =
     let mutable uri = Unchecked.defaultof<Uri>
@@ -178,7 +186,9 @@ let tryExtractAuthorityFromRemoteUrl (remoteUrl: string) : Result<string, exn> =
 /// Applies already-resolved command authentication to a simple-git instance.
 /// This lets provider sessions resolve an injected strategy once and reuse the
 /// same scoped material for planning, explicit LFS transfer, and ref publish.
+/// The instance runs `invocation`, so its environment is completed for that executable.
 let applyCommandAuthentication
+    (invocation: GitExecution.GitInvocation)
     (gitFactory: GitFactory)
     (baseOptions: SimpleGitOptions)
     (commandAuth: GitCommandAuthentication)
@@ -193,7 +203,8 @@ let applyCommandAuthentication
     let scopedOptions: SimpleGitOptions =
         emitJsExpr (baseOptions, mergedConfig) "{ ...$0, config: $1 }"
 
-    gitFactory scopedOptions |> fun git -> git.env commandAuth.Environment
+    gitFactory scopedOptions
+    |> fun git -> git.env (GitExecution.completeEnvironment invocation commandAuth.Environment)
 
 /// Redacts bearer/basic headers and credential URLs before errors or diagnostics leave the service boundary.
 let redactToken (text: string) : string =

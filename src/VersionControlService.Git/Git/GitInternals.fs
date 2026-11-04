@@ -13,6 +13,7 @@ module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodeProcess = VersionControlService.Runtime.Node.Process
 module NodeOutput = VersionControlService.Runtime.Node.OutputReporter
 module NodeInterop = VersionControlService.Runtime.Node.Interop
+module GitExecution = VersionControlService.Git.GitExecution
 
 type GitProgressCallback = GitProgressDto -> unit
 
@@ -195,9 +196,11 @@ let internal withGitOutputProgress (progressCallback: GitProgressCallback option
     withGitOutput progressCallback None [||] git
 
 // `internal` stays inside the library assembly boundary.
-let internal unsafeOptions =
+// A host-selected path can contain spaces, which simple-git refuses in a custom binary unless the
+// option allows them. The bare name "git" needs no exception.
+let internal unsafeOptionsFor (invocation: GitExecution.GitInvocation) =
     SimpleGitUnsafeOptions(
-        allowUnsafeCustomBinary = false,
+        allowUnsafeCustomBinary = invocation.Explicit,
         allowUnsafeProtocolOverride = false,
         allowUnsafePack = false
     )
@@ -210,7 +213,9 @@ let internal syncTimeout =
 
 /// Creates the standard simple-git options used by Git services.
 /// maxConcurrentProcesses is intentionally one to serialize commands for a repository-scoped instance.
+/// The instance runs the executable of `invocation`.
 let internal createOptions
+    (invocation: GitExecution.GitInvocation)
     (baseDir: string)
     (timeout: SimpleGitTimeoutOptions)
     (progressCallback: GitProgressCallback option)
@@ -223,22 +228,23 @@ let internal createOptions
     | Some handler ->
         SimpleGitOptions(
             baseDir = baseDir,
-            binary = U3.Case1 "git",
+            binary = U3.Case1 invocation.Executable,
             maxConcurrentProcesses = 1,
             timeout = timeout,
-            ``unsafe`` = unsafeOptions,
+            ``unsafe`` = unsafeOptionsFor invocation,
             progress = handler
         )
     | None ->
         SimpleGitOptions(
             baseDir = baseDir,
-            binary = U3.Case1 "git",
+            binary = U3.Case1 invocation.Executable,
             maxConcurrentProcesses = 1,
             timeout = timeout,
-            ``unsafe`` = unsafeOptions
+            ``unsafe`` = unsafeOptionsFor invocation
         )
 
 let internal createUntimedOptions
+    (invocation: GitExecution.GitInvocation)
     (baseDir: string)
     (progressCallback: GitProgressCallback option)
     (abortSignal: obj option)
@@ -247,16 +253,17 @@ let internal createUntimedOptions
     // property setters would write to a different key that simple-git never reads.
     SimpleGitOptions(
         baseDir = baseDir,
-        binary = U3.Case1 "git",
+        binary = U3.Case1 invocation.Executable,
         maxConcurrentProcesses = 1,
-        ``unsafe`` = unsafeOptions,
+        ``unsafe`` = unsafeOptionsFor invocation,
         ?progress = (progressCallback |> Option.map (fun progress -> progressFromSimpleGit >> progress)),
         ?abort = (abortSignal |> Option.map unbox<IAbortSignal>)
     )
 
 /// Creates a simple-git instance with non-interactive prompt suppression applied.
-let internal createGit (options: SimpleGitOptions) : ISimpleGit =
-    SimpleGit.create options |> applyNonInteractiveEnv
+/// `invocation` is the one that built the options, so the environment matches the binary.
+let internal createGit (invocation: GitExecution.GitInvocation) (options: SimpleGitOptions) : ISimpleGit =
+    SimpleGit.create options |> applyNonInteractiveEnv invocation
 
 /// Converts exceptions from simple-git/spawned Git into the service-specific failure record.
 /// Messages are redacted here before they leave the service boundary.

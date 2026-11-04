@@ -16,6 +16,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+-   `GitExecution.setGitExecutableProvider` lets a host choose the git executable for every Git operation in the process. The selection has to be an absolute path, and `None` uses the git on the PATH. `GitExecution.resetGitExecutableProvider` goes back to automatic discovery.
+-   `DependencyStatus.ProbeExecutablePath` names the git executable that `CheckDependencies` ran.
+
+### Changed
+
+-   `DependencyStatus` has a new `ProbeExecutablePath` field, so record literals have to set it.
+-   With an explicit selection, the Git provider's `CheckDependencies` checks that git and does not fall back to the one on the PATH. An unusable selection marks every component as not installed, and the `Remediation` names the path.
+
+### Removed
+
+-   `TextDiffSupervisorOptions.GitExecutable` is removed, so record literals have to drop it. The text diff supervisor uses the `GitExecution` selection.
+
 ## 0.3.0 - 2026-11-01
 
 ### Added

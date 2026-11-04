@@ -99,4 +99,8 @@ type DependencyStatus = {
     Version: string option
     Compatible: bool
     Remediation: string option
+    /// The executable the provider ran or tried to run for this check, as an absolute path when it could
+    /// be resolved. None when the provider runs no executable, and also when it could not resolve the
+    /// executable it would run.
+    ProbeExecutablePath: string option
 }
