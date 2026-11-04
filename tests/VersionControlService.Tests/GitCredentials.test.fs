@@ -287,7 +287,7 @@ Vitest.describe (
 
                         let! materializeResult =
                             materialization.Materialize
-                                (RepositoryPath.tryCreate relativePath |> Result.defaultWith failwith)
+                                [| RepositoryPath.tryCreate relativePath |> Result.defaultWith failwith |]
                                 (ctx "credential-materialize-transfer")
                             |> Async.StartAsPromise
 
@@ -295,7 +295,7 @@ Vitest.describe (
 
                         let! _ =
                             materialization.Dematerialize
-                                (RepositoryPath.tryCreate relativePath |> Result.defaultWith failwith)
+                                [| RepositoryPath.tryCreate relativePath |> Result.defaultWith failwith |]
                                 (ctx "credential-dematerialize-transfer")
                             |> Async.StartAsPromise
 
@@ -416,7 +416,7 @@ Vitest.describe (
 
                         let! materializeResult =
                             materialization.Materialize
-                                (RepositoryPath.tryCreate relativePath |> Result.defaultWith failwith)
+                                [| RepositoryPath.tryCreate relativePath |> Result.defaultWith failwith |]
                                 (ctx "credential-userinfo-materialize")
                             |> Async.StartAsPromise
 
@@ -533,7 +533,7 @@ Vitest.describe (
 
                         let! materializeResult =
                             materialization.Materialize
-                                (RepositoryPath.tryCreate relativePath |> Result.defaultWith failwith)
+                                [| RepositoryPath.tryCreate relativePath |> Result.defaultWith failwith |]
                                 (ctx "listing-once-materialize")
                             |> Async.StartAsPromise
 
@@ -884,7 +884,7 @@ Vitest.describe (
 
                     let! dematerializeResult =
                         materialization.Dematerialize
-                            (RepositoryPath.tryCreate "materialized.bin" |> Result.defaultWith failwith)
+                            [| RepositoryPath.tryCreate "materialized.bin" |> Result.defaultWith failwith |]
                             (ctx "credential-dematerialize")
                         |> Async.StartAsPromise
 
@@ -892,7 +892,7 @@ Vitest.describe (
 
                     let! materializeResult =
                         materialization.Materialize
-                            (RepositoryPath.tryCreate "materialized.bin" |> Result.defaultWith failwith)
+                            [| RepositoryPath.tryCreate "materialized.bin" |> Result.defaultWith failwith |]
                             (ctx "credential-materialize")
                         |> Async.StartAsPromise
 

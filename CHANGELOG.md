@@ -30,9 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -   With an explicit selection, the Git provider's `CheckDependencies` checks that git and does not fall back to the one on the PATH. An unusable selection marks every component as not installed, and the `Remediation` names the path.
 -   lakeFS requests that time out fail with the category `Timeout` and the code `timeout`, as in the Git provider. They used to fail as `Network` with `network_failure`.
 -   The lakeFS provider removes the credentials of the connection from failure messages built from an error response.
+-   `ObjectMaterializationService.Materialize` and `Dematerialize` take an array of paths, so one call covers a single file or a whole folder. A call with one path still fails with that path's own code and message.
 
 ### Removed
 
+-   `ObjectBatchMaterializationService`, `WorkspaceSession.ObjectBatchMaterialization` and `ServiceAvailability.ObjectBatchMaterialization` are removed, because `ObjectMaterialization` takes several paths now. Record literals have to drop the field.
 -   `TextDiffSupervisorOptions.GitExecutable` is removed, so record literals have to drop it. The text diff supervisor uses the `GitExecution` selection.
 
 ## 0.3.0 - 2026-11-01

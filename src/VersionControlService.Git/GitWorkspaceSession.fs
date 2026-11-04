@@ -6297,16 +6297,6 @@ let private createSessionWithTextDiff
                         (preflightIndexLock state)
                         serializeLargeObjectWork
                 )
-            ObjectBatchMaterialization =
-                Some(
-                    GitLfsExtensions.createObjectBatchMaterialization
-                        state.RepoPath
-                        (fun arguments context -> runGit state.Hooks state.RepoPath arguments None context)
-                        state.Credentials
-                        state.ConnectionProfileId
-                        (preflightIndexLock state)
-                        serializeLargeObjectWork
-                )
             StoragePolicy =
                 Some(
                     GitLfsExtensions.createStoragePolicy

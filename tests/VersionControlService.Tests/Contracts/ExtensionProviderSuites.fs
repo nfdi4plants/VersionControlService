@@ -26,6 +26,15 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 Vitest.expect(List.toArray discovered).toEqual (List.toArray (List.sort harness.ExpectedServices))
             }
 
+            profileTest "the availability of object materialization follows the harness expectation"
+            <| fun () -> promise {
+                let! workspace = harness.CreateWorkspace()
+                let availability = WorkspaceSession.availability workspace.Session
+
+                Vitest.expect(availability.ObjectMaterialization)
+                    .toBe (harness.ExpectedServices |> List.contains "materialization")
+            }
+
             if harness.ExpectedServices |> List.contains "materialization" then
                 profileTest "object materialization lists and hydrates objects"
                 <| fun () -> promise {
@@ -40,23 +49,20 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     expectValue "list objects" listResult |> ignore
                 }
 
-            if harness.ExpectedServices |> List.contains "batch-materialization" then
-                profileTest "batch materialization of no paths changes nothing"
+                profileTest "object materialization of no paths changes nothing"
                 <| fun () -> promise {
                     let! workspace = harness.CreateWorkspace()
 
-                    let batchMaterialization =
-                        match workspace.Session.ObjectBatchMaterialization with
+                    let materialization =
+                        match workspace.Session.ObjectMaterialization with
                         | Some service -> service
-                        | None -> failwith "The harness advertises batch-materialization but the session lacks it."
+                        | None -> failwith "The harness advertises materialization but the session lacks it."
 
-                    let! materializeResult = run (batchMaterialization.Materialize [||] (ctx "batch-materialize-none"))
-                    expectNoOp "batch materialize of no paths" materializeResult |> ignore
+                    let! materializeResult = run (materialization.Materialize [||] (ctx "materialize-none"))
+                    expectNoOp "materialize of no paths" materializeResult |> ignore
 
-                    let! dematerializeResult =
-                        run (batchMaterialization.Dematerialize [||] (ctx "batch-dematerialize-none"))
-
-                    expectNoOp "batch dematerialize of no paths" dematerializeResult |> ignore
+                    let! dematerializeResult = run (materialization.Dematerialize [||] (ctx "dematerialize-none"))
+                    expectNoOp "dematerialize of no paths" dematerializeResult |> ignore
                 }
 
             if harness.ExpectedServices |> List.contains "storage-policy" then

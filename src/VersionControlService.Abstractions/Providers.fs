@@ -18,7 +18,6 @@ type WorkspaceSession = {
     TextDiff: TextDiffService option
     ConflictResolution: ConflictResolutionService option
     ObjectMaterialization: ObjectMaterializationService option
-    ObjectBatchMaterialization: ObjectBatchMaterializationService option
     StoragePolicy: StoragePolicyService option
     Maintenance: StorageMaintenanceService option
     RepositoryBrowser: RepositoryBrowserService option
@@ -32,7 +31,6 @@ type ServiceAvailability = {
     TextDiff: bool
     ConflictResolution: bool
     ObjectMaterialization: bool
-    ObjectBatchMaterialization: bool
     StoragePolicy: bool
     Maintenance: bool
     RepositoryBrowser: bool
@@ -69,7 +67,6 @@ module WorkspaceSession =
         TextDiff = session.TextDiff.IsSome
         ConflictResolution = session.ConflictResolution.IsSome
         ObjectMaterialization = session.ObjectMaterialization.IsSome
-        ObjectBatchMaterialization = session.ObjectBatchMaterialization.IsSome
         StoragePolicy = session.StoragePolicy.IsSome
         Maintenance = session.Maintenance.IsSome
         RepositoryBrowser = session.RepositoryBrowser.IsSome
@@ -100,13 +97,6 @@ module WorkspaceSession =
         ListObjects = fun _ -> async { return noOp objectMaterializationReason [||] }
         Materialize = fun _ _ -> async { return noOp objectMaterializationReason () }
         Dematerialize = fun _ _ -> async { return noOp objectMaterializationReason () }
-    }
-
-    let private objectBatchMaterializationReason = "The provider has no object batch materialization service."
-
-    let private noOpObjectBatchMaterialization: ObjectBatchMaterializationService = {
-        Materialize = fun _ _ -> async { return noOp objectBatchMaterializationReason () }
-        Dematerialize = fun _ _ -> async { return noOp objectBatchMaterializationReason () }
     }
 
     let private storagePolicyReason = "The provider has no storage policy service."
@@ -158,7 +148,6 @@ module WorkspaceSession =
         TextDiff = None
         ConflictResolution = None
         ObjectMaterialization = None
-        ObjectBatchMaterialization = None
         StoragePolicy = None
         Maintenance = None
         RepositoryBrowser = None
@@ -185,8 +174,6 @@ module WorkspaceSession =
         TextDiff = Some(Option.defaultValue noOpTextDiff session.TextDiff)
         ConflictResolution = Some(Option.defaultValue noOpConflictResolution session.ConflictResolution)
         ObjectMaterialization = Some(Option.defaultValue noOpObjectMaterialization session.ObjectMaterialization)
-        ObjectBatchMaterialization =
-            Some(Option.defaultValue noOpObjectBatchMaterialization session.ObjectBatchMaterialization)
         StoragePolicy = Some(Option.defaultValue noOpStoragePolicy session.StoragePolicy)
         Maintenance = Some(Option.defaultValue noOpStorageMaintenance session.Maintenance)
         RepositoryBrowser = Some(Option.defaultValue noOpRepositoryBrowser session.RepositoryBrowser)

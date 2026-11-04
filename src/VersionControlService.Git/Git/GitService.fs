@@ -3578,38 +3578,6 @@ let freeLfsFiles
     runLfsPaths arcPath requestedPaths context (fun resolvedPaths results order ->
         runLfsFree arcPath resolvedPaths credentials connectionProfileId reportProgress context results order)
 
-/// Frees one file. The result is false when the file already was a pointer.
-let freeLocalLfsCopy
-    (arcPath: string)
-    (requestedPath: string)
-    (credentials: GitCredentialStrategy.GitCredentialStrategy)
-    (connectionProfileId: string option)
-    (context: OperationContext)
-    : JS.Promise<GitResult<bool>> = promise {
-    match! freeLfsFiles arcPath [| requestedPath |] credentials connectionProfileId context.ReportProgress context with
-    | Error failure -> return Error failure
-    | Ok outcomes ->
-        match outcomes[0].Result with
-        | Ok Changed -> return Ok true
-        | Ok AlreadyInState -> return Ok false
-        | Error failure -> return Error failure
-}
-
-let downloadLfsFile
-    (arcPath: string)
-    (requestedPath: string)
-    (credentials: GitCredentialStrategy.GitCredentialStrategy)
-    (connectionProfileId: string option)
-    (context: OperationContext)
-    : JS.Promise<GitResult<unit>> = promise {
-    match! downloadLfsFiles arcPath [| requestedPath |] credentials connectionProfileId context.ReportProgress context with
-    | Error failure -> return Error failure
-    | Ok outcomes ->
-        match outcomes[0].Result with
-        | Ok _ -> return Ok()
-        | Error failure -> return Error failure
-}
-
 /// Discards validated pathspecs by restoring tracked paths from HEAD and cleaning selected untracked files.
 let discardPaths (arcPath: string) (pathSpecs: string[]) : JS.Promise<GitResult<string[]>> = promise {
     match validatePathspecs pathSpecs with

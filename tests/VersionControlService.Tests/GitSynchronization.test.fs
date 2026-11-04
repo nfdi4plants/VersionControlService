@@ -6050,7 +6050,7 @@ Vitest.describe (
                         |> Option.defaultWith (fun () -> failwith "Expected Git object materialization.")
 
                     let! materializeResult =
-                        materialization.Materialize (mkPath "large.bin") (ctx "lfs-materialize-after-cancel")
+                        materialization.Materialize [| mkPath "large.bin" |] (ctx "lfs-materialize-after-cancel")
                         |> Async.StartAsPromise
 
                     expectSucceeded "materialize after the canceled download" materializeResult |> ignore

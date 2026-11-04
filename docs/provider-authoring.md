@@ -66,8 +66,7 @@ Optional services advertise real capability:
 | `Synchronization` | refresh, preview update, update, publish, and synchronize |
 | `TextDiff` | resumable pages for a working file against its version at HEAD |
 | `ConflictResolution` | provider-owned conflict sessions and stale-handle checks |
-| `ObjectMaterialization` | list, hydrate, and dematerialize large or lazy objects |
-| `ObjectBatchMaterialization` | hydrate or dematerialize many objects in one operation |
+| `ObjectMaterialization` | list large or lazy objects, and hydrate or dematerialize many of them in one call |
 | `StoragePolicy` | literal-path policy and host-facing settings |
 | `Maintenance` | prune and deduplicate local storage |
 | `RepositoryBrowser` | a credential-free repository URL |
