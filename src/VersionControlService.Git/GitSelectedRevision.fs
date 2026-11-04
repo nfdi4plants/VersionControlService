@@ -290,7 +290,7 @@ let private resolveSelectedPathPolicies
                             AffectedPaths = inlinePointerPaths
                             RecoveryAction =
                                 Some {
-                                    Code = "retry_materialization"
+                                    Code = ObjectMaterializationCodes.RetryMaterializationRecovery
                                     Instructions =
                                         Some "Materialize the affected files, refresh the status and create the revision again."
                                 }

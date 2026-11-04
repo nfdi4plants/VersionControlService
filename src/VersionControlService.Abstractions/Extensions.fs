@@ -292,7 +292,36 @@ type ObjectState = {
     ObjectId: string option
 }
 
-/// Optional object-materialization extension (Git LFS hydration, lakeFS object download).
+/// Stable codes of the failures and recoveries that object materialization returns. A provider that supplies
+/// `ObjectMaterializationService` or `ObjectBatchMaterializationService` uses them, and a consumer decides by
+/// the code because the messages can change.
+module ObjectMaterializationCodes =
+
+    /// A path has local changes that the call would overwrite, for example an edited file. A batch call
+    /// returns it when every failed path was refused for this reason.
+    [<Literal>]
+    let LocalChanges = "local_changes"
+
+    /// Some paths of a batch Materialize failed, and not all of them for local changes.
+    [<Literal>]
+    let BatchMaterializationIncomplete = "batch_materialization_incomplete"
+
+    /// Some paths of a batch Dematerialize failed, and not all of them for local changes.
+    [<Literal>]
+    let BatchDematerializationIncomplete = "batch_dematerialization_incomplete"
+
+    /// Recovery: materialize the affected paths again. An operation that downloads large objects after its
+    /// own transfer, such as an update, also uses it when that download did not finish.
+    [<Literal>]
+    let RetryMaterializationRecovery = "retry_materialization"
+
+    /// Recovery: dematerialize the affected paths again.
+    [<Literal>]
+    let RetryDematerializationRecovery = "retry_dematerialization"
+
+/// Optional object-materialization extension. A provider supplies it when its workspace holds large or
+/// lazily fetched objects as references that a call replaces with the object's content, or the reverse.
+/// Failures and recoveries use the codes in `ObjectMaterializationCodes`.
 type ObjectMaterializationService = {
     ListObjects: OperationContext -> Async<OperationResult<ObjectState[]>>
     Materialize: RepositoryPath -> OperationContext -> Async<OperationResult<unit>>
@@ -303,7 +332,7 @@ type ObjectMaterializationService = {
 }
 
 /// Optional batch variant of the object-materialization extension. A provider supplies it when it can
-/// download or free many large objects in one operation, which is faster than one Materialize or
+/// materialize or dematerialize many objects in one operation, which is faster than one Materialize or
 /// Dematerialize call per path.
 ///
 /// Paths are exact keys, as for the single calls, and a duplicate counts once. An empty array or paths that
@@ -312,10 +341,16 @@ type ObjectMaterializationService = {
 /// paths in AffectedPaths and one "<path>: <message>" line per failed path in Details. The outcome's
 /// AffectedPaths lists the changed paths. A canceled run reports the paths that finished as changed and
 /// fails the others with a Canceled failure (PartiallySucceeded when some changed, Failed when none).
+///
+/// The failure code is `ObjectMaterializationCodes.LocalChanges` when every failed path was refused for
+/// local changes. Otherwise it is `ObjectMaterializationCodes.BatchMaterializationIncomplete` for Materialize
+/// and `ObjectMaterializationCodes.BatchDematerializationIncomplete` for Dematerialize. A partial success
+/// carries the recovery `ObjectMaterializationCodes.RetryMaterializationRecovery` or
+/// `ObjectMaterializationCodes.RetryDematerializationRecovery`.
 type ObjectBatchMaterializationService = {
-    /// Replaces the pointers of the given paths with their content.
+    /// Replaces the references of the given paths with their content.
     Materialize: RepositoryPath[] -> OperationContext -> Async<OperationResult<unit>>
-    /// Replaces the content of the given paths with their pointers. Each path follows the rules of the
+    /// Replaces the content of the given paths with their references. Each path follows the rules of the
     /// single Dematerialize call.
     Dematerialize: RepositoryPath[] -> OperationContext -> Async<OperationResult<unit>>
 }

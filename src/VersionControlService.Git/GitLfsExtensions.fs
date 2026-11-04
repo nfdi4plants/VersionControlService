@@ -44,7 +44,10 @@ let private toOperationFailure (failure: GitService.GitFailure) : OperationFailu
                     StateChanged = true
             }
         | None when failure.Kind = GitFailureKind.LocalChanges ->
-            OperationFailure.createRedacted (categoryOfKind failure.Kind) "local_changes" failure.Message
+            OperationFailure.createRedacted
+                (categoryOfKind failure.Kind)
+                ObjectMaterializationCodes.LocalChanges
+                failure.Message
         | None ->
             OperationFailure.createRedacted (categoryOfKind failure.Kind) "lfs_operation_failed" failure.Message
 
@@ -490,17 +493,17 @@ type internal BatchAction = {
 }
 
 let internal batchMaterializeAction = {
-    IncompleteCode = "batch_materialization_incomplete"
+    IncompleteCode = ObjectMaterializationCodes.BatchMaterializationIncomplete
     Recovery = {
-        Code = "retry_materialization"
+        Code = ObjectMaterializationCodes.RetryMaterializationRecovery
         Instructions = Some "Materialize the path again to replace the pointer with the object's content."
     }
 }
 
 let private batchDematerializeAction = {
-    IncompleteCode = "batch_dematerialization_incomplete"
+    IncompleteCode = ObjectMaterializationCodes.BatchDematerializationIncomplete
     Recovery = {
-        Code = "retry_dematerialization"
+        Code = ObjectMaterializationCodes.RetryDematerializationRecovery
         Instructions = Some "Free the path again after the reported problem is fixed."
     }
 }
@@ -553,7 +556,7 @@ let internal toBatchResult (action: BatchAction) (outcomes: GitService.LfsPathOu
             basis with
                 Code =
                     if allCanceled then "operation_canceled"
-                    elif allLocalChanges then "local_changes"
+                    elif allLocalChanges then ObjectMaterializationCodes.LocalChanges
                     else action.IncompleteCode
                 Message = $"{failed.Length} of {outcomes.Length} paths failed: {basis.Message}"
                 StateChanged = changed.Length > 0 || (failures |> Array.exists (fun (_, item) -> item.StateChanged))

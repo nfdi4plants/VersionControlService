@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -   `DependencyStatus.ProbeExecutablePath` names the git executable that `CheckDependencies` ran.
 -   The lakeFS provider reports its HTTP requests on `OperationContext.ReportOutput`, with the credentials of the connection removed.
 -   `CommandOutput.ObserveNotice` adds a `Notice` line to a command. `OutputReporter.knownSecrets` and `beginCommandWithSecrets` start a command that hides credentials the caller knows as values.
+-   `ObjectMaterializationCodes` holds the failure and recovery codes of object materialization. The Git provider reports the same strings as before.
 
 ### Changed
 

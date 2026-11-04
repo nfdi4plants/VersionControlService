@@ -113,7 +113,7 @@ let private codeOfKind (kind: GitFailureKind) =
     | GitFailureKind.LfsBackupRetained -> "lfs_backup_retained"
     | GitFailureKind.InvalidLfsThreshold -> "invalid_lfs_threshold"
     | GitFailureKind.RemoteProjectAlreadyExists -> "remote_project_exists"
-    | GitFailureKind.LocalChanges -> "local_changes"
+    | GitFailureKind.LocalChanges -> ObjectMaterializationCodes.LocalChanges
     | GitFailureKind.Unknown -> "git_failure"
 
 let private toOperationFailure (failure: GitService.GitFailure) : OperationFailure =
@@ -133,7 +133,7 @@ let private hydrationFailure (operation: string) (detail: string) =
 /// itself succeeded. A user cancellation gets its own wording so nobody goes looking
 /// for an outage that did not happen.
 let private materializationRecovery (failure: OperationFailure) : RecoveryAction = {
-    Code = "retry_materialization"
+    Code = ObjectMaterializationCodes.RetryMaterializationRecovery
     Instructions =
         Some(
             if failure.Category = Canceled then
@@ -144,7 +144,7 @@ let private materializationRecovery (failure: OperationFailure) : RecoveryAction
 }
 
 let private localMaterializationRecovery () : RecoveryAction = {
-    Code = "retry_materialization"
+    Code = ObjectMaterializationCodes.RetryMaterializationRecovery
     Instructions = Some "Materialize the path again to replace the pointer with the object's content."
 }
 
