@@ -386,7 +386,6 @@ Vitest.describe (
                     TextDiff = false
                     ConflictResolution = true
                     ObjectMaterialization = true
-                    ObjectBatchMaterialization = false
                     StoragePolicy = false
                     Maintenance = false
                     RepositoryBrowser = false
@@ -396,7 +395,6 @@ Vitest.describe (
                     TextDiff = true
                     ConflictResolution = true
                     ObjectMaterialization = true
-                    ObjectBatchMaterialization = true
                     StoragePolicy = true
                     Maintenance = true
                     RepositoryBrowser = true
@@ -437,20 +435,21 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "batch materialization fallback returns a warned no-op",
+            "object materialization fallback returns a warned no-op",
             fun () -> promise {
                 let factory = createFakeFactory ()
-                let context = OperationContext.detached "portable-fallback-batch-materialization"
+                let context = OperationContext.detached "portable-fallback-object-materialization"
 
                 let workflow = async {
                     let! session = openFakeSession factory context
                     let coreOnly = WorkspaceSession.createCoreOnly session.Descriptor session.Core
                     let filled = WorkspaceSession.withFallbackServices coreOnly
-                    let batch =
-                        filled.ObjectBatchMaterialization
-                        |> Option.defaultWith (fun () -> failwith "Expected the fallback batch materialization service.")
-                    let! materialized = batch.Materialize [| fakePath |] context
-                    let! dematerialized = batch.Dematerialize [| fakePath |] context
+                    let objects =
+                        filled.ObjectMaterialization
+                        |> Option.defaultWith (fun () ->
+                            failwith "Expected the fallback object materialization service.")
+                    let! materialized = objects.Materialize [| fakePath |] context
+                    let! dematerialized = objects.Dematerialize [| fakePath |] context
                     return materialized, dematerialized
                 }
 
@@ -460,11 +459,13 @@ Vitest.describe (
                 |> List.iter (fun result ->
                     match result with
                     | Succeeded outcome ->
-                        Vitest.expect(outcome.Effect).toEqual (NoOp(Some "The provider has no object batch materialization service."))
+                        Vitest
+                            .expect(outcome.Effect)
+                            .toEqual (NoOp(Some "The provider has no object materialization service."))
                         Vitest.expect(outcome.Warnings.Length).toBe (1)
                         Vitest.expect(outcome.Warnings[0].Code).toBe (FallbackServiceCodes.ServiceUnavailable)
                     | PartiallySucceeded _
-                    | Failed _ -> failwith "The batch materialization fallback did not return a successful no-op.")
+                    | Failed _ -> failwith "The object materialization fallback did not return a successful no-op.")
             }
         )
 
@@ -512,7 +513,6 @@ Vitest.describe (
                     TextDiff = true
                     ConflictResolution = true
                     ObjectMaterialization = true
-                    ObjectBatchMaterialization = true
                     StoragePolicy = true
                     Maintenance = true
                     RepositoryBrowser = true

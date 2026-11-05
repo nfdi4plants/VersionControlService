@@ -19,6 +19,7 @@ module LakeFsObjectTransfer = VersionControlService.LakeFs.LakeFsObjectTransfer
 module LakeFsSelectedRevision = VersionControlService.LakeFs.LakeFsSelectedRevision
 module LakeFsSynchronization = VersionControlService.LakeFs.LakeFsSynchronization
 module LakeFsConflictSession = VersionControlService.LakeFs.LakeFsConflictSession
+module LakeFsRequestOutput = VersionControlService.LakeFs.LakeFsRequestOutput
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodeInterop = VersionControlService.Runtime.Node.Interop
 module NodePath = VersionControlService.Runtime.Node.Path
@@ -613,17 +614,17 @@ let private interruptedSelectedRevisionFailure
             |]
     }
 
-/// Cancellation recovery uses a detached context because the caller's signal is
+/// Cancellation recovery uses a context without cancellation because the caller's signal is
 /// already set. It only resets the provider-owned branch when both the local
 /// ownership proof and the live expected head still match.
 let private recoverInterruptedSelectedRevision
     (state: SessionState)
     (resolved: LakeFsConnection)
     (expectedHead: string option)
-    (operationId: string)
+    (context: OperationContext)
     =
     async {
-        let recoveryContext = OperationContext.detached $"{operationId}-recovery"
+        let recoveryContext = LakeFsRequestOutput.withoutCancellation context "recovery"
         let ownsBranch =
             state.Index.OwnershipToken <> ""
             && workspaceBranchName state.Binding.WorkspaceRoot state.Index.OwnershipToken
@@ -907,7 +908,7 @@ let private createRevision (state: SessionState) (request: CreateRevisionRequest
                                         state
                                         resolved
                                         expectedParent
-                                        context.OperationId
+                                        context
 
                                 return Failed interrupted
                             | LakeFsObjectTransfer.TransferFailed(failure, completed) ->
@@ -949,7 +950,7 @@ let private createRevision (state: SessionState) (request: CreateRevisionRequest
                                             state
                                             resolved
                                             expectedParent
-                                            context.OperationId
+                                            context
 
                                     return Failed interrupted
                                 else
@@ -969,7 +970,7 @@ let private createRevision (state: SessionState) (request: CreateRevisionRequest
                                                 state
                                                 resolved
                                                 expectedParent
-                                                context.OperationId
+                                                context
 
                                         return Failed interrupted
                                     | Error failure ->
@@ -994,7 +995,7 @@ let private createRevision (state: SessionState) (request: CreateRevisionRequest
                                                     state
                                                     resolved
                                                     expectedParent
-                                                    context.OperationId
+                                                    context
 
                                             return Failed interrupted
                                         else
@@ -1715,6 +1716,7 @@ let private refresh (state: SessionState) (context: OperationContext) =
         if context.Cancellation.IsCancellationRequested() then
             return OperationResult.canceled "The refresh was canceled."
         else
+            LakeFsApi.reportStepStart ProgressPhaseCodes.Refresh "Fetching online changes" context
             let! targetHead = getTargetHead state context
 
             match targetHead with
@@ -1836,6 +1838,9 @@ let private buildConflictItems
         // because a return cannot leave a loop inside the builder.
         let firstFailure: OperationFailure option ref = ref None
 
+        // The candidate downloads of one build form a batch, and the first one announces it.
+        let downloadAnnounced = ref false
+
         for path in overlapping do
           if firstFailure.Value.IsNone then
             let key = objectKey state path
@@ -1843,6 +1848,10 @@ let private buildConflictItems
             let readRef reference =
                 async {
                     let downloadedPath = temporaryPath state "conflict-candidate"
+
+                    if not downloadAnnounced.Value then
+                        downloadAnnounced.Value <- true
+                        LakeFsApi.reportStepStart ProgressPhaseCodes.DownloadObjects "Downloading objects" context
 
                     let! content =
                         LakeFsApi.downloadObjectToFile
@@ -1963,6 +1972,8 @@ let private updateAgainst (state: SessionState) (head: string) (context: Operati
                         match workspaceBeforeMerge with
                         | Error failure -> return Failed failure
                         | Ok observedWorkspace ->
+                            LakeFsApi.reportStepStart ProgressPhaseCodes.Update "Merging online changes" context
+
                             let! merged =
                                 LakeFsApi.merge
                                     resolved
@@ -2239,6 +2250,11 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                         | Error failure -> return Failed { failure with Retryable = true }
                         | Ok observedTarget ->
                             // Act: merge the workspace branch into the logical target.
+                            LakeFsApi.reportStepStart
+                                ProgressPhaseCodes.Publish
+                                "Publishing workspace revisions"
+                                context
+
                             let! merged =
                                 LakeFsApi.merge
                                     resolved
@@ -2832,6 +2848,8 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                     do! barrier state "finalize-merge-verified" context
 
                                                     let mutable resolutionFailure: OperationFailure option = None
+                                                    // The first resolution upload announces the batch.
+                                                    let mutable uploadAnnounced = false
 
                                                     for item in conflict.Items do
                                                         if resolutionFailure.IsNone then
@@ -2897,6 +2915,14 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                                 match sourceAndValidation with
                                                                 | Error failure -> resolutionFailure <- Some failure
                                                                 | Ok(sourcePath, validateSource) ->
+                                                                    if not uploadAnnounced then
+                                                                        uploadAnnounced <- true
+
+                                                                        LakeFsApi.reportStepStart
+                                                                            ProgressPhaseCodes.UploadObjects
+                                                                            "Uploading objects"
+                                                                            context
+
                                                                     let! upload =
                                                                         LakeFsApi.uploadObjectFromFileChecked
                                                                             resolved
@@ -3242,7 +3268,7 @@ let private openSessionFromStateDirectory
                                         resolved
                                         state.Index.Repository
                                         workspaceBranch
-                                        (OperationContext.detached $"{context.OperationId}-cleanup")
+                                        (LakeFsRequestOutput.withoutCancellation context "cleanup")
 
                                 match deleted with
                                 | Ok() -> return Failed failure

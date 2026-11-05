@@ -24,7 +24,6 @@ type ChildOwner = {
 
 type TextDiffSupervisorOptions = {
     TempRoot: string
-    GitExecutable: string option
     OnEvent: (SupervisorEvent -> unit) option
 }
 
@@ -55,7 +54,6 @@ module TextDiffSupervisorOptions =
 
     let defaults = {
         TempRoot = NodeWorkerThreads.tmpdir ()
-        GitExecutable = None
         OnEvent = None
     }
 
@@ -146,7 +144,7 @@ let private releasedOwnerMessage = "The worker request is being released and can
 let private removeTree (path: string) : JS.Promise<unit> =
     NodeFileSystem.rmAsync path (NodeFileSystem.RmOptions(recursive = true, force = true, maxRetries = 4, retryDelay = 40))
 
-type TextDiffSupervisor internal (instanceDirectory: string, gitExecutable: string, options: TextDiffSupervisorOptions) =
+type TextDiffSupervisor internal (instanceDirectory: string, options: TextDiffSupervisorOptions) =
     let children = Dictionary<int, ChildOwner * JS.Promise<NodeProcess.ChildExit>>()
     let spoolOwners = Dictionary<string, ChildOwner>()
     let workerDirectories = HashSet<string>()
@@ -281,11 +279,12 @@ type TextDiffSupervisor internal (instanceDirectory: string, gitExecutable: stri
                     return raise (InvalidOperationException(releasedOwnerMessage))
                 else
                     let gitArguments = Microsoft.FSharp.Collections.Array.concat [| [| "--literal-pathspecs"; "-c"; "protocol.allow=never" |]; arguments |]
-                    let environment = GitExecution.resolvedEnvironment () |> localOnlyEnvironment
+                    let invocation = GitExecution.resolveInvocation ()
+                    let environment = GitExecution.resolvedEnvironmentFor invocation |> localOnlyEnvironment
 
                     let! result =
                         NodeProcess.runBoundedWithLifecycle
-                            gitExecutable
+                            invocation.Executable
                             gitArguments
                             cwd
                             environment
@@ -329,12 +328,13 @@ type TextDiffSupervisor internal (instanceDirectory: string, gitExecutable: stri
                             else
                                 spoolOwners[targetPath] <- owner
                                 let arguments = [| "--literal-pathspecs"; "-c"; "protocol.allow=never"; "cat-file"; "blob"; oid |]
-                                let environment = GitExecution.resolvedEnvironment () |> localOnlyEnvironment
+                                let invocation = GitExecution.resolveInvocation ()
+                                let environment = GitExecution.resolvedEnvironmentFor invocation |> localOnlyEnvironment
                                 descriptorTransferred <- true
 
                                 let! child =
                                     NodeProcess.spawnToFileTracked
-                                        gitExecutable
+                                        invocation.Executable
                                         arguments
                                         cwd
                                         environment
@@ -399,7 +399,6 @@ let checkFolderOwner (userId: int) (folder: string) (stats: NodePositionalFile.P
             failwith $"The text diff folder {folder} belongs to user {stats.Uid} and the current user is {userId}. Use a temp root that the current user owns."
 
 let create (options: TextDiffSupervisorOptions) : JS.Promise<TextDiffSupervisor> = promise {
-    let gitExecutable = defaultArg options.GitExecutable "git"
     let parentDirectory = NodePath.join [| options.TempRoot; "text-diff" |]
 
     let! existing = promise {
@@ -434,5 +433,5 @@ let create (options: TextDiffSupervisorOptions) : JS.Promise<TextDiffSupervisor>
     let instanceName = $"{processId ()}-{randomSuffix}"
     let instanceDirectory = NodePath.join [| parentDirectory; instanceName |]
     do! NodePositionalFile.mkdirRecursive instanceDirectory
-    return TextDiffSupervisor(instanceDirectory, gitExecutable, options)
+    return TextDiffSupervisor(instanceDirectory, options)
 }

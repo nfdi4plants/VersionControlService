@@ -45,7 +45,9 @@ module OperationCancellation =
 /// Progress report with a stable phase code and a sanitized display message.
 /// Raw subprocess output is never forwarded without redaction.
 type OperationProgress = {
-    /// Stable machine-readable phase code such as "transfer" or "commit".
+    /// Stable machine-readable phase code. The steps that several providers report have their codes in
+    /// `ProgressPhaseCodes`, for example "fetch" or "merge". A provider adds codes of its own for the
+    /// details of its engine, such as the meters of a transfer.
     PhaseCode: string
     /// Optional item or repository path the progress refers to.
     Item: string option
@@ -55,17 +57,58 @@ type OperationProgress = {
     DisplayMessage: string option
 }
 
+/// Phase codes of the steps that more than one provider reports. A provider announces the start of a step with
+/// an event that has no numbers and names the step in its `DisplayMessage`, so a host can show the step before
+/// the first meter of a transfer arrives. Meters of the transfer follow under the provider's own codes. A
+/// provider reports only the steps its engine really runs and invents no event for a step it lacks. Codes that
+/// name the details of one engine, such as the Git LFS phases, are not part of this module.
+///
+/// Both providers report `Refresh`, `Update` and `Clone`. The lakeFS provider reports the optional codes today,
+/// and the Git provider runs those steps and reports them under codes of its own.
+module ProgressPhaseCodes =
+
+    /// Observing or acquiring the changes of the target. A Refresh reports it before it reads the target, and a
+    /// Synchronize reports it through the Refresh it contains.
+    [<Literal>]
+    let Refresh = "fetch"
+
+    /// Incorporating the changes of the target into the workspace. An Update reports it before the merge, and a
+    /// Synchronize reports it through the Update it contains.
+    [<Literal>]
+    let Update = "merge"
+
+    /// Provisioning a cloned workspace. A Clone reports it before it creates the workspace.
+    [<Literal>]
+    let Clone = "clone"
+
+    /// Optional. Downloading objects into the workspace. A provider reports it once before the first object of a
+    /// batch downloads and skips it for a batch that downloads nothing.
+    [<Literal>]
+    let DownloadObjects = "download-objects"
+
+    /// Optional. Uploading objects from the workspace. A provider reports it once before the first object of a
+    /// batch uploads and skips it for a batch that uploads nothing.
+    [<Literal>]
+    let UploadObjects = "upload-objects"
+
+    /// Optional. Publishing the workspace revisions to the target. A provider reports it before the target takes
+    /// the revisions and skips it when there is nothing to publish.
+    [<Literal>]
+    let Publish = "publish"
+
 /// The kind of an output entry.
 [<RequireQualifiedAccess>]
 type OperationOutputKind =
-    /// The header of a subprocess, such as "git lfs pull origin main". It has no `-c` configuration pairs.
+    /// The header of an external call: a subprocess such as "git lfs pull origin main" or an HTTP request such as
+    /// "lakefs GET /repositories/arc1/branches/main". The header of a subprocess has no `-c` configuration pairs.
     | Command
     | StdOut
     | StdErr
     /// A message from the library, for example that a line was too long to keep.
     | Notice
 
-/// One entry of the raw output channel: a redacted line from a subprocess that an operation ran.
+/// One entry of the raw output channel: a redacted line from an external call that an operation made, such as a
+/// subprocess or an HTTP request.
 /// The channel carries diagnostics and keeps no transcript. Progress stays in `OperationProgress`.
 ///
 /// A line that git rewrites in place with a carriage return, such as a progress meter, arrives as
@@ -73,7 +116,7 @@ type OperationOutputKind =
 /// partial entry in the host's view, whether that next entry is partial or complete. A complete
 /// entry (`IsPartial` false) is never replaced.
 type OperationOutput = {
-    /// Groups the entries of one subprocess. It is empty for a notice that concerns the whole operation.
+    /// Groups the entries of one external call. It is empty for a notice that concerns the whole operation.
     CommandId: string
     Kind: OperationOutputKind
     /// Redacted text without a line terminator.
@@ -86,7 +129,8 @@ type OperationContext = {
     OperationId: string
     Cancellation: OperationCancellation
     ReportProgress: OperationProgress -> unit
-    /// Receives batches of redacted subprocess output. None means the host did not ask for output,
+    /// Receives batches of redacted output of the external calls an operation makes, such as subprocesses or
+    /// HTTP requests. None means the host did not ask for output,
     /// and a provider then does no work for it. Create a context with output through
     /// `OperationContext.createWithOutput`.
     ReportOutput: (OperationOutput[] -> unit) option

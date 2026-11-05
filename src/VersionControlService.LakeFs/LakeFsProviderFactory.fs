@@ -214,6 +214,10 @@ let createFactory
                 elif context.Cancellation.IsCancellationRequested() then
                     return OperationResult.canceled "The lakeFS clone was canceled before provisioning."
                 else
+                    // The clone only provisions the directory and the binding. The session that opens the
+                    // binding creates the workspace branch and downloads the objects.
+                    LakeFsApi.reportStepStart ProgressPhaseCodes.Clone "Preparing repository workspace" context
+
                     if not targetExists then
                         NodeFileSystem.mkdirSync request.TargetPath (NodeFileSystem.MkdirOptions(recursive = true))
 

@@ -9,6 +9,8 @@ open VersionControlService.Runtime.Node.Path
 open VersionControlService.Bindings.SimpleGit
 open VersionControlService.Git.GitInternals
 
+module GitExecution = VersionControlService.Git.GitExecution
+
 type ExistingPathKind =
     | Directory
     | File
@@ -129,8 +131,11 @@ let initRepository (targetPath: string) : JS.Promise<GitService.GitResult<string
                 match kindResult with
                 | Error statError -> return errorResult statError
                 | Ok(Some ExistingPathKind.Directory) ->
+                    let existingInvocation = GitExecution.resolveInvocation ()
+
                     let existingGit =
-                        createOptions normalizedTargetPath standardTimeout None |> createGit
+                        createOptions existingInvocation normalizedTargetPath standardTimeout None
+                        |> createGit existingInvocation
 
                     let! existingRepoResult = runSimpleGit (fun git -> git.checkIsRepo ()) existingGit
 
@@ -151,7 +156,11 @@ let initRepository (targetPath: string) : JS.Promise<GitService.GitResult<string
             match preInitResult with
             | Error failure -> return Error failure
             | Ok() ->
-                let initGit = createOptions normalizedTargetPath standardTimeout None |> createGit
+                let initInvocation = GitExecution.resolveInvocation ()
+
+                let initGit =
+                    createOptions initInvocation normalizedTargetPath standardTimeout None
+                    |> createGit initInvocation
 
                 let! initResult =
                     runSimpleGit

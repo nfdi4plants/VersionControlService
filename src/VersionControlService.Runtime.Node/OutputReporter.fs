@@ -163,6 +163,21 @@ let collectSecrets (arguments: string[]) (environment: (string * string)[]) : st
     |> Seq.sortByDescending (fun secret -> secret.Length)
     |> Seq.toArray
 
+/// The secrets of a call that knows its credentials as plain values, such as the access key and the secret of an
+/// HTTP client. collectSecrets finds credentials only inside arguments and does not see a bare value. Each value
+/// is replaced as written, decoded and percent-encoded, longest first. A value shorter than four characters is
+/// left out like in collectSecrets, so a credential that short stays visible in the output.
+let knownSecrets (values: string[]) : string[] =
+    let secrets = ResizeArray<string>()
+
+    for value in values do
+        addEncodedForms secrets value
+
+    secrets
+    |> Seq.distinct
+    |> Seq.sortByDescending (fun secret -> secret.Length)
+    |> Seq.toArray
+
 /// Replaces each known secret and then applies the structural redaction.
 let redactText (secrets: string[]) (text: string) : string =
     let mutable result = text
@@ -462,9 +477,10 @@ type private LineFramer
             else
                 completeLine ()
 
-/// The output of one subprocess. The runner passes the decoded text of each stream to it and calls Finish
-/// once the process has ended, whatever the reason. Finish flushes the channel, so the end of every
-/// subprocess delivers its pending entries at once and the batch rate holds only within a subprocess.
+/// The output of one external call, such as a subprocess or an HTTP request. The runner passes the decoded text
+/// of each stream to it and calls Finish once the call has ended, whatever the reason. Finish flushes the
+/// channel, so the end of every call delivers its pending entries at once and the batch rate holds only
+/// within a call.
 [<AllowNullLiteral>]
 type CommandOutput(channel: OutputChannel, commandId: string, secrets: string[], reportStdout: bool) =
     let stdoutFramer =
@@ -472,6 +488,9 @@ type CommandOutput(channel: OutputChannel, commandId: string, secrets: string[],
 
     let stderrFramer =
         LineFramer(OperationOutputKind.StdErr, commandId, secrets, channel.Clock, channel.Enqueue)
+
+    let noticeFramer =
+        LineFramer(OperationOutputKind.Notice, commandId, secrets, channel.Clock, channel.Enqueue)
 
     let mutable finished = false
 
@@ -483,12 +502,19 @@ type CommandOutput(channel: OutputChannel, commandId: string, secrets: string[],
         if not finished then
             stderrFramer.Push text
 
-    /// Sends the last state of both streams and everything that still waits in the channel.
+    /// Reports one line of the library about this call, for example the status of an HTTP response. The line
+    /// carries the command id of the call and passes the same redaction and line limits as the streams.
+    member _.ObserveNotice(text: string) =
+        if not finished then
+            noticeFramer.Push(text + "\n")
+
+    /// Sends the last state of the streams and everything that still waits in the channel.
     member _.Finish() =
         if not finished then
             finished <- true
             stdoutFramer.Finish()
             stderrFramer.Finish()
+            noticeFramer.Finish()
             channel.Flush()
 
 /// Where a spawned command reports its output. ReportStdout is set only by a call that declared its
@@ -543,6 +569,26 @@ module OutputTarget =
     let withStdout (target: OutputTarget option) : OutputTarget option =
         target |> Option.map (fun current -> { current with ReportStdout = true })
 
+/// Starts a command with secrets that the caller already knows, for example from `knownSecrets`: queues its
+/// header and returns the object that frames its streams.
+let beginCommandWithSecrets
+    (channel: OutputChannel)
+    (command: string)
+    (headerArguments: string[])
+    (secrets: string[])
+    (reportStdout: bool)
+    : CommandOutput =
+    let commandId = channel.NextCommandId()
+
+    channel.Enqueue {
+        CommandId = commandId
+        Kind = OperationOutputKind.Command
+        Text = commandHeader secrets command headerArguments
+        IsPartial = false
+    }
+
+    CommandOutput(channel, commandId, secrets, reportStdout)
+
 /// Starts a command: queues its header and returns the object that frames its streams. `headerArguments`
 /// feed the header and `secretArguments` feed the secret scan. They differ when a tool applies part of its
 /// configuration itself. The header leaves out the leading `-c` pairs.
@@ -554,14 +600,4 @@ let beginCommand
     (environment: (string * string)[])
     (reportStdout: bool)
     : CommandOutput =
-    let secrets = collectSecrets secretArguments environment
-    let commandId = channel.NextCommandId()
-
-    channel.Enqueue {
-        CommandId = commandId
-        Kind = OperationOutputKind.Command
-        Text = commandHeader secrets command headerArguments
-        IsPartial = false
-    }
-
-    CommandOutput(channel, commandId, secrets, reportStdout)
+    beginCommandWithSecrets channel command headerArguments (collectSecrets secretArguments environment) reportStdout

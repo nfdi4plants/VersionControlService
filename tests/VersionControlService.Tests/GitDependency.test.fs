@@ -8,6 +8,12 @@ module GitWorkspaceSession = VersionControlService.Git.GitWorkspaceSession
 module GitCommandResolver = VersionControlService.Git.GitCommandResolver
 module NodeProcess = VersionControlService.Runtime.Node.Process
 
+[<Emit("{ PATH: $0 }")>]
+let private environmentWithPath (_path: string) : obj = jsNative
+
+[<Emit("$0.PATH")>]
+let private pathOf (_environment: obj) : string = jsNative
+
 let private context (name: string) = OperationContext.detached name
 
 let private processOutput exitCode stdout stderr : NodeProcess.ProcessOutput = {
@@ -117,6 +123,74 @@ Vitest.describe (
                     GitCommandResolver.resolveGitToolPath (fun _ -> false) "win32" @"C:\Git\cmd;C:\Windows"
 
                 Vitest.expect(path).toBe (@"C:\Git\cmd;C:\Windows")
+        )
+)
+
+Vitest.describe (
+    "GitCommandResolver.ensureGitToolPath cache",
+    fun () ->
+        Vitest.test (
+            "a PATH that an earlier call produced is answered from the cache",
+            fun () ->
+                GitCommandResolver.resetCache ()
+
+                try
+                    let probes = ref 0
+
+                    let probe (_executable: string) (_environment: obj) (_path: string) =
+                        probes.Value <- probes.Value + 1
+                        false
+
+                    let first =
+                        GitCommandResolver.ensureGitToolPathWith probe "linux" "git" (environmentWithPath "/custom/bin")
+
+                    let resolved = pathOf first
+
+                    Vitest.expect(resolved <> "/custom/bin").toBe true
+                    Vitest.expect(resolved.EndsWith ":/custom/bin").toBe true
+                    Vitest.expect(probes.Value).toBe 1
+
+                    let second =
+                        GitCommandResolver.ensureGitToolPathWith probe "linux" "git" (environmentWithPath resolved)
+
+                    Vitest.expect(pathOf second).toBe resolved
+                    Vitest.expect(probes.Value).toBe 1
+                finally
+                    GitCommandResolver.resetCache ()
+        )
+
+        Vitest.test (
+            "the cache keeps one answer per executable and PATH until it is reset",
+            fun () ->
+                GitCommandResolver.resetCache ()
+
+                try
+                    let probes = ref 0
+
+                    let probe (_executable: string) (_environment: obj) (_path: string) =
+                        probes.Value <- probes.Value + 1
+                        false
+
+                    let resolve executable =
+                        GitCommandResolver.ensureGitToolPathWith
+                            probe
+                            "linux"
+                            executable
+                            (environmentWithPath "/custom/bin")
+                        |> ignore
+
+                    resolve "git"
+                    resolve "git"
+                    Vitest.expect(probes.Value).toBe 1
+
+                    resolve "/opt/tools/git"
+                    Vitest.expect(probes.Value).toBe 2
+
+                    GitCommandResolver.resetCache ()
+                    resolve "git"
+                    Vitest.expect(probes.Value).toBe 3
+                finally
+                    GitCommandResolver.resetCache ()
         )
 )
 

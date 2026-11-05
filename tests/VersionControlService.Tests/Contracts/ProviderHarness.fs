@@ -188,8 +188,6 @@ module SuiteHelpers =
                 "conflicts"
             if session.ObjectMaterialization.IsSome then
                 "materialization"
-            if session.ObjectBatchMaterialization.IsSome then
-                "batch-materialization"
             if session.StoragePolicy.IsSome then
                 "storage-policy"
             if session.Maintenance.IsSome then
@@ -1414,6 +1412,7 @@ module FakeHarness =
                                 Version = Some "1.0"
                                 Compatible = true
                                 Remediation = None
+                                ProbeExecutablePath = None
                             }
                         |]
                 }

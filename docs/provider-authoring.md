@@ -66,8 +66,7 @@ Optional services advertise real capability:
 | `Synchronization` | refresh, preview update, update, publish, and synchronize |
 | `TextDiff` | resumable pages for a working file against its version at HEAD |
 | `ConflictResolution` | provider-owned conflict sessions and stale-handle checks |
-| `ObjectMaterialization` | list, hydrate, and dematerialize large or lazy objects |
-| `ObjectBatchMaterialization` | hydrate or dematerialize many objects in one operation |
+| `ObjectMaterialization` | list large or lazy objects, and hydrate or dematerialize many of them in one call |
 | `StoragePolicy` | literal-path policy and host-facing settings |
 | `Maintenance` | prune and deduplicate local storage |
 | `RepositoryBrowser` | a credential-free repository URL |
@@ -163,6 +162,10 @@ Cancellation that reaches the runner after the merge finishes has two truthful o
 
 Use the supplied `OperationContext` throughout the operation. Check cancellation between bounded units of work and pass it into process, network, and streaming helpers. Report progress with stable phase codes. Byte totals use `float` so values above two GiB remain exact across .NET and JavaScript.
 
+Use the codes of `ProgressPhaseCodes` for the steps that other providers report too. A Refresh reports `ProgressPhaseCodes.Refresh` (`fetch`) when it starts. An Update reports `ProgressPhaseCodes.Update` (`merge`) before its merge, and a Clone reports `ProgressPhaseCodes.Clone` (`clone`) when it starts. Announce the start with an event that has no numbers (`Item`, `Completed` and `Total` are `None`) and a `DisplayMessage` that names the step, so a host can show the step before the first meter of a transfer arrives. The module also has optional codes for the transfer of objects (`DownloadObjects` and `UploadObjects`) and for publishing (`Publish`). Both shipped providers report the three codes above. The lakeFS provider reports the optional codes today. The Git provider runs the same steps and reports them under its own codes. The [consuming guide](consuming.md#progress-of-git-transfers) lists the codes of its downloads. Report an optional code only when your engine really runs that step. Announce a batch of objects once before its first object transfers, and report nothing for a batch that transfers nothing. Never invent an event for a step the engine lacks. A host can read a missing event of a common code as a step that did not run. It cannot read a missing optional code that way, because an engine may report that step under a code of its own. Keep the codes for the details of your engine, such as the phases of a transfer, under names of your own.
+
+The start of a step names an activity, and a meter measures a transfer. Meters keep the codes of their provider, for example `lakefs-download` and `lakefs-upload` for lakeFS, and their messages describe the measurement. `Synchronization.compose` reports no events of its own. Each provider reports its steps from its own Refresh, Update and Publish, and a Synchronize carries the events of the steps it runs. The fallback services of `WorkspaceSession.withFallbackServices` report no progress.
+
 Messages, details, progress text, bindings, and repository URLs must not contain secrets. Resolve credentials from the binding's `ConnectionProfileId`, scope them to the operation, and pass provider output through the redaction guard before returning it.
 
 ## Storage settings reseed
@@ -199,6 +202,8 @@ The published records are intentionally small. Add new capability as a new optio
 
 `ServiceAvailability` is the exception to the rule about published records: a new optional service adds a required field to it, and that is a deliberate breaking change so a consumer's availability report can never be silently incomplete.
 
-`OperationContext` is the second exception. It is an observation record that the host builds, and the next release adds the field `ReportOutput` to it. Code that builds the record as a literal has to add `ReportOutput = None`. Code that calls `OperationContext.create`, `createWithOutput` or `detached`, and a provider that only reads the context, compile as before. A provider that runs subprocesses reports their output only when `context.ReportOutput` is `Some`, and it redacts every line first, as the [consuming guide](consuming.md#raw-output-of-subprocesses) describes.
+`OperationContext` is the second exception. It is an observation record that the host builds, and it has the field `ReportOutput`. Code that builds the record as a literal has to set `ReportOutput = None`. Code that calls `OperationContext.create`, `createWithOutput` or `detached`, and a provider that only reads the context, compile as before. A provider that makes external calls, such as subprocesses or HTTP requests, reports their output only when `context.ReportOutput` is `Some`, and it redacts every line first, as the [consuming guide](consuming.md#raw-output-of-subprocesses) describes. A provider that continues work after the caller canceled keeps the output callback of the original context and replaces only its cancellation, so the follow-up calls reach the same log.
+
+A call that knows its credentials as plain values, such as the access key and the secret of an HTTP client, gets the list of secrets to replace from `OutputReporter.knownSecrets` and starts its command with `OutputReporter.beginCommandWithSecrets`. `CommandOutput.ObserveNotice` adds a `Notice` line of the library to that command, for example the status of an HTTP response.
 
 Run the shared conformance profiles before publishing an external provider. The harness contract and profile expectations are described in [conformance-profiles.md](conformance-profiles.md).

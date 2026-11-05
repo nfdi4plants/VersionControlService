@@ -11,6 +11,8 @@ open VersionControlService.LakeFs.LakeFsTypes
 
 module NodeCancellation = VersionControlService.Runtime.Node.Cancellation
 module LakeFsBinaryTransfer = VersionControlService.LakeFs.LakeFsBinaryTransfer
+module LakeFsTransportError = VersionControlService.LakeFs.LakeFsTransportError
+module LakeFsRequestOutput = VersionControlService.LakeFs.LakeFsRequestOutput
 
 [<Emit("Buffer.from($0, 'utf8').toString('base64')")>]
 let private toBase64 (_value: string) : string = jsNative
@@ -27,7 +29,7 @@ let private jsonStringify (_value: obj) : string = jsNative
 [<Emit("JSON.parse($0)")>]
 let private jsonParse (_text: string) : obj = jsNative
 
-let private classifyStatus (status: int) (body: string) : OperationFailure =
+let private classifyStatus (connection: LakeFsConnection) (status: int) (body: string) : OperationFailure =
     let category, code =
         match status with
         | 401 -> Authentication, "unauthorized"
@@ -38,8 +40,12 @@ let private classifyStatus (status: int) (body: string) : OperationFailure =
         | status when status >= 500 -> ProviderError, "server_error"
         | _ -> ProviderError, "request_failed"
 
+    // A server can echo the credentials it received, so the body is cleaned of this connection's secrets too.
     {
-        OperationFailure.createRedacted category code $"lakeFS request failed ({status}): {body}" with
+        OperationFailure.createRedacted
+            category
+            code
+            (LakeFsRequestOutput.redactText connection $"lakeFS request failed ({status}): {body}") with
             Retryable = status >= 500
     }
 
@@ -83,33 +89,36 @@ let request
                     | None -> ()
                 ]
 
-            try
-                let! response = Async.AwaitPromise(fetchJs (url, options))
-                let! bodyText = Async.AwaitPromise(response?text () |> unbox<JS.Promise<string>>)
+            let output = LakeFsRequestOutput.tryBegin connection method path context
 
-                return
-                    Ok {
-                        Status = unbox<int> response?status
-                        BodyText = bodyText
-                    }
-            with error ->
-                // Only a requested cancellation counts as canceled. The abort signal handed to fetch
-                // comes from this context, so an aborted request always has the flag set, and
-                // transport errors that merely mention "abort" stay network failures.
-                if context.Cancellation.IsCancellationRequested() then
-                    return
-                        Error(
+            try
+                try
+                    let! response = Async.AwaitPromise(fetchJs (url, options))
+                    let status = unbox<int> response?status
+                    LakeFsRequestOutput.reportStatus output status
+                    let! bodyText = Async.AwaitPromise(response?text () |> unbox<JS.Promise<string>>)
+
+                    if status < 200 || status >= 300 then
+                        LakeFsRequestOutput.reportErrorBody output bodyText
+
+                    return Ok { Status = status; BodyText = bodyText }
+                with error ->
+                    // Only a requested cancellation counts as canceled. The abort signal handed to fetch
+                    // comes from this context, so an aborted request always has the flag set, and
+                    // transport errors that merely mention "abort" stay network failures.
+                    let failure =
+                        if context.Cancellation.IsCancellationRequested() then
                             OperationFailure.create Canceled "operation_canceled" "The lakeFS request was canceled."
-                        )
-                else
-                    return
-                        Error {
-                            OperationFailure.createRedacted
-                                Network
-                                "network_failure"
-                                $"The lakeFS endpoint is unreachable: {error.Message}" with
-                                Retryable = true
-                        }
+                        else
+                            LakeFsTransportError.toFailure
+                                "The lakeFS endpoint is unreachable"
+                                "The lakeFS request timed out"
+                                (box error)
+
+                    LakeFsRequestOutput.reportFailed output failure
+                    return Error failure
+            finally
+                LakeFsRequestOutput.finish output
     }
 
 /// Request that fails on non-2xx statuses with classification.
@@ -120,7 +129,7 @@ let requestChecked connection method path body context =
         match result with
         | Error failure -> return Error failure
         | Ok response when response.Status >= 200 && response.Status < 300 -> return Ok response
-        | Ok response -> return Error(classifyStatus response.Status response.BodyText)
+        | Ok response -> return Error(classifyStatus connection response.Status response.BodyText)
     }
 
 let private parsePagination (parsed: obj) : LakeFsPagination =
@@ -322,6 +331,17 @@ let listObjects
                         Mtime = unbox<float> item?mtime
                     })
                 )
+    }
+
+/// Announces a step before it runs, in the shape the Git provider uses: the event has no numbers and names the
+/// step in its message. The byte meters of a transfer keep their own codes and their own message.
+let reportStepStart (phaseCode: string) (message: string) (context: OperationContext) =
+    context.ReportProgress {
+        PhaseCode = phaseCode
+        Item = None
+        Completed = None
+        Total = None
+        DisplayMessage = Some message
     }
 
 let downloadObjectToFile

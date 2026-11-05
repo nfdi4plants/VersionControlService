@@ -292,31 +292,58 @@ type ObjectState = {
     ObjectId: string option
 }
 
-/// Optional object-materialization extension (Git LFS hydration, lakeFS object download).
+/// Stable codes of the failures and recoveries that object materialization returns. A provider that supplies
+/// `ObjectMaterializationService` uses them, and a consumer decides by the code because the messages can change.
+module ObjectMaterializationCodes =
+
+    /// A path has local changes that the call would overwrite, for example an edited file. A call returns it
+    /// when every failed path was refused for this reason.
+    [<Literal>]
+    let LocalChanges = "local_changes"
+
+    /// Some paths of a Materialize call with several paths failed, and not all of them for local changes.
+    [<Literal>]
+    let BatchMaterializationIncomplete = "batch_materialization_incomplete"
+
+    /// Some paths of a Dematerialize call with several paths failed, and not all of them for local changes.
+    [<Literal>]
+    let BatchDematerializationIncomplete = "batch_dematerialization_incomplete"
+
+    /// Recovery: materialize the affected paths again. An operation that downloads large objects after its
+    /// own transfer, such as an update, also uses it when that download did not finish.
+    [<Literal>]
+    let RetryMaterializationRecovery = "retry_materialization"
+
+    /// Recovery: dematerialize the affected paths again.
+    [<Literal>]
+    let RetryDematerializationRecovery = "retry_dematerialization"
+
+/// Optional object-materialization extension. A provider supplies it when its workspace holds large or
+/// lazily fetched objects as references that a call replaces with the object's content, or the reverse.
+/// ListObjects reports the state of those objects. Materialize and Dematerialize take an array of paths, so
+/// one call serves a single file and a whole folder, and a provider that handles many paths in one operation
+/// is faster than one call per path.
+///
+/// Paths are exact keys and a duplicate counts once. An empty array or paths that are already in the target
+/// state give Succeeded with a NoOp effect. When some paths fail and others changed, the result is
+/// PartiallySucceeded. When none changed, it is Failed. A failure lists the failed paths in AffectedPaths and
+/// one "<path>: <message>" line per failed path in Details. The outcome's AffectedPaths lists the changed
+/// paths. A canceled run reports the paths that finished as changed and fails the others with a Canceled
+/// failure (PartiallySucceeded when some changed, Failed when none).
+///
+/// A call with one path fails with that path's own code and message. With several paths, the failure code
+/// is `ObjectMaterializationCodes.LocalChanges` when every failed path was refused for local changes.
+/// Otherwise it is `ObjectMaterializationCodes.BatchMaterializationIncomplete` for Materialize and
+/// `ObjectMaterializationCodes.BatchDematerializationIncomplete` for Dematerialize. A partial success carries
+/// the recovery `ObjectMaterializationCodes.RetryMaterializationRecovery` or
+/// `ObjectMaterializationCodes.RetryDematerializationRecovery`.
 type ObjectMaterializationService = {
     ListObjects: OperationContext -> Async<OperationResult<ObjectState[]>>
-    Materialize: RepositoryPath -> OperationContext -> Async<OperationResult<unit>>
-    /// When Dematerialize replaces a materialized file with the provider's reference, it also removes the
-    /// provider-local copy of the object. A provider does this only after checking that its remote has the object,
-    /// and it keeps the copy when the local storage is shared with other workspaces.
-    Dematerialize: RepositoryPath -> OperationContext -> Async<OperationResult<unit>>
-}
-
-/// Optional batch variant of the object-materialization extension. A provider supplies it when it can
-/// download or free many large objects in one operation, which is faster than one Materialize or
-/// Dematerialize call per path.
-///
-/// Paths are exact keys, as for the single calls, and a duplicate counts once. An empty array or paths that
-/// are already in the target state give Succeeded with a NoOp effect. When some paths fail and others
-/// changed, the result is PartiallySucceeded. When none changed, it is Failed. A failure lists the failed
-/// paths in AffectedPaths and one "<path>: <message>" line per failed path in Details. The outcome's
-/// AffectedPaths lists the changed paths. A canceled run reports the paths that finished as changed and
-/// fails the others with a Canceled failure (PartiallySucceeded when some changed, Failed when none).
-type ObjectBatchMaterializationService = {
-    /// Replaces the pointers of the given paths with their content.
+    /// Replaces the references of the given paths with their content.
     Materialize: RepositoryPath[] -> OperationContext -> Async<OperationResult<unit>>
-    /// Replaces the content of the given paths with their pointers. Each path follows the rules of the
-    /// single Dematerialize call.
+    /// Replaces the content of the given paths with their references. For each path that changes, it also
+    /// removes the provider-local copy of the object. A provider does this only after checking that its remote
+    /// has the object, and it keeps the copy when the local storage is shared with other workspaces.
     Dematerialize: RepositoryPath[] -> OperationContext -> Async<OperationResult<unit>>
 }
 

@@ -251,6 +251,12 @@ let private gitProviderId =
 
 let private ctx (name: string) = OperationContext.detached name
 
+let private expectSucceeded (operationName: string) (result: OperationResult<'T>) : 'T =
+    match result with
+    | Succeeded outcome -> outcome.Value
+    | PartiallySucceeded(_, failure)
+    | Failed failure -> failwith $"{operationName} did not succeed ({failure.Code}): {failure.Message}"
+
 /// A work repository whose origin already has two branches at different commits, plus one
 /// unpushed commit on main that adds an LFS file. Returns the remote tip ids and the LFS oid.
 let private createOutboundLfsPushFixture () = promise {
@@ -298,9 +304,11 @@ let private planOutboundLfsPush
     (runSpawnedGit: GitLfsAdapter.GitSpawnRequest -> JS.Promise<GitLfsAdapter.GitSpawnResult>)
     (workPath: string)
     =
+    let invocation = GitExecution.resolveInvocation ()
+
     let git =
-        GitInternals.createOptions workPath GitInternals.standardTimeout None
-        |> GitInternals.createGit
+        GitInternals.createOptions invocation workPath GitInternals.standardTimeout None
+        |> GitInternals.createGit invocation
 
     GitLfsService.planOutboundPush
         (fun operation currentGit -> GitInternals.runSimpleGit id operation currentGit)
@@ -444,7 +452,7 @@ let private createFreedLfsFixture () = promise {
 
     for relativePath, _ in lfsDownloadFiles do
         let! freed =
-            materialization.Dematerialize (repositoryPath relativePath) (ctx $"free-{relativePath}")
+            materialization.Dematerialize [| repositoryPath relativePath |] (ctx $"free-{relativePath}")
             |> Async.StartAsPromise
 
         match freed with
@@ -596,18 +604,13 @@ let private openSession (workPath: string) (barePath: string) : WorkspaceSession
 
     GitWorkspaceSession.createSession GitWorkspaceSession.GitSessionHooks.none binding
 
-/// The batch materialization service of a new session over a work repository whose origin is `barePath`.
-let private openBatchMaterialization (workPath: string) (barePath: string) : ObjectBatchMaterializationService =
-    (openSession workPath barePath).ObjectBatchMaterialization
-    |> Option.defaultWith (fun () -> failwith "Expected the object batch materialization service.")
-
-/// The single-path materialization service of a new session over a work repository whose origin is `barePath`.
+/// The materialization service of a new session over a work repository whose origin is `barePath`.
 let private openMaterialization (workPath: string) (barePath: string) : ObjectMaterializationService =
     (openSession workPath barePath).ObjectMaterialization
     |> Option.defaultWith (fun () -> failwith "Expected the object-materialization service.")
 
-/// The batch materialization service of a session whose credential strategy hands out a token for the remote at `remoteUrl`.
-let private openBatchMaterializationWithToken (workPath: string) (remoteUrl: string) : ObjectBatchMaterializationService =
+/// The materialization service of a session whose credential strategy hands out a token for the remote at `remoteUrl`.
+let private openMaterializationWithToken (workPath: string) (remoteUrl: string) : ObjectMaterializationService =
     let strategy: GitCredentialStrategy.GitCredentialStrategy = {
         ResolveCredential =
             fun _host _profileId -> async { return Some { Username = "oauth2"; Secret = "unreachable-token" } }
@@ -629,8 +632,8 @@ let private openBatchMaterializationWithToken (workPath: string) (remoteUrl: str
 
     GitWorkspaceSession.createSessionWithCredentials GitWorkspaceSession.GitSessionHooks.none strategy binding
     |> fun session ->
-        session.ObjectBatchMaterialization
-        |> Option.defaultWith (fun () -> failwith "Expected the object batch materialization service.")
+        session.ObjectMaterialization
+        |> Option.defaultWith (fun () -> failwith "Expected the object-materialization service.")
 
 [<Emit("Date.now()")>]
 let private nowMilliseconds () : float = jsNative
@@ -1793,7 +1796,7 @@ Vitest.describe (
 
                         let! dematerializeResult =
                             materialization.Dematerialize
-                                (repositoryPath "guarded.bin")
+                                [| repositoryPath "guarded.bin" |]
                                 (ctx "dirty-dematerialize")
                             |> Async.StartAsPromise
 
@@ -1809,7 +1812,7 @@ Vitest.describe (
 
                         let! cleanDematerialize =
                             materialization.Dematerialize
-                                (repositoryPath "guarded.bin")
+                                [| repositoryPath "guarded.bin" |]
                                 (ctx "clean-dematerialize")
                             |> Async.StartAsPromise
 
@@ -1830,7 +1833,7 @@ Vitest.describe (
 
                         let! restoredMaterialization =
                             materialization.Materialize
-                                (repositoryPath "guarded.bin")
+                                [| repositoryPath "guarded.bin" |]
                                 (ctx "restore-after-dematerialize")
                             |> Async.StartAsPromise
 
@@ -1847,7 +1850,7 @@ Vitest.describe (
 
                         let! materializeResult =
                             materialization.Materialize
-                                (repositoryPath "guarded.bin")
+                                [| repositoryPath "guarded.bin" |]
                                 (ctx "dirty-materialize")
                             |> Async.StartAsPromise
 
@@ -1894,7 +1897,7 @@ Vitest.describe (
 
                         let! dematerializeResult =
                             materialization.Dematerialize
-                                (repositoryPath "missing-remote-object.bin")
+                                [| repositoryPath "missing-remote-object.bin" |]
                                 (ctx "missing-remote-dematerialize")
                             |> Async.StartAsPromise
 
@@ -1959,7 +1962,9 @@ Vitest.describe (
                             |> Option.defaultWith (fun () -> failwith "Expected Git object materialization service.")
 
                         let! materializeResult =
-                            materialization.Materialize (repositoryPath relativePath) (ctx "missing-remote-materialize")
+                            materialization.Materialize
+                                [| repositoryPath relativePath |]
+                                (ctx "missing-remote-materialize")
                             |> Async.StartAsPromise
 
                         match materializeResult with
@@ -2010,7 +2015,9 @@ Vitest.describe (
                             |> Option.defaultWith (fun () -> failwith "Expected Git object materialization.")
 
                         let! dematerializeResult =
-                            materialization.Dematerialize (repositoryPath "b.bin") (ctx "unpushed-duplicate-dematerialize")
+                            materialization.Dematerialize
+                                [| repositoryPath "b.bin" |]
+                                (ctx "unpushed-duplicate-dematerialize")
                             |> Async.StartAsPromise
 
                         match dematerializeResult with
@@ -2097,7 +2104,9 @@ Vitest.describe (
                             |> Option.defaultWith (fun () -> failwith "Expected Git object materialization.")
 
                         let! dematerializeResult =
-                            materialization.Dematerialize (repositoryPath relativePath) (ctx "merge-object-dematerialize")
+                            materialization.Dematerialize
+                                [| repositoryPath relativePath |]
+                                (ctx "merge-object-dematerialize")
                             |> Async.StartAsPromise
 
                         match dematerializeResult with
@@ -2149,7 +2158,9 @@ Vitest.describe (
                             |> Option.defaultWith (fun () -> failwith "Expected Git object materialization.")
 
                         let! dematerializeResult =
-                            materialization.Dematerialize (repositoryPath "a.bin") (ctx "unrelated-branch-dematerialize")
+                            materialization.Dematerialize
+                                [| repositoryPath "a.bin" |]
+                                (ctx "unrelated-branch-dematerialize")
                             |> Async.StartAsPromise
 
                         match dematerializeResult with
@@ -2202,7 +2213,9 @@ Vitest.describe (
                             |> Option.defaultWith (fun () -> failwith "Expected Git object materialization.")
 
                         let! dematerializeResult =
-                            materialization.Dematerialize (repositoryPath "c.bin") (ctx "detached-head-dematerialize")
+                            materialization.Dematerialize
+                                [| repositoryPath "c.bin" |]
+                                (ctx "detached-head-dematerialize")
                             |> Async.StartAsPromise
 
                         match dematerializeResult with
@@ -2285,7 +2298,7 @@ Vitest.describe (
 
                             let! dematerializeResult =
                                 materialization.Dematerialize
-                                    (repositoryPath relativePath)
+                                    [| repositoryPath relativePath |]
                                     (ctx $"unpushed-{relativePath}")
                                 |> Async.StartAsPromise
 
@@ -2309,7 +2322,7 @@ Vitest.describe (
 
                         let! dematerializeResult =
                             materialization.Dematerialize
-                                (repositoryPath "plain.bin")
+                                [| repositoryPath "plain.bin" |]
                                 (ctx "unpushed-excluded-plain")
                             |> Async.StartAsPromise
 
@@ -2362,7 +2375,9 @@ Vitest.describe (
                             |> Option.defaultWith (fun () -> failwith "Expected the object-materialization service.")
 
                         let! dematerializeResult =
-                            materialization.Dematerialize (repositoryPath relativePath) (ctx "pushed-bracket-dematerialize")
+                            materialization.Dematerialize
+                                [| repositoryPath relativePath |]
+                                (ctx "pushed-bracket-dematerialize")
                             |> Async.StartAsPromise
 
                         match dematerializeResult with
@@ -2375,7 +2390,9 @@ Vitest.describe (
                         Vitest.expect(localObjectExistsAfter).toBe false
 
                         let! materializeResult =
-                            materialization.Materialize (repositoryPath relativePath) (ctx "pushed-bracket-materialize")
+                            materialization.Materialize
+                                [| repositoryPath relativePath |]
+                                (ctx "pushed-bracket-materialize")
                             |> Async.StartAsPromise
 
                         match materializeResult with
@@ -2426,7 +2443,7 @@ Vitest.describe (
 
                         let! dematerializeResult =
                             materialization.Dematerialize
-                                (repositoryPath requestedPath)
+                                [| repositoryPath requestedPath |]
                                 (ctx "free-bracket-path-keeps-sibling-edit")
                             |> Async.StartAsPromise
 
@@ -2664,7 +2681,9 @@ Vitest.describe (
 
                         for relativePath in [| requestedPath; siblingPath |] do
                             let! dematerializeResult =
-                                materialization.Dematerialize (repositoryPath relativePath) (ctx $"free-{relativePath}")
+                                materialization.Dematerialize
+                                    [| repositoryPath relativePath |]
+                                    (ctx $"free-{relativePath}")
                                 |> Async.StartAsPromise
 
                             match dematerializeResult with
@@ -2693,7 +2712,7 @@ Vitest.describe (
 
                                     return!
                                         materialization.Materialize
-                                            (repositoryPath requestedPath)
+                                            [| repositoryPath requestedPath |]
                                             (ctx "download-requested")
                                         |> Async.StartAsPromise
                                 finally
@@ -3288,7 +3307,7 @@ Vitest.describe (
                     let! root, workPath, barePath = createFreedLfsFixture ()
 
                     try
-                        let batch = openBatchMaterialization workPath barePath
+                        let batch = openMaterialization workPath barePath
                         let dirtyPath = "data/b.bin"
                         let dirtyContent = "changed after the commit\n"
                         do! writeUtf8FileAsync (join [| workPath; dirtyPath |]) dirtyContent
@@ -3341,7 +3360,7 @@ Vitest.describe (
                         let! statusBefore = statusLinesOf workPath
                         Vitest.expect(statusBefore).toEqual [| " M data/a.bin"; " M data/b.bin" |]
 
-                        let batch = openBatchMaterialization workPath barePath
+                        let batch = openMaterialization workPath barePath
                         let reports = ResizeArray<OperationProgress>()
 
                         let! result =
@@ -3416,7 +3435,9 @@ Vitest.describe (
                         Vitest.expect(statusBefore).toEqual [| " M data/a.bin" |]
 
                         let! result =
-                            materialization.Materialize (repositoryPath "data/a.bin") (ctx "materialize-stale-index")
+                            materialization.Materialize
+                                [| repositoryPath "data/a.bin" |]
+                                (ctx "materialize-stale-index")
                             |> Async.StartAsPromise
 
                         match result with
@@ -3609,7 +3630,7 @@ Vitest.describe (
 
                         let! result =
                             (openMaterialization workPath barePath).Materialize
-                                (repositoryPath editedPath)
+                                [| repositoryPath editedPath |]
                                 (ctx "materialize-local-changes")
                             |> Async.StartAsPromise
 
@@ -3617,6 +3638,10 @@ Vitest.describe (
                         | Failed failure ->
                             Vitest.expect(failure.Code).toBe "local_changes"
                             Vitest.expect(failure.Category).toEqual ProviderError
+                            // A call for one path keeps the message of that path, with no count in front of it.
+                            Vitest.expect(failure.Message.Contains $"'{editedPath}'").toBe true
+                            Vitest.expect(failure.Message.Contains "paths failed").toBe false
+                            Vitest.expect(failure.AffectedPaths).toEqual [| editedPath |]
                         | Succeeded _
                         | PartiallySucceeded _ -> failwith "A file with local changes must not be materialized."
 
@@ -3644,12 +3669,15 @@ Vitest.describe (
 
                         let! result =
                             (openMaterialization workPath (join [| root; "origin.git" |])).Dematerialize
-                                (repositoryPath editedPath)
+                                [| repositoryPath editedPath |]
                                 (ctx "dematerialize-local-changes")
                             |> Async.StartAsPromise
 
                         match result with
-                        | Failed failure -> Vitest.expect(failure.Code).toBe "local_changes"
+                        | Failed failure ->
+                            Vitest.expect(failure.Code).toBe "local_changes"
+                            Vitest.expect(failure.Message.Contains "paths failed").toBe false
+                            Vitest.expect(failure.AffectedPaths).toEqual [| editedPath |]
                         | Succeeded _
                         | PartiallySucceeded _ -> failwith "A file with local changes must not be freed."
 
@@ -3678,7 +3706,7 @@ Vitest.describe (
                             do! writeUtf8FileAsync (join [| workPath; editedPath |]) "content of X\n"
 
                         let! result =
-                            (openBatchMaterialization workPath barePath).Materialize
+                            (openMaterialization workPath barePath).Materialize
                                 (editedPaths |> Array.map repositoryPath)
                                 (ctx "batch-materialize-local-changes")
                             |> Async.StartAsPromise
@@ -3717,7 +3745,7 @@ Vitest.describe (
                         let unlistedPath = "data/unlisted.bin"
 
                         let! result =
-                            (openBatchMaterialization workPath barePath).Materialize
+                            (openMaterialization workPath barePath).Materialize
                                 ([| editedPath; unlistedPath |] |> Array.map repositoryPath)
                                 (ctx "batch-materialize-local-changes-and-unlisted")
                             |> Async.StartAsPromise
@@ -3782,7 +3810,7 @@ Vitest.describe (
                     let stopFaking: (unit -> unit) ref = ref ignore
 
                     try
-                        let batch = openBatchMaterialization workPath barePath
+                        let batch = openMaterialization workPath barePath
 
                         // The preflight passes because the lock appears only with the checkout. The text is what
                         // git-lfs 3.7.0 prints, and it does not name the lock.
@@ -3832,7 +3860,7 @@ Vitest.describe (
                     let stopFaking: (unit -> unit) ref = ref ignore
 
                     try
-                        let batch = openBatchMaterialization workPath barePath
+                        let batch = openMaterialization workPath barePath
 
                         stopFaking.Value <-
                             fakeLfsCheckoutWithIndexError "" "Error updating the Git index:\n\n\nErrors logged to 'x.log'."
@@ -3876,7 +3904,7 @@ Vitest.describe (
                     let! root, workPath = createPushedLfsFixture false
 
                     try
-                        let batch = openBatchMaterialization workPath (join [| root; "origin.git" |])
+                        let batch = openMaterialization workPath (join [| root; "origin.git" |])
                         let paths = [| "data/a.bin"; "other/c.bin" |]
 
                         let! result =
@@ -3919,7 +3947,7 @@ Vitest.describe (
                     let! root, workPath = createPushedLfsFixture false
 
                     try
-                        let batch = openBatchMaterialization workPath (join [| root; "origin.git" |])
+                        let batch = openMaterialization workPath (join [| root; "origin.git" |])
 
                         let! result =
                             batch.Materialize
@@ -3956,7 +3984,7 @@ Vitest.describe (
                         do! commitAndPushLfsFiles workPath manyLfsFiles
                         do! resetToPointersWithoutCache workPath [| "long-term-observation-programme-with-a-descriptive-name" |]
 
-                        let batch = openBatchMaterialization workPath barePath
+                        let batch = openMaterialization workPath barePath
 
                         let! result =
                             batch.Materialize
@@ -3993,7 +4021,7 @@ Vitest.describe (
 
                     try
                         do! commitAndPushLfsFiles workPath manyLfsFiles
-                        let batch = openBatchMaterialization workPath barePath
+                        let batch = openMaterialization workPath barePath
 
                         let! result =
                             batch.Dematerialize
@@ -4047,7 +4075,7 @@ Vitest.describe (
                         let! siblingObjectPath = lfsObjectPathForHeadFile workPath siblingPath
                         do! resetToPointersWithoutCache workPath [| "runs" |]
 
-                        let batch = openBatchMaterialization workPath barePath
+                        let batch = openMaterialization workPath barePath
 
                         let! result =
                             batch.Materialize
@@ -4090,7 +4118,7 @@ Vitest.describe (
                     let! root, workPath = createPushedLfsFixture true
 
                     try
-                        let batch = openBatchMaterialization workPath (join [| root; "origin.git" |])
+                        let batch = openMaterialization workPath (join [| root; "origin.git" |])
                         let unpushedPath = "other/c.bin"
 
                         let! result =
@@ -4145,7 +4173,7 @@ Vitest.describe (
                     let stopObserving: (unit -> unit) ref = ref ignore
 
                     try
-                        let batch = openBatchMaterialization workPath (join [| root; "origin.git" |])
+                        let batch = openMaterialization workPath (join [| root; "origin.git" |])
                         let unpushedPath = "other/c.bin"
 
                         stopObserving.Value <- observeGitSpawnArguments observedCommands
@@ -4214,7 +4242,7 @@ Vitest.describe (
                         let remoteUrl = "https://127.0.0.1:1/origin.git"
                         let! _ = runGitOk workPath [| "remote"; "set-url"; "origin"; remoteUrl |]
 
-                        let batch = openBatchMaterializationWithToken workPath remoteUrl
+                        let batch = openMaterializationWithToken workPath remoteUrl
                         let paths = lfsDownloadFiles |> Array.map fst
 
                         stopObserving.Value <- observeGitSpawnArguments observedCommands
@@ -4285,7 +4313,7 @@ Vitest.describe (
                         let remoteUrl = "https://127.0.0.1:1/origin.git"
                         let! _ = runGitOk workPath [| "remote"; "set-url"; "origin"; remoteUrl |]
 
-                        let batch = openBatchMaterializationWithToken workPath remoteUrl
+                        let batch = openMaterializationWithToken workPath remoteUrl
                         let paths = manyLfsFiles |> Array.map (fun (_, relativePath, _) -> relativePath)
 
                         stopObserving.Value <- observeGitSpawnArguments observedCommands
@@ -4354,7 +4382,7 @@ Vitest.describe (
                     let! root, workPath, barePath = createFreedLfsFixture ()
 
                     try
-                        let batch = openBatchMaterialization workPath barePath
+                        let batch = openMaterialization workPath barePath
 
                         let! result =
                             batch.Materialize
@@ -4550,6 +4578,156 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "a batch result for one path fails with the message and the code of that path",
+            fun () -> promise {
+                let failed (kind: GitEngineTypes.GitFailureKind) (message: string) =
+                    ({
+                        Path = "a.bin"
+                        Result = Error({ Kind = kind; Message = message }: GitService.GitFailure)
+                    }: GitService.LfsPathOutcome)
+
+                match
+                    GitLfsExtensions.toBatchResult
+                        GitLfsExtensions.batchMaterializeAction
+                        [| failed GitEngineTypes.GitFailureKind.LocalChanges "'a.bin' has local changes." |]
+                with
+                | Failed failure ->
+                    Vitest.expect(failure.Code).toBe "local_changes"
+                    Vitest.expect(failure.Message).toBe "'a.bin' has local changes."
+                    Vitest.expect(failure.AffectedPaths).toEqual [| "a.bin" |]
+                    Vitest.expect(failure.Details).toEqual [| "a.bin: 'a.bin' has local changes." |]
+                | Succeeded _
+                | PartiallySucceeded _ -> failwith "Expected a failure for a refused path."
+
+                match
+                    GitLfsExtensions.toBatchResult
+                        GitLfsExtensions.batchDematerializeAction
+                        [| failed GitEngineTypes.GitFailureKind.Unknown "object store is unreadable" |]
+                with
+                | Failed failure ->
+                    Vitest.expect(failure.Code).toBe "lfs_operation_failed"
+                    Vitest.expect(failure.Message).toBe "object store is unreadable"
+                    Vitest.expect(failure.AffectedPaths).toEqual [| "a.bin" |]
+                    Vitest.expect(failure.Details).toEqual [| "a.bin: object store is unreadable" |]
+                | Succeeded _
+                | PartiallySucceeded _ -> failwith "Expected a failure for a path that failed to download."
+
+                match
+                    GitLfsExtensions.toBatchResult
+                        GitLfsExtensions.batchDematerializeAction
+                        [| failed GitEngineTypes.GitFailureKind.LfsBackupRetained "the backup stays at a.bin.bak" |]
+                with
+                | Failed failure ->
+                    Vitest.expect(failure.Code).toBe "lfs_backup_retained"
+                    Vitest.expect(failure.StateChanged).toBe true
+                    Vitest.expect(failure.Message).toBe "the backup stays at a.bin.bak"
+                | Succeeded _
+                | PartiallySucceeded _ -> failwith "Expected a failure for a path whose backup was retained."
+            }
+        )
+
+        Vitest.test (
+            "a batch result in which refusals for local changes mix with another failure names the other failure",
+            fun () -> promise {
+                let failed (path: string) (kind: GitEngineTypes.GitFailureKind) (message: string) =
+                    ({
+                        Path = path
+                        Result = Error({ Kind = kind; Message = message }: GitService.GitFailure)
+                    }: GitService.LfsPathOutcome)
+
+                let refusal = failed "a.bin" GitEngineTypes.GitFailureKind.LocalChanges "'a.bin' has local changes."
+
+                let unreadable =
+                    failed "b.bin" GitEngineTypes.GitFailureKind.Network "object store is unreadable"
+
+                for outcomes in [| [| refusal; unreadable |]; [| unreadable; refusal |] |] do
+                    match GitLfsExtensions.toBatchResult GitLfsExtensions.batchMaterializeAction outcomes with
+                    | Failed failure ->
+                        Vitest.expect(failure.Code).toBe "batch_materialization_incomplete"
+                        Vitest.expect(failure.Category).toEqual Network
+                        Vitest.expect(failure.Message).toBe "2 of 2 paths failed: object store is unreadable"
+                    | Succeeded _
+                    | PartiallySucceeded _ -> failwith "Expected a failure when no path changed."
+
+                // A cancellation does not name the cause either, so the refusal supplies the message.
+                match
+                    GitLfsExtensions.toBatchResult
+                        GitLfsExtensions.batchMaterializeAction
+                        [| failed "c.bin" GitEngineTypes.GitFailureKind.Canceled "canceled"; refusal |]
+                with
+                | Failed failure ->
+                    Vitest.expect(failure.Code).toBe "batch_materialization_incomplete"
+                    Vitest.expect(failure.Message).toBe "2 of 2 paths failed: 'a.bin' has local changes."
+                | Succeeded _
+                | PartiallySucceeded _ -> failwith "Expected a failure when no path changed."
+            }
+        )
+
+        Vitest.test (
+            "a call for one path names it in its first progress event and a call for two paths does not",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! lfsProbe = runGit "." [| "lfs"; "version" |]
+
+                match lfsProbe with
+                | Error _ -> Vitest.expect(true).toBe true
+                | Ok _ ->
+                    let! root, workPath, barePath = createFreedLfsFixture ()
+
+                    try
+                        let materialization = openMaterialization workPath barePath
+                        let reports = ResizeArray<OperationProgress>()
+
+                        let reportingContext (name: string) =
+                            reports.Clear()
+                            OperationContext.create name OperationCancellation.none reports.Add
+
+                        let firstReport () =
+                            Vitest.expect(reports.Count).toBeGreaterThan 0
+                            reports[0]
+
+                        let onePath = repositoryPath "data/a.bin"
+                        let twoPaths = [| repositoryPath "data/a.bin"; repositoryPath "data/b.bin" |]
+
+                        let! materialized =
+                            materialization.Materialize [| onePath |] (reportingContext "progress-materialize-one")
+                            |> Async.StartAsPromise
+
+                        expectSucceeded "materialize one path" materialized |> ignore
+                        Vitest.expect((firstReport ()).PhaseCode).toBe "lfs-materialize"
+                        Vitest.expect((firstReport ()).Item).toEqual (Some "data/a.bin")
+
+                        let! freed =
+                            materialization.Dematerialize [| onePath |] (reportingContext "progress-dematerialize-one")
+                            |> Async.StartAsPromise
+
+                        expectSucceeded "free one path" freed |> ignore
+                        Vitest.expect((firstReport ()).PhaseCode).toBe "lfs-dematerialize"
+                        Vitest.expect((firstReport ()).Item).toEqual (Some "data/a.bin")
+
+                        let! materializedTwo =
+                            materialization.Materialize twoPaths (reportingContext "progress-materialize-two")
+                            |> Async.StartAsPromise
+
+                        expectSucceeded "materialize two paths" materializedTwo |> ignore
+                        Vitest.expect((firstReport ()).PhaseCode).toBe "lfs-materialize"
+                        Vitest.expect((firstReport ()).Item).toEqual None
+
+                        let! freedTwo =
+                            materialization.Dematerialize twoPaths (reportingContext "progress-dematerialize-two")
+                            |> Async.StartAsPromise
+
+                        expectSucceeded "free two paths" freedTwo |> ignore
+                        Vitest.expect((firstReport ()).PhaseCode).toBe "lfs-dematerialize"
+                        Vitest.expect((firstReport ()).Item).toEqual None
+                        do! removeDirectoryAsync root
+                    with error ->
+                        do! removeDirectoryAsync root
+                        return raise error
+            }
+        )
+
+        Vitest.test (
             "a workspace mutation waits until a running dematerialization finishes",
             TestOptions(timeout = 120000),
             fun () -> promise {
@@ -4613,7 +4791,7 @@ Vitest.describe (
                         holdArmed.Value <- true
 
                         let dematerialization =
-                            materialization.Dematerialize (repositoryPath relativePath) (ctx "held-dematerialize")
+                            materialization.Dematerialize [| repositoryPath relativePath |] (ctx "held-dematerialize")
                             |> Async.StartAsPromise
 
                         let waitedMs = ref 0
@@ -4701,7 +4879,9 @@ Vitest.describe (
                         stopObserving.Value <- observeGitSpawnArguments observedCommands
 
                         let! dematerializeResult =
-                            materialization.Dematerialize (repositoryPath relativePath) (ctx "hash-in-place-dematerialize")
+                            materialization.Dematerialize
+                                [| repositoryPath relativePath |]
+                                (ctx "hash-in-place-dematerialize")
                             |> Async.StartAsPromise
 
                         stopObserving.Value ()
@@ -4757,7 +4937,7 @@ Vitest.describe (
                             |> Option.defaultWith (fun () -> failwith "Expected the object-materialization service.")
 
                         let! dematerializeResult =
-                            materialization.Dematerialize (repositoryPath relativePath) (ctx "backup-dematerialize")
+                            materialization.Dematerialize [| repositoryPath relativePath |] (ctx "backup-dematerialize")
                             |> Async.StartAsPromise
 
                         match dematerializeResult with
@@ -4817,7 +4997,9 @@ Vitest.describe (
                         stopAppending.Value <- appendAfterLfsPointerCommand objectPath appendedText
 
                         let! dematerializeResult =
-                            materialization.Dematerialize (repositoryPath relativePath) (ctx "changed-during-dematerialize")
+                            materialization.Dematerialize
+                                [| repositoryPath relativePath |]
+                                (ctx "changed-during-dematerialize")
                             |> Async.StartAsPromise
 
                         stopAppending.Value ()
@@ -4879,7 +5061,7 @@ Vitest.describe (
 
                         let! dematerializeResult =
                             materialization.Dematerialize
-                                (repositoryPath relativePath)
+                                [| repositoryPath relativePath |]
                                 (ctx "save-after-pointer-checkout")
                             |> Async.StartAsPromise
 
@@ -4941,7 +5123,7 @@ Vitest.describe (
 
                         let! dematerializeResult =
                             materialization.Dematerialize
-                                (repositoryPath relativePath)
+                                [| repositoryPath relativePath |]
                                 (ctx "save-after-final-status")
                             |> Async.StartAsPromise
 
@@ -5007,7 +5189,7 @@ Vitest.describe (
 
                         let! dematerializeResult =
                             materialization.Dematerialize
-                                (repositoryPath relativePath)
+                                [| repositoryPath relativePath |]
                                 (ctx "recreated-before-pointer-checkout")
                             |> Async.StartAsPromise
 
@@ -5112,7 +5294,9 @@ Vitest.describe (
                             |> Option.defaultWith (fun () -> failwith "Expected the object-materialization service.")
 
                         let! dematerializeResult =
-                            materialization.Dematerialize (repositoryPath relativePath) (ctx "free-before-held-download")
+                            materialization.Dematerialize
+                                [| repositoryPath relativePath |]
+                                (ctx "free-before-held-download")
                             |> Async.StartAsPromise
 
                         match dematerializeResult with
@@ -5124,7 +5308,7 @@ Vitest.describe (
                         holdArmed.Value <- true
 
                         let materializationRun =
-                            materialization.Materialize (repositoryPath relativePath) (ctx "held-materialize")
+                            materialization.Materialize [| repositoryPath relativePath |] (ctx "held-materialize")
                             |> Async.StartAsPromise
 
                         let waitedMs = ref 0

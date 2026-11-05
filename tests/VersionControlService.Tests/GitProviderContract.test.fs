@@ -400,7 +400,6 @@ let createGitHarness () : ProviderTestHarness =
             "synchronization"
             "conflicts"
             "materialization"
-            "batch-materialization"
             "storage-policy"
             "maintenance"
             "browser"
@@ -565,6 +564,14 @@ let private registrations = [|
     OperationalProviderSuite.register gitHarness
     ExtensionProviderSuites.register gitHarness
     ConsumerWorkflowSuite.register gitHarness
+|]
+
+// The step events and output profiles register for the real providers only. They stay outside the seven shared
+// profiles, which the in-memory fake registers too, because the fake reports no progress and no output. The Git
+// harness configures no credentials, so the output profile has no secret values to look for.
+let private realProviderRegistrations = [|
+    StepEventsProviderSuite.register gitHarness
+    OutputProviderSuite.register gitHarness [||]
 |]
 
 let private expectProviderValue (operationName: string) (result: OperationResult<'T>) : 'T =
@@ -2624,7 +2631,7 @@ Vitest.describe (
                     let path = RepositoryPath.tryCreate "materialized.bin" |> Result.defaultWith failwith
 
                     let! initialDematerialize =
-                        materialization.Dematerialize path (OperationContext.detached "materialization-prepare")
+                        materialization.Dematerialize [| path |] (OperationContext.detached "materialization-prepare")
                         |> Async.StartAsPromise
 
                     expectProviderValue "prepare materialization context" initialDematerialize |> ignore
@@ -2641,14 +2648,14 @@ Vitest.describe (
                                     materializeCancellation.Cancel())
 
                     let! materializeResult =
-                        materialization.Materialize path materializeContext |> Async.StartAsPromise
+                        materialization.Materialize [| path |] materializeContext |> Async.StartAsPromise
 
                     Vitest.expect(materializeTransferStarted).toBe true
                     let materializeFailure = expectProviderFailure "canceled materialization" materializeResult
                     Vitest.expect(materializeFailure.Category).toEqual Canceled
 
                     let! restoredMaterialization =
-                        materialization.Materialize path (OperationContext.detached "materialization-restore")
+                        materialization.Materialize [| path |] (OperationContext.detached "materialization-restore")
                         |> Async.StartAsPromise
 
                     expectProviderValue "restore materialization" restoredMaterialization |> ignore
@@ -2817,11 +2824,12 @@ if (command === 'ls-files') {
                                                 |> ignore)
 
                                 let! canceledResult =
-                                    materialization.Dematerialize path dematerializeContext |> Async.StartAsPromise
+                                    materialization.Dematerialize [| path |] dematerializeContext
+                                    |> Async.StartAsPromise
 
                                 let! immediateRetry =
                                     materialization.Dematerialize
-                                        path
+                                        [| path |]
                                         (OperationContext.detached "dematerialization-immediate-retry")
                                     |> Async.StartAsPromise
 
@@ -2881,7 +2889,9 @@ if (command === 'ls-files') {
                     let! listResult = materialization.ListObjects listContext |> Async.StartAsPromise
                     expectProviderValue "listing progress" listResult |> ignore
 
-                    let! _ = materialization.Dematerialize path (OperationContext.detached "progress-prepare") |> Async.StartAsPromise
+                    let! _ =
+                        materialization.Dematerialize [| path |] (OperationContext.detached "progress-prepare")
+                        |> Async.StartAsPromise
 
                     let materializeReports = ResizeArray<OperationProgress>()
                     let materializeContext =
@@ -2890,10 +2900,13 @@ if (command === 'ls-files') {
                             OperationCancellation.none
                             materializeReports.Add
 
-                    let! materializeResult = materialization.Materialize path materializeContext |> Async.StartAsPromise
+                    let! materializeResult =
+                        materialization.Materialize [| path |] materializeContext |> Async.StartAsPromise
                     expectProviderValue "materialization progress" materializeResult |> ignore
 
-                    let! _ = materialization.Dematerialize path (OperationContext.detached "progress-reset") |> Async.StartAsPromise
+                    let! _ =
+                        materialization.Dematerialize [| path |] (OperationContext.detached "progress-reset")
+                        |> Async.StartAsPromise
                     let dematerializeReports = ResizeArray<OperationProgress>()
                     let dematerializeContext =
                         OperationContext.create
@@ -2902,7 +2915,7 @@ if (command === 'ls-files') {
                             dematerializeReports.Add
 
                     let! dematerializeResult =
-                        materialization.Dematerialize path dematerializeContext |> Async.StartAsPromise
+                        materialization.Dematerialize [| path |] dematerializeContext |> Async.StartAsPromise
 
                     expectProviderValue "dematerialization progress" dematerializeResult |> ignore
 
@@ -4637,7 +4650,7 @@ Vitest.describe (
 
                     let! result =
                         materialization.Materialize
-                            (mkRepositoryPath "base.txt")
+                            [| mkRepositoryPath "base.txt" |]
                             (OperationContext.detached "materialize-index-lock")
                         |> Async.StartAsPromise
 

@@ -100,6 +100,40 @@ let lakeFsFactory =
 `LakeFsCredentials.unconfigured` refuses every profile and is the right default until
 the user has configured one.
 
+### Choosing the git executable
+
+The Git provider runs the `git` found on the PATH unless the host selects another one. A
+host that ships its own git, or lets the user pick one, installs a provider once at
+startup:
+
+```fsharp
+module GitExecution = VersionControlService.Git.GitExecution
+
+// settings.GitExecutablePath is a string option the host reads from its own settings.
+GitExecution.setGitExecutableProvider (fun () -> settings.GitExecutablePath)
+```
+
+One selection serves every factory in the process, and no factory needs rebuilding when it
+changes. simple-git captures its binary and environment when an operation creates its
+instance, so for simple-git a changed setting applies from the next operation. Process
+requests and the Git LFS adapter ask the provider at each start. The text diff supervisor
+asks it each time it launches git. For all of them a changed setting applies from the next
+start. The provider must not throw. `None` or a blank string means the
+git found on the PATH. An explicit selection has to be the absolute path of a file, because
+only the dependency check validates it. Its directory goes first in the PATH of the git
+child processes, so a git-lfs installed beside it is found. A test that installs a
+provider restores automatic discovery with `GitExecution.resetGitExecutableProvider ()`.
+
+`CheckDependencies` uses the same selection, resolved once for the whole check. A
+selection that names no usable file makes every component report `Installed = false`,
+with a `Remediation` that names the path and the reason, and the check does not fall back
+to the git on the PATH. `DependencyStatus.ProbeExecutablePath` is the git executable the
+check ran, so the host can show which one is in use. It is the same for all three
+components. With automatic discovery it is `None` when the PATH holds no git. When the
+`git-lfs-configuration` component is not set up, an explicit selection puts the quoted
+selected path in place of `git` in the command of its `Remediation`, so the user runs the
+git that the provider uses. Automatic discovery keeps the plain `git` command.
+
 ## Naming a repository
 
 A `RepositoryLocation` is nonsecret provider-owned location data plus the profile that
@@ -241,6 +275,8 @@ Each `DependencyStatus` names the component, whether it is installed, the versio
 whether that version is compatible, and a `Remediation` string to show the user. Git reports
 three components: `git`, `git-lfs`, and `git-lfs-configuration` for whether the LFS filter
 is set up. Show the remediation text for a degraded component and let the user carry on.
+`ProbeExecutablePath` names the git executable the check ran, as described under
+[Choosing the git executable](#choosing-the-git-executable).
 
 `InstallDependency` takes a component name and attempts the remediation the provider
 supports. Git supports only `git-lfs-configuration` and answers anything else
@@ -391,6 +427,9 @@ succeed without further changes, which is what decides whether the host offers a
 `AffectedPaths` and `RevisionEvidence` name what the failure was about. Messages and details
 arrive redacted, so a host can show them to a user.
 
+A request that timed out fails with the category `Timeout` and the code `timeout` in both
+providers.
+
 `OperationOutcome.Publication` is the field to read before telling anyone their work is safe.
 `Published` means the result is visible on the logical target. `LocalOnly` means the revisions
 exist locally and a publish can still be retried. `PublicationNotApplicable` means the
@@ -476,8 +515,7 @@ The text diff fallback returns `NotDiffable ProviderUnsupported` from `Open`. It
 lakeFS has no text diff service, so it gets this fallback.
 
 A fallback write also succeeds and changes nothing. `Materialize`, `Dematerialize`,
-`SetPathPolicy` and `SetSettings` return `Succeeded` with the same warning. The
-`Materialize` and `Dematerialize` of the batch service do the same. Read the
+`SetPathPolicy` and `SetSettings` return `Succeeded` with the same warning. Read the
 warning before you treat one of these as done. The storage settings reseed in
 [provider authoring](provider-authoring.md) shows why this matters. It tells a host to
 write its saved threshold through `SetSettings` and mark the migration complete only
@@ -550,11 +588,10 @@ degrade quietly. Keep them absent when the interface changes shape per provider,
 a host must never offer an action the provider cannot carry out. Two hosts can make
 opposite choices against the same provider, which is the intent.
 
-Use `ObjectBatchMaterialization` when an action covers many paths, for example a folder,
-because one call is faster than one `ObjectMaterialization` call per path. When the
-provider does not supply it, call `ObjectMaterialization.Materialize` or `Dematerialize`
-for each path instead. A filled session always has the service, but its fallback changes
-nothing, so read the `service_unavailable` warning before you treat the result as done.
+`ObjectMaterialization.Materialize` and `Dematerialize` take an array of paths, so one call
+serves a single file and a folder. A call with many paths is faster than one call per path.
+A filled session always has the service, but its fallback changes nothing, so read the
+`service_unavailable` warning before you treat the result as done.
 
 ## Paged text diffs
 
@@ -1351,19 +1388,79 @@ process leaves its `index.lock` behind, so `remove_index_lock` is the usual reco
 and a host needs a path for it. The recovery codes a Git update can report are listed in
 [provider authoring](provider-authoring.md).
 
-The large-object download of an Update or a Synchronize (with `versioncontrolservice.lfs.materializelargeobjects` on) is `git lfs fetch` followed by `git lfs checkout`. A cancel kills only the fetch, and no checkout starts. The checkout is local and holds the index lock while it runs, so the provider never kills it. A cancel that arrives during the checkout takes effect when the checkout ends, and the call reports the work that finished, which is `Succeeded` when every file is checked out. A canceled fetch returns `PartiallySucceeded` with category `Canceled`, code `hydration_failed` and the recovery `retry_materialization`. A fetch that fails without a cancel, for example because the server lost one object, still runs the checkout, so the files whose objects arrived are checked out, and the result is the failure of the fetch. The provider never deletes a lock file. When the checkout fails and an `index.lock` exists, or when Git names the lock in its failure text, the partial result reports `remove_index_lock` instead. A failed fetch keeps `retry_materialization`, because the fetch takes no lock. With a held lock, git-lfs writes the files, prints `Error updating the Git index:` without Git's lock message and still exits with 0. The provider reads that text from the checkout and treats the run as a failed checkout. Every `git lfs checkout` of the provider runs to its end, because it holds the index lock. Besides the checkout of the download, these are the checkouts of a batch `Materialize`, of the unmark in `StoragePolicy.SetPathPolicy`, of the local materialization of a picked conflict object and of `RestorePaths`. A cancel never kills a running checkout. A batch `Materialize`, the unmark, the pick and `RestorePaths` look for the lock file through `git rev-parse --git-path index.lock` after the index error. When it exists, the unmark fails with `index_locked`, a batch `Materialize` gets the recovery `remove_index_lock` on its failure, and the pick and `RestorePaths` return `PartiallySucceeded` with that recovery. Without a lock file the failure is plain. The unmark fails with `object_materialization_failed` and the text of git-lfs. A batch `Materialize` that changed at least one path returns `PartiallySucceeded` with `retry_materialization`, and one that changed no path returns `Failed` with no recovery action. The pick and `RestorePaths` keep `retry_materialization`. Git-lfs wrote the files in each case, so these failures have `StateChanged` set to `true`. Remove the lock once no git process runs, then retry the download. The retry finds the files with their content but with index entries that still hold the stat data of the pointers, so `git status` lists them as modified. A single or batch `Materialize` repairs such an entry with `git add` when the file is a regular file with the size and the SHA-256 of its object and the entry has no staged change. The attributes must also still register the path with the lfs filter. The `git add` stages nothing, because the clean filter reproduces the committed pointer for that content (the file's content hashes to the pointer's object and the attributes route the path through the lfs filter). The repair changes the index, so the path counts as changed. A single `Materialize` returns a performed outcome, a batch `Materialize` lists the path in `AffectedPaths`, and the progress report of the path says the file is materialized. A held lock fails the repair with the lock failure, and any other modified file keeps the local-changes failure.
+The large-object download of an Update or a Synchronize (with `versioncontrolservice.lfs.materializelargeobjects` on) is `git lfs fetch` followed by `git lfs checkout`. A cancel kills only the fetch, and no checkout starts. The checkout is local and holds the index lock while it runs, so the provider never kills it. A cancel that arrives during the checkout takes effect when the checkout ends, and the call reports the work that finished, which is `Succeeded` when every file is checked out. A canceled fetch returns `PartiallySucceeded` with category `Canceled`, code `hydration_failed` and the recovery `retry_materialization`. A fetch that fails without a cancel, for example because the server lost one object, still runs the checkout, so the files whose objects arrived are checked out, and the result is the failure of the fetch. The provider never deletes a lock file. When the checkout fails and an `index.lock` exists, or when Git names the lock in its failure text, the partial result reports `remove_index_lock` instead. A failed fetch keeps `retry_materialization`, because the fetch takes no lock. With a held lock, git-lfs writes the files, prints `Error updating the Git index:` without Git's lock message and still exits with 0. The provider reads that text from the checkout and treats the run as a failed checkout. Every `git lfs checkout` of the provider runs to its end, because it holds the index lock. Besides the checkout of the download, these are the checkouts of `Materialize`, of the unmark in `StoragePolicy.SetPathPolicy`, of the local materialization of a picked conflict object and of `RestorePaths`. A cancel never kills a running checkout. `Materialize`, the unmark, the pick and `RestorePaths` look for the lock file through `git rev-parse --git-path index.lock` after the index error. When it exists, the unmark fails with `index_locked`, `Materialize` gets the recovery `remove_index_lock` on its failure, and the pick and `RestorePaths` return `PartiallySucceeded` with that recovery. Without a lock file the failure is plain. The unmark fails with `object_materialization_failed` and the text of git-lfs. A `Materialize` that changed at least one path returns `PartiallySucceeded` with `retry_materialization`, and one that changed no path returns `Failed` with no recovery action. The pick and `RestorePaths` keep `retry_materialization`. Git-lfs wrote the files in each case, so these failures have `StateChanged` set to `true`. Remove the lock once no git process runs, then retry the download. The retry finds the files with their content but with index entries that still hold the stat data of the pointers, so `git status` lists them as modified. `Materialize` repairs such an entry with `git add` when the file is a regular file with the size and the SHA-256 of its object and the entry has no staged change. The attributes must also still register the path with the lfs filter. The `git add` stages nothing, because the clean filter reproduces the committed pointer for that content (the file's content hashes to the pointer's object and the attributes route the path through the lfs filter). The repair changes the index, so the path counts as changed. `Materialize` lists the path in `AffectedPaths`, and the progress report of the path says the file is materialized. A held lock fails the repair with the lock failure, and any other modified file keeps the local-changes failure.
 
-The local-changes failure of `Materialize` and `Dematerialize` has the code `local_changes` and the category `ProviderError`. It covers a path with local changes, for example an edited file. The single-path `ObjectMaterialization` and `ObjectBatchMaterialization` both use it. A batch call returns `local_changes` when every failed path was refused for local changes. The result is `Failed` when no path changed and `PartiallySucceeded` otherwise, with the failed paths in `AffectedPaths` and one `<path>: <message>` line per failed path in `Details`. A batch with any other failed path keeps `batch_materialization_incomplete` for `Materialize` and `batch_dematerialization_incomplete` for `Dematerialize`. A partial success keeps the recovery `retry_materialization` or `retry_dematerialization`. Decide by the code. The message names the path and can change.
+The failures and recoveries of object materialization have the codes of the `ObjectMaterializationCodes` module, and a provider that supplies `ObjectMaterialization` uses them. The local-changes failure of `Materialize` and `Dematerialize` has the code `local_changes` (`ObjectMaterializationCodes.LocalChanges`) and the category `ProviderError`. It covers a path with local changes, for example an edited file. A call returns `local_changes` when every failed path was refused for local changes. The result is `Failed` when no path changed and `PartiallySucceeded` otherwise, with the failed paths in `AffectedPaths` and one `<path>: <message>` line per failed path in `Details`. A call with several paths and any other failed path has `batch_materialization_incomplete` (`BatchMaterializationIncomplete`) for `Materialize` and `batch_dematerialization_incomplete` (`BatchDematerializationIncomplete`) for `Dematerialize`. A call with one path fails with that path's own code and message, for example `lfs_backup_retained` when Git kept a backup file. A partial success has the recovery `retry_materialization` (`RetryMaterializationRecovery`) or `retry_dematerialization` (`RetryDematerializationRecovery`). Decide by the code. The message can change. For a call with several paths it starts with how many paths failed and then gives the message of the first failure that is neither a cancellation nor a refusal for local changes.
 
 The Git provider runs `git lfs ls-files -j` with no time limit, because that command prints nothing until it has listed every file. This applies to `ObjectMaterialization.ListObjects`, `Materialize` (including its download step) and `Dematerialize`. Each of them takes an `OperationContext`. Cancel the context to stop one that runs too long. The cancellation ends the git-lfs process and the operation returns a `Canceled` failure.
 
-The `Materialize` and `Dematerialize` of `ObjectBatchMaterialization` behave the same way, and a canceled batch reports the paths that finished as changed.
+A canceled `Materialize` or `Dematerialize` with several paths reports the paths that finished as changed.
 
-`OperationProgress` carries a stable `PhaseCode` such as `transfer`, an optional item,
+`OperationProgress` carries a stable `PhaseCode` such as `fetch`, an optional item,
 completed and total counts, and a sanitized `DisplayMessage`. Counts are `float` because
 JavaScript has no native 64-bit integer, so a float is what carries byte totals above two
 GiB exactly on both runtimes. Show the message, and branch on the
 phase code.
+
+### Step events across providers
+
+`ProgressPhaseCodes` holds the phase codes of the steps that more than one provider reports. The start of a
+step is an event without numbers: `Item`, `Completed` and `Total` are `None`, and the `DisplayMessage` names
+the step. A host can show the step before the first meter of a transfer arrives, and it needs no knowledge of
+the provider to do so.
+
+| Constant | Code | Step |
+| --- | --- | --- |
+| `Refresh` | `fetch` | Observing or acquiring the changes of the target |
+| `Update` | `merge` | Incorporating the changes of the target into the workspace |
+| `Clone` | `clone` | Provisioning a cloned workspace |
+| `DownloadObjects` | `download-objects` | Downloading objects into the workspace |
+| `UploadObjects` | `upload-objects` | Uploading objects from the workspace |
+| `Publish` | `publish` | Publishing the workspace revisions to the target |
+
+The first three mark the start of the operation they are named for, and both providers report them. A
+Synchronize adds no step of its own and reports the steps of the operations it runs. The last three are
+optional. The lakeFS provider reports them today. The Git provider runs the same steps and reports them under
+codes of its own, such as `lfs-pull` and `clone-lfs-pull` for the downloads and `push` and `lfs-upload` for the
+publish. It also keeps its own codes for the other details of git and Git LFS, such as the `-checkout` phases.
+These codes are not part of the vocabulary. The tables below list the codes of its downloads. A host can
+read a missing event of one of the first three codes as a step that did not run. A missing optional code says
+nothing about the step, because a provider may report it under a code of its own.
+
+The lakeFS provider reports all six codes, each with a start event of this shape:
+
+| Code | `DisplayMessage` | Reported before |
+| --- | --- | --- |
+| `fetch` | Fetching online changes | the Refresh reads the target |
+| `merge` | Merging online changes | the update merges the target into the workspace branch |
+| `clone` | Preparing repository workspace | the clone creates the directory and the binding |
+| `download-objects` | Downloading objects | the first object of a batch downloads |
+| `upload-objects` | Uploading objects | the first object of a batch uploads |
+| `publish` | Publishing workspace revisions | the publish merges the workspace branch into the target |
+
+lakeFS reports a step only when it does the work. An update with nothing to merge, or one that opens a
+conflict session, reports no `merge`. A batch that downloads nothing, for example one that only removes
+files, reports no `download-objects`, and a selected revision that only deletes objects reports no
+`upload-objects`. A publish that finds nothing to publish, or that fails its precondition check, reports no
+`publish`. The downloads of an update, a switch, a restore, the candidates of a conflict session and the first
+open of a workspace form one batch each. The uploads of a selected revision and the uploads of the
+resolutions of a conflict session do the same.
+
+The lakeFS clone only provisions the directory and the binding. It reports `clone` and downloads nothing.
+Opening the binding creates the workspace branch and downloads the objects, so the `download-objects` event of
+a fresh workspace arrives with the `Open` call and no second `clone` event follows.
+
+A step start and a meter differ. The start announces an activity and carries the message that names it. A
+meter measures a transfer and carries numbers, and its message describes the measurement. Meters keep the
+codes of their provider. The Git meters of a fetch and a clone use the codes `fetch` and `clone`. The lakeFS
+meters use `lakefs-download` and `lakefs-upload`, with the object key in `Item`, the bytes so far in
+`Completed` and the size of the object in `Total` when it is known. After the uploads of a selected revision,
+lakeFS also reports `selected-upload-complete` with the finished transfers in `Completed` and the selected
+paths in `Total`. These codes belong to the provider and are not part of the vocabulary. The providers do not
+normalize each other's messages or meters.
+
+The fallback services of a filled session report no progress. A host that wraps a session with
+`WorkspaceSession.withFallbackServices` receives the events of the provider's own services unchanged.
 
 ### Progress of Git transfers
 
@@ -1406,13 +1503,14 @@ arrives. These events carry a `DisplayMessage`:
 
 The checkout after the fetch of a clone reports the same event under `clone-lfs-pull-checkout`.
 
-A batch call also reports how many of its files are done. `Materialize` of
-`ObjectBatchMaterialization` uses the phase code `lfs-materialize-files`, and `Dematerialize` uses
+A call with several paths also reports how many of its files are done. `Materialize` uses the phase code
+`lfs-materialize-files`, and `Dematerialize` uses
 `lfs-dematerialize-files`. `Item` is `None` and `Total` is the number of distinct requested paths.
 `Completed` counts the paths that have an outcome, whatever the outcome is. A downloaded file counts
 as soon as its checkout ends, before the check of its content. `Completed` only rises, and it reaches
-`Total` when the call returns a result. These count events exist only for batch calls with more than
-one path. A call with a single path keeps its earlier progress sequence and reports none.
+`Total` when the call returns a result. These count events exist only for calls with more than
+one path. The first event of a call names its file in `Item` when the call has one path, and `Item` is `None`
+when it has more.
 
 ### Raw output of subprocesses
 
@@ -1481,10 +1579,34 @@ The channel has these limits:
 | End of a subprocess | Everything that waits is delivered at once, without waiting for the batch rate, before the operation completes. |
 
 The Git provider reports the subprocesses of Refresh, Update, Synchronize, Publish, Clone and Bind, the
-large-object listing, download and free of `ObjectMaterialization` and `ObjectBatchMaterialization`, and
+large-object listing, download and free of `ObjectMaterialization`, and
 the LFS upload of a publish. It does not report the text diff workers, the byte-exact object reads, the
 cleanup of the LFS cache (prune and dedup) or the few configuration probes that run without an operation
-context. The lakeFS provider runs no subprocesses and reports no output.
+context.
+
+The lakeFS provider runs no subprocesses and reports its HTTP requests instead. Every request of an
+operation is one command. The `Command` header reads `lakefs <method> <target>`, with the target relative
+to `/api/v1`, for example `lakefs GET /repositories/arc1/branches/main` or
+`lakefs GET /repositories/arc1/refs/main/objects?path=data%2Fa.bin`. A `Notice` gives the status code and
+the time until the response arrived, for example `status 200 after 12 ms`. A response with a status
+outside 200 to 299 adds its body as `StdErr` lines. A transport failure or a timeout adds a `Notice` with
+the elapsed time and a `StdErr` line with the reason, and a cancellation adds a `Notice`. A transfer that
+completes adds a `Notice` with its byte count and total time. Object bodies and the bodies of successful
+responses never reach the channel. A request that the caller canceled before it started reports nothing.
+
+The command of a request ends when the request has settled. An object download ends after its file is
+written, and an upload ends after the provider has verified that the whole body was sent. A body that
+breaks while it is read therefore keeps the status that the response already had.
+
+The provider replaces the access key id and the secret of the connection with `[REDACTED]` in every line,
+including the Basic credential built from them and the percent-encoded forms. It also replaces the value
+of a query parameter whose name looks like a credential, such as a signature or a token. A credential shorter than four characters is not replaced,
+because the channel leaves out values that short, so use longer credentials if the log is shown to others.
+The failure messages of the provider get the same replacement.
+
+The end of a request delivers its pending entries at once, as the end of a subprocess does. An operation
+with many short requests, such as a paginated listing, can therefore deliver more than ten batches per
+second. The entries of one request stay together in order, and the host decides how many of them to keep.
 
 Show the output only in a folded or secondary view. Never use a raw line as the headline of an
 operation. The headline comes from progress and from the result.

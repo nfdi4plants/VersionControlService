@@ -109,11 +109,11 @@ module OutputObservers =
             flushStdout ()
             flushStderr ()
 
-let private resolveGitEnvironment (environment: obj option) =
-    environment
-    |> Option.defaultWith createNonInteractiveEnv
-    |> GitCommandResolver.ensureGitToolPath
-    |> GitExecution.forceEnglishDiagnostics
+/// The environment of one start. A caller's environment is a base that this start completes for its own executable.
+let private resolveGitEnvironment (invocation: GitExecution.GitInvocation) (environment: obj option) =
+    match environment with
+    | Some inherited -> GitExecution.completeEnvironment invocation inherited
+    | None -> createNonInteractiveEnv invocation
 
 let private runGitProcess
     (captureStdout: bool)
@@ -124,9 +124,11 @@ let private runGitProcess
     promise {
     let! result =
         Fable.Core.JS.Constructors.Promise.Create(fun resolve _ ->
-            let environment = resolveGitEnvironment request.Environment
+            let invocation = GitExecution.resolveInvocation ()
+            let environment = resolveGitEnvironment invocation request.Environment
 
             // The header is queued before the spawn. Nothing is computed when the host asked for no output.
+            // It names git whatever path the host selected.
             let commandOutput =
                 request.Output
                 |> Option.map (fun target ->
@@ -150,7 +152,7 @@ let private runGitProcess
                     | None -> ()
                 ]
 
-            let proc: obj = childProcessDynamic?spawn ("git", request.Arguments, spawnOptions)
+            let proc: obj = childProcessDynamic?spawn (invocation.Executable, request.Arguments, spawnOptions)
             let stdoutChunks = ResizeArray<obj>()
             let stderrChunks = ResizeArray<string>()
             let mutable finished = false

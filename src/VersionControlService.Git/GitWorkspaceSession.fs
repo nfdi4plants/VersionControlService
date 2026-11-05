@@ -113,7 +113,7 @@ let private codeOfKind (kind: GitFailureKind) =
     | GitFailureKind.LfsBackupRetained -> "lfs_backup_retained"
     | GitFailureKind.InvalidLfsThreshold -> "invalid_lfs_threshold"
     | GitFailureKind.RemoteProjectAlreadyExists -> "remote_project_exists"
-    | GitFailureKind.LocalChanges -> "local_changes"
+    | GitFailureKind.LocalChanges -> ObjectMaterializationCodes.LocalChanges
     | GitFailureKind.Unknown -> "git_failure"
 
 let private toOperationFailure (failure: GitService.GitFailure) : OperationFailure =
@@ -133,7 +133,7 @@ let private hydrationFailure (operation: string) (detail: string) =
 /// itself succeeded. A user cancellation gets its own wording so nobody goes looking
 /// for an outage that did not happen.
 let private materializationRecovery (failure: OperationFailure) : RecoveryAction = {
-    Code = "retry_materialization"
+    Code = ObjectMaterializationCodes.RetryMaterializationRecovery
     Instructions =
         Some(
             if failure.Category = Canceled then
@@ -144,7 +144,7 @@ let private materializationRecovery (failure: OperationFailure) : RecoveryAction
 }
 
 let private localMaterializationRecovery () : RecoveryAction = {
-    Code = "retry_materialization"
+    Code = ObjectMaterializationCodes.RetryMaterializationRecovery
     Instructions = Some "Materialize the path again to replace the pointer with the object's content."
 }
 
@@ -157,18 +157,33 @@ let private awaitGit (operation: JS.Promise<GitService.GitResult<'T>>) : Async<R
         | Error failure -> return Error(toOperationFailure failure)
     }
 
-/// Direct git process invocation honoring the RunProcess hook.
-let private mergeGitEnvironment (requestEnvironment: (string * string)[]) =
+/// Direct git process invocation honoring the RunProcess hook. The executable and the environment
+/// overrides of the request come from one resolution of the selected git executable.
+let private createGitRequestFor
+    (invocation: GitExecution.GitInvocation)
+    (arguments: string[])
+    (requestEnvironment: (string * string)[])
+    =
     let requestNames = requestEnvironment |> Array.map fst |> Set.ofArray
 
-    Array.append
-        (GitExecution.environmentOverrides ()
-         |> Array.filter (fun (name, _) -> not (Set.contains name requestNames)))
-        requestEnvironment
+    {
+        NodeProcess.ProcessRequest.create invocation.Executable arguments with
+            Environment =
+                Array.append
+                    (GitExecution.environmentOverridesFor invocation
+                     |> Array.filter (fun (name, _) -> not (Set.contains name requestNames)))
+                    requestEnvironment
+    }
 
-/// Runs git with a progress phase code for its meter lines. Stderr meters are always read. Stdout is
-/// read and reported to the output channel only when `observeStdout` is set, because the stdout of most calls is data.
-let private runGitWithProgress
+/// The same request, resolving the selected git executable anew.
+let private createGitRequest (arguments: string[]) (requestEnvironment: (string * string)[]) =
+    createGitRequestFor (GitExecution.resolveInvocation ()) arguments requestEnvironment
+
+/// Runs git with a progress phase code for its meter lines, using the given resolution of the selected
+/// executable. Stderr meters are always read. Stdout is read and reported to the output channel only when
+/// `observeStdout` is set, because the stdout of most calls is data.
+let private runGitWithInvocation
+    (invocation: GitExecution.GitInvocation)
     (phaseCode: string)
     (observeStdout: bool)
     (hooks: GitSessionHooks)
@@ -180,10 +195,9 @@ let private runGitWithProgress
     : Async<Result<NodeProcess.ProcessOutput, OperationFailure>> =
     async {
         let request = {
-            NodeProcess.ProcessRequest.create "git" arguments with
+            createGitRequestFor invocation arguments environment with
                 WorkingDirectory = Some repoPath
                 StdinData = stdinData
-                Environment = mergeGitEnvironment environment
                 ProgressPhase = phaseCode
                 ObserveStdoutProgress = observeStdout
                 ReportStdoutOutput = observeStdout
@@ -196,6 +210,31 @@ let private runGitWithProgress
         | Succeeded outcome -> return Ok outcome.Value
         | PartiallySucceeded(_, failure)
         | Failed failure -> return Error failure
+    }
+
+/// Runs git with a progress phase code for its meter lines. Each call resolves the selected executable anew.
+let private runGitWithProgress
+    (phaseCode: string)
+    (observeStdout: bool)
+    (hooks: GitSessionHooks)
+    (repoPath: string)
+    (arguments: string[])
+    (stdinData: string option)
+    (environment: (string * string)[])
+    (context: OperationContext)
+    : Async<Result<NodeProcess.ProcessOutput, OperationFailure>> =
+    async {
+        return!
+            runGitWithInvocation
+                (GitExecution.resolveInvocation ())
+                phaseCode
+                observeStdout
+                hooks
+                repoPath
+                arguments
+                stdinData
+                environment
+                context
     }
 
 let private runGitEnv hooks repoPath arguments stdinData environment context =
@@ -2005,9 +2044,8 @@ let private readConflictStagePreview
                 return Ok(Some(unsupportedConflictPreview path))
             | Ok _ ->
                 let request = {
-                    NodeProcess.ProcessRequest.create "git" [| "cat-file"; "blob"; stageInfo.BlobId |] with
+                    createGitRequest [| "cat-file"; "blob"; stageInfo.BlobId |] [||] with
                         WorkingDirectory = Some state.RepoPath
-                        Environment = mergeGitEnvironment [||]
                         ProgressPhase = "git"
                 }
 
@@ -2054,9 +2092,8 @@ let private readConflictStagePointer
                 | None ->
                     async {
                         let request = {
-                            NodeProcess.ProcessRequest.create "git" [| "cat-file"; "blob"; stageInfo.BlobId |] with
+                            createGitRequest [| "cat-file"; "blob"; stageInfo.BlobId |] [||] with
                                 WorkingDirectory = Some state.RepoPath
-                                Environment = mergeGitEnvironment [||]
                                 ProgressPhase = "git"
                         }
 
@@ -2289,10 +2326,9 @@ let private createRevisionTransaction (state: SessionState) (request: CreateRevi
                 fun arguments stdinData environment ->
                     async {
                         let processRequest = {
-                            NodeProcess.ProcessRequest.create "git" arguments with
+                            createGitRequest arguments environment with
                                 WorkingDirectory = Some state.RepoPath
                                 StdinData = stdinData
-                                Environment = mergeGitEnvironment environment
                                 ProgressPhase = "git"
                         }
 
@@ -3670,7 +3706,7 @@ let private refresh (state: SessionState) (context: OperationContext) =
                 | Error failure -> return Failed failure
                 | Ok authArguments ->
 
-                reportStepStart "fetch" "Fetching online changes" context
+                reportStepStart ProgressPhaseCodes.Refresh "Fetching online changes" context
 
                 let! fetchResult = runGitFetchChecked state.Hooks state.RepoPath authArguments remote context
 
@@ -3941,7 +3977,7 @@ let private updateFromState
                                     false
                                 )
                         else
-                            reportStepStart "merge" "Merging online changes" context
+                            reportStepStart ProgressPhaseCodes.Update "Merging online changes" context
 
                             let! result =
                                 runGitEnv
@@ -6261,16 +6297,6 @@ let private createSessionWithTextDiff
                         (preflightIndexLock state)
                         serializeLargeObjectWork
                 )
-            ObjectBatchMaterialization =
-                Some(
-                    GitLfsExtensions.createObjectBatchMaterialization
-                        state.RepoPath
-                        (fun arguments context -> runGit state.Hooks state.RepoPath arguments None context)
-                        state.Credentials
-                        state.ConnectionProfileId
-                        (preflightIndexLock state)
-                        serializeLargeObjectWork
-                )
             StoragePolicy =
                 Some(
                     GitLfsExtensions.createStoragePolicy
@@ -6420,22 +6446,35 @@ let private createFactoryWithSessions
     (credentials: GitCredentialStrategy.GitCredentialStrategy)
     (openSession: WorkspaceBinding -> WorkspaceSession)
     : ProviderFactory =
-    let checkDependencies (context: OperationContext) : Async<OperationResult<DependencyStatus[]>> =
+    // The remediation of an explicit selection names the path and the reason, so the host can show
+    // which file the user chose.
+    let selectedGitRemediation (path: string) (problem: string) =
+        $"The selected Git executable '{path}' {problem}. Choose another file or use the Git found on PATH."
+
+    // Every git command of the check runs with the one resolution passed in, so the three results
+    // describe the same git.
+    let checkSelectedGit
+        (invocation: GitExecution.GitInvocation)
+        (probeExecutablePath: string option)
+        (context: OperationContext)
+        : Async<OperationResult<DependencyStatus[]>> =
+        let runGitForCheck (arguments: string[]) =
+            runGitWithInvocation invocation "git" false hooks "." arguments None [||] context
+
         async {
-            let! gitVersion = runGit hooks "." [| "--version" |] None context
+            let! gitVersion = runGitForCheck [| "--version" |]
 
             match gitVersion with
             | Error failure when failure.Category = Canceled -> return Failed failure
             | _ ->
-                let! lfsVersion = runGit hooks "." [| "lfs"; "version" |] None context
+                let! lfsVersion = runGitForCheck [| "lfs"; "version" |]
 
                 match lfsVersion with
                 | Error failure when failure.Category = Canceled -> return Failed failure
                 | _ ->
                     let! lfsFilter =
                         async {
-                            let! globalFilter =
-                                runGit hooks "." [| "config"; "--global"; "--get"; "filter.lfs.process" |] None context
+                            let! globalFilter = runGitForCheck [| "config"; "--global"; "--get"; "filter.lfs.process" |]
 
                             match globalFilter with
                             | Error _ -> return globalFilter
@@ -6443,7 +6482,7 @@ let private createFactoryWithSessions
                                 return globalFilter
                             | Ok _ ->
                                 let! systemFilter =
-                                    runGit hooks "." [| "config"; "--system"; "--get"; "filter.lfs.process" |] None context
+                                    runGitForCheck [| "config"; "--system"; "--get"; "filter.lfs.process" |]
 
                                 match systemFilter with
                                 | Error failure when failure.Category = Canceled -> return systemFilter
@@ -6457,50 +6496,69 @@ let private createFactoryWithSessions
                     | _ ->
                         // The remediation names the cause, so a Git that could not start or
                         // failed does not read like a missing or outdated install.
-                        let versionFailureDetail (command: string) (result: Result<NodeProcess.ProcessOutput, OperationFailure>) =
+                        let versionFailureCause
+                            (command: string)
+                            (result: Result<NodeProcess.ProcessOutput, OperationFailure>)
+                            =
                             match result with
-                            | Error failure -> $"{failure.Message.TrimEnd('.')}. "
+                            | Error failure -> failure.Message.TrimEnd('.')
                             | Ok output when String.IsNullOrWhiteSpace output.StdErr ->
-                                $"`{command}` exited with code {output.ExitCode}. "
-                            | Ok output -> $"`{command}` exited with code {output.ExitCode}: {output.StdErr.Trim().TrimEnd('.')}. "
+                                $"`{command}` exited with code {output.ExitCode}"
+                            | Ok output ->
+                                $"`{command}` exited with code {output.ExitCode}: {output.StdErr.Trim().TrimEnd('.')}"
+
+                        let versionFailureDetail
+                            (command: string)
+                            (result: Result<NodeProcess.ProcessOutput, OperationFailure>)
+                            =
+                            $"{versionFailureCause command result}. "
+
+                        // A program that fails to start or does not print Git's version line is not
+                        // Git, whatever else it prints.
+                        let gitNotInstalled (cause: string) : DependencyStatus = {
+                            Component = "git"
+                            Installed = false
+                            Version = None
+                            Compatible = false
+                            Remediation =
+                                Some(
+                                    if invocation.Explicit then
+                                        selectedGitRemediation
+                                            invocation.Executable
+                                            ("did not run as Git (" + cause + ")")
+                                    else
+                                        cause + ". Install Git 2.42 or newer and ensure it is on PATH."
+                                )
+                            ProbeExecutablePath = probeExecutablePath
+                        }
 
                         let gitStatus: DependencyStatus =
                             match gitVersion with
                             | Ok output when output.ExitCode = 0 ->
                                 let versionText = output.StdOut.Trim()
 
-                                // Git LFS 3.7 lists files from the index only with Git 2.42 or newer.
-                                // With older Git, `git lfs checkout` reads the HEAD tree and leaves a
-                                // picked conflict candidate, which is staged but not committed, as a pointer.
-                                let compatible =
-                                    match GitService.tryParseVersion versionText with
-                                    | Some(major, minor, _) -> major > 2 || (major = 2 && minor >= 42)
-                                    | None -> false
+                                match GitService.tryParseVersion versionText with
+                                | None -> gitNotInstalled "`git --version` printed no Git version line"
+                                | Some(major, minor, _) ->
+                                    // Git LFS 3.7 lists files from the index only with Git 2.42 or newer.
+                                    // With older Git, `git lfs checkout` reads the HEAD tree and leaves a
+                                    // picked conflict candidate, which is staged but not committed, as a pointer.
+                                    let compatible = major > 2 || (major = 2 && minor >= 42)
 
-                                {
-                                    Component = "git"
-                                    Installed = true
-                                    Version = Some versionText
-                                    Compatible = compatible
-                                    Remediation =
-                                        if compatible then
-                                            None
-                                        else
-                                            Some
-                                                "Install Git 2.42 or newer: Git LFS needs it to check out files that are staged but not committed."
-                                }
-                            | _ ->
-                                {
-                                    Component = "git"
-                                    Installed = false
-                                    Version = None
-                                    Compatible = false
-                                    Remediation =
-                                        Some(
-                                            versionFailureDetail "git --version" gitVersion
-                                            + "Install Git 2.42 or newer and ensure it is on PATH."
-                                        )
-                                }
+                                    {
+                                        Component = "git"
+                                        Installed = true
+                                        Version = Some versionText
+                                        Compatible = compatible
+                                        Remediation =
+                                            if compatible then
+                                                None
+                                            else
+                                                Some
+                                                    "Install Git 2.42 or newer: Git LFS needs it to check out files that are staged but not committed."
+                                        ProbeExecutablePath = probeExecutablePath
+                                    }
+                            | _ -> gitNotInstalled (versionFailureCause "git --version" gitVersion)
 
                         let lfsStatus: DependencyStatus =
                             match lfsVersion with
@@ -6522,6 +6580,7 @@ let private createFactoryWithSessions
                                             None
                                         else
                                             Some "Install a supported Git LFS release and ensure `git lfs version` succeeds."
+                                    ProbeExecutablePath = probeExecutablePath
                                 }
                             | _ ->
                                 {
@@ -6534,6 +6593,7 @@ let private createFactoryWithSessions
                                             versionFailureDetail "git lfs version" lfsVersion
                                             + "Install Git LFS and ensure `git lfs version` succeeds."
                                         )
+                                    ProbeExecutablePath = probeExecutablePath
                                 }
 
                         let filterInstalled =
@@ -6553,12 +6613,40 @@ let private createFactoryWithSessions
                                         None
                                     elif not lfsStatus.Installed then
                                         Some "Install Git LFS before configuring its global filter process."
+                                    elif invocation.Explicit then
+                                        // A bare git on PATH can be another installation than the selected one.
+                                        Some
+                                            $"Run `\"{invocation.Executable}\" lfs install --skip-repo` to configure Git LFS globally."
                                     else
                                         Some "Run `git lfs install --skip-repo` to configure Git LFS globally."
+                                ProbeExecutablePath = probeExecutablePath
                             }
 
                         return OperationResult.succeeded [| gitStatus; lfsStatus; filterStatus |]
         }
+
+    // An explicit selection that cannot start git has no fallback to the git on PATH. All three
+    // components report it as not installed and name the path.
+    let unusableSelectionStatuses (path: string) (problem: string) : DependencyStatus[] =
+        let remediation = selectedGitRemediation path problem
+
+        [| "git"; "git-lfs"; "git-lfs-configuration" |]
+        |> Array.map (fun dependencyComponent -> {
+            Component = dependencyComponent
+            Installed = false
+            Version = None
+            Compatible = false
+            Remediation = Some remediation
+            ProbeExecutablePath = Some path
+        })
+
+    let checkDependencies (context: OperationContext) : Async<OperationResult<DependencyStatus[]>> = async {
+        let invocation = GitExecution.resolveInvocation ()
+
+        match GitExecution.explicitSelectionProblem invocation with
+        | Some problem -> return OperationResult.succeeded (unusableSelectionStatuses invocation.Executable problem)
+        | None -> return! checkSelectedGit invocation (GitExecution.probeExecutablePath invocation) context
+    }
 
     let manualLfsInstallationRequired () =
         OperationFailure.create
@@ -6823,7 +6911,7 @@ let private createFactoryWithSessions
                             | Error failure -> return Error failure
                             | Ok () ->
                                 cloneStarted <- true
-                                reportStepStart "clone" "Cloning the repository" context
+                                reportStepStart ProgressPhaseCodes.Clone "Cloning the repository" context
 
                                 // Git keeps large objects as pointers until hydration so a download
                                 // failure can be reported as partial success.
