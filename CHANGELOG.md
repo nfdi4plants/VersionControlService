@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## 0.4.0 - 2026-11-05
+
 ### Added
 
 -   `GitExecution.setGitExecutableProvider` lets a host choose the git executable for every Git operation in the process. The selection has to be an absolute path, and `None` uses the git on the PATH. `GitExecution.resetGitExecutableProvider` goes back to automatic discovery.
