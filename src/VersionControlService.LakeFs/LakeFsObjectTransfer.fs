@@ -33,10 +33,16 @@ let transferSelected
     : Async<SelectedTransferResult> =
     async {
         let mutable failure: OperationFailure option = None
+        let mutable uploadAnnounced = false
         let completed = ResizeArray<CompletedObjectTransfer>()
 
         for selected in objects do
             if failure.IsNone then
+                // The first upload announces the batch. Deletions and a path without content do not upload.
+                if not uploadAnnounced && not selected.IsDeletion && selected.SourcePath.IsSome then
+                    uploadAnnounced <- true
+                    LakeFsApi.reportStepStart ProgressPhaseCodes.UploadObjects "Uploading objects" context
+
                 let! result =
                     if selected.IsDeletion then
                         async {

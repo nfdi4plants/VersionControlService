@@ -45,7 +45,9 @@ module OperationCancellation =
 /// Progress report with a stable phase code and a sanitized display message.
 /// Raw subprocess output is never forwarded without redaction.
 type OperationProgress = {
-    /// Stable machine-readable phase code such as "transfer" or "commit".
+    /// Stable machine-readable phase code. The steps that several providers report have their codes in
+    /// `ProgressPhaseCodes`, for example "fetch" or "merge". A provider adds codes of its own for the
+    /// details of its engine, such as the meters of a transfer.
     PhaseCode: string
     /// Optional item or repository path the progress refers to.
     Item: string option
@@ -54,6 +56,45 @@ type OperationProgress = {
     /// Sanitized human-readable message.
     DisplayMessage: string option
 }
+
+/// Phase codes of the steps that more than one provider reports. A provider announces the start of a step with
+/// an event that has no numbers and names the step in its `DisplayMessage`, so a host can show the step before
+/// the first meter of a transfer arrives. Meters of the transfer follow under the provider's own codes. A
+/// provider reports only the steps its engine really runs and invents no event for a step it lacks. Codes that
+/// name the details of one engine, such as the Git LFS phases, are not part of this module.
+///
+/// Both providers report `Refresh`, `Update` and `Clone`. The lakeFS provider reports the optional codes today,
+/// and the Git provider runs those steps and reports them under codes of its own.
+module ProgressPhaseCodes =
+
+    /// Observing or acquiring the changes of the target. A Refresh reports it before it reads the target, and a
+    /// Synchronize reports it through the Refresh it contains.
+    [<Literal>]
+    let Refresh = "fetch"
+
+    /// Incorporating the changes of the target into the workspace. An Update reports it before the merge, and a
+    /// Synchronize reports it through the Update it contains.
+    [<Literal>]
+    let Update = "merge"
+
+    /// Provisioning a cloned workspace. A Clone reports it before it creates the workspace.
+    [<Literal>]
+    let Clone = "clone"
+
+    /// Optional. Downloading objects into the workspace. A provider reports it once before the first object of a
+    /// batch downloads and skips it for a batch that downloads nothing.
+    [<Literal>]
+    let DownloadObjects = "download-objects"
+
+    /// Optional. Uploading objects from the workspace. A provider reports it once before the first object of a
+    /// batch uploads and skips it for a batch that uploads nothing.
+    [<Literal>]
+    let UploadObjects = "upload-objects"
+
+    /// Optional. Publishing the workspace revisions to the target. A provider reports it before the target takes
+    /// the revisions and skips it when there is nothing to publish.
+    [<Literal>]
+    let Publish = "publish"
 
 /// The kind of an output entry.
 [<RequireQualifiedAccess>]

@@ -7150,6 +7150,24 @@ Vitest.describe (
                         Vitest.expect(first.DisplayMessage.IsSome).toBe true
 
                     Vitest.expect(firstReportOf "clone" < firstReportOf "clone-lfs-pull").toBe true
+
+                    // The list keeps every start, so a step that starts twice fails the check.
+                    let cloneStarts =
+                        reports
+                        |> Seq.filter (fun report ->
+                            report.PhaseCode.StartsWith "clone"
+                            && report.Item.IsNone
+                            && report.Completed.IsNone
+                            && report.Total.IsNone
+                            && report.DisplayMessage.IsSome)
+                        |> Seq.map (fun report -> report.PhaseCode, report.DisplayMessage.Value)
+                        |> Seq.toArray
+
+                    Vitest.expect(cloneStarts).toEqual [|
+                        "clone", "Cloning the repository"
+                        "clone-lfs-pull", "Downloading large files"
+                        "clone-lfs-pull-checkout", "Checking out large files"
+                    |]
                     do! removeDirectoryAsync root
                 with error ->
                     do! removeDirectoryAsync root
@@ -7228,6 +7246,36 @@ Vitest.describe (
                         |> Seq.toArray
 
                     Vitest.expect(reportedSteps).toEqual steps
+
+                    // The list keeps every event, so a step that starts twice fails the checks below. A start has a
+                    // message and a reset has none, and neither carries numbers.
+                    let numberless =
+                        reports
+                        |> Seq.filter (fun report ->
+                            Array.contains report.PhaseCode steps
+                            && report.Item.IsNone
+                            && report.Completed.IsNone
+                            && report.Total.IsNone)
+                        |> Seq.toArray
+
+                    let starts =
+                        numberless
+                        |> Array.choose (fun report ->
+                            report.DisplayMessage |> Option.map (fun message -> report.PhaseCode, message))
+
+                    let resets =
+                        numberless
+                        |> Array.filter (fun report -> report.DisplayMessage.IsNone)
+                        |> Array.map (fun report -> report.PhaseCode)
+
+                    Vitest.expect(starts).toEqual [|
+                        "fetch", "Fetching online changes"
+                        "merge", "Merging online changes"
+                        "lfs-pull", "Downloading large files"
+                        "lfs-pull-checkout", "Checking out large files"
+                    |]
+
+                    Vitest.expect(resets).toEqual [| "refresh-state"; "update-inspection" |]
 
                     for code in [| "fetch"; "merge"; "lfs-pull"; "lfs-pull-checkout" |] do
                         let first = reports |> Seq.find (fun report -> report.PhaseCode = code)

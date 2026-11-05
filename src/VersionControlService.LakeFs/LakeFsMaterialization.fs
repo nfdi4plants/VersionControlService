@@ -4,6 +4,7 @@ open System
 open Fable.Core
 open VersionControlService.Abstractions
 
+module LakeFsApi = VersionControlService.LakeFs.LakeFsApi
 module LakeFsIndex = VersionControlService.LakeFs.LakeFsWorkspaceIndex
 module LakeFsStateStore = VersionControlService.LakeFs.LakeFsStateStore
 module NodeBinaryIO = VersionControlService.Runtime.Node.BinaryIO
@@ -840,6 +841,10 @@ let private prepareInternal
                     else
                         let temporaryPath =
                             NodePath.join [| transactionDirectory; $"object-{index.ToString().PadLeft(8, '0')}.tmp" |]
+
+                        // The first object opens the batch. A batch without objects never reaches this line.
+                        if index = 0 then
+                            LakeFsApi.reportStepStart ProgressPhaseCodes.DownloadObjects "Downloading objects" context
 
                         let! downloaded = download preparedObject temporaryPath context
 

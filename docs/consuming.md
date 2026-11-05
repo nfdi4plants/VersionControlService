@@ -1396,11 +1396,71 @@ The Git provider runs `git lfs ls-files -j` with no time limit, because that com
 
 A canceled `Materialize` or `Dematerialize` with several paths reports the paths that finished as changed.
 
-`OperationProgress` carries a stable `PhaseCode` such as `transfer`, an optional item,
+`OperationProgress` carries a stable `PhaseCode` such as `fetch`, an optional item,
 completed and total counts, and a sanitized `DisplayMessage`. Counts are `float` because
 JavaScript has no native 64-bit integer, so a float is what carries byte totals above two
 GiB exactly on both runtimes. Show the message, and branch on the
 phase code.
+
+### Step events across providers
+
+`ProgressPhaseCodes` holds the phase codes of the steps that more than one provider reports. The start of a
+step is an event without numbers: `Item`, `Completed` and `Total` are `None`, and the `DisplayMessage` names
+the step. A host can show the step before the first meter of a transfer arrives, and it needs no knowledge of
+the provider to do so.
+
+| Constant | Code | Step |
+| --- | --- | --- |
+| `Refresh` | `fetch` | Observing or acquiring the changes of the target |
+| `Update` | `merge` | Incorporating the changes of the target into the workspace |
+| `Clone` | `clone` | Provisioning a cloned workspace |
+| `DownloadObjects` | `download-objects` | Downloading objects into the workspace |
+| `UploadObjects` | `upload-objects` | Uploading objects from the workspace |
+| `Publish` | `publish` | Publishing the workspace revisions to the target |
+
+The first three mark the start of the operation they are named for, and both providers report them. A
+Synchronize adds no step of its own and reports the steps of the operations it runs. The last three are
+optional. The lakeFS provider reports them today. The Git provider runs the same steps and reports them under
+codes of its own, such as `lfs-pull` and `clone-lfs-pull` for the downloads and `push` and `lfs-upload` for the
+publish. It also keeps its own codes for the other details of git and Git LFS, such as the `-checkout` phases.
+These codes are not part of the vocabulary. The tables below list the codes of its downloads. A host can
+read a missing event of one of the first three codes as a step that did not run. A missing optional code says
+nothing about the step, because a provider may report it under a code of its own.
+
+The lakeFS provider reports all six codes, each with a start event of this shape:
+
+| Code | `DisplayMessage` | Reported before |
+| --- | --- | --- |
+| `fetch` | Fetching online changes | the Refresh reads the target |
+| `merge` | Merging online changes | the update merges the target into the workspace branch |
+| `clone` | Preparing repository workspace | the clone creates the directory and the binding |
+| `download-objects` | Downloading objects | the first object of a batch downloads |
+| `upload-objects` | Uploading objects | the first object of a batch uploads |
+| `publish` | Publishing workspace revisions | the publish merges the workspace branch into the target |
+
+lakeFS reports a step only when it does the work. An update with nothing to merge, or one that opens a
+conflict session, reports no `merge`. A batch that downloads nothing, for example one that only removes
+files, reports no `download-objects`, and a selected revision that only deletes objects reports no
+`upload-objects`. A publish that finds nothing to publish, or that fails its precondition check, reports no
+`publish`. The downloads of an update, a switch, a restore, the candidates of a conflict session and the first
+open of a workspace form one batch each. The uploads of a selected revision and the uploads of the
+resolutions of a conflict session do the same.
+
+The lakeFS clone only provisions the directory and the binding. It reports `clone` and downloads nothing.
+Opening the binding creates the workspace branch and downloads the objects, so the `download-objects` event of
+a fresh workspace arrives with the `Open` call and no second `clone` event follows.
+
+A step start and a meter differ. The start announces an activity and carries the message that names it. A
+meter measures a transfer and carries numbers, and its message describes the measurement. Meters keep the
+codes of their provider. The Git meters of a fetch and a clone use the codes `fetch` and `clone`. The lakeFS
+meters use `lakefs-download` and `lakefs-upload`, with the object key in `Item`, the bytes so far in
+`Completed` and the size of the object in `Total` when it is known. After the uploads of a selected revision,
+lakeFS also reports `selected-upload-complete` with the finished transfers in `Completed` and the selected
+paths in `Total`. These codes belong to the provider and are not part of the vocabulary. The providers do not
+normalize each other's messages or meters.
+
+The fallback services of a filled session report no progress. A host that wraps a session with
+`WorkspaceSession.withFallbackServices` receives the events of the provider's own services unchanged.
 
 ### Progress of Git transfers
 

@@ -793,6 +793,27 @@ let private registrations =
 
         [||]
 
+// The step events and output profiles register for the real providers only. They stay outside the seven shared
+// profiles, which the in-memory fake registers too, because the fake reports no progress and no output.
+let private registerRealProviderProfiles () =
+    let credentials = connection ()
+
+    [|
+        StepEventsProviderSuite.register lakeFsHarness
+        OutputProviderSuite.register lakeFsHarness [| credentials.AccessKeyId; credentials.SecretAccessKey |]
+    |]
+
+let private realProviderRegistrations =
+    if integrationEnabled () then
+        registerRealProviderProfiles ()
+    else
+        Vitest.Describe.Skip.skip (
+            "lakeFS integration skipped: Docker not available",
+            fun () -> registerRealProviderProfiles () |> ignore
+        )
+
+        [||]
+
 Vitest.describe (
     "lakeFS clone contract",
     fun () ->

@@ -314,6 +314,97 @@ let fallbackServicesTests =
             expectUnsupported conflictReason cancelResult
         }
 
+        testCaseAsync "fallback services report no progress"
+        <| async {
+            let reports = ResizeArray<OperationProgress>()
+            let capturing = OperationContext.create "fallback-progress" OperationCancellation.none reports.Add
+            let session = WorkspaceSession.withFallbackServices (WorkspaceSession.createCoreOnly descriptor (FakeProvider.createCore ()))
+            let synchronization = require "synchronization" session.Synchronization
+            let conflicts = require "conflict resolution" session.ConflictResolution
+            let objectMaterialization = require "object materialization" session.ObjectMaterialization
+            let storagePolicy = require "storage policy" session.StoragePolicy
+            let maintenance = require "maintenance" session.Maintenance
+            let repositoryBrowser = require "repository browser" session.RepositoryBrowser
+            let textDiff = require "text diff" session.TextDiff
+
+            let! _ = synchronization.Refresh capturing
+            let! _ = synchronization.PreviewUpdate capturing
+            let! _ = synchronization.Update { ExpectedWorkspaceVersion = "version" } capturing
+            let! _ = synchronization.Publish { ExpectedWorkspaceVersion = "version"; ExpectedTargetRevision = None } capturing
+            let! _ =
+                synchronization.Synchronize
+                    {
+                        ExpectedWorkspaceVersion = "version"
+                        ExpectedTargetRevision = None
+                        AcceptUpdateRisks = false
+                        PublishLocalRevisions = true
+                    }
+                    capturing
+            let! _ = conflicts.GetActiveSession capturing
+            let! _ = objectMaterialization.ListObjects capturing
+            let! _ = objectMaterialization.Materialize [| path |] capturing
+            let! _ = objectMaterialization.Dematerialize [| path |] capturing
+            let! _ = storagePolicy.GetSettings capturing
+            let! _ = storagePolicy.SetPathPolicy path true capturing
+            let! _ = maintenance.Prune capturing
+            let! _ = maintenance.Deduplicate capturing
+            let! _ = repositoryBrowser.GetRepositoryWebUrl capturing
+            let! _ =
+                textDiff.Open
+                    {
+                        Path = path
+                        PreviousPath = None
+                        Preparation = None
+                        PreviousEncoding = None
+                        CurrentEncoding = None
+                        ContextLines = 3
+                        Continuation = None
+                        Storage = DiffStoragePolicy.PreferDisk(0L, 67108864L)
+                    }
+                    capturing
+
+            Expect.isEmpty reports "No fallback service invents a progress event."
+        }
+
+        testCaseAsync "a filled session keeps the progress events of a provider service"
+        <| async {
+            let announcement: OperationProgress = {
+                PhaseCode = ProgressPhaseCodes.Refresh
+                Item = None
+                Completed = None
+                Total = None
+                DisplayMessage = Some "Fetching online changes"
+            }
+            let provider = FakeProvider.createFinalSynchronization ()
+            let reporting = {
+                provider with
+                    Refresh =
+                        fun operationContext ->
+                            async {
+                                operationContext.ReportProgress announcement
+                                return! provider.Refresh operationContext
+                            }
+            }
+            let raw = {
+                WorkspaceSession.createCoreOnly descriptor (FakeProvider.createCore ()) with
+                    Synchronization = Some reporting
+            }
+            let filled = WorkspaceSession.withFallbackServices raw
+
+            let observe (session: WorkspaceSession) =
+                async {
+                    let reports = ResizeArray<OperationProgress>()
+                    let capturing = OperationContext.create "provider-progress" OperationCancellation.none reports.Add
+                    let! _ = (require "synchronization" session.Synchronization).Refresh capturing
+                    return List.ofSeq reports
+                }
+
+            let! rawReports = observe raw
+            let! filledReports = observe filled
+            Expect.equal rawReports [ announcement ] "The provider service reports its step start."
+            Expect.equal filledReports rawReports "The filled session reports the same events."
+        }
+
         testCaseAsync "factory fallback fills successful opens and preserves outcome fields"
         <| async {
             let originalBrowser = FakeProvider.createBrowser ()

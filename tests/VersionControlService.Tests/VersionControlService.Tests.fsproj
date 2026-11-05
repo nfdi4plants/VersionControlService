@@ -13,6 +13,8 @@
     <Compile Include="Contracts\OperationalProviderSuite.fs" />
     <Compile Include="Contracts\ExtensionProviderSuites.fs" />
     <Compile Include="Contracts\ConsumerWorkflowSuite.fs" />
+    <Compile Include="Contracts\StepEventsProviderSuite.fs" />
+    <Compile Include="Contracts\OutputProviderSuite.fs" />
     <Compile Include="GitProviderContract.test.fs" />
     <Compile Include="GitDependency.test.fs" />
     <Compile Include="GitExecution.test.fs" />

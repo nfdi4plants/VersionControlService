@@ -3366,3 +3366,458 @@ Vitest.describe (
             }
         )
 )
+
+open VersionControlService.Tests.Contracts.ProviderHarness
+open VersionControlService.Tests.Contracts.ProviderHarness.SuiteHelpers
+
+// The step events of the lakeFS provider against a live lakeFS. A step start has no numbers and a message. The byte
+// meters and the selected-upload-complete event carry numbers, so the starts are the events without numbers.
+
+let private capture (name: string) =
+    let reports = ResizeArray<OperationProgress>()
+    reports, OperationContext.create name OperationCancellation.none reports.Add
+
+let private stepStarts (reports: ResizeArray<OperationProgress>) =
+    reports
+    |> Seq.filter (fun report ->
+        report.Item.IsNone
+        && report.Completed.IsNone
+        && report.Total.IsNone
+        && report.DisplayMessage.IsSome
+    )
+    |> Seq.map (fun report -> report.PhaseCode, report.DisplayMessage.Value)
+    |> Seq.toArray
+
+let private fetchStart = ProgressPhaseCodes.Refresh, "Fetching online changes"
+let private mergeStart = ProgressPhaseCodes.Update, "Merging online changes"
+let private cloneStart = ProgressPhaseCodes.Clone, "Preparing repository workspace"
+
+let private downloadStart =
+    ProgressPhaseCodes.DownloadObjects, "Downloading objects"
+
+let private uploadStart = ProgressPhaseCodes.UploadObjects, "Uploading objects"
+
+let private publishStart =
+    ProgressPhaseCodes.Publish, "Publishing workspace revisions"
+
+/// The meters of one transfer direction with their position among the events.
+let private metersOf (phaseCode: string) (reports: ResizeArray<OperationProgress>) =
+    reports
+    |> Seq.indexed
+    |> Seq.filter (fun (_, report) -> report.PhaseCode = phaseCode)
+    |> Seq.toArray
+
+let private indexOfPhase (phaseCode: string) (reports: ResizeArray<OperationProgress>) =
+    reports |> Seq.findIndex (fun report -> report.PhaseCode = phaseCode)
+
+/// Every meter follows the start of its step and carries the byte numbers and the object key.
+let private expectMetersAfter (startIndex: int) (meters: (int * OperationProgress)[]) =
+    Vitest.expect(meters.Length > 0).toBe true
+
+    for index, meter in meters do
+        Vitest.expect(index > startIndex).toBe true
+        Vitest.expect(meter.Item.IsSome).toBe true
+        Vitest.expect(meter.Completed.IsSome).toBe true
+
+let private synchronizeWithoutPublish (workspace: HarnessWorkspace) (context: OperationContext) = promise {
+    let! status = getStatus workspace
+
+    return!
+        run (
+            (syncService workspace.Session).Synchronize
+                {
+                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                    ExpectedTargetRevision = None
+                    AcceptUpdateRisks = false
+                    PublishLocalRevisions = false
+                }
+                context
+        )
+}
+
+let private createRevisionOf (workspace: HarnessWorkspace) (paths: string[]) (context: OperationContext) = promise {
+    let! status = getStatus workspace
+
+    return!
+        run (
+            workspace.Session.Core.CreateRevision
+                {
+                    Message = "step events revision"
+                    Paths = paths |> Array.map mkPath
+                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                }
+                context
+        )
+}
+
+let private liveTest (name: string) (body: ProviderTestHarness -> JS.Promise<unit>) =
+    Vitest.test (
+        name,
+        TestOptions(timeout = 120000, skip = not (integrationEnabled ())),
+        fun () -> promise {
+            if not (integrationEnabled ()) then
+                return failwith "lakeFS integration skipped: Docker not available"
+
+            let harness = createLakeFsHarness ()
+
+            try
+                do! body harness
+                do! harness.Cleanup()
+            with error ->
+                do! harness.Cleanup()
+                return raise error
+        }
+    )
+
+Vitest.describe (
+    "lakeFS step events",
+    fun () ->
+        liveTest
+            "an update that downloads objects reports fetch, merge and one download batch"
+            (fun harness -> promise {
+                let! workspace = harness.CreateWorkspace()
+
+                do!
+                    harness.AdvanceTarget workspace [|
+                        {
+                            Path = "first.txt"
+                            Content = Some "first content\n"
+                        }
+                        {
+                            Path = "second.txt"
+                            Content = Some "second content\n"
+                        }
+                    |]
+
+                let reports, context = capture "step-events-update-download"
+                let! result = synchronizeWithoutPublish workspace context
+
+                expectPerformed "synchronize with downloads" result |> ignore
+                Vitest.expect(stepStarts reports).toEqual [| fetchStart; mergeStart; downloadStart |]
+
+                let meters = metersOf "lakefs-download" reports
+                expectMetersAfter (indexOfPhase ProgressPhaseCodes.DownloadObjects reports) meters
+
+                for _, meter in meters do
+                    Vitest.expect(meter.DisplayMessage).toEqual (Some "lakeFS object bytes transferred")
+            })
+
+        liveTest
+            "an update that only removes objects reports no download"
+            (fun harness -> promise {
+                let! workspace = harness.CreateWorkspace()
+                do! harness.AdvanceTarget workspace [| { Path = "base.txt"; Content = None } |]
+
+                let reports, context = capture "step-events-update-removal"
+                let! result = synchronizeWithoutPublish workspace context
+
+                expectPerformed "synchronize with a removal" result |> ignore
+                Vitest.expect(stepStarts reports).toEqual [| fetchStart; mergeStart |]
+                Vitest.expect((metersOf "lakefs-download" reports).Length).toBe 0
+            })
+
+        liveTest
+            "an update with nothing to merge reports no events"
+            (fun harness -> promise {
+                let! workspace = harness.CreateWorkspace()
+                let! status = getStatus workspace
+                let reports, context = capture "step-events-update-noop"
+
+                let! result =
+                    run (
+                        (syncService workspace.Session).Update
+                            {
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            context
+                    )
+
+                expectNoOp "update of an up-to-date workspace" result |> ignore
+                Vitest.expect(reports.Count).toBe 0
+            })
+
+        liveTest
+            "a conflicting update reports one download for its candidates and no merge"
+            (fun harness -> promise {
+                let! workspace = harness.CreateWorkspace()
+
+                do!
+                    harness.AdvanceTarget workspace [|
+                        {
+                            Path = "base.txt"
+                            Content = Some "target version\n"
+                        }
+                    |]
+
+                do! workspace.WriteFile "base.txt" "workspace version\n"
+                let! revisionResult = createRevisionOf workspace [| "base.txt" |] (ctx "step-events-conflict-save")
+                expectPerformed "conflicting workspace revision" revisionResult |> ignore
+
+                let! status = getStatus workspace
+                let reports, context = capture "step-events-conflict-update"
+
+                let! updateResult =
+                    run (
+                        (syncService workspace.Session).Update
+                            {
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                            }
+                            context
+                    )
+
+                let failure = carriedFailure "conflicting update" updateResult
+                Vitest.expect(failure.Code).toBe ConformanceCodes.ConflictsDetected
+                Vitest.expect(stepStarts reports).toEqual [| downloadStart |]
+                // The base and the target version of the one path download as one batch.
+                Vitest.expect((metersOf "lakefs-download" reports).Length > 0).toBe true
+
+                // The finalization uploads the resolution as one batch.
+                let! sessionResult =
+                    run ((conflictService workspace.Session).GetActiveSession(ctx "step-events-conflict-session"))
+
+                let summary =
+                    match expectValue "active conflict session" sessionResult with
+                    | Some value -> value
+                    | None -> failwith "Expected an active conflict session."
+
+                let! resolveStatus = getStatus workspace
+
+                let! resolveResult =
+                    run (
+                        (conflictService workspace.Session).Resolve
+                            {
+                                Handle = summary.Handle
+                                ExpectedWorkspaceVersion = resolveStatus.WorkspaceVersion
+                                Path = mkPath "base.txt"
+                                Resolution = SupplyResolvedContent "resolved content\n"
+                            }
+                            (ctx "step-events-conflict-resolve")
+                    )
+
+                let resolution = expectValue "conflict resolution" resolveResult
+                let! finalizeStatus = getStatus workspace
+                let finalizeReports, finalizeContext = capture "step-events-conflict-finalize"
+
+                let! finalizeResult =
+                    run (
+                        (conflictService workspace.Session).Finalize
+                            {
+                                Handle = resolution.RefreshedHandle
+                                ExpectedWorkspaceVersion = finalizeStatus.WorkspaceVersion
+                                Message = Some "step events finalize"
+                            }
+                            finalizeContext
+                    )
+
+                expectValue "conflict finalization" finalizeResult |> ignore
+
+                let uploadStarts =
+                    stepStarts finalizeReports |> Array.filter (fun start -> start = uploadStart)
+
+                Vitest.expect(uploadStarts).toEqual [| uploadStart |]
+                Vitest.expect(stepStarts finalizeReports |> Array.contains mergeStart).toBe false
+            })
+
+        liveTest
+            "a selected revision reports one upload batch and a deletion alone reports none"
+            (fun harness -> promise {
+                let! workspace = harness.CreateWorkspace()
+                do! workspace.WriteFile "first.txt" "first content\n"
+                do! workspace.WriteFile "second.txt" "second content\n"
+
+                let reports, context = capture "step-events-revision-upload"
+                let! uploadResult = createRevisionOf workspace [| "first.txt"; "second.txt" |] context
+
+                expectPerformed "revision with uploads" uploadResult |> ignore
+                Vitest.expect(stepStarts reports).toEqual [| uploadStart |]
+
+                expectMetersAfter
+                    (indexOfPhase ProgressPhaseCodes.UploadObjects reports)
+                    (metersOf "lakefs-upload" reports)
+
+                let completion =
+                    reports
+                    |> Seq.find (fun report -> report.PhaseCode = "selected-upload-complete")
+
+                Vitest.expect(completion.Completed).toEqual (Some 2.0)
+                Vitest.expect(completion.Total).toEqual (Some 2.0)
+
+                do! workspace.RemoveFile "base.txt"
+                let deletionReports, deletionContext = capture "step-events-revision-deletion"
+                let! deletionResult = createRevisionOf workspace [| "base.txt" |] deletionContext
+
+                expectPerformed "revision with a deletion" deletionResult |> ignore
+                Vitest.expect(stepStarts deletionReports).toEqual [||]
+                Vitest.expect((metersOf "lakefs-upload" deletionReports).Length).toBe 0
+            })
+
+        liveTest
+            "a publish reports one publish step and a publish with nothing to publish reports none"
+            (fun harness -> promise {
+                let! workspace = harness.CreateWorkspace()
+                do! workspace.WriteFile "local.txt" "local content\n"
+                let! revisionResult = createRevisionOf workspace [| "local.txt" |] (ctx "step-events-publish-save")
+                expectPerformed "revision before the publish" revisionResult |> ignore
+
+                let publish (name: string) = promise {
+                    let reports, context = capture name
+                    let! status = getStatus workspace
+
+                    let! result =
+                        run (
+                            (syncService workspace.Session).Publish
+                                {
+                                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                    ExpectedTargetRevision = None
+                                }
+                                context
+                        )
+
+                    return reports, result
+                }
+
+                let! reports, result = publish "step-events-publish"
+                expectPerformed "publish" result |> ignore
+                Vitest.expect(stepStarts reports).toEqual [| publishStart |]
+
+                let! secondReports, secondResult = publish "step-events-publish-again"
+                expectNoOp "publish without local revisions" secondResult |> ignore
+                Vitest.expect(secondReports.Count).toBe 0
+            })
+
+        liveTest
+            "a synchronize that updates and publishes reports its steps in order"
+            (fun harness -> promise {
+                let! workspace = harness.CreateWorkspace()
+
+                do!
+                    harness.AdvanceTarget workspace [|
+                        {
+                            Path = "remote.txt"
+                            Content = Some "remote content\n"
+                        }
+                    |]
+
+                do! workspace.WriteFile "local.txt" "local content\n"
+                let! revisionResult = createRevisionOf workspace [| "local.txt" |] (ctx "step-events-both-save")
+                expectPerformed "local revision" revisionResult |> ignore
+
+                let! status = getStatus workspace
+                let reports, context = capture "step-events-both"
+
+                let! result =
+                    run (
+                        (syncService workspace.Session).Synchronize
+                            {
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                                AcceptUpdateRisks = false
+                                PublishLocalRevisions = true
+                            }
+                            context
+                    )
+
+                expectPerformed "synchronize with publishing" result |> ignore
+
+                Vitest.expect(stepStarts reports).toEqual [| fetchStart; mergeStart; downloadStart; publishStart |]
+            })
+
+        liveTest
+            "a clone reports the clone step and the open of the clone reports the download"
+            (fun harness -> promise {
+                let! anchor = harness.CreateWorkspace()
+                let! clonePath = harness.CreateLocalPath()
+                let cloneReports, cloneContext = capture "step-events-clone"
+
+                let! cloneResult =
+                    run (
+                        harness.Factory.Clone
+                            {
+                                Location = anchor.Binding.Location
+                                TargetPath = clonePath
+                                TargetRef = None
+                                MaterializeAllObjects = true
+                            }
+                            cloneContext
+                    )
+
+                let binding = expectValue "clone" cloneResult
+                Vitest.expect(stepStarts cloneReports).toEqual [| cloneStart |]
+                Vitest.expect((metersOf "lakefs-download" cloneReports).Length).toBe 0
+
+                let openReports, openContext = capture "step-events-clone-open"
+                let! openResult = run (harness.Factory.Open binding openContext)
+                expectValue "open of the clone" openResult |> ignore
+
+                Vitest.expect(stepStarts openReports).toEqual [| downloadStart |]
+
+                expectMetersAfter
+                    (indexOfPhase ProgressPhaseCodes.DownloadObjects openReports)
+                    (metersOf "lakefs-download" openReports)
+
+                let reopenReports, reopenContext = capture "step-events-clone-reopen"
+                let! reopenResult = run (harness.Factory.Open binding reopenContext)
+                expectValue "reopen of the clone" reopenResult |> ignore
+                Vitest.expect(reopenReports.Count).toBe 0
+            })
+
+        liveTest
+            "a filled session keeps the raw event sequence and its fallback services report none"
+            (fun harness -> promise {
+                let! workspace = harness.CreateWorkspace()
+                let raw = workspace.Session
+                let filled = WorkspaceSession.withFallbackServices raw
+
+                let refreshOf (session: WorkspaceSession) (name: string) = promise {
+                    let reports, context = capture name
+                    let! result = run ((syncService session).Refresh context)
+                    expectOutcome "refresh" result |> ignore
+                    return reports
+                }
+
+                let! rawReports = refreshOf raw "step-events-raw-refresh"
+                let! filledReports = refreshOf filled "step-events-filled-refresh"
+                Vitest.expect(stepStarts rawReports).toEqual [| fetchStart |]
+                Vitest.expect(stepStarts filledReports).toEqual (stepStarts rawReports)
+
+                do!
+                    harness.AdvanceTarget workspace [|
+                        {
+                            Path = "later.txt"
+                            Content = Some "later content\n"
+                        }
+                    |]
+
+                let reports, context = capture "step-events-filled-synchronize"
+                let! status = getStatus workspace
+
+                let! result =
+                    run (
+                        (syncService filled).Synchronize
+                            {
+                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedTargetRevision = None
+                                AcceptUpdateRisks = false
+                                PublishLocalRevisions = false
+                            }
+                            context
+                    )
+
+                expectPerformed "filled synchronize" result |> ignore
+                Vitest.expect(stepStarts reports).toEqual [| fetchStart; mergeStart; downloadStart |]
+
+                // The lakeFS session has no object materialization, so the filled one runs the no-op fallback.
+                Vitest.expect(raw.ObjectMaterialization.IsNone).toBe true
+                Vitest.expect(raw.StoragePolicy.IsNone).toBe true
+                Vitest.expect(raw.Maintenance.IsNone).toBe true
+                Vitest.expect(raw.RepositoryBrowser.IsNone).toBe true
+
+                let fallbackReports, fallbackContext = capture "step-events-fallback"
+                let! _ = run ((filled.ObjectMaterialization.Value).ListObjects fallbackContext)
+                let! _ = run ((filled.ObjectMaterialization.Value).Materialize [| mkPath "base.txt" |] fallbackContext)
+                let! _ = run ((filled.StoragePolicy.Value).GetSettings fallbackContext)
+                let! _ = run ((filled.Maintenance.Value).Prune fallbackContext)
+                let! _ = run ((filled.RepositoryBrowser.Value).GetRepositoryWebUrl fallbackContext)
+                Vitest.expect(fallbackReports.Count).toBe 0
+            })
+)

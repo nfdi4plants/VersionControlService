@@ -23,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -   The lakeFS provider reports its HTTP requests on `OperationContext.ReportOutput`, with the credentials of the connection removed.
 -   `CommandOutput.ObserveNotice` adds a `Notice` line to a command. `OutputReporter.knownSecrets` and `beginCommandWithSecrets` start a command that hides credentials the caller knows as values.
 -   `ObjectMaterializationCodes` holds the failure and recovery codes of object materialization. The Git provider reports the same strings as before.
+-   `ProgressPhaseCodes` holds the phase codes of steps that more than one provider reports. Both providers report `fetch`, `merge` and `clone`. Only lakeFS reports `download-objects`, `upload-objects` and `publish`, because Git reports those steps under its own codes.
+-   The lakeFS provider reports an event when a step starts, with the codes of `ProgressPhaseCodes`. A step that does no work reports nothing.
 
 ### Changed
 

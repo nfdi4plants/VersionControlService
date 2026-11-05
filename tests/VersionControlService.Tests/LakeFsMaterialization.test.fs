@@ -216,3 +216,118 @@ Vitest.describe (
             }
         )
 )
+
+Vitest.describe (
+    "lakeFS materialization step events",
+    fun () ->
+        // Runs one preparation with a download that only records itself. The progress events and the downloads
+        // share one list, so the order of the announcement and the downloads is visible.
+        let prepareAndRecord prepare (objectNames: string[]) (removalNames: string[]) = promise {
+            let! root = createTempDirectoryAsync ()
+            let transactionsDirectory = join [| root; "transactions" |]
+            let! _ = fsPromisesDynamic?mkdir transactionsDirectory |> unbox<JS.Promise<obj>>
+
+            try
+                let reports = ResizeArray<OperationProgress>()
+                let order = ResizeArray<string>()
+
+                let objects: LakeFsMaterialization.MaterializationObject[] =
+                    objectNames
+                    |> Array.map (fun name -> {
+                        Path = repositoryPath name
+                        ObjectKey = name
+                        TargetPath = join [| root; name |]
+                        BaseChecksum = $"base-{name}"
+                        Mtime = 1.0
+                    })
+
+                let removals =
+                    removalNames
+                    |> Array.map (fun name -> repositoryPath name, join [| root; name |])
+
+                let download
+                    (prepared: LakeFsMaterialization.MaterializationObject)
+                    (temporaryPath: string)
+                    (_: OperationContext)
+                    : Async<Result<NodeBinaryIO.StreamCopyResult, OperationFailure>> =
+                    async {
+                        order.Add $"download {prepared.ObjectKey}"
+                        NodeFileSystem.writeUtf8FileExclusiveAndFlushSync temporaryPath $"body-{prepared.ObjectKey}"
+
+                        return
+                            Ok {
+                                BytesCopied = 1.0
+                                Sha256 = $"hash-{prepared.ObjectKey}"
+                            }
+                    }
+
+                let barrier (_: string) (_: OperationContext) = async { return () }
+
+                let context =
+                    OperationContext.create
+                        "lakefs-materialization-step-events"
+                        OperationCancellation.none
+                        (fun progress ->
+                            reports.Add progress
+                            order.Add "progress"
+                        )
+
+                let! preparedResult =
+                    prepare transactionsDirectory emptyIndex false objects removals download barrier context
+                    |> Async.StartAsPromise
+
+                match preparedResult with
+                | Error(failure: OperationFailure) -> failwith $"Materialization preparation failed: {failure.Code}"
+                | Ok plan ->
+                    let! cleaned = LakeFsMaterialization.cleanup plan |> Async.StartAsPromise
+
+                    match cleaned with
+                    | Ok() -> ()
+                    | Error failure -> failwith $"Materialization cleanup failed: {failure.Code}"
+
+                do! removeDirectoryAsync root
+                return reports.ToArray(), order.ToArray()
+            with error ->
+                do! removeDirectoryAsync root
+                return raise error
+        }
+
+        for variant, prepare in
+            [
+                "prepare", LakeFsMaterialization.prepare
+                "prepareSelected", LakeFsMaterialization.prepareSelected
+            ] do
+            Vitest.test (
+                $"{variant} announces the downloads of a batch once before the first object",
+                TestOptions(timeout = 120000),
+                fun () -> promise {
+                    let! reports, order = prepareAndRecord prepare [| "first.bin"; "second.bin" |] [||]
+
+                    Vitest.expect(order).toEqual [|
+                        "progress"
+                        "download first.bin"
+                        "download second.bin"
+                    |]
+                    Vitest.expect(reports.Length).toBe 1
+                    Vitest.expect(reports[0].PhaseCode).toBe ProgressPhaseCodes.DownloadObjects
+                    Vitest.expect(reports[0].Item).toEqual None
+                    Vitest.expect(reports[0].Completed).toEqual None
+                    Vitest.expect(reports[0].Total).toEqual None
+                    Vitest.expect(reports[0].DisplayMessage).toEqual (Some "Downloading objects")
+                }
+            )
+
+            Vitest.test (
+                $"{variant} announces no download for a batch that downloads nothing",
+                TestOptions(timeout = 120000),
+                fun () -> promise {
+                    let! emptyReports, emptyOrder = prepareAndRecord prepare [||] [||]
+                    let! removalReports, removalOrder = prepareAndRecord prepare [||] [| "gone.bin" |]
+
+                    Vitest.expect(emptyReports.Length).toBe 0
+                    Vitest.expect(emptyOrder).toEqual [||]
+                    Vitest.expect(removalReports.Length).toBe 0
+                    Vitest.expect(removalOrder).toEqual [||]
+                }
+            )
+)

@@ -333,6 +333,17 @@ let listObjects
                 )
     }
 
+/// Announces a step before it runs, in the shape the Git provider uses: the event has no numbers and names the
+/// step in its message. The byte meters of a transfer keep their own codes and their own message.
+let reportStepStart (phaseCode: string) (message: string) (context: OperationContext) =
+    context.ReportProgress {
+        PhaseCode = phaseCode
+        Item = None
+        Completed = None
+        Total = None
+        DisplayMessage = Some message
+    }
+
 let downloadObjectToFile
     (connection: LakeFsConnection)
     (repository: string)

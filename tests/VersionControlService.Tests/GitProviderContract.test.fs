@@ -566,6 +566,14 @@ let private registrations = [|
     ConsumerWorkflowSuite.register gitHarness
 |]
 
+// The step events and output profiles register for the real providers only. They stay outside the seven shared
+// profiles, which the in-memory fake registers too, because the fake reports no progress and no output. The Git
+// harness configures no credentials, so the output profile has no secret values to look for.
+let private realProviderRegistrations = [|
+    StepEventsProviderSuite.register gitHarness
+    OutputProviderSuite.register gitHarness [||]
+|]
+
 let private expectProviderValue (operationName: string) (result: OperationResult<'T>) : 'T =
     match result with
     | Succeeded outcome -> outcome.Value

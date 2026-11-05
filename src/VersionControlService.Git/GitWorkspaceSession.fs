@@ -3706,7 +3706,7 @@ let private refresh (state: SessionState) (context: OperationContext) =
                 | Error failure -> return Failed failure
                 | Ok authArguments ->
 
-                reportStepStart "fetch" "Fetching online changes" context
+                reportStepStart ProgressPhaseCodes.Refresh "Fetching online changes" context
 
                 let! fetchResult = runGitFetchChecked state.Hooks state.RepoPath authArguments remote context
 
@@ -3977,7 +3977,7 @@ let private updateFromState
                                     false
                                 )
                         else
-                            reportStepStart "merge" "Merging online changes" context
+                            reportStepStart ProgressPhaseCodes.Update "Merging online changes" context
 
                             let! result =
                                 runGitEnv
@@ -6911,7 +6911,7 @@ let private createFactoryWithSessions
                             | Error failure -> return Error failure
                             | Ok () ->
                                 cloneStarted <- true
-                                reportStepStart "clone" "Cloning the repository" context
+                                reportStepStart ProgressPhaseCodes.Clone "Cloning the repository" context
 
                                 // Git keeps large objects as pointers until hydration so a download
                                 // failure can be reported as partial success.
